@@ -116,22 +116,48 @@ the CUDA path keeps x as F32 (matching Metal).  These are different
 algorithms and their results legitimately diverge by ~3-7%; bit-exact
 agreement with CPU would require quantising x to q8_K in CUDA too.
 
-Useful next investigations:
+### Key insight: Metal also reads F32 x for Q8_0 matvec
 
-1. Quantise x to q8_K on the CUDA side before Q8_0 matmul.  Would make
-   us bit-exact with CPU (and probably Metal too, since Metal's Q8_0
-   matvec also reads F32 x but produces small precision differences from
-   the F32 accumulation order).
-2. Per-token / per-layer logits dump to bisect *which* of the 43 layer
-   transitions degrade the output most.  Currently every layer compounds
-   ~3-7% relative error and the cumulative effect produces wrong tokens.
-3. FP8 KV quantization: a Round 2 attempt at adding per-64-element
-   power-of-2 scaling (matching Metal's `kernel_dsv4_fp8_kv_quantize_f32`)
-   made the metal-graph-test diff bigger and inference output worse.
-   The CPU reference appears to skip FP8 quantization (or model it
-   differently), so faithfully reproducing Metal's FP8 actually drifts
-   us further from CPU.  Need to investigate what the CPU path does for
-   the FP8 KV step before retrying.
+Confirmed by reading `metal/dense.metal::kernel_mul_mv_q8_0_f32_impl`:
+
+```c
+device const float * y = (device const float *) (src1 + offset1);
+...
+for (i = 0; i < NQ; ++i) sumq += qs[i] * yl[i];  // int8 × F32
+sumf[row] += sumq * ax[row][ib].d;
+```
+
+So **Metal does the same F32 dot as our CUDA**.  The CPU reference is the
+outlier: it quantises x to q8_K before the GEMM, which introduces ~0.4%
+error per element and produces the 0.03-0.07 diffs we see against CPU.
+
+This means Metal's actual numerical behaviour should be very close to
+our CUDA, and the inference output quality should also be similar.
+The fact that ds4-cuda still produces somewhat degraded text suggests
+there is an undiscovered structural bug, not just precision drift.
+
+### Next investigations (priority order)
+
+1. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
+   dumps the residual / KV / attention output / logits at each of the
+   43 layers and compare against a Metal capture for the same prompt.
+   This bisects the layer where my drift differs from Metal's, not from
+   CPU.  Without this, we are debugging blind because CPU is the
+   "wrong" reference for our F32-x algorithmic choice.
+2. **Try cuBLAS-LT for F16 GEMM**.  CUDA 13.0 may have lifted the
+   `CUBLAS_STATUS_NOT_SUPPORTED` we saw for host-mmap pointers + small-m
+   shapes.  cublasLtMatmul has a wider supported config space.
+3. **Audit decode-time numeric paths**.  The metal-graph-test only
+   covers layer-0 prefill.  decode_mixed_batch / decode_heads /
+   compressor_update are exercised only during text generation, and
+   subtle bugs there would only show in actual inference.
+4. **FP8 KV quantization (deferred)**.  A Round 2 attempt at adding
+   per-64-element power-of-2 scaling (matching Metal's
+   `kernel_dsv4_fp8_kv_quantize_f32`) made the metal-graph-test diff
+   bigger and inference output worse.  The CPU reference appears to
+   skip FP8 quantization, so faithfully reproducing Metal's FP8 drifts
+   us further from CPU.  Need a Metal-vs-CUDA per-layer dump (item 1)
+   before retrying this, because the CPU diff metric is misleading here.
 
 ### cuBLAS GemmEx note
 
