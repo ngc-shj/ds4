@@ -205,10 +205,16 @@ __global__ void ds4_cuda_kernel_attn_prefill_static_mixed_f32(
     const int32_t jlo = (int32_t)t + 1 - (int32_t)window;
     const int32_t jraw_lo = jlo > 0 ? jlo : 0;
     const int32_t jraw_hi = (int32_t)t;
-    /* Compressed visibility cutoff: comp row c covers [c*ratio, c*ratio+ratio-1].
-     * Visible iff last covered pos < window start, i.e. (c+1)*ratio <= jraw_lo */
-    const uint32_t comp_visible = (jraw_lo >= (int32_t)ratio)
-        ? (uint32_t)jraw_lo / ratio : 0u;
+    /* Compressed visibility: token q sees comp rows [0, (q+1)/ratio).  This is
+     * an additional view of older positions that the model attends to in
+     * parallel with the raw window — both are visible even when their
+     * position ranges overlap.  Matches metal's
+     * ds4_metal_fill_static_mixed_prefill_mask:
+     *   const uint32_t n_visible = (q + 1u) / ratio;
+     * (was previously gated on `jraw_lo / ratio`, which silently zeroed comp
+     * for any token whose raw window still reached position 0 — i.e. always
+     * for typical prefills shorter than DS4_N_SWA=128.) */
+    const uint32_t comp_visible = ((uint32_t)t + 1u) / ratio;
     const uint32_t comp_hi = comp_visible < n_comp ? comp_visible : n_comp;
 
     extern __shared__ float smem[];

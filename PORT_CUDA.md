@@ -322,39 +322,53 @@ decode hc diff also drops broadly: layer 1 0.051→0.006, layer 30
 assistant reply; longer story prompts get a longer coherent prefix
 (~30 tokens) but eventually still degrade.
 
+#### Round 5 fix (committed)
+
+`ds4_cuda_kernel_attn_prefill_static_mixed_f32` was using the wrong
+formula to gate compressed-row visibility per token:
+
+```c
+const uint32_t comp_visible = (jraw_lo >= (int32_t)ratio)
+    ? (uint32_t)jraw_lo / ratio : 0u;
+```
+
+This zeroed `comp_visible` whenever the SWA window still reached
+position 0 — i.e. essentially always for prefill batches shorter than
+`DS4_N_SWA = 128`.  Tokens 4+ in our N=16 test should have been
+attending to compressor rows 1..n, but the kernel showed them none.
+
+Metal's `ds4_metal_fill_static_mixed_prefill_mask` and CPU's
+`layer_attention_mixed_one` both use:
+
+```c
+const uint32_t n_visible = (q + 1u) / ratio;
+```
+
+Token q sees comp rows [0, (q+1)/ratio) **in addition to** the raw
+SWA window — both are visible even where their position ranges
+overlap.  Fix: replace the CUDA formula with `(t + 1u) / ratio`.
+
+Bisection: this bug created the row 0..3 vs row 4+ pattern in layer 3
+raw_kv (and every subsequent ratio=4 / ratio=128 layer's KV).  The
+4-token boundary corresponded exactly to the moment compressor row 0
+becomes visible to attention (token 3 in CPU/Metal but never in
+CUDA's old formula).
+
+After the fix:
+- Layer 3 raw_kv per-row: all 16 rows max=0.125 (clean F16 noise)
+- decode-at worst hc_max: **24.46 → 8.99** (~63% reduction)
+- decode-at logits_max: **7.5 → 3.8** (~50% reduction)
+- Greedy story prompt coherent prefix: ~30 tokens → ~50 tokens
+
 ### Next investigations (priority order)
 
-1. **Second 4-token boundary at layer 2 → layer 3 (UNRESOLVED).**
-   Per-row prefill cache trace shows raw_kv at layers 0/1/2 are clean
-   for all 16 rows (max=0.0625-0.125, F16 noise), but **layer 3
-   raw_kv has rows 0-3 clean (max≤0.125) and rows 4-15 corrupted
-   (max=0.19-0.50)**.  Same pattern recurs at every subsequent
-   ratio=4 / ratio=128 layer pair.  Since layer 2 input HC is correct
-   for all tokens (from clean layer 2 K cache), layer 2 OUTPUT HC
-   for tokens 4+ is being silently corrupted *during* layer 2's
-   batched encode.
-
-   Things that make layer 2 different from layer 1: compressor
-   matmul, compressor pool emit (4 rows), `compressor_prefill_state_ratio4`,
-   indexer compressor matmul + RoPE + projection + emit + state init.
-   Disabling `metal_graph_refresh_ratio4_compressor_state` (env
-   `DS4_DEBUG_SKIP_COMPRESSOR_REFRESH`) does NOT change the pattern.
-   `hc_expand_(add_)split` was already audited and fixed in Round 3;
-   `hc_split_weighted_sum_norm_hc4` and `hc_split_weighted_sum_hc4`
-   correctly derive n_rows from output buffer size.  Other batched
-   kernels (Q8_0 matmul, attn_output_low, attention_prefill_static_mixed,
-   batched RoPE) all use n_tok parameter or per-(t,h) blocks.
-
-   Reproduce with `--metal-graph-decode-test 16` and the
-   `DS4_METAL_DECODE_TRACE_CACHE_PER_ROW=1` env var (also set
-   `DS4_METAL_DECODE_TRACE_CACHE=1`).  Look for the row 0..3 vs row
-   4+ jump in `prefill-cache layer 3 raw_kv` per-row output.
-
-2. **Remaining accumulated drift.**  After Round 3+4 fixes, decode-time
-   per-layer hc diff still grows from ~0.006 at layer 1 to ~25 at
-   layer 42, with no single dominant layer (drift is now broadly
-   distributed).  Notable jumps: layer 15 (0.45→2.15), layer 36+ (6→24).
-   Some of this may be downstream of investigation #1.
+1. **Remaining accumulated drift.**  After Round 3+4+5 fixes,
+   decode-time per-layer hc diff still grows from ~0.006 at layer 1
+   to ~9 at layer 42.  The growth is now smoother and broadly
+   distributed.  Suspects: precision drift across 43 layers of
+   Q8_0/F16 matmul, the `compressor_state_init_ratio4` path that
+   leaves state[4..7]=0/-INF where CPU per-token leaves them as a
+   duplicate of state[0..3].
 2. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
    dumps the residual / KV / attention output / logits at each of the
    43 layers and compare against a Metal capture for the same prompt.
