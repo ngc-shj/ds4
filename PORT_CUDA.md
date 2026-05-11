@@ -154,17 +154,19 @@ round:
 | Initial | 0 tokens (BOS/image repetition) |
 | Round 1+2 (router, sinks, HC) | ~10 tokens |
 | Compressor RMSNorm+RoPE fix | ~30 tokens (4-line license header) |
-| FP8 per-chunk scaling fix | ~60 tokens (7-line license header) |
+| FP8 per-chunk scaling fix | ~60 tokens (7-line license header — but actually license-header gibberish was a different bug) |
+| Round 3 (HC expand grid) | "Hello" → normal assistant reply |
+| Round 4 (compressor prefill RMSNorm/RoPE/FP8) | story prompts ~30 tokens |
+| Round 5 (prefill_static_mixed comp visibility) | story prompts ~50 tokens |
 
-Example greedy outputs:
-- `-p "Hello" --temp 0`:
-  _"# PyUtilib: A Python framework for efficient data-intensive computing._
-  _# Copyright (c) 2017, Sandia National Laboratories._
-  _# (http://www.sandia.gov)..."_
-- `-p "Hello" --temp 0.7 --seed 42`:
-  _"contractors price guide with 15 years experience. Your background is_
-  _in both construction and market analysis specializing in project cost_
-  _estimation. You are also a skilled negotiator..."_
+Greedy `-p "Hello"` after Round 3+:
+> _"Hello! How can I assist you today? If you have any questions or
+> need help with something, feel free to ask."_
+
+Greedy chess story after Round 5:
+> _"Jasper was a sleek, gray tabby who spent his days napping in
+> sunbeams and watching his owner, Arthur, with quiet, feline disdain.
+> Arthur was a chess enthusiast"_ (then degrades to mojibake)
 
 The output still degrades at the tail of long generations.  Likely
 remaining sources: cumulative Q8_0 / F16 GEMM precision drift over 43
