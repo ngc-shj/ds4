@@ -362,21 +362,65 @@ After the fix:
 - decode-at logits_max: **7.5 → 3.8** (~50% reduction)
 - Greedy story prompt coherent prefix: ~30 tokens → ~50 tokens
 
+### Metal vs CUDA tensor-dump comparison (Method 2)
+
+The decode-at test compares CUDA against the CPU reference, but CPU
+runs different algorithms in places (q8_K activation quantize for
+Q-LoRA, two-pass softmax pool, etc.) so its diffs are not a clean
+ground truth for "is CUDA matching the production Metal path".  The
+project ships a per-tensor binary dump hook that works on **both**
+backends — set `DS4_METAL_GRAPH_DUMP_PREFIX=<prefix>` and any of
+`DS4_METAL_GRAPH_DUMP_NAME=<substring>`,
+`DS4_METAL_GRAPH_DUMP_LAYER=<n|all>`,
+`DS4_METAL_GRAPH_DUMP_POS=<pos>`.
+
+54 dump points cover the full pipeline: HC pre/post mixers, attn
+norm/Q/KV at every stage, attention output, MoE logits/probs/topk and
+each per-expert intermediate, FFN norm, compressor cache and rolling
+state, indexer scores and topk, and the output head.  Files are raw
+F32 (`.bin`) or int32 (`.i32`) — no header.
+
+`tools/dump_diff.py` pairs files between two prefixes by their
+`<name>-<layer>_pos<pos>` suffix and reports per-tensor max-abs,
+RMS, relative-to-peak, and the top mismatched indices.  Filters
+support `name=<substr>`, `layer=<n|a..b>`, `pos=<n|a..b>`.
+
+Workflow once a Mac is available for a Metal capture:
+
+```sh
+# On Mac (Metal):
+DS4_METAL_GRAPH_DUMP_PREFIX=/tmp/metal_run \
+DS4_METAL_GRAPH_DUMP_LAYER=all DS4_METAL_GRAPH_DUMP_POS=15 \
+  ./ds4 -m model.gguf --metal -p "Hello" --metal-graph-decode-test 16
+
+# Sync /tmp/metal_run_*.bin to the CUDA box.
+
+# On Linux (CUDA, identical command):
+DS4_METAL_GRAPH_DUMP_PREFIX=/tmp/cuda_run \
+DS4_METAL_GRAPH_DUMP_LAYER=all DS4_METAL_GRAPH_DUMP_POS=15 \
+  ./ds4 -m model.gguf --metal -p "Hello" --metal-graph-decode-test 16
+
+tools/dump_diff.py /tmp/metal_run /tmp/cuda_run
+```
+
+The same command pair, run with both prefixes pointed at the CUDA
+build, validates the tool itself: every file should diff to exactly
+zero (CUDA self-determinism check).
+
 ### Next investigations (priority order)
 
-1. **Remaining accumulated drift.**  After Round 3+4+5 fixes,
+1. **Run Method 2 against a Metal capture.**  This is the only way
+   to verify whether the remaining drift after Rounds 3-5 is real
+   algorithmic divergence or precision noise inherited from CPU's
+   different quantization path.  Until we have a Metal-side dump,
+   chasing further per-layer diffs blind is unproductive.
+2. **Remaining accumulated drift.**  After Round 3+4+5 fixes,
    decode-time per-layer hc diff still grows from ~0.006 at layer 1
    to ~9 at layer 42.  The growth is now smoother and broadly
    distributed.  Suspects: precision drift across 43 layers of
    Q8_0/F16 matmul, the `compressor_state_init_ratio4` path that
    leaves state[4..7]=0/-INF where CPU per-token leaves them as a
    duplicate of state[0..3].
-2. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
-   dumps the residual / KV / attention output / logits at each of the
-   43 layers and compare against a Metal capture for the same prompt.
-   This bisects the layer where my drift differs from Metal's, not from
-   CPU.  Without this, we are debugging blind because CPU is the
-   "wrong" reference for our F32-x algorithmic choice.
 2. **Try cuBLAS-LT for F16 GEMM**.  CUDA 13.0 may have lifted the
    `CUBLAS_STATUS_NOT_SUPPORTED` we saw for host-mmap pointers + small-m
    shapes.  cublasLtMatmul has a wider supported config space.
