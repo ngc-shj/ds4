@@ -808,8 +808,7 @@ int ds4_metal_compressor_prefill_tensor(ds4_metal_tensor *cc, ds4_metal_tensor *
         const void *m, uint64_t ms, uint64_t ao, uint32_t at, uint64_t no, uint32_t nt,
         uint32_t hd, uint32_t ratio, uint32_t pos0, uint32_t nt2, uint32_t nr, uint32_t nco,
         bool qfp8, float fb, float fs, float ef, float af, float bf, float bs, float eps) {
-    (void)no;(void)nt;(void)pos0;(void)nr;(void)nco;(void)qfp8;
-    (void)fb;(void)fs;(void)ef;(void)af;(void)bf;(void)bs;(void)eps;
+    (void)nt;
     if (!cc || !skv || !ssc || !kv || !sc || !m || hd == 0 || ratio == 0 || nt2 == 0) return 0;
     const uint32_t coff   = (ratio == 4u) ? 2u : 1u;
     const uint32_t width  = coff * hd;
@@ -826,13 +825,48 @@ int ds4_metal_compressor_prefill_tensor(ds4_metal_tensor *cc, ds4_metal_tensor *
     DS4_CUDA_CHECK(cudaMemsetAsync(tensor_fptr(skv), 0, state_bytes, ds4_cuda_stream));
     DS4_CUDA_CHECK(cudaMemsetAsync(tensor_fptr(ssc), 0, state_bytes, ds4_cuda_stream));
 
-    /* Pool n_comp blocks. */
-    if (n_comp > 0) {
+    if (n_comp == 0) return 1;
+
+    /* Pool n_comp blocks into the comp cache (raw softmax-pooled values). */
+    {
         const int BLK = 128;
         dim3 grid(n_comp, ds4_cuda_ceil_div((int)hd, BLK));
         ds4_cuda_kernel_compressor_prefill_f32<<<grid, BLK, 0, ds4_cuda_stream>>>(
             tensor_fptr(cc), tensor_cfptr(kv), tensor_cfptr(sc), ape, at,
             hd, ratio, coff, n_comp);
+    }
+
+    /* Mirror compressor_decode_one's per-row finishing pipeline:
+     *   pool -> RMSNorm(weight, eps) -> RoPE -> (FP8 if attn-class head_dim).
+     * Without these, the prefilled comp cache differs from CPU/Metal by
+     * O(1) per row regardless of N, which propagates into every layer that
+     * reads the compressed cache. */
+    if (no > ms || (uint64_t)hd * sizeof(float) > ms - no) return 0;
+    const float *norm_w = (const float *)ds4_cuda_weight_ptr(m, no);
+    ds4_cuda_kernel_rms_norm_w_f32<256><<<n_comp, 256, 0, ds4_cuda_stream>>>(
+        tensor_fptr(cc), tensor_fptr(cc), norm_w, hd, eps);
+
+    /* RoPE each emitted row at its logical position pos+1-ratio = c*ratio+pos0. */
+    if (nr > 0 && (nr & 1u) == 0u) {
+        for (uint32_t c = 0; c < n_comp; c++) {
+            const uint32_t comp_pos = pos0 + c * ratio;
+            dim3 grid(1, 1);
+            ds4_cuda_kernel_rope_tail_f32<<<grid, 128, 0, ds4_cuda_stream>>>(
+                tensor_fptr(cc) + (uint64_t)c * hd,
+                /*n_tok=*/1u, /*n_head=*/1u, hd, nr, comp_pos, nco,
+                /*inverse=*/0,
+                fb, fs, ef, af, bf, bs);
+        }
+    }
+
+    /* FP8 round-trip on the rotated rows.  CPU only does this for the
+     * attention-class head_dim (= DS4_N_HEAD_DIM = 128); the indexer
+     * compressor (head_dim=64 in production) is left as plain F32. */
+    if (qfp8 && hd == 128u) {
+        for (uint32_t c = 0; c < n_comp; c++) {
+            ds4_cuda_kernel_fp8_kv_quantize_f32<<<1, 64, 0, ds4_cuda_stream>>>(
+                tensor_fptr(cc) + (uint64_t)c * hd, hd, nr);
+        }
     }
     return 1;
 }

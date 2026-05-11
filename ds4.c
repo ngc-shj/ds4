@@ -13565,6 +13565,16 @@ static int metal_graph_decode_at_test(
                             il, n_comp_cpu, n_comp_gpu,
                             max_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n),
                             rms_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n));
+                    if (il <= 4 && getenv("DS4_METAL_DECODE_TRACE_CACHE_PER_ROW") != NULL) {
+                        for (uint32_t r = 0; r < n_comp_cpu; r++) {
+                            const float row_max = max_abs_diff(
+                                cpu_cache.layer[il].attn_comp_kv + (uint64_t)r * DS4_N_HEAD_DIM,
+                                gpu_comp + (uint64_t)r * DS4_N_HEAD_DIM,
+                                DS4_N_HEAD_DIM);
+                            fprintf(stderr,
+                                    "ds4:   comp row %2u  max=%g\n", r, row_max);
+                        }
+                    }
                 }
                 free(gpu_comp);
             } else if (n_comp_gpu != 0) {

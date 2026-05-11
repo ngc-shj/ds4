@@ -294,16 +294,44 @@ Tail degradation in long generations still occurs — the indexer /
 compressor caches at ratio=4 layers still differ by ~3-5 max-abs from
 CPU, which is the next bug to attack.
 
+#### Round 4 fix (committed)
+
+`ds4_metal_compressor_prefill_tensor` was running ONLY the
+softmax-pool kernel and silently ignored its `no` (norm offset),
+`nr` (n_rotation), `qfp8`, RoPE, and `eps` parameters via `(void)`
+casts.  The decode-time `compressor_update_tensor` correctly chains
+**pool → RMSNorm(weight) → RoPE → FP8(if attn-class)**; the prefill
+path was missing the last three steps.
+
+CPU reference (`compressor_decode_one` in ds4.c):
+```c
+compressor_pool_decode_state(pooled, ...);
+// RMSNorm(weight=norm, eps=DS4_RMS_EPS)
+// RoPE at comp_pos = pos + 1 - ratio
+if (head_dim == DS4_N_HEAD_DIM) dsv4_fp8_kv_quantize_row(out_comp, ...);
+```
+
+Without the finishing pipeline, every prefilled comp row entered the
+attention path as a raw pre-norm, pre-rotated value, biasing each
+ratio=4 layer's mixed attention.
+
+After the fix, layer 2 `attn_comp` max diff drops from **3.857 →
+0.215** (94%) and `idx_comp` from **4.958 → 0.042** (99%).  Per-layer
+decode hc diff also drops broadly: layer 1 0.051→0.006, layer 30
+15.66→4.86, final logits 15.4→7.5.  `Hello` still produces a normal
+assistant reply; longer story prompts get a longer coherent prefix
+(~30 tokens) but eventually still degrade.
+
 ### Next investigations (priority order)
 
-1. **Compressor / indexer cache divergence at ratio=4 layers.**  Even
-   after the HC expand grid fix, layer 2's `attn_comp_kv` and
-   `index_comp_kv` post-prefill differ from CPU by max=3.86 and
-   max=4.96 respectively (constant values across N=4..16, suggesting
-   a single deterministic projection or pooling bug rather than
-   accumulated drift).  Bisect by running the decode-at test with
-   `DS4_METAL_DECODE_TRACE_CACHE=1` and comparing per-row diffs in
-   the comp/index caches.
+1. **Remaining accumulated drift.**  After Round 3+4 fixes, decode-time
+   per-layer hc diff still grows from ~0.006 at layer 1 to ~25 at
+   layer 42, with no single dominant layer (drift is now broadly
+   distributed).  Notable jumps: layer 15 (0.45→2.15), layer 36+ (6→24).
+   Suspects: precision drift across 43 layers of Q8_0/F16 matmul,
+   the post-prefill `compressor_state_init_ratio4` and the rolling
+   `compressor_update_tensor` writes to state_kv/state_score (those
+   are the bridge between prefill and decode for ratio=4 layers).
 2. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
    dumps the residual / KV / attention output / logits at each of the
    43 layers and compare against a Metal capture for the same prompt.
