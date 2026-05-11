@@ -445,7 +445,6 @@ __global__ void ds4_cuda_kernel_attn_indexed_mixed_batch_f32(
         uint32_t n_tok, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t n_comp, uint32_t top_k, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim) {
-    (void)ratio;
     const uint32_t t = blockIdx.x;
     const uint32_t h = blockIdx.y;
     if (t >= n_tok || h >= n_head) return;
@@ -458,6 +457,11 @@ __global__ void ds4_cuda_kernel_attn_indexed_mixed_batch_f32(
     uint32_t take = window;
     if (take > n_raw) take = n_raw;
     if (take > cur_pos + 1) take = cur_pos + 1;
+    /* Per-token causal visibility: token at qpos sees comp rows [0, (qpos+1)/ratio).
+     * Matches metal's kernel_dsv4_indexed_mixed_attention_heads8 visible cutoff
+     * and prevents reading compressed rows that cover positions >= qpos+1. */
+    uint32_t visible = (cur_pos + 1u) / ratio;
+    if (visible > n_comp) visible = n_comp;
 
     extern __shared__ float smem[];
     float *warp_buf = smem;
@@ -478,7 +482,8 @@ __global__ void ds4_cuda_kernel_attn_indexed_mixed_batch_f32(
     }
     for (uint32_t k = 0; k < top_k; k++) {
         const int32_t c = topk[(uint64_t)t * top_k + k];
-        if (c < 0 || (uint32_t)c >= n_comp) continue;
+        if (c < 0) continue;
+        if ((uint32_t)c >= visible) break;  // matches metal: stop on first invisible idx
         const float kj = (threadIdx.x < head_dim)
             ? comp_kv[(uint64_t)c * head_dim + threadIdx.x] : 0.0f;
         float dot = qval * kj;
@@ -506,7 +511,8 @@ __global__ void ds4_cuda_kernel_attn_indexed_mixed_batch_f32(
     }
     for (uint32_t k = 0; k < top_k; k++) {
         const int32_t c = topk[(uint64_t)t * top_k + k];
-        if (c < 0 || (uint32_t)c >= n_comp) continue;
+        if (c < 0) continue;
+        if ((uint32_t)c >= visible) break;
         const float kj = (threadIdx.x < head_dim)
             ? comp_kv[(uint64_t)c * head_dim + threadIdx.x] : 0.0f;
         float dot = qval * kj;
