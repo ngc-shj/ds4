@@ -72,9 +72,21 @@ backend.  This is the primary tool for bisecting CUDA bugs against CPU.
 | Attention sinks read as `__half`, but model stores F32 | many downstream | (sinks corrupt) | 0 |
 | HC expand split read `pre[hc]` as `post`, dropped the combine matrix entirely | after_attn_hc | 4.69 | 0.003 |
 
-After these three fixes, the pipeline produces semi-coherent English on a
-Hello prompt instead of `<begin_of_sentence>` repetition.  Logits diff
-shrank from 40.6 to 4.5.
+After these three fixes, logits diff shrank from 40.6 to 4.5.
+
+#### Round 2 fix (committed)
+
+| Bug | Diff before | Diff after |
+| --- | --- | --- |
+| Hash-mode router used uniform 1/6 weights, but CPU computes `probs[selected]/sum * 1.5` | `router_w` 0.955 → 0.000288; `routed` 18.5 → 0.171; `logits` 4.52 → 0.18 | — |
+
+DS4 V4 Flash early layers use hash routing, and my hash-mode path was
+just stuffing uniform weights instead of running the `sqrt(softplus())`
+probability through the same renormalisation as the top-K path.  Single
+fix in `cuda/router.cuh`; everything else stays the same.
+
+After Round 2, the pipeline produces multilingual semi-coherent text on
+"Hello" (was BOS-repetition before any fixes).
 
 #### Remaining diffs at layer 0 (CPU reference vs CUDA)
 
@@ -82,33 +94,44 @@ shrank from 40.6 to 4.5.
 embed_hc      = 0
 hc_pre        = 0
 attn_norm     = 1.5e-08
-q_rope        = 0.032         (small; Q8_0 matmul precision compound)
+q_rope        = 0.032
 kv_rope       = 0.053
 raw_cache     = 0.063
 attn_out      = 0.068
-after_attn_hc = 0.003         (fixed in round 1)
+after_attn_hc = 0.003
 ffn_cur       = 0.003
 ffn_norm      = 0.006
 shared        = 0.004
-router_w      = 0.955         (top-K selection differs due to upstream drift)
-routed        = 18.5          (largest single error - MoE output magnitude off)
-ffn_out       = 18.5
-after_ffn_hc  = 21.9
-logits        = 4.52
+router_w      = 0.000288       (Round 2)
+routed        = 0.171          (Round 2)
+ffn_out       = 0.171
+after_ffn_hc  = 0.205
+logits        = 0.18           (Round 2; was 4.52, was 40.64)
 ```
 
-The `routed` diff is the dominant remaining problem.  Both `router_w` and
-`routed` likely stem from upstream Q-projection / RoPE accuracy: small
-input-side drift is amplified by the router's top-K threshold (close
-experts flip rank).  Useful next investigations:
+The remaining ~0.03-0.07 diffs in q_rope/kv_rope/raw_cache/attn_out are
+upstream Q8_0 / F16 matmul precision compounding.  The CPU reference
+quantises x to q8_K before the Q-LoRA matmul (block_q8_K input), while
+the CUDA path keeps x as F32 (matching Metal).  These are different
+algorithms and their results legitimately diverge by ~3-7%; bit-exact
+agreement with CPU would require quantising x to q8_K in CUDA too.
 
-1. Bit-exact Q8_0 GEMM against the CPU `dot_q8_0_q8_K`-style accumulation
-   order.  My block kernel accumulates in a different scan order than the
-   ARM-NEON CPU reference, which can drift in mixed-precision summation.
-2. cuBLAS-LT F16 matmul that accepts host pointers.  Replace the custom
-   block-per-row F16 kernel.
-3. Side-by-side IQ2_XXS / Q2_K block dequant smoke tests with a known
-   block - they currently lack micro-level validation.
+Useful next investigations:
+
+1. Quantise x to q8_K on the CUDA side before Q8_0 matmul.  Would make
+   us bit-exact with CPU (and probably Metal too, since Metal's Q8_0
+   matvec also reads F32 x but produces small precision differences from
+   the F32 accumulation order).
+2. Per-token / per-layer logits dump to bisect *which* of the 43 layer
+   transitions degrade the output most.  Currently every layer compounds
+   ~3-7% relative error and the cumulative effect produces wrong tokens.
+3. FP8 KV quantization: a Round 2 attempt at adding per-64-element
+   power-of-2 scaling (matching Metal's `kernel_dsv4_fp8_kv_quantize_f32`)
+   made the metal-graph-test diff bigger and inference output worse.
+   The CPU reference appears to skip FP8 quantization (or model it
+   differently), so faithfully reproducing Metal's FP8 actually drifts
+   us further from CPU.  Need to investigate what the CPU path does for
+   the FP8 KV step before retrying.
 
 ### cuBLAS GemmEx note
 
