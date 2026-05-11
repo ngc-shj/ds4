@@ -580,6 +580,21 @@ Do not treat the CPU path as the production target. The server is Metal-only,
 and the optimized implementation lives in the Metal graph path. This may
 change in the future.
 
+### CUDA backend (Linux / NVIDIA GB10)
+
+An in-progress CUDA backend is available for NVIDIA Grace+Blackwell systems
+(initial target: GB10 / DGX Spark, sm_121).  Build with:
+
+```sh
+make DS4_BACKEND=cuda
+```
+
+The CUDA path links cleanly and the device + memory + kernel-dispatch
+plumbing is functional (`./ds4 --cuda-smoke-test` confirms an end-to-end
+allocate-write-launch-read round trip on the GPU).  Real inference still
+requires porting the compute kernels - see [PORT_CUDA.md](PORT_CUDA.md) for the
+tier-by-tier status and porting plan.
+
 ## Test Vectors
 
 `tests/test-vectors` contains short and long-context continuation vectors
