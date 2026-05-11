@@ -324,14 +324,37 @@ assistant reply; longer story prompts get a longer coherent prefix
 
 ### Next investigations (priority order)
 
-1. **Remaining accumulated drift.**  After Round 3+4 fixes, decode-time
+1. **Second 4-token boundary at layer 2 → layer 3 (UNRESOLVED).**
+   Per-row prefill cache trace shows raw_kv at layers 0/1/2 are clean
+   for all 16 rows (max=0.0625-0.125, F16 noise), but **layer 3
+   raw_kv has rows 0-3 clean (max≤0.125) and rows 4-15 corrupted
+   (max=0.19-0.50)**.  Same pattern recurs at every subsequent
+   ratio=4 / ratio=128 layer pair.  Since layer 2 input HC is correct
+   for all tokens (from clean layer 2 K cache), layer 2 OUTPUT HC
+   for tokens 4+ is being silently corrupted *during* layer 2's
+   batched encode.
+
+   Things that make layer 2 different from layer 1: compressor
+   matmul, compressor pool emit (4 rows), `compressor_prefill_state_ratio4`,
+   indexer compressor matmul + RoPE + projection + emit + state init.
+   Disabling `metal_graph_refresh_ratio4_compressor_state` (env
+   `DS4_DEBUG_SKIP_COMPRESSOR_REFRESH`) does NOT change the pattern.
+   `hc_expand_(add_)split` was already audited and fixed in Round 3;
+   `hc_split_weighted_sum_norm_hc4` and `hc_split_weighted_sum_hc4`
+   correctly derive n_rows from output buffer size.  Other batched
+   kernels (Q8_0 matmul, attn_output_low, attention_prefill_static_mixed,
+   batched RoPE) all use n_tok parameter or per-(t,h) blocks.
+
+   Reproduce with `--metal-graph-decode-test 16` and the
+   `DS4_METAL_DECODE_TRACE_CACHE_PER_ROW=1` env var (also set
+   `DS4_METAL_DECODE_TRACE_CACHE=1`).  Look for the row 0..3 vs row
+   4+ jump in `prefill-cache layer 3 raw_kv` per-row output.
+
+2. **Remaining accumulated drift.**  After Round 3+4 fixes, decode-time
    per-layer hc diff still grows from ~0.006 at layer 1 to ~25 at
    layer 42, with no single dominant layer (drift is now broadly
    distributed).  Notable jumps: layer 15 (0.45→2.15), layer 36+ (6→24).
-   Suspects: precision drift across 43 layers of Q8_0/F16 matmul,
-   the post-prefill `compressor_state_init_ratio4` and the rolling
-   `compressor_update_tensor` writes to state_kv/state_score (those
-   are the bridge between prefill and decode for ratio=4 layers).
+   Some of this may be downstream of investigation #1.
 2. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
    dumps the residual / KV / attention output / logits at each of the
    43 layers and compare against a Metal capture for the same prompt.
