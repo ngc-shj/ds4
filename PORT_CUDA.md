@@ -58,42 +58,57 @@ pipeline (embedding → norm → Q/KV projection → KV store → RoPE → atten
 output projection → HC mixers → router → IQ2_XXS+Q2_K MoE → compressor →
 indexer → mixed attention → output norm → unembedding) is functional.
 
-### Known numerical issues (output is structurally produced but degraded)
+### Numerical accuracy work (in progress)
 
-The generated text on the Q2 model currently does not match what the Metal
-backend produces.  Smoke tests pass element-wise, but end-to-end output
-quality is poor.  Likely sources, all numerical refinements rather than
-structural bugs:
+Use `./ds4 -p "Hello" --metal --ctx 256 --metal-graph-test` to see
+per-layer max-abs diff between the CPU reference and the active GPU
+backend.  This is the primary tool for bisecting CUDA bugs against CPU.
 
-1. **Router probability formula.**  Metal uses
-   `probs = sqrt(softplus(logit))` followed by normalised top-K selection
-   plus a 1.5x route-weight scaling (see metal `kernel_dsv4_softplus_sqrt`
-   and `kernel_dsv4_router_weights_one`).  The CUDA backend currently uses a
-   plain softmax instead.  Implementing the exact two-stage formulation is
-   required for routing to match.
-2. **Compressor scoring/pooling.**  My implementation reproduces the
-   ratio-4 prev-half / second-half trick but uses a single online-softmax
-   over the 8 / `ratio` rows.  Metal stages the score-with-APE through a
-   separate intermediate buffer and runs `softmax_pool` over 8 rows per
-   `c`.  The math is the same; numerical drift may stem from accumulator
-   ordering.  Worth validating with a small synthetic test against captured
-   Metal outputs.
-3. **Attention sinks.**  Sinks are read as F16 and treated as logits before
-   max-stable softmax.  Metal may scale them differently.
-4. **Mixed-attention compressed visibility.**  Static-mixed currently uses
-   `comp_hi = jraw_lo / ratio`; the Metal version may use
-   `(jraw_lo - 1) / ratio` or another off-by-one.  Worth verifying against a
-   reference run.
-5. **F16 GEMM precision.**  The custom block-per-row F16 GEMM accumulates in
-   F32 but does not match cuBLAS's tensor-core rounding exactly.  At 80GB
-   weight scale this should be fine for inference but is the easiest to
-   swap for cuBLAS-LT once host-mmap pointer support is solid.
+#### Round 1 fixes (committed)
 
-Suggested debugging next step: run
-`./ds4 --dump-logprobs /tmp/cuda.json --temp 0 -p "Hello"` on both Metal and
-CUDA backends and bisect the layer where divergence appears.  The test
-runner `./ds4_test --logprob-vectors` (mentioned in the project's main
-testing notes) is the right validator once the backends agree.
+| Bug | Layer it broke | Diff before | Diff after |
+| --- | --- | --- | --- |
+| Router computed softmax instead of `sqrt(softplus(logit))` plus 1.5x | `router_w` weights | (selection wrong) | 0.955 |
+| Attention sinks read as `__half`, but model stores F32 | many downstream | (sinks corrupt) | 0 |
+| HC expand split read `pre[hc]` as `post`, dropped the combine matrix entirely | after_attn_hc | 4.69 | 0.003 |
+
+After these three fixes, the pipeline produces semi-coherent English on a
+Hello prompt instead of `<begin_of_sentence>` repetition.  Logits diff
+shrank from 40.6 to 4.5.
+
+#### Remaining diffs at layer 0 (CPU reference vs CUDA)
+
+```
+embed_hc      = 0
+hc_pre        = 0
+attn_norm     = 1.5e-08
+q_rope        = 0.032         (small; Q8_0 matmul precision compound)
+kv_rope       = 0.053
+raw_cache     = 0.063
+attn_out      = 0.068
+after_attn_hc = 0.003         (fixed in round 1)
+ffn_cur       = 0.003
+ffn_norm      = 0.006
+shared        = 0.004
+router_w      = 0.955         (top-K selection differs due to upstream drift)
+routed        = 18.5          (largest single error - MoE output magnitude off)
+ffn_out       = 18.5
+after_ffn_hc  = 21.9
+logits        = 4.52
+```
+
+The `routed` diff is the dominant remaining problem.  Both `router_w` and
+`routed` likely stem from upstream Q-projection / RoPE accuracy: small
+input-side drift is amplified by the router's top-K threshold (close
+experts flip rank).  Useful next investigations:
+
+1. Bit-exact Q8_0 GEMM against the CPU `dot_q8_0_q8_K`-style accumulation
+   order.  My block kernel accumulates in a different scan order than the
+   ARM-NEON CPU reference, which can drift in mixed-precision summation.
+2. cuBLAS-LT F16 matmul that accepts host pointers.  Replace the custom
+   block-per-row F16 kernel.
+3. Side-by-side IQ2_XXS / Q2_K block dequant smoke tests with a known
+   block - they currently lack micro-level validation.
 
 ### cuBLAS GemmEx note
 
