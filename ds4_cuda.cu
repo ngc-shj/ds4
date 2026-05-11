@@ -2165,17 +2165,44 @@ __device__ __forceinline__ static int32_t q4_unpack4_to_int32(uint8_t p0, uint8_
            (((int32_t)((uint8_t)v3)) << 24);
 }
 
+/* Unpack 4 signed-4-bit nibbles -> int32 of 4 sign-extended bytes for dp4a.
+ *
+ * `p` holds 4 packed bytes in its 4 byte positions; `ctrl` is a __byte_perm
+ * control word that selects which two source bytes provide the 4 nibbles
+ * (typically 0x1100 for bytes 0,1 or 0x3322 for bytes 2,3).  __byte_perm
+ * spreads the chosen 2 bytes across 4 dest byte positions, then we extract
+ * low/high nibbles by mask + shift, and sign-extend using the
+ * `signbit * 0x1E` trick: each 0x08-byte multiplied by 0x1E becomes 0xF0
+ * without inter-byte carry (8 * 30 = 240, within byte). */
+__device__ __forceinline__ static int32_t q4_unpack4_prmt(uint32_t p, uint32_t ctrl) {
+    uint32_t spread = __byte_perm(p, 0u, ctrl);
+    uint32_t low_lane  = spread & 0x000F000Fu;
+    uint32_t high_lane = (spread & 0x00F000F0u) >> 4;
+    uint32_t un = low_lane | (high_lane << 8);
+    uint32_t signbit = un & 0x08080808u;
+    uint32_t signext = signbit * 0x1Eu;
+    return (int32_t)(un | signext);
+}
+
 __device__ __forceinline__ static int32_t q4_block_dot(const uint8_t *packed, const int8_t *xqb) {
+    /* Block layout: 16 packed bytes = 4 int32 words = 32 nibbles = 8 dp4a
+     * passes.  Each 4-byte word yields 2 dp4a inputs (bytes 0,1 and bytes
+     * 2,3 respectively).  packed_row is 16-byte aligned, so 4-byte reads
+     * are safe and coalesce well. */
     const int32_t *xq32 = (const int32_t *)xqb;
+    const uint32_t *p32 = (const uint32_t *)packed;
     int32_t dot = 0;
     #pragma unroll
-    for (int i = 0; i < 8; i++) {
-        int32_t qa = q4_unpack4_to_int32(packed[i * 2 + 0], packed[i * 2 + 1]);
-        int32_t qb = xq32[i];
-        dot = __dp4a(qa, qb, dot);
+    for (int i = 0; i < 4; i++) {
+        uint32_t pw = p32[i];
+        int32_t qa0 = q4_unpack4_prmt(pw, 0x1100u);
+        int32_t qa1 = q4_unpack4_prmt(pw, 0x3322u);
+        dot = __dp4a(qa0, xq32[i * 2 + 0], dot);
+        dot = __dp4a(qa1, xq32[i * 2 + 1], dot);
     }
     return dot;
 }
+
 
 /* Q4_0 GEMV (split-row layout): per row, all fp16 scales come first then
  * all 16-byte packed nibble groups.  Each warp computes one output row;
