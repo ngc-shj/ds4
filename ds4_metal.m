@@ -3899,6 +3899,21 @@ int ds4_gpu_begin_commands(void) {
     return g_batch_cb != nil;
 }
 
+int ds4_gpu_step_args_setup(uint32_t token,
+                              uint32_t pos,
+                              uint32_t raw_row,
+                              uint32_t n_raw,
+                              uint32_t raw_start,
+                              uint32_t n_comp,
+                              uint32_t n_index_comp,
+                              uint32_t top_k,
+                              uint32_t comp_row,
+                              uint32_t emit) {
+    (void)token; (void)pos; (void)raw_row; (void)n_raw; (void)raw_start;
+    (void)n_comp; (void)n_index_comp; (void)top_k; (void)comp_row; (void)emit;
+    return 1;
+}
+
 int ds4_gpu_flush_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!g_batch_cb) return 0;

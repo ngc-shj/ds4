@@ -34,6 +34,22 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* CUDA only: push per-decode-step state into device __constant__ memory before
+ * ds4_gpu_begin_commands().  Required when DS4_CUDA_GRAPH=1 so the captured
+ * graph can be reused without per-token cudaGraphExecUpdate.  When the CUDA
+ * graph backend is not active this is a cheap no-op.  Non-CUDA backends
+ * provide a stub implementation that returns 1. */
+int ds4_gpu_step_args_setup(uint32_t token,
+                              uint32_t pos,
+                              uint32_t raw_row,
+                              uint32_t n_raw,
+                              uint32_t raw_start,
+                              uint32_t n_comp,
+                              uint32_t n_index_comp,
+                              uint32_t top_k,
+                              uint32_t comp_row,
+                              uint32_t emit);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
@@ -244,6 +260,11 @@ int ds4_gpu_head_rms_norm_tensor(
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_tok,
+        uint32_t          head_dim,
+        uint32_t          n_rot);
+
+int ds4_gpu_dsv4_fp8_kv_quantize_comp_row_tensor(
+        ds4_gpu_tensor *comp_cache,
         uint32_t          head_dim,
         uint32_t          n_rot);
 

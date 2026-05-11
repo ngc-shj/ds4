@@ -9292,21 +9292,11 @@ static bool metal_graph_encode_decode_layer(
                                                         DS4_ROPE_YARN_BETA_FAST,
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS) != 0;
-        if (ok && emit) {
-            ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
-                    g->layer_attn_comp_cache[il],
-                    (uint64_t)comp_row * DS4_N_HEAD_DIM * sizeof(float),
-                    (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
-            if (!comp_row_view) {
-                ok = false;
-            } else {
-                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
-                if (ok) {
-                    metal_graph_debug_dump_tensor("KVcompress", comp_row_view, DS4_N_HEAD_DIM, il, pos);
-                }
-                ds4_gpu_tensor_free(comp_row_view);
-            }
-        }
+        /* fp8 quant of the just-emitted comp row.  Launched unconditionally so
+         * the captured graph stays structurally identical across emit-true and
+         * emit-false decode steps; the kernel gates internally on g_step_args.emit
+         * and addresses the row via g_step_args.comp_row. */
+        if (ok) ok = ds4_gpu_dsv4_fp8_kv_quantize_comp_row_tensor(g->layer_attn_comp_cache[il], DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
         if (ok && emit) g->layer_n_comp[il]++;
 
         if (ok && ratio == 4) {
@@ -10675,6 +10665,17 @@ static bool metal_graph_encode_token_raw_swa(
 
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+    }
+    /* With an odd DS4_N_LAYER, the in-loop cur_hc/after_ffn_hc swap leaves
+     * the labels flipped at end of token; the next token would then start
+     * from the opposite physical buffer, baking different pointer args into
+     * the captured CUDA Graph and forcing per-token cudaGraphExecUpdate.
+     * Restore canonical labeling so consecutive token captures are
+     * structurally and argumentally identical. */
+    if (DS4_N_LAYER & 1) {
+        ds4_gpu_tensor *tmp = g->cur_hc;
+        g->cur_hc = g->after_ffn_hc;
+        g->after_ffn_hc = tmp;
     }
     return ok;
 }
@@ -12532,6 +12533,47 @@ static bool metal_graph_encode_layer_batch(
     return ok;
 }
 
+/* Push all per-decode-step state into the CUDA __constant__ symbol BEFORE
+ * begin_commands so the captured graph can be reused unchanged across decode
+ * steps.  On non-CUDA backends this is a stubbed no-op. */
+static bool metal_graph_push_decode_step_args(
+        const ds4_gpu_graph *g,
+        int                  token,
+        uint32_t             pos) {
+    const uint32_t raw_row = g->raw_cap ? pos % g->raw_cap : 0u;
+    const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+    const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
+    /* All ratio-4 (compressed) layers advance their compressor counters
+     * lock-step during normal decode after prefill, so picking any layer's
+     * counter gives the canonical value for the entire decode step.  Find
+     * the first compressed layer to read from; if none exists the values
+     * stay zero and the (unused) compressor kernels early-exit on emit. */
+    uint32_t n_comp = 0;
+    uint32_t n_index_comp = 0;
+    uint32_t comp_row = 0;
+    uint32_t emit = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        n_comp = g->layer_n_comp[il];
+        n_index_comp = g->layer_n_index_comp[il];
+        comp_row = n_comp;
+        emit = ((pos + 1u) % ratio) == 0u ? 1u : 0u;
+        break;
+    }
+    const uint32_t top_k = metal_graph_decode_indexer_top_k(g);
+    return ds4_gpu_step_args_setup((uint32_t)token,
+                                     pos,
+                                     raw_row,
+                                     n_raw,
+                                     raw_start,
+                                     n_comp,
+                                     n_index_comp,
+                                     top_k,
+                                     comp_row,
+                                     emit) != 0;
+}
+
 /* Execute one Metal decode token and read back logits. */
 static bool metal_graph_eval_token_raw_swa(
         ds4_gpu_graph *g,
@@ -12543,6 +12585,7 @@ static bool metal_graph_eval_token_raw_swa(
     const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
 
+    if (!metal_graph_push_decode_step_args(g, token, pos)) return false;
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights, token, pos, logits != NULL, true);
     const double t_encoded = profile ? now_sec() : 0.0;
@@ -12586,6 +12629,7 @@ static bool metal_graph_eval_token_raw_swa_top(
         float                 *logits) {
     if (!top_id) return false;
 
+    if (!metal_graph_push_decode_step_args(g, token, pos)) return false;
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = metal_graph_encode_token_raw_swa(g, model, weights,
                                                   token, pos, true, true);

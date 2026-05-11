@@ -380,6 +380,7 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            if (getenv("DS4_BENCH_DUMP_TOKENS")) fprintf(stderr, "bench_tok %d %d\n", i, token);
             if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
