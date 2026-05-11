@@ -13394,6 +13394,277 @@ static int metal_graph_prompt_logits_test(
     return ok ? 0 : 1;
 }
 
+/* Decode-time diagnostic: prefill N tokens on both CPU and GPU, then run a
+ * single decode step at pos=N on both sides and report per-layer hidden-state
+ * diffs plus final logits diff.  This exercises decode-only kernels
+ * (compressor_update, indexer scoring, decode_mixed attention) that the
+ * prefill-only metal_graph_test does not cover.  The bug we are bisecting
+ * is tail degradation in long generations, which strongly implies one of
+ * those decode-only paths drifts from CPU. */
+static int metal_graph_decode_at_test(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        const token_vec   *prompt,
+        int                n_prefill,
+        int                ctx_size) {
+    if (prompt->len <= 0) {
+        fprintf(stderr, "ds4: Metal decode-at test needs a non-empty prompt\n");
+        return 1;
+    }
+    if (n_prefill <= 0 || n_prefill >= prompt->len) {
+        fprintf(stderr,
+                "ds4: Metal decode-at test needs 1 <= n_prefill < prompt_len (got n_prefill=%d, prompt_len=%d)\n",
+                n_prefill, prompt->len);
+        return 1;
+    }
+    if (n_prefill >= ctx_size) {
+        fprintf(stderr,
+                "ds4: Metal decode-at test needs n_prefill < ctx_size (got n_prefill=%d, ctx_size=%d)\n",
+                n_prefill, ctx_size);
+        return 1;
+    }
+
+    const uint32_t prefill_cap = (uint32_t)n_prefill;
+    const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t vocab_dim = weights->output->dim[1];
+
+    ds4_metal_graph g;
+    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+                                        raw_cap, (uint32_t)ctx_size, prefill_cap, false);
+    if (!ok) {
+        metal_graph_free(&g);
+        fprintf(stderr, "ds4: failed to initialize Metal graph for decode-at test\n");
+        return 1;
+    }
+    /* Read-back of intermediate ffn_out is not strictly required for cur_hc
+     * diffs, but enabling it keeps the fused decode path on the same code
+     * path the basic graph test uses, avoiding silent skips in the encoder. */
+    g.materialize_ffn_out = true;
+
+    ds4_kv_cache cpu_cache;
+    kv_cache_init(&cpu_cache, (uint32_t)ctx_size, raw_cap);
+
+    /* Run prefill on both sides to populate KV / compressor / indexer state.
+     * The CPU loop uses the same per-token decode entry point as real
+     * inference, which is the tightest match for what the GPU prefill kernels
+     * are emulating. */
+    fprintf(stderr, "ds4: decode-at test prefilling %d tokens on CPU...\n", n_prefill);
+    for (int t = 0; t < n_prefill; t++) {
+        forward_token_raw_swa_cpu(NULL, model, weights, &cpu_cache,
+                                  prompt->v[t], (uint32_t)t);
+    }
+    fprintf(stderr, "ds4: decode-at test prefilling %d tokens on GPU...\n", n_prefill);
+    ok = metal_graph_prefill_raw_swa(&g, model, weights, prompt, n_prefill, NULL, true);
+    if (!ok) {
+        fprintf(stderr, "ds4: Metal decode-at test prefill failed\n");
+        if (ds4_metal_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after prefill failure also failed\n");
+        }
+        kv_cache_free(&cpu_cache);
+        metal_graph_free(&g);
+        return 1;
+    }
+
+    /* Allocate per-layer scratch on both sides for the test decode step. */
+    const int test_token = prompt->v[n_prefill];
+    const uint32_t test_pos = (uint32_t)n_prefill;
+    const uint32_t raw_row = test_pos % g.raw_cap;
+    const uint32_t n_raw = metal_graph_raw_span_for_batch(&g, test_pos, 1);
+
+    float *cpu_cur = xmalloc((size_t)hc_dim * sizeof(float));
+    float *cpu_next = xmalloc((size_t)hc_dim * sizeof(float));
+    float *gpu_hc = xmalloc((size_t)hc_dim * sizeof(float));
+    float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *cpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
+    float *gpu_logits = xmalloc((size_t)vocab_dim * sizeof(float));
+
+    /* Allocate the CPU decode scratch with capacity sized for the longest
+     * compressor history any layer might present (mirroring the helper that
+     * forward_token_raw_swa_cpu uses internally). */
+    ds4_cpu_decode_scratch scratch;
+    uint32_t ctx_guess = test_pos + 1u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = cpu_cache.layer[il].compress_ratio;
+        if (ratio != 0 && cpu_cache.layer[il].comp_cap > 2) {
+            const uint32_t ctx_from_comp = (cpu_cache.layer[il].comp_cap - 2u) * ratio;
+            if (ctx_guess < ctx_from_comp) ctx_guess = ctx_from_comp;
+        }
+    }
+    cpu_decode_scratch_init(&scratch, ctx_guess);
+
+    /* Seed both sides with the embedding of the test token. */
+    embed_token_f16(model, weights, test_token, plain);
+    hc_from_plain_embedding(cpu_cur, plain, DS4_N_EMBD, DS4_N_HC);
+
+    if (ok) ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = ds4_metal_embed_token_hc_tensor(g.cur_hc,
+                                                 model->map,
+                                                 model->size,
+                                                 weights->token_embd->abs_offset,
+                                                 (uint32_t)weights->token_embd->dim[1],
+                                                 (uint32_t)test_token,
+                                                 DS4_N_EMBD,
+                                                 DS4_N_HC) != 0;
+    if (ok) ok = ds4_metal_end_commands() != 0;
+
+    fprintf(stderr,
+            "ds4: decode-at test running 1 decode step at pos=%u, token=%d (n_raw=%u, raw_row=%u)\n",
+            test_pos, test_token, n_raw, raw_row);
+
+    /* Optional: report CPU-vs-GPU divergence in the post-prefill caches before
+     * running the decode step.  This separates prefill drift from decode drift
+     * when reading the per-layer hc diffs below. */
+    if (ok && getenv("DS4_METAL_DECODE_TRACE_CACHE") != NULL) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t n_raw_cpu = cpu_cache.layer[il].n_raw;
+            if (n_raw_cpu != 0) {
+                const uint64_t raw_phys_n = (uint64_t)g.raw_cap * DS4_N_HEAD_DIM;
+                const uint64_t raw_logical_n = (uint64_t)n_raw_cpu * DS4_N_HEAD_DIM;
+                const uint32_t raw_start = n_raw_cpu < g.raw_cap ? 0u : ((uint32_t)n_prefill % g.raw_cap);
+                float *gpu_raw_phys = xmalloc((size_t)raw_phys_n * sizeof(float));
+                float *gpu_raw_logical = xmalloc((size_t)raw_logical_n * sizeof(float));
+                if (ds4_metal_tensor_read(g.layer_raw_cache[il], 0, gpu_raw_phys,
+                                          raw_phys_n * sizeof(float)) != 0) {
+                    for (uint32_t r = 0; r < n_raw_cpu; r++) {
+                        const uint32_t phys = (raw_start + r) % g.raw_cap;
+                        memcpy(gpu_raw_logical + (uint64_t)r * DS4_N_HEAD_DIM,
+                               gpu_raw_phys + (uint64_t)phys * DS4_N_HEAD_DIM,
+                               (size_t)DS4_N_HEAD_DIM * sizeof(float));
+                    }
+                    fprintf(stderr,
+                            "ds4: prefill-cache layer %2u raw_n=%u raw_max=%g raw_rms=%g\n",
+                            il, n_raw_cpu,
+                            max_abs_diff(cpu_cache.layer[il].raw_kv, gpu_raw_logical, raw_logical_n),
+                            rms_abs_diff(cpu_cache.layer[il].raw_kv, gpu_raw_logical, raw_logical_n));
+                }
+                free(gpu_raw_logical);
+                free(gpu_raw_phys);
+            }
+            const uint32_t n_comp_cpu = cpu_cache.layer[il].n_comp;
+            const uint32_t n_comp_gpu = g.layer_n_comp[il];
+            if (n_comp_cpu != 0) {
+                const uint64_t n = (uint64_t)n_comp_cpu * DS4_N_HEAD_DIM;
+                float *gpu_comp = xmalloc((size_t)n * sizeof(float));
+                if (ds4_metal_tensor_read(g.layer_attn_comp_cache[il], 0, gpu_comp,
+                                          n * sizeof(float)) != 0) {
+                    fprintf(stderr,
+                            "ds4: prefill-cache layer %2u comp_n_cpu=%u comp_n_gpu=%u attn_max=%g attn_rms=%g\n",
+                            il, n_comp_cpu, n_comp_gpu,
+                            max_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n),
+                            rms_abs_diff(cpu_cache.layer[il].attn_comp_kv, gpu_comp, n));
+                }
+                free(gpu_comp);
+            } else if (n_comp_gpu != 0) {
+                fprintf(stderr,
+                        "ds4: prefill-cache layer %2u comp_n_cpu=0 comp_n_gpu=%u (gpu emitted but cpu did not!)\n",
+                        il, n_comp_gpu);
+            }
+            const uint32_t n_index_cpu = cpu_cache.layer[il].n_index_comp;
+            const uint32_t n_index_gpu = g.layer_n_index_comp[il];
+            if (n_index_cpu != 0 && g.layer_index_comp_cache[il]) {
+                const uint64_t ni = (uint64_t)n_index_cpu * DS4_N_INDEXER_HEAD_DIM;
+                float *gpu_index = xmalloc((size_t)ni * sizeof(float));
+                if (ds4_metal_tensor_read(g.layer_index_comp_cache[il], 0, gpu_index,
+                                          ni * sizeof(float)) != 0) {
+                    fprintf(stderr,
+                            "ds4: prefill-cache layer %2u idx_n_cpu=%u idx_n_gpu=%u idx_max=%g idx_rms=%g\n",
+                            il, n_index_cpu, n_index_gpu,
+                            max_abs_diff(cpu_cache.layer[il].index_comp_kv, gpu_index, ni),
+                            rms_abs_diff(cpu_cache.layer[il].index_comp_kv, gpu_index, ni));
+                }
+                free(gpu_index);
+            } else if (n_index_gpu != 0) {
+                fprintf(stderr,
+                        "ds4: prefill-cache layer %2u idx_n_cpu=0 idx_n_gpu=%u (gpu emitted but cpu did not!)\n",
+                        il, n_index_gpu);
+            }
+        }
+    }
+
+    /* Optional teacher-forcing: at the start of every layer, overwrite the
+     * GPU residual hc with the CPU's, so the per-layer diff measures only
+     * that single layer's compute drift, not the accumulated drift from
+     * earlier layers.  Useful for bisecting which layer's kernels diverge
+     * most from the CPU reference. */
+    const bool teacher_force = getenv("DS4_METAL_DECODE_TEACHER_FORCE") != NULL;
+
+    double worst_diff = 0.0;
+    uint32_t worst_layer = 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (teacher_force) {
+            ok = ds4_metal_tensor_write(g.cur_hc, 0, cpu_cur, hc_dim * sizeof(float)) != 0;
+        }
+        if (ok) ok = ds4_metal_begin_commands() != 0;
+        if (ok) ok = metal_graph_encode_decode_layer(&g, model, &weights->layer[il],
+                                                     il, test_pos,
+                                                     g.layer_raw_cache[il], g.raw_cap,
+                                                     raw_row, n_raw, test_token);
+        ds4_metal_tensor *tmp = g.cur_hc;
+        g.cur_hc = g.after_ffn_hc;
+        g.after_ffn_hc = tmp;
+        if (ok) ok = ds4_metal_end_commands() != 0;
+
+        layer_forward_raw_swa_one(cpu_next, model, &weights->layer[il],
+                                  &cpu_cache.layer[il], cpu_cur,
+                                  il, test_pos, test_token, &scratch);
+
+        if (ok) ok = ds4_metal_tensor_read(g.cur_hc, 0, gpu_hc, hc_dim * sizeof(float)) != 0;
+        if (ok) {
+            const double m = max_abs_diff(cpu_next, gpu_hc, hc_dim);
+            const double r = rms_abs_diff(cpu_next, gpu_hc, hc_dim);
+            const uint32_t ratio = cpu_cache.layer[il].compress_ratio;
+            const uint32_t n_comp = cpu_cache.layer[il].n_comp;
+            const uint32_t n_raw_cpu = cpu_cache.layer[il].n_raw;
+            fprintf(stderr,
+                    "ds4: decode-at layer %2u%s  hc_max=%g  hc_rms=%g  ratio=%u n_comp=%u n_raw=%u\n",
+                    il, teacher_force ? " teacher" : "",
+                    m, r, ratio, n_comp, n_raw_cpu);
+            if (m > worst_diff) { worst_diff = m; worst_layer = il; }
+        }
+
+        float *t = cpu_cur;
+        cpu_cur = cpu_next;
+        cpu_next = t;
+    }
+
+    if (ok) ok = ds4_metal_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_output_head(&g, model, weights, vocab_dim);
+    if (ok) ok = ds4_metal_end_commands() != 0;
+    if (ok) ok = ds4_metal_tensor_read(g.logits, 0, gpu_logits, vocab_dim * sizeof(float)) != 0;
+
+    if (ok) {
+        output_logits_one_decode_scratch(cpu_logits, model, weights, cpu_cur, &scratch);
+        const uint64_t cpu_top = argmax_f32(cpu_logits, vocab_dim);
+        const uint64_t gpu_top = argmax_f32(gpu_logits, vocab_dim);
+        fprintf(stderr,
+                "ds4: decode-at summary  worst_layer=%u worst_hc_max=%g  logits_max=%g logits_rms=%g  cpu_top=%llu gpu_top=%llu cpu_top_logit=%g gpu_top_logit=%g\n",
+                worst_layer, worst_diff,
+                max_abs_diff(cpu_logits, gpu_logits, vocab_dim),
+                rms_abs_diff(cpu_logits, gpu_logits, vocab_dim),
+                (unsigned long long)cpu_top,
+                (unsigned long long)gpu_top,
+                cpu_logits[cpu_top],
+                gpu_logits[gpu_top]);
+    } else {
+        fprintf(stderr, "ds4: Metal decode-at test failed during decode step or output head\n");
+        if (ds4_metal_synchronize() == 0) {
+            fprintf(stderr, "ds4: Metal synchronize after decode-at failure also failed\n");
+        }
+    }
+
+    cpu_decode_scratch_free(&scratch);
+    free(gpu_logits);
+    free(cpu_logits);
+    free(plain);
+    free(gpu_hc);
+    free(cpu_next);
+    free(cpu_cur);
+    kv_cache_free(&cpu_cache);
+    metal_graph_free(&g);
+    return ok ? 0 : 1;
+}
+
 #endif
 
 typedef struct ds4_vocab ds4_vocab;
@@ -15571,6 +15842,23 @@ int ds4_engine_metal_graph_prompt_test(ds4_engine *e, const ds4_tokens *prompt, 
     (void)prompt;
     (void)ctx_size;
     fprintf(stderr, "ds4: Metal prompt graph test requested but this build has no Metal support\n");
+    return 1;
+#endif
+}
+
+int ds4_engine_metal_graph_decode_test(ds4_engine *e, const ds4_tokens *prompt, int n_prefill, int ctx_size) {
+#ifndef DS4_NO_METAL
+    if (!e->metal_ready) {
+        fprintf(stderr, "ds4: Metal decode-at test requested but Metal is unavailable\n");
+        return 1;
+    }
+    return metal_graph_decode_at_test(&e->model, &e->weights, prompt, n_prefill, ctx_size);
+#else
+    (void)e;
+    (void)prompt;
+    (void)n_prefill;
+    (void)ctx_size;
+    fprintf(stderr, "ds4: Metal decode-at test requested but this build has no Metal support\n");
     return 1;
 #endif
 }

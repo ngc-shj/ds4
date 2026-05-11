@@ -40,6 +40,8 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool metal_graph_decode_test;
+    int  metal_graph_decode_n_prefill;
     bool cuda_smoke_test;
 } cli_generation_options;
 
@@ -156,6 +158,13 @@ static void usage(FILE *fp) {
         "      Run the GPU-resident self-token graph across all layers.\n"
         "  --metal-graph-prompt-test\n"
         "      Compare CPU and GPU graph logits for the full prompt.\n"
+        "  --metal-graph-decode-test [N]\n"
+        "      Prefill the first N prompt tokens on both CPU and GPU, then run\n"
+        "      a single decode step at pos=N and report per-layer hidden-state\n"
+        "      diffs plus final logits diff. Exercises decode-only kernels\n"
+        "      (compressor_update, indexer scoring, decode_mixed attention)\n"
+        "      that the prefill-only graph tests do not cover. Default N: 64\n"
+        "      (or prompt_len/2 for shorter prompts).\n"
         "\n"
         "Normal CLI commands:\n"
         "  ./ds4\n"
@@ -696,6 +705,19 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     }
     if (cfg->gen.metal_graph_prompt_test) {
         rc = ds4_engine_metal_graph_prompt_test(engine, &prompt, cfg->gen.ctx_size);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
+    if (cfg->gen.metal_graph_decode_test) {
+        int n_prefill = cfg->gen.metal_graph_decode_n_prefill;
+        if (n_prefill <= 0) {
+            /* Default: half the prompt (clipped to a reasonable test size).
+             * The bug we are bisecting kicks in around 60 generated tokens, so
+             * a prefill of ~64 captures the worst-case state cheaply. */
+            n_prefill = prompt.len > 1 ? (prompt.len > 128 ? 64 : prompt.len / 2) : 1;
+            if (n_prefill < 1) n_prefill = 1;
+        }
+        rc = ds4_engine_metal_graph_decode_test(engine, &prompt, n_prefill, cfg->gen.ctx_size);
         ds4_tokens_free(&prompt);
         return rc;
     }
@@ -1253,6 +1275,23 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--metal-graph-prompt-test")) {
             c.gen.metal_graph_prompt_test = true;
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--metal-graph-decode-test")) {
+            c.gen.metal_graph_decode_test = true;
+            c.engine.backend = DS4_BACKEND_METAL;
+            /* Optional N argument: the number of prefill tokens before the
+             * test decode step.  Accepts a positive integer; anything else is
+             * left for the next option to consume. */
+            if (i + 1 < argc) {
+                const char *next = argv[i + 1];
+                if (next[0] != '-' && next[0] != '\0') {
+                    char *end = NULL;
+                    long v = strtol(next, &end, 10);
+                    if (end != next && *end == '\0' && v > 0 && v <= INT32_MAX) {
+                        c.gen.metal_graph_decode_n_prefill = (int)v;
+                        i++;
+                    }
+                }
+            }
         } else if (!strcmp(arg, "--metal-graph-generate")) {
             fprintf(stderr, "ds4: --metal-graph-generate was removed; --metal is the graph path\n");
             exit(2);

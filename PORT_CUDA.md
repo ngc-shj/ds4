@@ -191,9 +191,75 @@ our CUDA, and the inference output quality should also be similar.
 The fact that ds4-cuda still produces somewhat degraded text suggests
 there is an undiscovered structural bug, not just precision drift.
 
+### Decode-at diagnostic (added)
+
+`--metal-graph-decode-test [N]` prefills N tokens on both CPU and CUDA,
+then runs a single decode step at `pos=N` on `prompt[N]` and reports
+per-layer hidden-state diffs plus final logits diff.  This exercises
+the decode-only kernels (`compressor_update`, `indexer_score_one`,
+`decode_mixed_batch`) that the prefill-only graph test cannot reach.
+
+Two env-var modes for finer bisection:
+
+- `DS4_METAL_DECODE_TRACE_CACHE=1` — before the decode step, also report
+  CPU-vs-GPU diffs of the post-prefill `raw_kv` / `attn_comp_kv` /
+  `index_comp_kv` caches per layer.  Separates prefill drift from decode
+  drift.
+- `DS4_METAL_DECODE_TEACHER_FORCE=1` — at the start of each decode
+  layer, overwrite the GPU `cur_hc` with the CPU's, so each layer's
+  reported diff measures only that single layer's compute drift, not
+  the accumulated drift from earlier layers.
+
+#### First-run findings (N=16, 19-token prompt)
+
+The diagnostic immediately bisected the dominant drift source:
+
+```
+prefill-cache layer  0 raw_kv  max=0.125   rms=0.007    (essentially correct)
+prefill-cache layer  1 raw_kv  max=11.539  rms=0.750    (BLAST)
+prefill-cache layer  2 raw_kv  max=3.822   rms=0.535
+prefill-cache layer  3 raw_kv  max=7.129   rms=0.646
+...                    raw_kv  max~5-9 steady state for all subsequent layers
+```
+
+Every subsequent layer's post-prefill KV cache differs from CPU by a
+similar 4-9 max-abs.  The **single** large step is between layer 0 and
+layer 1; once corrupted, the streams stay corrupted.
+
+This is an actionable lead because:
+
+1. `metal_graph_first_token_full_test` (single-token decode at pos=0)
+   already shows per-layer hc match between CPU and CUDA across all
+   43 layers — so per-token decode kernels at layer 0→1 are correct.
+2. `metal_graph_decode_test` (Round 1+2) reports layer-0 prefill diff of
+   logits=0.18 — layer 0 prefill itself is correct.
+3. The new test runs **batched** prefill of N=16 tokens, and exposes
+   that the layer 0 → layer 1 transition diverges *only in batch mode*.
+
+The likely culprit is a CUDA **batched** prefill kernel that does not
+match its per-token CPU equivalent: HC post weighted-sum, batched
+SwiGLU, batched HC mix, or one of the HC-stream split/expand kernels
+called from `metal_graph_encode_layer_batch` at layer 0.
+
+With teacher forcing (each decode-layer input forced to CPU), top-1
+greedy token matches (cpu=9035 = gpu=9035) and logits diff drops from
+15.4 to 5.7.  Without teacher forcing the top-1 mismatches.  Layers
+28, 36, 42 also stand out as having larger per-layer compute drift
+(11.7, 13.9, 25.0) even with teacher-forced inputs — these are all
+ratio=4 layers (compressed + indexer), suggesting a secondary bug in
+the `decode_mixed_batch` / indexer path that compounds the prefill
+divergence.
+
 ### Next investigations (priority order)
 
-1. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
+1. **Bisect the layer 0 → layer 1 batched prefill blast.**  The
+   `--metal-graph-decode-test` cache trace showed layer 0 raw_kv
+   essentially matches CPU but layer 1 raw_kv has max=11.5 diff.
+   Capture HC state after each layer-0 stage in batch mode (HC pre,
+   attention, HC post, FFN, HC post) and diff against CPU's per-token
+   pipeline.  Likely culprit is one of the batched HC mixers or the
+   batched FFN at layer 0.
+2. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
    dumps the residual / KV / attention output / logits at each of the
    43 layers and compare against a Metal capture for the same prompt.
    This bisects the layer where my drift differs from Metal's, not from
