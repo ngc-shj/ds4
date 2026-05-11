@@ -50,7 +50,7 @@ __device__ __forceinline__ float ds4_cuda_attn_block_sum(float val, float *smem_
  *   window:   sliding-window length (token attends to [t-window+1 .. t]) */
 template <int BLOCK>
 __global__ void ds4_cuda_kernel_attn_prefill_raw_f32(
-        float *heads, const float *q, const float *raw_kv, const __half *sinks,
+        float *heads, const float *q, const float *raw_kv, const float *sinks,
         uint32_t n_tok, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     const uint32_t t = blockIdx.x;
     const uint32_t h = blockIdx.y;
@@ -70,7 +70,7 @@ __global__ void ds4_cuda_kernel_attn_prefill_raw_f32(
     float *warp_buf = smem;            /* 32 entries */
     float *score_bcast = smem + 32;    /* 1 entry, reused */
 
-    const float sink = sinks ? __half2float(sinks[h]) : -FLT_MAX;
+    const float sink = sinks ? sinks[h] : -FLT_MAX;
 
     /* Pass 1: max logit over the window plus the attention sink. */
     float max_logit = sink;
@@ -112,7 +112,7 @@ __global__ void ds4_cuda_kernel_attn_prefill_raw_f32(
  * absolute position. */
 template <int BLOCK>
 __global__ void ds4_cuda_kernel_attn_decode_raw_batch_f32(
-        float *heads, const float *q, const float *raw_kv, const __half *sinks,
+        float *heads, const float *q, const float *raw_kv, const float *sinks,
         uint32_t n_tok, uint32_t pos0,
         uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t window, uint32_t n_head, uint32_t head_dim) {
@@ -134,7 +134,7 @@ __global__ void ds4_cuda_kernel_attn_decode_raw_batch_f32(
     extern __shared__ float smem[];
     float *warp_buf = smem;
     float *score_bcast = smem + 32;
-    const float sink = sinks ? __half2float(sinks[h]) : -FLT_MAX;
+    const float sink = sinks ? sinks[h] : -FLT_MAX;
 
     float max_logit = sink;
     for (uint32_t j = 0; j < take; j++) {
@@ -189,7 +189,7 @@ __global__ void ds4_cuda_kernel_attn_decode_raw_batch_f32(
 template <int BLOCK>
 __global__ void ds4_cuda_kernel_attn_prefill_static_mixed_f32(
         float *heads, const float *q, const float *raw_kv, const float *comp_kv,
-        const __half *sinks,
+        const float *sinks,
         uint32_t n_tok, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim) {
     const uint32_t t = blockIdx.x;
@@ -214,7 +214,7 @@ __global__ void ds4_cuda_kernel_attn_prefill_static_mixed_f32(
     extern __shared__ float smem[];
     float *warp_buf = smem;
     float *score_bcast = smem + 32;
-    const float sink = sinks ? __half2float(sinks[h]) : -FLT_MAX;
+    const float sink = sinks ? sinks[h] : -FLT_MAX;
 
     /* Pass 1: max. */
     float max_l = sink;
@@ -274,7 +274,7 @@ __global__ void ds4_cuda_kernel_attn_prefill_static_mixed_f32(
 template <int BLOCK>
 __global__ void ds4_cuda_kernel_attn_prefill_masked_mixed_f32(
         float *heads, const float *q, const float *raw_kv, const float *comp_kv,
-        const float *comp_mask, const __half *sinks,
+        const float *comp_mask, const float *sinks,
         uint32_t n_tok, uint32_t n_comp, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim) {
     (void)ratio;
@@ -293,7 +293,7 @@ __global__ void ds4_cuda_kernel_attn_prefill_masked_mixed_f32(
     extern __shared__ float smem[];
     float *warp_buf = smem;
     float *score_bcast = smem + 32;
-    const float sink = sinks ? __half2float(sinks[h]) : -FLT_MAX;
+    const float sink = sinks ? sinks[h] : -FLT_MAX;
 
     float max_l = sink;
     for (int32_t j = jraw_lo; j <= jraw_hi; j++) {
@@ -353,7 +353,7 @@ __global__ void ds4_cuda_kernel_attn_prefill_masked_mixed_f32(
 template <int BLOCK>
 __global__ void ds4_cuda_kernel_attn_decode_mixed_batch_f32(
         float *heads, const float *q, const float *raw_kv, const float *comp_kv,
-        const float *comp_mask, uint32_t use_comp_mask, const __half *sinks,
+        const float *comp_mask, uint32_t use_comp_mask, const float *sinks,
         uint32_t n_tok, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
     (void)ratio;
@@ -373,7 +373,7 @@ __global__ void ds4_cuda_kernel_attn_decode_mixed_batch_f32(
     extern __shared__ float smem[];
     float *warp_buf = smem;
     float *score_bcast = smem + 32;
-    const float sink = sinks ? __half2float(sinks[h]) : -FLT_MAX;
+    const float sink = sinks ? sinks[h] : -FLT_MAX;
 
     float max_l = sink;
     for (uint32_t j = 0; j < take; j++) {
@@ -435,7 +435,7 @@ __global__ void ds4_cuda_kernel_attn_decode_mixed_batch_f32(
 template <int BLOCK>
 __global__ void ds4_cuda_kernel_attn_indexed_mixed_batch_f32(
         float *heads, const float *q, const float *raw_kv, const float *comp_kv,
-        const int32_t *topk, const __half *sinks,
+        const int32_t *topk, const float *sinks,
         uint32_t n_tok, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t n_comp, uint32_t top_k, uint32_t window, uint32_t ratio,
         uint32_t n_head, uint32_t head_dim) {
@@ -456,7 +456,7 @@ __global__ void ds4_cuda_kernel_attn_indexed_mixed_batch_f32(
     extern __shared__ float smem[];
     float *warp_buf = smem;
     float *score_bcast = smem + 32;
-    const float sink = sinks ? __half2float(sinks[h]) : -FLT_MAX;
+    const float sink = sinks ? sinks[h] : -FLT_MAX;
 
     float max_l = sink;
     for (uint32_t j = 0; j < take; j++) {

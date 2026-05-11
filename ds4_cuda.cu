@@ -839,8 +839,8 @@ int ds4_metal_attention_decode_heads_tensor(ds4_metal_tensor *h, const void *m, 
      * the batched mixed-decode kernel with n_tok=1, window=n_raw (consume
      * all available raw rows), ratio=1 (unused). */
     if (!h || !q || !raw_kv || !m || nh == 0 || hd == 0) return 0;
-    if (so > ms || (uint64_t)nh * sizeof(__half) > ms - so) return 0;
-    const __half *sinks = (const __half *)ds4_cuda_weight_ptr(m, so);
+    if (so > ms || (uint64_t)nh * sizeof(float) > ms - so) return 0;
+    const float *sinks = (const float *)ds4_cuda_weight_ptr(m, so);
     const float *cmask_p = (use_mask && comp_mask) ? tensor_cfptr(comp_mask) : nullptr;
     const float *ckv_p = comp_kv ? tensor_cfptr(comp_kv) : nullptr;
     dim3 grid(1, nh);
@@ -857,8 +857,8 @@ int ds4_metal_attention_prefill_raw_heads_tensor(ds4_metal_tensor *h, const void
         uint64_t so, const ds4_metal_tensor *q, const ds4_metal_tensor *raw_kv,
         uint32_t nt, uint32_t win, uint32_t nh, uint32_t hd) {
     if (!h || !q || !raw_kv || !m || nt == 0 || nh == 0 || hd == 0) return 0;
-    if (so > ms || (uint64_t)nh * sizeof(__half) > ms - so) return 0;
-    const __half *sinks = (const __half *)ds4_cuda_weight_ptr(m, so);
+    if (so > ms || (uint64_t)nh * sizeof(float) > ms - so) return 0;
+    const float *sinks = (const float *)ds4_cuda_weight_ptr(m, so);
     dim3 grid(nt, nh);
     DS4_CUDA_ATTN_DISPATCH(
         ds4_cuda_kernel_attn_prefill_raw_f32, hd, grid, ds4_cuda_stream,
@@ -871,8 +871,8 @@ int ds4_metal_attention_decode_raw_batch_heads_tensor(ds4_metal_tensor *h, const
         uint32_t nt, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t win, uint32_t nh, uint32_t hd) {
     if (!h || !q || !raw_kv || !m || nt == 0 || nh == 0 || hd == 0) return 0;
-    if (so > ms || (uint64_t)nh * sizeof(__half) > ms - so) return 0;
-    const __half *sinks = (const __half *)ds4_cuda_weight_ptr(m, so);
+    if (so > ms || (uint64_t)nh * sizeof(float) > ms - so) return 0;
+    const float *sinks = (const float *)ds4_cuda_weight_ptr(m, so);
     dim3 grid(nt, nh);
     DS4_CUDA_ATTN_DISPATCH(
         ds4_cuda_kernel_attn_decode_raw_batch_f32, hd, grid, ds4_cuda_stream,
@@ -886,8 +886,8 @@ int ds4_metal_attention_decode_mixed_batch_heads_tensor(ds4_metal_tensor *h, con
         uint32_t nt, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t n_comp, uint32_t win, uint32_t ratio, uint32_t nh, uint32_t hd) {
     if (!h || !q || !raw_kv || !comp_kv || !m || nt == 0 || nh == 0 || hd == 0) return 0;
-    if (so > ms || (uint64_t)nh * sizeof(__half) > ms - so) return 0;
-    const __half *sinks = (const __half *)ds4_cuda_weight_ptr(m, so);
+    if (so > ms || (uint64_t)nh * sizeof(float) > ms - so) return 0;
+    const float *sinks = (const float *)ds4_cuda_weight_ptr(m, so);
     const float *mask_p = (use_mask && comp_mask) ? tensor_cfptr(comp_mask) : nullptr;
     dim3 grid(nt, nh);
     DS4_CUDA_ATTN_DISPATCH(
@@ -903,8 +903,8 @@ int ds4_metal_attention_indexed_mixed_batch_heads_tensor(ds4_metal_tensor *h, co
         uint32_t nt, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
         uint32_t n_comp, uint32_t top_k, uint32_t win, uint32_t ratio, uint32_t nh, uint32_t hd) {
     if (!h || !q || !raw_kv || !comp_kv || !topk || !m || nt == 0 || nh == 0 || hd == 0) return 0;
-    if (so > ms || (uint64_t)nh * sizeof(__half) > ms - so) return 0;
-    const __half *sinks = (const __half *)ds4_cuda_weight_ptr(m, so);
+    if (so > ms || (uint64_t)nh * sizeof(float) > ms - so) return 0;
+    const float *sinks = (const float *)ds4_cuda_weight_ptr(m, so);
     const int32_t *topk_p = (const int32_t *)tensor_cfptr(topk);
     dim3 grid(nt, nh);
     DS4_CUDA_ATTN_DISPATCH(
@@ -919,8 +919,8 @@ int ds4_metal_attention_prefill_static_mixed_heads_tensor(ds4_metal_tensor *h, c
         const ds4_metal_tensor *comp_kv, uint32_t nt, uint32_t n_comp,
         uint32_t win, uint32_t ratio, uint32_t nh, uint32_t hd) {
     if (!h || !q || !raw_kv || !comp_kv || !m || nt == 0 || nh == 0 || hd == 0) return 0;
-    if (so > ms || (uint64_t)nh * sizeof(__half) > ms - so) return 0;
-    const __half *sinks = (const __half *)ds4_cuda_weight_ptr(m, so);
+    if (so > ms || (uint64_t)nh * sizeof(float) > ms - so) return 0;
+    const float *sinks = (const float *)ds4_cuda_weight_ptr(m, so);
     dim3 grid(nt, nh);
     DS4_CUDA_ATTN_DISPATCH(
         ds4_cuda_kernel_attn_prefill_static_mixed_f32, hd, grid, ds4_cuda_stream,
@@ -933,8 +933,8 @@ int ds4_metal_attention_prefill_masked_mixed_heads_tensor(ds4_metal_tensor *h, c
         const ds4_metal_tensor *comp_kv, const ds4_metal_tensor *comp_mask,
         uint32_t nt, uint32_t n_comp, uint32_t win, uint32_t ratio, uint32_t nh, uint32_t hd) {
     if (!h || !q || !raw_kv || !comp_kv || !comp_mask || !m || nt == 0 || nh == 0 || hd == 0) return 0;
-    if (so > ms || (uint64_t)nh * sizeof(__half) > ms - so) return 0;
-    const __half *sinks = (const __half *)ds4_cuda_weight_ptr(m, so);
+    if (so > ms || (uint64_t)nh * sizeof(float) > ms - so) return 0;
+    const float *sinks = (const float *)ds4_cuda_weight_ptr(m, so);
     dim3 grid(nt, nh);
     DS4_CUDA_ATTN_DISPATCH(
         ds4_cuda_kernel_attn_prefill_masked_mixed_f32, hd, grid, ds4_cuda_stream,

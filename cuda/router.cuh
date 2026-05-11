@@ -22,7 +22,18 @@
 #define DS4_CUDA_N_EXPERTS 256
 #define DS4_CUDA_TOP_K     6
 
-/* One block per token, BLOCK threads. */
+/* Softplus with the same saturation Metal uses (>20 collapses to the input
+ * to avoid overflow in exp()). */
+__device__ __forceinline__ float ds4_cuda_softplus(float x) {
+    return x > 20.0f ? x : log1pf(expf(x));
+}
+
+/* DS4 router probability transform.  Matches metal kernel_dsv4_softplus_sqrt:
+ *   probs[e] = sqrt(softplus(logits[e]))
+ * which is NOT a softmax distribution.  Top-K is then taken by
+ * (probs + bias) (bias is a learned per-expert scalar that influences
+ * selection only) and the surviving weights are renormalised by their own
+ * sum and multiplied by 1.5 (DS4's expert-weight scale). */
 template <int BLOCK>
 __global__ void ds4_cuda_kernel_router_select_f32(
         int32_t *selected, float *weights, float *probs,
@@ -32,6 +43,9 @@ __global__ void ds4_cuda_kernel_router_select_f32(
     const uint32_t t = blockIdx.x;
     if (t >= n_tok) return;
 
+    /* Hash mode: just look up the six expert ids in the precomputed table,
+     * leave probs zeroed (engine doesn't read them on hash path), and use
+     * uniform 1/6 weights -- DS4's hash router does not weight-average. */
     if (hash_mode) {
         if (threadIdx.x < DS4_CUDA_TOP_K) {
             const uint32_t row = (uint32_t)tokens[t] % hash_rows;
@@ -48,81 +62,39 @@ __global__ void ds4_cuda_kernel_router_select_f32(
     const float *lp = logits + (uint64_t)t * DS4_CUDA_N_EXPERTS;
     float       *pp = probs  + (uint64_t)t * DS4_CUDA_N_EXPERTS;
 
-    /* Softmax over 256 logits. */
-    float my_max = -FLT_MAX;
+    /* Phase 1: probs = sqrt(softplus(logits)).  Each thread handles a stripe
+     * of the 256-element row. */
     for (uint32_t e = threadIdx.x; e < DS4_CUDA_N_EXPERTS; e += BLOCK) {
-        if (lp[e] > my_max) my_max = lp[e];
-    }
-    __shared__ float wm[32];
-    for (int off = 16; off > 0; off >>= 1)
-        my_max = fmaxf(my_max, __shfl_xor_sync(0xffffffff, my_max, off));
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    if (lane == 0) wm[warp] = my_max;
-    __syncthreads();
-    if (warp == 0) {
-        my_max = (threadIdx.x < (BLOCK + 31) / 32) ? wm[lane] : -FLT_MAX;
-        for (int off = 16; off > 0; off >>= 1)
-            my_max = fmaxf(my_max, __shfl_xor_sync(0xffffffff, my_max, off));
-        if (lane == 0) wm[0] = my_max;
-    }
-    __syncthreads();
-    const float lmax = wm[0];
-
-    float my_sum = 0.0f;
-    for (uint32_t e = threadIdx.x; e < DS4_CUDA_N_EXPERTS; e += BLOCK) {
-        const float v = expf(lp[e] - lmax);
-        pp[e] = v;
-        my_sum += v;
-    }
-    __shared__ float ws[32];
-    for (int off = 16; off > 0; off >>= 1) my_sum += __shfl_xor_sync(0xffffffff, my_sum, off);
-    if (lane == 0) ws[warp] = my_sum;
-    __syncthreads();
-    if (warp == 0) {
-        my_sum = (threadIdx.x < (BLOCK + 31) / 32) ? ws[lane] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1) my_sum += __shfl_xor_sync(0xffffffff, my_sum, off);
-        if (lane == 0) ws[0] = my_sum;
-    }
-    __syncthreads();
-    const float total = ws[0];
-    const float inv_total = 1.0f / total;
-    for (uint32_t e = threadIdx.x; e < DS4_CUDA_N_EXPERTS; e += BLOCK) {
-        pp[e] *= inv_total;
+        pp[e] = sqrtf(ds4_cuda_softplus(lp[e]));
     }
     __syncthreads();
 
-    /* Top-K selection.  256 experts is small enough to do serially on thread 0;
-     * the gain from a parallel top-K kernel here is dwarfed by the MoE matmul
-     * that follows.  See PORT_CUDA.md tier 6 for the parallel variant. */
+    /* Phase 2: select top-K by (probs + bias).  Serial on thread 0; 256
+     * experts make this cheap relative to the MoE matmul that follows. */
     if (threadIdx.x == 0) {
-        /* Score = prob + bias (bias gates the choice but probs stay unbiased
-         * for the weights).  We can't malloc 256 floats; use a hand-rolled
-         * "remove best by setting to -inf" approach with a copy buffer.  Local
-         * register array won't fit, so we use shared memory we already have. */
-        /* Reuse wm/ws for scratch (they were size 32 each).  Need 256: stage
-         * out to pp temporarily, knowing pp will be overwritten on the next
-         * call anyway. */
-        float score[DS4_CUDA_N_EXPERTS];
+        float scratch[DS4_CUDA_N_EXPERTS];
         for (int e = 0; e < DS4_CUDA_N_EXPERTS; e++) {
-            score[e] = pp[e] + (has_bias ? bias[e] : 0.0f);
+            scratch[e] = pp[e] + (has_bias ? bias[e] : 0.0f);
         }
-        float w_sum = 0.0f;
+        int32_t sel[DS4_CUDA_TOP_K];
         for (int k = 0; k < DS4_CUDA_TOP_K; k++) {
             int   best = 0;
             float bv   = -FLT_MAX;
             for (int e = 0; e < DS4_CUDA_N_EXPERTS; e++) {
-                if (score[e] > bv) { bv = score[e]; best = e; }
+                if (scratch[e] > bv) { bv = scratch[e]; best = e; }
             }
+            sel[k] = best;
             selected[(uint64_t)t * DS4_CUDA_TOP_K + k] = best;
-            const float wk = pp[best];
-            weights[(uint64_t)t * DS4_CUDA_TOP_K + k] = wk;
-            w_sum += wk;
-            score[best] = -FLT_MAX;
+            scratch[best] = -FLT_MAX;
         }
-        const float inv = 1.0f / w_sum;
+        /* Phase 3: weights[k] = probs[sel[k]] / max(sum, 6.103515625e-5) * 1.5
+         * NB: probs (not scratch+bias) are used for the weights. */
+        float w_sum = 0.0f;
+        for (int k = 0; k < DS4_CUDA_TOP_K; k++) w_sum += pp[sel[k]];
+        const float denom = fmaxf(w_sum, 6.103515625e-5f);
+        const float inv = 1.5f / denom;
         for (int k = 0; k < DS4_CUDA_TOP_K; k++) {
-            weights[(uint64_t)t * DS4_CUDA_TOP_K + k] *= inv;
+            weights[(uint64_t)t * DS4_CUDA_TOP_K + k] = pp[sel[k]] * inv;
         }
     }
 }

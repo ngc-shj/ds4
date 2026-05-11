@@ -75,39 +75,77 @@ __global__ void ds4_cuda_kernel_hc_weighted_sum_f32(
     out[(uint64_t)row * n_embd + i] = acc;
 }
 
-/* HC expand: combine the sublayer output back into the n_hc residual streams.
- * Math from metal/dsv4_misc.metal::kernel_hc_expand_f32:
- *   out_hc[hc, i] = residual_hc[hc, i] + post[hc] * (block_out[i] + comb[hc] * 0)
- * Simplified DS4 form: out_hc[hc, i] = residual_hc[hc, i] + post[hc] * block_out[i].
- * The optional `comb` vector lets multi-stream blocks blend before adding;
- * we keep the API but pass only the simple variant below. */
+/* HC expand split (n_hc==4 production case).
+ *
+ * Reference: metal/dsv4_hc.metal::kernel_dsv4_hc_expand4.  The math is:
+ *   out_hc[t, dst_hc, d] = block_out[t, d] * post[t, dst_hc]
+ *                         + sum_src_hc comb[t, src_hc, dst_hc] *
+ *                                       residual_hc[t, src_hc, d]
+ *
+ * The split tensor layout per token is
+ *     [pre[n_hc], post[n_hc], comb[n_hc * n_hc]]   -- mix_hc = 2*n_hc + n_hc^2
+ * with comb's fastest-changing dim being dst_hc (Metal nb_comb0=sizeof(float),
+ * nb_comb1=n_hc*sizeof(float)).  So linear index for comb element
+ * (src_hc, dst_hc) is `src_hc * n_hc + dst_hc`. */
 __global__ void ds4_cuda_kernel_hc_expand_split_f32(
         float *out_hc, const float *block_out, const float *residual_hc,
         const float *split, uint32_t n_embd, uint32_t n_hc) {
-    /* split layout matches metal/dsv4_misc.metal: the first n_hc entries are
-     * the per-hc "post" scales used here.  Following entries (combine matrix)
-     * are unused by hc_expand_split, which is the simple post-add path. */
-    const uint32_t i  = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t hc = blockIdx.y;
-    if (i >= n_embd || hc >= n_hc) return;
-    const float post = split[hc];
-    const float r = residual_hc[(uint64_t)hc * n_embd + i];
-    out_hc[(uint64_t)hc * n_embd + i] = r + post * block_out[i];
+    constexpr int HC = 4;
+    if (n_hc != HC) return;
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (d >= n_embd) return;
+
+    const uint32_t mix_hc = 2u * HC + HC * HC;
+    const float *post = split + (uint64_t)t * mix_hc + HC;
+    const float *cm   = split + (uint64_t)t * mix_hc + 2u * HC;
+    const float bv    = block_out[(uint64_t)t * n_embd + d];
+    const float *res  = residual_hc + (uint64_t)t * HC * n_embd;
+    const float r0    = res[(uint64_t)0 * n_embd + d];
+    const float r1    = res[(uint64_t)1 * n_embd + d];
+    const float r2    = res[(uint64_t)2 * n_embd + d];
+    const float r3    = res[(uint64_t)3 * n_embd + d];
+    #pragma unroll
+    for (int dst_hc = 0; dst_hc < HC; dst_hc++) {
+        float acc = bv * post[dst_hc];
+        acc += cm[0 * HC + dst_hc] * r0;
+        acc += cm[1 * HC + dst_hc] * r1;
+        acc += cm[2 * HC + dst_hc] * r2;
+        acc += cm[3 * HC + dst_hc] * r3;
+        out_hc[((uint64_t)t * HC + dst_hc) * n_embd + d] = acc;
+    }
 }
 
-/* Same idea but with two summed block outputs (used after the FFN where
- * shared + routed expert outputs both contribute). */
+/* Same as hc_expand_split with two block outputs summed first. */
 __global__ void ds4_cuda_kernel_hc_expand_add_split_f32(
         float *out_hc, const float *block_out, const float *block_add,
         const float *residual_hc, const float *split,
         uint32_t n_embd, uint32_t n_hc) {
-    const uint32_t i  = blockIdx.x * blockDim.x + threadIdx.x;
-    const uint32_t hc = blockIdx.y;
-    if (i >= n_embd || hc >= n_hc) return;
-    const float post = split[hc];
-    const float r = residual_hc[(uint64_t)hc * n_embd + i];
-    const float b = block_out[i] + block_add[i];
-    out_hc[(uint64_t)hc * n_embd + i] = r + post * b;
+    constexpr int HC = 4;
+    if (n_hc != HC) return;
+    const uint32_t d = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (d >= n_embd) return;
+
+    const uint32_t mix_hc = 2u * HC + HC * HC;
+    const float *post = split + (uint64_t)t * mix_hc + HC;
+    const float *cm   = split + (uint64_t)t * mix_hc + 2u * HC;
+    const float bv    = block_out[(uint64_t)t * n_embd + d]
+                       + block_add[(uint64_t)t * n_embd + d];
+    const float *res  = residual_hc + (uint64_t)t * HC * n_embd;
+    const float r0    = res[(uint64_t)0 * n_embd + d];
+    const float r1    = res[(uint64_t)1 * n_embd + d];
+    const float r2    = res[(uint64_t)2 * n_embd + d];
+    const float r3    = res[(uint64_t)3 * n_embd + d];
+    #pragma unroll
+    for (int dst_hc = 0; dst_hc < HC; dst_hc++) {
+        float acc = bv * post[dst_hc];
+        acc += cm[0 * HC + dst_hc] * r0;
+        acc += cm[1 * HC + dst_hc] * r1;
+        acc += cm[2 * HC + dst_hc] * r2;
+        acc += cm[3 * HC + dst_hc] * r3;
+        out_hc[((uint64_t)t * HC + dst_hc) * n_embd + d] = acc;
+    }
 }
 
 /* HC split sinkhorn: per-token mixer logits -> per-token split tensor with
@@ -299,13 +337,15 @@ __global__ void ds4_cuda_kernel_hc_expand_with_comb_hc4_f32(
     const float r3 = res[(uint64_t)3 * n_embd + d];
     const float *pp = post + (uint64_t)t * HC;
     const float *cm = comb + (uint64_t)t * HC * HC;
+    /* Metal's comb layout has dst_hc as the fastest-changing dim (nb_comb0 =
+     * sizeof(float)) so the linear index is comb[src_hc * HC + dst_hc]. */
     #pragma unroll
     for (int dst_hc = 0; dst_hc < HC; dst_hc++) {
         float acc = bv * pp[dst_hc];
-        acc += cm[dst_hc * HC + 0] * r0;
-        acc += cm[dst_hc * HC + 1] * r1;
-        acc += cm[dst_hc * HC + 2] * r2;
-        acc += cm[dst_hc * HC + 3] * r3;
+        acc += cm[0 * HC + dst_hc] * r0;
+        acc += cm[1 * HC + dst_hc] * r1;
+        acc += cm[2 * HC + dst_hc] * r2;
+        acc += cm[3 * HC + dst_hc] * r3;
         dst[((uint64_t)t * HC + dst_hc) * n_embd + d] = acc;
     }
 }
