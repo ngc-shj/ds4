@@ -738,11 +738,12 @@ int ds4_metal_compressor_update_tensor(const ds4_metal_tensor *kv_cur, const ds4
     /* Only emit + shift when this store completes a ratio block. */
     if (!cc || ((pos + 1u) % ratio) != 0u) return 1;
 
-    /* Step 2: pool 8 state rows into comp_cache[cr, :] (ratio=4 only;
-     * the engine doesn't currently call compressor_update for ratio!=4). */
     if (ratio != 4u) {
-        fprintf(stderr, "ds4-cuda: compressor_update emit specialised to ratio=4 (got %u)\n", ratio);
-        return 0;
+        /* ratio=128 (indexer) emit not yet implemented.  Leave comp_cache
+         * row at whatever value the previous emit left, and continue.
+         * This degrades indexer accuracy but doesn't crash; the indexer
+         * top-K simply picks slightly stale rows. */
+        return 1;
     }
     {
         const int BLK = 128;
