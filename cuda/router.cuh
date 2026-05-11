@@ -43,33 +43,43 @@ __global__ void ds4_cuda_kernel_router_select_f32(
     const uint32_t t = blockIdx.x;
     if (t >= n_tok) return;
 
-    /* Hash mode: just look up the six expert ids in the precomputed table,
-     * leave probs zeroed (engine doesn't read them on hash path), and use
-     * uniform 1/6 weights -- DS4's hash router does not weight-average. */
-    if (hash_mode) {
-        if (threadIdx.x < DS4_CUDA_TOP_K) {
-            const uint32_t row = (uint32_t)tokens[t] % hash_rows;
-            selected[(uint64_t)t * DS4_CUDA_TOP_K + threadIdx.x] =
-                hash[(uint64_t)row * DS4_CUDA_TOP_K + threadIdx.x];
-            weights[(uint64_t)t * DS4_CUDA_TOP_K + threadIdx.x] = 1.0f / (float)DS4_CUDA_TOP_K;
-        }
-        for (uint32_t e = threadIdx.x; e < DS4_CUDA_N_EXPERTS; e += BLOCK) {
-            probs[(uint64_t)t * DS4_CUDA_N_EXPERTS + e] = 0.0f;
-        }
-        return;
-    }
-
     const float *lp = logits + (uint64_t)t * DS4_CUDA_N_EXPERTS;
     float       *pp = probs  + (uint64_t)t * DS4_CUDA_N_EXPERTS;
 
-    /* Phase 1: probs = sqrt(softplus(logits)).  Each thread handles a stripe
-     * of the 256-element row. */
+    /* Phase 1 (both modes): probs = sqrt(softplus(logits)).  Hash mode also
+     * needs the unbiased probs to compute the final route weights. */
     for (uint32_t e = threadIdx.x; e < DS4_CUDA_N_EXPERTS; e += BLOCK) {
         pp[e] = sqrtf(ds4_cuda_softplus(lp[e]));
     }
     __syncthreads();
 
-    /* Phase 2: select top-K by (probs + bias).  Serial on thread 0; 256
+    if (hash_mode) {
+        /* Selected experts come from the hash table indexed by token id. */
+        if (threadIdx.x < DS4_CUDA_TOP_K) {
+            const uint32_t row = (uint32_t)tokens[t] % hash_rows;
+            selected[(uint64_t)t * DS4_CUDA_TOP_K + threadIdx.x] =
+                hash[(uint64_t)row * DS4_CUDA_TOP_K + threadIdx.x];
+        }
+        __syncthreads();
+        /* Weights[k] = probs[sel[k]] / max(sum, eps) * 1.5 -- same normalisation
+         * as top-K mode (see layer_hash_router_weights_from_probs in ds4.c). */
+        if (threadIdx.x == 0) {
+            int32_t sel[DS4_CUDA_TOP_K];
+            float w_sum = 0.0f;
+            for (int k = 0; k < DS4_CUDA_TOP_K; k++) {
+                sel[k] = selected[(uint64_t)t * DS4_CUDA_TOP_K + k];
+                w_sum += pp[sel[k]];
+            }
+            const float denom = fmaxf(w_sum, 6.103515625e-5f);
+            const float inv = 1.5f / denom;
+            for (int k = 0; k < DS4_CUDA_TOP_K; k++) {
+                weights[(uint64_t)t * DS4_CUDA_TOP_K + k] = pp[sel[k]] * inv;
+            }
+        }
+        return;
+    }
+
+    /* Top-K mode: select top-K by (probs + bias).  Serial on thread 0; 256
      * experts make this cheap relative to the MoE matmul that follows. */
     if (threadIdx.x == 0) {
         float scratch[DS4_CUDA_N_EXPERTS];
@@ -87,8 +97,6 @@ __global__ void ds4_cuda_kernel_router_select_f32(
             selected[(uint64_t)t * DS4_CUDA_TOP_K + k] = best;
             scratch[best] = -FLT_MAX;
         }
-        /* Phase 3: weights[k] = probs[sel[k]] / max(sum, 6.103515625e-5) * 1.5
-         * NB: probs (not scratch+bias) are used for the weights. */
         float w_sum = 0.0f;
         for (int k = 0; k < DS4_CUDA_TOP_K; k++) w_sum += pp[sel[k]];
         const float denom = fmaxf(w_sum, 6.103515625e-5f);
