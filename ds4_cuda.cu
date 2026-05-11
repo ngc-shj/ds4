@@ -301,23 +301,37 @@ int ds4_metal_set_model_map(const void *model_map, uint64_t model_size) {
     g_model_map = model_map;
     g_model_size = model_size;
     if (model_map && model_size) {
-        /* cudaHostRegisterReadOnly avoids the driver tracking dirty pages for
-         * write-back: the GGUF mapping is immutable as far as inference is
-         * concerned. */
+        /* Try a few registration modes.  File-backed mmap declines
+         * Default+ReadOnly on some kernels; Default alone often works.
+         * Then explicitly advise the driver that the range is read-mostly
+         * so the unified-memory path doesn't keep tracking dirty pages. */
         cudaError_t e = cudaHostRegister((void *)model_map, (size_t)model_size,
                                          cudaHostRegisterReadOnly);
+        if (e != cudaSuccess) {
+            e = cudaHostRegister((void *)model_map, (size_t)model_size,
+                                 cudaHostRegisterDefault);
+        }
         if (e == cudaSuccess) {
             g_model_pinned = true;
         } else {
-            /* Some kernels (older driver, /proc-backed mappings) don't accept
-             * HostRegister.  Fall through: managed-memory + UVA will still let
-             * device code read these pointers, just without the pin. */
             fprintf(stderr,
                     "ds4-cuda: cudaHostRegister(model_map=%p, %llu) declined (%s); "
                     "continuing without pinned mapping\n",
                     model_map, (unsigned long long)model_size,
                     cudaGetErrorString(e));
         }
+
+        /* Even without HostRegister, cudaMemAdvise on the UVA range can move
+         * the pages into a GPU-cacheable state on GB10 / unified-memory
+         * systems.  CUDA 13 switched to a cudaMemLocation argument.  Failure
+         * here is non-fatal. */
+        int device = 0;
+        cudaGetDevice(&device);
+        cudaMemLocation loc = { cudaMemLocationTypeDevice, device };
+        cudaMemAdvise(model_map, (size_t)model_size,
+                      cudaMemAdviseSetReadMostly, loc);
+        cudaMemAdvise(model_map, (size_t)model_size,
+                      cudaMemAdviseSetPreferredLocation, loc);
     }
     return 1;
 }
