@@ -40,6 +40,7 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    bool cuda_smoke_test;
 } cli_generation_options;
 
 typedef struct {
@@ -1217,8 +1218,16 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend(need_arg(&i, argc, argv, arg));
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
-        } else if (!strcmp(arg, "--metal")) {
+        } else if (!strcmp(arg, "--metal") || !strcmp(arg, "--cuda")) {
+            /* On Linux + DS4_CUDA builds, --metal and --cuda are aliases:
+             * both select the GPU backend, which is provided by ds4_cuda.cu.
+             * The engine enum stays Metal-named so ds4.c needs no change. */
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--cuda-smoke-test")) {
+            /* Initialise CUDA, allocate / write / read a small tensor through
+             * the public ds4_metal_* API, run the simple add kernel and report
+             * pass/fail.  Useful before loading a 80+ GiB GGUF on a fresh box. */
+            c.gen.cuda_smoke_test = true;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
@@ -1264,8 +1273,212 @@ static cli_config parse_options(int argc, char **argv) {
     return c;
 }
 
+#if defined(DS4_CUDA)
+/* Standalone CUDA smoke test: brings up the device, allocates a tensor pair
+ * through the public ds4_metal_* API, runs the trivial add kernel, and reads
+ * the result back.  Lets you confirm the GPU path is reachable before
+ * spending time on an 80 GiB GGUF load. */
+extern int ds4_metal_init(void);
+extern void ds4_metal_cleanup(void);
+extern int ds4_metal_begin_commands(void);
+extern int ds4_metal_end_commands(void);
+typedef struct ds4_metal_tensor ds4_metal_tensor;
+extern ds4_metal_tensor *ds4_metal_tensor_alloc(uint64_t bytes);
+extern void ds4_metal_tensor_free(ds4_metal_tensor *t);
+extern int ds4_metal_tensor_write(ds4_metal_tensor *t, uint64_t off, const void *data, uint64_t n);
+extern int ds4_metal_tensor_read(const ds4_metal_tensor *t, uint64_t off, void *data, uint64_t n);
+extern int ds4_metal_add_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *a, const ds4_metal_tensor *b, uint32_t n);
+extern int ds4_metal_rms_norm_plain_tensor(ds4_metal_tensor *out, const ds4_metal_tensor *x, uint32_t n, float eps);
+extern int ds4_metal_rms_norm_weight_tensor(ds4_metal_tensor *o, const ds4_metal_tensor *x, const void *m, uint64_t ms, uint64_t wo, uint32_t n, float eps);
+extern int ds4_metal_set_model_map(const void *m, uint64_t ms);
+extern int ds4_metal_matmul_f32_tensor(ds4_metal_tensor *o, const void *m, uint64_t ms, uint64_t wo, uint64_t in_dim, uint64_t out_dim, const ds4_metal_tensor *x, uint64_t nt);
+extern int ds4_metal_rope_tail_tensor(ds4_metal_tensor *x, uint32_t nt, uint32_t nh, uint32_t hd, uint32_t nr, uint32_t pos0, uint32_t nco, _Bool inv, float fb, float fs, float ef, float af, float bf, float bs);
+extern int ds4_metal_store_raw_kv_tensor(ds4_metal_tensor *cache, const ds4_metal_tensor *kv, uint32_t cap, uint32_t row, uint32_t hd);
+extern int ds4_metal_matmul_q8_0_tensor(ds4_metal_tensor *out, const void *m, uint64_t ms, uint64_t wo, uint64_t in_dim, uint64_t out_dim, const ds4_metal_tensor *x, uint64_t nt);
+
+static int smoke_check(const char *label, int cond) {
+    fprintf(stderr, "ds4 cuda-smoke: %-30s %s\n", label, cond ? "OK" : "FAIL");
+    return cond;
+}
+
+static int run_cuda_smoke_test(void) {
+    if (!ds4_metal_init()) return 1;
+    int ok = 1;
+
+    /* (1) add: y = a + b */
+    {
+        const uint32_t N = 16;
+        float a[16], b[16], out[16];
+        for (uint32_t i = 0; i < N; i++) { a[i] = (float)i; b[i] = (float)(i * 10); }
+        ds4_metal_tensor *ta = ds4_metal_tensor_alloc(N * sizeof(float));
+        ds4_metal_tensor *tb = ds4_metal_tensor_alloc(N * sizeof(float));
+        ds4_metal_tensor *tc = ds4_metal_tensor_alloc(N * sizeof(float));
+        ds4_metal_tensor_write(ta, 0, a, sizeof(a));
+        ds4_metal_tensor_write(tb, 0, b, sizeof(b));
+        ds4_metal_begin_commands();
+        ds4_metal_add_tensor(tc, ta, tb, N);
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(tc, 0, out, sizeof(out));
+        int pass = 1;
+        for (uint32_t i = 0; i < N; i++) if (out[i] != a[i] + b[i]) pass = 0;
+        ok &= smoke_check("add(16)", pass);
+        ds4_metal_tensor_free(ta); ds4_metal_tensor_free(tb); ds4_metal_tensor_free(tc);
+    }
+
+    /* (2) rms_norm_plain: scale = 1/sqrt(mean(x^2)+eps).  All-ones input
+     *     gives scale = 1/sqrt(1+eps) -> output ≈ 1.0 for every element. */
+    {
+        const uint32_t N = 256;
+        float x[256], out[256];
+        for (uint32_t i = 0; i < N; i++) x[i] = 1.0f;
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(N * sizeof(float));
+        ds4_metal_tensor *ty = ds4_metal_tensor_alloc(N * sizeof(float));
+        ds4_metal_tensor_write(tx, 0, x, sizeof(x));
+        ds4_metal_begin_commands();
+        ds4_metal_rms_norm_plain_tensor(ty, tx, N, 1e-6f);
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(ty, 0, out, sizeof(out));
+        int pass = 1;
+        for (uint32_t i = 0; i < N; i++) {
+            const float diff = out[i] - 1.0f;
+            if (diff < -1e-3f || diff > 1e-3f) pass = 0;
+        }
+        ok &= smoke_check("rms_norm_plain(256, ones)", pass);
+        ds4_metal_tensor_free(tx); ds4_metal_tensor_free(ty);
+    }
+
+    /* (3) F32 matmul via cuBLAS: identity matrix gives y = x.  Use a small
+     *     in_dim=4, out_dim=4 weight in host memory, register it as a
+     *     model_map so the GEMM path can find it. */
+    {
+        const uint64_t D = 4;
+        /* Row-major (out, in) identity. */
+        float W[16] = { 1,0,0,0,  0,1,0,0,  0,0,1,0,  0,0,0,1 };
+        float x[4]  = { 1.5f, -2.0f, 3.0f, 0.25f };
+        float y[4]  = { 0 };
+        if (!ds4_metal_set_model_map(W, sizeof(W))) ok &= smoke_check("set_model_map", 0);
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(D * sizeof(float));
+        ds4_metal_tensor *ty = ds4_metal_tensor_alloc(D * sizeof(float));
+        ds4_metal_tensor_write(tx, 0, x, sizeof(x));
+        ds4_metal_begin_commands();
+        ds4_metal_matmul_f32_tensor(ty, W, sizeof(W), 0, D, D, tx, 1);
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(ty, 0, y, sizeof(y));
+        int pass = 1;
+        for (uint32_t i = 0; i < D; i++) {
+            const float diff = y[i] - x[i];
+            if (diff < -1e-4f || diff > 1e-4f) pass = 0;
+        }
+        ok &= smoke_check("matmul_f32(I@x)", pass);
+        ds4_metal_tensor_free(tx); ds4_metal_tensor_free(ty);
+        ds4_metal_set_model_map(NULL, 0);
+    }
+
+    /* (4) RoPE tail no-op at pos=0: with theta_base=0, sin=0, cos=1, the
+     *     transform reduces to identity.  Validates kernel dispatch and
+     *     in-place tail-only write semantics. */
+    {
+        const uint32_t HD = 8, NR = 8;
+        float x[8] = { 1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f };
+        float y[8];
+        ds4_metal_tensor *t = ds4_metal_tensor_alloc(HD * sizeof(float));
+        ds4_metal_tensor_write(t, 0, x, sizeof(x));
+        ds4_metal_begin_commands();
+        ds4_metal_rope_tail_tensor(t, 1, 1, HD, NR,
+                                   /*pos0=*/0, /*n_ctx_orig=*/4096, /*inverse=*/0,
+                                   /*freq_base=*/10000.f, /*freq_scale=*/1.f,
+                                   /*ext_factor=*/0.f, /*attn_factor=*/1.f,
+                                   /*beta_fast=*/32.f, /*beta_slow=*/1.f);
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(t, 0, y, sizeof(y));
+        int pass = 1;
+        for (uint32_t i = 0; i < HD; i++) {
+            const float diff = y[i] - x[i];
+            if (diff < -1e-4f || diff > 1e-4f) pass = 0;
+        }
+        ok &= smoke_check("rope_tail(pos=0 identity)", pass);
+        ds4_metal_tensor_free(t);
+    }
+
+    /* (5) store_raw_kv: round trip through F16 and verify a representable
+     *     value survives.  1.0 is exactly representable in F16. */
+    {
+        const uint32_t HD = 4, CAP = 2, ROW = 1;
+        float kv[4]  = { 1.0f, 2.0f, 3.0f, 4.0f };
+        float cache[8] = { 0 };
+        ds4_metal_tensor *tk = ds4_metal_tensor_alloc(HD * sizeof(float));
+        ds4_metal_tensor *tc = ds4_metal_tensor_alloc(CAP * HD * sizeof(float));
+        ds4_metal_tensor_write(tk, 0, kv, sizeof(kv));
+        ds4_metal_begin_commands();
+        ds4_metal_store_raw_kv_tensor(tc, tk, CAP, ROW, HD);
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(tc, 0, cache, sizeof(cache));
+        int pass = (cache[ROW * HD + 0] == 1.0f) && (cache[ROW * HD + 1] == 2.0f);
+        ok &= smoke_check("store_raw_kv(row=1)", pass);
+        ds4_metal_tensor_free(tk); ds4_metal_tensor_free(tc);
+    }
+
+    /* (6) Q8_0 matmul: out_dim=2 rows × in_dim=32 with synthesised weights.
+     *     Block layout: 2-byte F16 scale + 32 int8 qs = 34 bytes/row.
+     *     Row 0: scale=0.5, qs=[1,1,...,1] -> dot with x = 0.5 * sum(x)
+     *     Row 1: scale=1.0, qs=[2,0,2,0,...] -> dot with x = 2*sum_evens(x) */
+    {
+        const uint64_t IN = 32, OUT = 2, NT = 1;
+        unsigned char w_bytes[2 * (2 + 32)];
+        /* Row 0: F16(0.5) = 0x3800, qs all 1 */
+        w_bytes[0] = 0x00; w_bytes[1] = 0x38;
+        for (int i = 0; i < 32; i++) w_bytes[2 + i] = (signed char)1;
+        /* Row 1: F16(1.0) = 0x3C00, qs alternate 2,0 */
+        w_bytes[34 + 0] = 0x00; w_bytes[34 + 1] = 0x3C;
+        for (int i = 0; i < 32; i++) w_bytes[34 + 2 + i] = (signed char)((i % 2 == 0) ? 2 : 0);
+
+        float x[32]; for (int i = 0; i < 32; i++) x[i] = (float)(i + 1); /* 1..32 */
+        float y[2] = { 0 };
+
+        ds4_metal_set_model_map(w_bytes, sizeof(w_bytes));
+        ds4_metal_tensor *tx = ds4_metal_tensor_alloc(IN * sizeof(float));
+        ds4_metal_tensor *ty = ds4_metal_tensor_alloc(OUT * sizeof(float));
+        ds4_metal_tensor_write(tx, 0, x, sizeof(x));
+        ds4_metal_begin_commands();
+        ds4_metal_matmul_q8_0_tensor(ty, w_bytes, sizeof(w_bytes), 0, IN, OUT, tx, NT);
+        ds4_metal_end_commands();
+        ds4_metal_tensor_read(ty, 0, y, sizeof(y));
+
+        /* sum(1..32) = 528.  Expected y[0] = 0.5 * 528 = 264.
+         * sum of odd-index positions (1,3,5,...,31) - but our qs uses pattern
+         * 2,0,2,0,... so it multiplies x[0],x[2],...,x[30] by 2.
+         * sum_evens(x) where x[i]=i+1: x[0]=1,x[2]=3,...,x[30]=31; that's
+         * sum of odd integers 1..31 = 256.  Expected y[1] = 2 * 256 = 512. */
+        int pass = 1;
+        if (y[0] < 263.9f || y[0] > 264.1f) pass = 0;
+        if (y[1] < 511.9f || y[1] > 512.1f) pass = 0;
+        if (!pass) fprintf(stderr, "  got y[0]=%.3f (want 264) y[1]=%.3f (want 512)\n", y[0], y[1]);
+        ok &= smoke_check("matmul_q8_0(2x32)", pass);
+        ds4_metal_tensor_free(tx); ds4_metal_tensor_free(ty);
+        ds4_metal_set_model_map(NULL, 0);
+    }
+
+    ds4_metal_cleanup();
+    fprintf(stderr, "ds4 cuda-smoke: %s\n", ok ? "ALL OK" : "FAIL");
+    return ok ? 0 : 1;
+}
+#endif
+
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+#if defined(DS4_CUDA)
+    if (cfg.gen.cuda_smoke_test) {
+        int rc = run_cuda_smoke_test();
+        free(cfg.prompt_owned);
+        return rc;
+    }
+#else
+    if (cfg.gen.cuda_smoke_test) {
+        fprintf(stderr, "ds4: --cuda-smoke-test requires a DS4_BACKEND=cuda build\n");
+        free(cfg.prompt_owned);
+        return 2;
+    }
+#endif
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
