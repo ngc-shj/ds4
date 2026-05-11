@@ -122,6 +122,7 @@ agreement with CPU would require quantising x to q8_K in CUDA too.
 | --- | ---: | ---: |
 | Initial (before mmap pinning) | 1.34 t/s | 3.51 t/s |
 | After cudaHostRegister + cudaMemAdvise | **7.92 t/s** | **7.22 t/s** |
+| After compressor_update full pipeline | 7.85 t/s | 7.10 t/s |
 
 The biggest single win was getting cudaHostRegister to accept the
 GGUF mmap.  `cudaHostRegisterReadOnly` was declined on this kernel +
@@ -137,20 +138,21 @@ Further perf headroom (not yet exploited):
 - cuBLAS-LT for the F16 / Q8_0 dense projections, if it accepts the
   host-pinned pointers now.
 
-### Empirical inference quality (after Rounds 1 & 2)
+### Empirical inference quality (after Rounds 1 & 2 & compressor fix)
 
-The remaining drift is small enough that **sampled decoding works**: with
-`--temp 0.7 --seed 42 -p "Hello"`, ds4-cuda produces coherent English
-(_"contractors management system expert. Here is the description..."_).
+Sampled and greedy decoding both produce coherent English / code now:
 
-But **greedy decoding (`--temp 0`) falls into a degenerate attractor**:
-the model emits `<|image|>` repeatedly because that token consistently
-wins the top-1 logit by a small margin (~0.18 max diff per logit).
-Some random seeds with temp>0 also fall into BOS-repetition loops.
+- `-p "Hello" --temp 0`:
+  _"#  PyUtilib: A Python utility library.\n#  Copyright (c) 2008 Sandia"_
+- `-p "Hello" --temp 0.7 --seed 42`:
+  _"contractors management system expert. Here is the description of the question for you: \"## Task Context: - You are an expert in contractors management systems."_
+- 60-token continuation:
+  _"contractors building a house. The house is to be built on a lot. The lot is bounded by three streets..."_
 
-This means the per-token logit ordering is *almost* correct but a small
-fraction of tokens have slightly inflated logits that win greedy
-selection.  That is the residual structural drift to track down.
+Quality still degrades at the tail of long generations (mojibake on the
+last ~5-10 tokens at 60+).  The 0.18 logits max diff isn't the cap; the
+remaining issues likely live in compressed-KV attention scoring and the
+quantized matmul precision compounding over 43 layers.
 
 ### Key insight: Metal also reads F32 x for Q8_0 matvec
 
