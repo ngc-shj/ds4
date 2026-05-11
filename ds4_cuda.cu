@@ -1356,7 +1356,13 @@ int ds4_metal_hc_expand_split_tensor(ds4_metal_tensor *o, const ds4_metal_tensor
      * "post" scales sit at offset n_hc (after the n_hc "pre" scales).  See
      * metal/dsv4_misc.metal::kernel_hc_expand_*. */
     const int BLK = 256;
-    dim3 grid(ds4_cuda_ceil_div((int)ne, BLK), nh);
+    /* Grid.y indexes tokens (blockIdx.y == t in the kernel), so derive n_tok
+     * from the output buffer size.  The earlier nh-only dispatch silently
+     * limited prefill to the first n_hc=4 rows and left rows 4+ stale. */
+    const uint64_t per_tok_bytes = (uint64_t)nh * ne * sizeof(float);
+    const uint32_t n_tok = (uint32_t)(ds4_metal_tensor_bytes(o) / per_tok_bytes);
+    if (n_tok == 0) return 0;
+    dim3 grid(ds4_cuda_ceil_div((int)ne, BLK), n_tok);
     /* The kernel uses split[hc] as post; engine slices `s` to point at the
      * post region directly, so we forward as-is. */
     ds4_cuda_kernel_hc_expand_split_f32<<<grid, BLK, 0, ds4_cuda_stream>>>(
@@ -1368,7 +1374,14 @@ int ds4_metal_hc_expand_add_split_tensor(ds4_metal_tensor *o, const ds4_metal_te
         uint32_t ne, uint32_t nh) {
     if (!o || !b || !ba || !r || !s || ne == 0 || nh == 0) return 0;
     const int BLK = 256;
-    dim3 grid(ds4_cuda_ceil_div((int)ne, BLK), nh);
+    /* See ds4_metal_hc_expand_split_tensor: blockIdx.y is the token index, so
+     * grid.y must be n_tok (not nh).  Without this, batched prefill with
+     * n_tokens > n_hc only ran the first n_hc rows of post-FFN HC mixing,
+     * silently corrupting all subsequent layers' inputs. */
+    const uint64_t per_tok_bytes = (uint64_t)nh * ne * sizeof(float);
+    const uint32_t n_tok = (uint32_t)(ds4_metal_tensor_bytes(o) / per_tok_bytes);
+    if (n_tok == 0) return 0;
+    dim3 grid(ds4_cuda_ceil_div((int)ne, BLK), n_tok);
     ds4_cuda_kernel_hc_expand_add_split_f32<<<grid, BLK, 0, ds4_cuda_stream>>>(
         tensor_fptr(o), tensor_cfptr(b), tensor_cfptr(ba),
         tensor_cfptr(r), tensor_cfptr(s), ne, nh);

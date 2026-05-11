@@ -250,15 +250,60 @@ ratio=4 layers (compressed + indexer), suggesting a secondary bug in
 the `decode_mixed_batch` / indexer path that compounds the prefill
 divergence.
 
+#### Round 3 fix (committed)
+
+The decode-at diagnostic with per-row trace
+(`DS4_METAL_DECODE_TRACE_CACHE_PER_ROW=1`) immediately localised the
+bug to a 4-token boundary:
+
+```
+layer 1 raw_kv  row 0..3  max=0.125          (clean F16 noise)
+layer 1 raw_kv  row 4..7  max=10-11          (BLAST)
+```
+
+The first four token rows pass through layer 0 correctly; rows 4+ do
+not.  Searching for hard-coded "4" in the batched prefill HC kernels
+found:
+
+```c
+int ds4_metal_hc_expand_add_split_tensor(...) {
+    dim3 grid(ds4_cuda_ceil_div((int)ne, BLK), nh);   // nh = DS4_N_HC = 4
+    ds4_cuda_kernel_hc_expand_add_split_f32<<<grid, ...>>>(...);
+}
+```
+
+The kernel uses `blockIdx.y` as the **token** index (`t`), but the
+dispatcher set `grid.y = nh = 4`.  For batched prefill with
+`n_tokens > 4`, only the first 4 token rows of post-FFN HC mixing ran;
+rows 4+ kept stale buffer contents, silently corrupting all
+subsequent layers' inputs.
+
+`ds4_metal_hc_expand_split_tensor` had the same bug.  Fix: derive
+`n_tok` from output buffer size (mirroring `ds4_metal_hc_expand_tensor`
+which already did this) and use it as `grid.y`.
+
+After the fix, layer 1 raw_kv max drops from **11.539 → 0.125** and
+all layers' raw_kv caches match CPU within F16 quantization noise.
+Greedy `-p "Hello"` now produces:
+
+> _"Hello! How can I assist you today? If you have any questions or
+> need help with something, feel free to ask."_
+
+(was: garbage license-header-style mojibake within ~60 tokens).
+Tail degradation in long generations still occurs — the indexer /
+compressor caches at ratio=4 layers still differ by ~3-5 max-abs from
+CPU, which is the next bug to attack.
+
 ### Next investigations (priority order)
 
-1. **Bisect the layer 0 → layer 1 batched prefill blast.**  The
-   `--metal-graph-decode-test` cache trace showed layer 0 raw_kv
-   essentially matches CPU but layer 1 raw_kv has max=11.5 diff.
-   Capture HC state after each layer-0 stage in batch mode (HC pre,
-   attention, HC post, FFN, HC post) and diff against CPU's per-token
-   pipeline.  Likely culprit is one of the batched HC mixers or the
-   batched FFN at layer 0.
+1. **Compressor / indexer cache divergence at ratio=4 layers.**  Even
+   after the HC expand grid fix, layer 2's `attn_comp_kv` and
+   `index_comp_kv` post-prefill differ from CPU by max=3.86 and
+   max=4.96 respectively (constant values across N=4..16, suggesting
+   a single deterministic projection or pooling bug rather than
+   accumulated drift).  Bisect by running the decode-at test with
+   `DS4_METAL_DECODE_TRACE_CACHE=1` and comparing per-row diffs in
+   the comp/index caches.
 2. **Per-layer logits dump in CUDA**.  Add an instrumentation flag that
    dumps the residual / KV / attention output / logits at each of the
    43 layers and compare against a Metal capture for the same prompt.

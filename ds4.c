@@ -13537,6 +13537,18 @@ static int metal_graph_decode_at_test(
                             il, n_raw_cpu,
                             max_abs_diff(cpu_cache.layer[il].raw_kv, gpu_raw_logical, raw_logical_n),
                             rms_abs_diff(cpu_cache.layer[il].raw_kv, gpu_raw_logical, raw_logical_n));
+                    /* For the first few layers, also report per-row diffs to
+                     * pinpoint which token positions diverge first. */
+                    if (il <= 2 && getenv("DS4_METAL_DECODE_TRACE_CACHE_PER_ROW") != NULL) {
+                        for (uint32_t r = 0; r < n_raw_cpu; r++) {
+                            const float row_max = max_abs_diff(
+                                cpu_cache.layer[il].raw_kv + (uint64_t)r * DS4_N_HEAD_DIM,
+                                gpu_raw_logical + (uint64_t)r * DS4_N_HEAD_DIM,
+                                DS4_N_HEAD_DIM);
+                            fprintf(stderr,
+                                    "ds4:   row %2u  max=%g\n", r, row_max);
+                        }
+                    }
                 }
                 free(gpu_raw_logical);
                 free(gpu_raw_phys);
