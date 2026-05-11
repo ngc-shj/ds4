@@ -143,21 +143,33 @@ Further perf headroom (not yet exploited):
 - cuBLAS-LT for the F16 / Q8_0 dense projections, if it accepts the
   host-pinned pointers now.
 
-### Empirical inference quality (after Rounds 1 & 2 & compressor fix)
+### Empirical inference quality (after compressor + FP8 fixes)
 
-Sampled and greedy decoding both produce coherent English / code now:
+Sampled and greedy decoding both produce coherent English / code now,
+with the coherent run extending further after each numerical-accuracy
+round:
 
+| Round | --temp 0 coherent run length |
+| --- | --- |
+| Initial | 0 tokens (BOS/image repetition) |
+| Round 1+2 (router, sinks, HC) | ~10 tokens |
+| Compressor RMSNorm+RoPE fix | ~30 tokens (4-line license header) |
+| FP8 per-chunk scaling fix | ~60 tokens (7-line license header) |
+
+Example greedy outputs:
 - `-p "Hello" --temp 0`:
-  _"#  PyUtilib: A Python utility library.\n#  Copyright (c) 2008 Sandia"_
+  _"# PyUtilib: A Python framework for efficient data-intensive computing._
+  _# Copyright (c) 2017, Sandia National Laboratories._
+  _# (http://www.sandia.gov)..."_
 - `-p "Hello" --temp 0.7 --seed 42`:
-  _"contractors management system expert. Here is the description of the question for you: \"## Task Context: - You are an expert in contractors management systems."_
-- 60-token continuation:
-  _"contractors building a house. The house is to be built on a lot. The lot is bounded by three streets..."_
+  _"contractors price guide with 15 years experience. Your background is_
+  _in both construction and market analysis specializing in project cost_
+  _estimation. You are also a skilled negotiator..."_
 
-Quality still degrades at the tail of long generations (mojibake on the
-last ~5-10 tokens at 60+).  The 0.18 logits max diff isn't the cap; the
-remaining issues likely live in compressed-KV attention scoring and the
-quantized matmul precision compounding over 43 layers.
+The output still degrades at the tail of long generations.  Likely
+remaining sources: cumulative Q8_0 / F16 GEMM precision drift over 43
+layers × ~30+ decode steps, and the still-unimplemented ratio=128
+indexer compressor emit.
 
 ### Key insight: Metal also reads F32 x for Q8_0 matvec
 
