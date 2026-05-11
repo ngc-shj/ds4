@@ -116,6 +116,27 @@ the CUDA path keeps x as F32 (matching Metal).  These are different
 algorithms and their results legitimately diverge by ~3-7%; bit-exact
 agreement with CPU would require quantising x to q8_K in CUDA too.
 
+### Performance (GB10, 86.7 GiB Q2 GGUF)
+
+| Configuration | Prefill | Generation |
+| --- | ---: | ---: |
+| Initial (before mmap pinning) | 1.34 t/s | 3.51 t/s |
+| After cudaHostRegister + cudaMemAdvise | **7.92 t/s** | **7.22 t/s** |
+
+The biggest single win was getting cudaHostRegister to accept the
+GGUF mmap.  `cudaHostRegisterReadOnly` was declined on this kernel +
+file-backed mapping combo; falling back to `cudaHostRegisterDefault`
+worked, and adding `cudaMemAdvise(SetReadMostly, SetPreferredLocation)`
+on top tells the unified-memory hardware to cache weight rows for
+matmul reuse.
+
+Further perf headroom (not yet exploited):
+- Tiled / shared-memory GEMM in place of the naive block-per-row kernels.
+- Fused gate+up MoE matmul + SwiGLU writing directly to the down input
+  (avoids a `mid` round-trip through global memory).
+- cuBLAS-LT for the F16 / Q8_0 dense projections, if it accepts the
+  host-pinned pointers now.
+
 ### Empirical inference quality (after Rounds 1 & 2)
 
 The remaining drift is small enough that **sampled decoding works**: with
