@@ -1248,14 +1248,37 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
+    /* Register the GGUF mmap as host-visible-from-device so kernels can
+     * dereference the pointer directly without a 80 GiB cudaMemcpy.
+     * On GB10 / DGX Spark cudaHostRegisterReadOnly is declined for a
+     * file-backed mmap; fall back to cudaHostRegisterDefault and add
+     * cudaMemAdvise hints so the unified-memory layer still caches
+     * weight rows for matmul reuse. */
     cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
                                        cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        err = cudaHostRegister((void *)model_map, (size_t)model_size,
+                               cudaHostRegisterDefault);
+    }
     if (err == cudaSuccess) {
         void *dev = NULL;
         err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
         if (err == cudaSuccess && dev) {
             g_model_device_base = (const char *)dev;
             g_model_registered = 1;
+            /* Best-effort: hint the driver that these pages are read-mostly
+             * and live near the GPU.  Failure here is non-fatal. */
+            int dev_id = 0;
+            (void)cudaGetDevice(&dev_id);
+            cudaMemLocation loc = {};
+            loc.type = cudaMemLocationTypeDevice;
+            loc.id = dev_id;
+            (void)cudaMemAdvise((void *)model_map, (size_t)model_size,
+                                   cudaMemAdviseSetReadMostly, loc);
+            (void)cudaMemAdvise((void *)model_map, (size_t)model_size,
+                                   cudaMemAdviseSetPreferredLocation, loc);
+            (void)cudaGetLastError();
             fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
                     (double)model_size / 1073741824.0);
         } else {
