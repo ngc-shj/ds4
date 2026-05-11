@@ -122,7 +122,12 @@ agreement with CPU would require quantising x to q8_K in CUDA too.
 | --- | ---: | ---: |
 | Initial (before mmap pinning) | 1.34 t/s | 3.51 t/s |
 | After cudaHostRegister + cudaMemAdvise | **7.92 t/s** | **7.22 t/s** |
-| After compressor_update full pipeline | 7.85 t/s | 7.10 t/s |
+| After compressor_update full pipeline | 8.16 t/s | 7.28 t/s |
+
+For comparison: Metal on M3 Max for the same Q2 model achieves ~25-30
+t/s.  Remaining 3-4x gap is from kernel-launch overhead (~2500 launches
+per token) and the naive Q8_0 / IQ2_XXS / Q2_K matmul kernels that don't
+use shared memory or tensor cores.
 
 The biggest single win was getting cudaHostRegister to accept the
 GGUF mmap.  `cudaHostRegisterReadOnly` was declined on this kernel +
