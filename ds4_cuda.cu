@@ -718,7 +718,7 @@ int ds4_metal_compressor_update_tensor(const ds4_metal_tensor *kv_cur, const ds4
         const void *m, uint64_t ms, uint64_t ao, uint32_t at, uint64_t no, uint32_t nt,
         uint32_t hd, uint32_t ratio, uint32_t pos, uint32_t cr, uint32_t nr, uint32_t nco,
         float fb, float fs, float ef, float af, float bf, float bs, float eps) {
-    (void)no;(void)nt;(void)nr;(void)nco;(void)fb;(void)fs;(void)ef;(void)af;(void)bf;(void)bs;(void)eps;
+    (void)nt;
     if (!kv_cur || !sc_cur || !skv || !ssc || !m || hd == 0 || ratio == 0) return 0;
     const uint32_t width = 2u * hd;
     const uint64_t ape_bytes = (uint64_t)ratio * width *
@@ -726,19 +726,61 @@ int ds4_metal_compressor_update_tensor(const ds4_metal_tensor *kv_cur, const ds4
     if (ao > ms || ape_bytes > ms - ao) return 0;
     const void *ape = ds4_cuda_weight_ptr(m, ao);
 
-    /* Store the incoming row into state[ratio + pos%ratio, :]. */
-    const int BLK = 256;
-    ds4_cuda_kernel_compressor_store_one_f32<<<
-        ds4_cuda_ceil_div((int)width, BLK), BLK, 0, ds4_cuda_stream>>>(
-        tensor_cfptr(kv_cur), tensor_cfptr(sc_cur), ape, at,
-        tensor_fptr(skv), tensor_fptr(ssc), width, ratio, pos);
-    /* If we've just filled the ratio buffer (pos % ratio == ratio - 1), emit
-     * a compressed row into cc[cr, :] and shift the rolling state. */
-    if (cc && (pos % ratio == ratio - 1u)) {
-        const int BLK2 = 256;
-        ds4_cuda_kernel_compressor_emit_shift_f32<<<
-            ds4_cuda_ceil_div((int)hd, BLK2), BLK2, 0, ds4_cuda_stream>>>(
-            tensor_fptr(cc), cr, tensor_fptr(skv), tensor_fptr(ssc), hd);
+    /* Step 1: store incoming row into state[ratio + pos%ratio, :]. */
+    {
+        const int BLK = 256;
+        ds4_cuda_kernel_compressor_store_one_f32<<<
+            ds4_cuda_ceil_div((int)width, BLK), BLK, 0, ds4_cuda_stream>>>(
+            tensor_cfptr(kv_cur), tensor_cfptr(sc_cur), ape, at,
+            tensor_fptr(skv), tensor_fptr(ssc), width, ratio, pos);
+    }
+
+    /* Only emit + shift when this store completes a ratio block. */
+    if (!cc || ((pos + 1u) % ratio) != 0u) return 1;
+
+    /* Step 2: pool 8 state rows into comp_cache[cr, :] (ratio=4 only;
+     * the engine doesn't currently call compressor_update for ratio!=4). */
+    if (ratio != 4u) {
+        fprintf(stderr, "ds4-cuda: compressor_update emit specialised to ratio=4 (got %u)\n", ratio);
+        return 0;
+    }
+    {
+        const int BLK = 128;
+        ds4_cuda_kernel_compressor_pool_only_f32<<<
+            ds4_cuda_ceil_div((int)hd, BLK), BLK, 0, ds4_cuda_stream>>>(
+            tensor_fptr(cc), cr, tensor_cfptr(skv), tensor_cfptr(ssc), hd);
+    }
+
+    /* Step 3: RMSNorm with learned weight on the just-emitted comp row.
+     * Use a 1-row view so the existing kernel can rewrite in place. */
+    {
+        const uint64_t norm_bytes = (uint64_t)hd * sizeof(float);
+        if (no > ms || norm_bytes > ms - no) return 0;
+        const float *norm_w = (const float *)ds4_cuda_weight_ptr(m, no);
+        ds4_cuda_kernel_rms_norm_w_f32<256><<<1, 256, 0, ds4_cuda_stream>>>(
+            tensor_fptr(cc) + (uint64_t)cr * hd,
+            tensor_fptr(cc) + (uint64_t)cr * hd,
+            norm_w, hd, eps);
+    }
+
+    /* Step 4: RoPE the comp row at its logical position (pos + 1 - ratio). */
+    {
+        const uint32_t comp_pos = pos + 1u - ratio;
+        dim3 grid(1, 1);
+        ds4_cuda_kernel_rope_tail_f32<<<grid, 128, 0, ds4_cuda_stream>>>(
+            tensor_fptr(cc) + (uint64_t)cr * hd,
+            /*n_tok=*/1u, /*n_head=*/1u, hd, nr, comp_pos, nco,
+            /*inverse=*/0,
+            fb, fs, ef, af, bf, bs);
+    }
+
+    /* Step 5: shift state[4..7] -> state[0..3]. */
+    {
+        const int BLK = 256;
+        const uint32_t n = 4u * width;
+        ds4_cuda_kernel_compressor_shift_ratio4_f32<<<
+            ds4_cuda_ceil_div((int)n, BLK), BLK, 0, ds4_cuda_stream>>>(
+            tensor_fptr(skv), tensor_fptr(ssc), hd);
     }
     return 1;
 }

@@ -176,26 +176,31 @@ __global__ void ds4_cuda_kernel_compressor_store_batch_f32(
     state_score[dst] = sc[(uint64_t)t * width + i] + ape_v;
 }
 
-/* Single-token emit + shift (called when pos_mod transitions ratio-1 -> 0).
- *   1. Pool state_kv[0..7] / state_score[0..7] into comp_cache[comp_row, :].
- *   2. state_kv[0..3] = state_kv[4..7]; state_kv[4..7] = init values.
- * One block per head_dim element. */
-__global__ void ds4_cuda_kernel_compressor_emit_shift_f32(
+/* Pool 8 state rows into comp_cache[comp_row, :].  Mirrors the prefill
+ * layout: rows 0..3 contribute their FIRST half of width, rows 4..7 their
+ * SECOND half.  Caller is responsible for the post-pool RMSNorm + RoPE and
+ * for the shift that prepares state for the next ratio block (those are
+ * separate kernels because they need model-map weights / position info). */
+__global__ void ds4_cuda_kernel_compressor_pool_only_f32(
         float *comp_cache, uint32_t comp_row,
-        float *state_kv, float *state_score,
+        const float *state_kv, const float *state_score,
         uint32_t head_dim) {
     const uint32_t w = blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= head_dim) return;
     const uint32_t width = 2u * head_dim;
 
-    /* Pool: read first head_dim entries of width plane.  Width has K (0..hd)
-     * and V (hd..2*hd) but the softmax pool used in prefill above only used
-     * one half; mirror that here. */
     float kv8[8], sc8[8];
+    /* Rows 0..3: previous ratio's first half (offset 0 within width). */
     #pragma unroll
-    for (int r = 0; r < 8; r++) {
+    for (int r = 0; r < 4; r++) {
         kv8[r] = state_kv[(uint64_t)r * width + w];
         sc8[r] = state_score[(uint64_t)r * width + w];
+    }
+    /* Rows 4..7: current ratio's second half (offset head_dim within width). */
+    #pragma unroll
+    for (int r = 0; r < 4; r++) {
+        kv8[4 + r] = state_kv[(uint64_t)(4 + r) * width + head_dim + w];
+        sc8[4 + r] = state_score[(uint64_t)(4 + r) * width + head_dim + w];
     }
     float max_s = sc8[0];
     #pragma unroll
@@ -208,23 +213,20 @@ __global__ void ds4_cuda_kernel_compressor_emit_shift_f32(
         acc += wgt * kv8[r];
     }
     comp_cache[(uint64_t)comp_row * head_dim + w] = acc / sum;
+}
 
-    /* Shift: rows 4..7 -> rows 0..3, rows 4..7 reset.  Done across both
-     * halves of width to keep state consistent. */
-    #pragma unroll
-    for (int r = 0; r < 4; r++) {
-        state_kv[(uint64_t)r * width + w] = state_kv[(uint64_t)(4 + r) * width + w];
-        state_kv[(uint64_t)r * width + head_dim + w] =
-            state_kv[(uint64_t)(4 + r) * width + head_dim + w];
-        state_score[(uint64_t)r * width + w] =
-            state_score[(uint64_t)(4 + r) * width + w];
-        state_score[(uint64_t)r * width + head_dim + w] =
-            state_score[(uint64_t)(4 + r) * width + head_dim + w];
-        state_kv[(uint64_t)(4 + r) * width + w] = 0.0f;
-        state_kv[(uint64_t)(4 + r) * width + head_dim + w] = 0.0f;
-        state_score[(uint64_t)(4 + r) * width + w] = -FLT_MAX;
-        state_score[(uint64_t)(4 + r) * width + head_dim + w] = -FLT_MAX;
-    }
+/* State shift after emit (ratio==4 only).  Mirrors Metal's
+ * kernel_dsv4_ratio4_shift_f32 exactly: copy state[4..7] (whole 4*width
+ * floats, both halves) over state[0..3].  No reset — subsequent
+ * compressor_store_one calls will overwrite state[4..7] in place. */
+__global__ void ds4_cuda_kernel_compressor_shift_ratio4_f32(
+        float *state_kv, float *state_score, uint32_t head_dim) {
+    const uint32_t width = 2u * head_dim;
+    const uint32_t n = 4u * width;
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n) return;
+    state_kv[gid] = state_kv[n + gid];
+    state_score[gid] = state_score[n + gid];
 }
 
 #endif /* DS4_CUDA_COMPRESS_CUH */
