@@ -14694,7 +14694,17 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  */
 
 const char *ds4_backend_name(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL ? "metal" : "cpu";
+    if (backend == DS4_BACKEND_METAL) {
+#if defined(DS4_CUDA)
+        /* On Linux + CUDA builds the "metal" enum value drives the ds4_metal_*
+         * dispatch, which is provided by ds4_cuda.cu.  Report the actual GPU
+         * backend so users don't see "metal" on an NVIDIA box. */
+        return "cuda";
+#else
+        return "metal";
+#endif
+    }
+    return "cpu";
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {

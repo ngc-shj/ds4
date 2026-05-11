@@ -4,6 +4,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* =========================================================================
  * Metal Tensor and Command Lifetime.
  * =========================================================================
@@ -12,6 +16,11 @@
  *
  * The public Metal API is tensor-resident: activations, KV state, and scratch
  * buffers stay device-owned across the whole prefill/decode command sequence.
+ *
+ * When DS4_CUDA is defined, the same ds4_metal_* symbols are provided by a
+ * CUDA implementation (ds4_cuda.cu) that mirrors this API on NVIDIA GPUs
+ * (initial target: GB10 / DGX Spark, sm_121).  The "metal" prefix is kept so
+ * the engine call sites in ds4.c stay backend-agnostic.
  */
 typedef struct ds4_metal_tensor ds4_metal_tensor;
 
@@ -785,5 +794,9 @@ int ds4_metal_matmul_q8_0_hc_expand_tensor(
         const ds4_metal_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
