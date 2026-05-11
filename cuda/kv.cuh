@@ -42,46 +42,91 @@ __global__ void ds4_cuda_kernel_store_raw_kv_batch_f32(
     raw_cache[(uint64_t)row * head_dim + i] = __half2float(h);
 }
 
-/* In-place FP8 e4m3 round trip across the nope prefix of one KV row, then
- * F16 round trip across the rotated tail, mirroring metal/dsv4_kv.metal's
- * fused store kernel.  After this kernel the caller's kv buffer holds the
- * quantised values that will be written into the raw cache. */
+/* In-place FP8 e4m3 quantise across the nope prefix of one KV row, with
+ * per-64-element block scaling (Metal kernel_dsv4_fp8_kv_quantize_f32).
+ * The rotated tail is LEFT UNCHANGED -- Metal's kernel copies src->dst for
+ * the tail, which is a no-op when called in place. */
 __global__ void ds4_cuda_kernel_fp8_kv_quantize_f32(
         float *kv, uint32_t head_dim, uint32_t n_rot) {
-    /* One block, blockDim.x threads, single token.  Each thread walks across
-     * head_dim with stride blockDim.x. */
-    const uint32_t nope = head_dim - n_rot;
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        const float v = kv[i];
-        if (i < nope) {
-            /* FP8 e4m3: 1 sign + 4 exp + 3 mantissa, saturate on overflow,
-             * matches metal/dsv4_kv.metal's e4m3 round trip. */
-            const __nv_fp8_e4m3 fp8(v);
-            kv[i] = __half2float((__half)fp8);
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t tid = threadIdx.x;
+    if (tid >= 64) return;
+
+    __shared__ float scratch[64];
+
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        const uint32_t i = off + tid;
+        float v = 0.0f;
+        if (i < n_nope) {
+            v = kv[i];
+            scratch[tid] = fabsf(v);
         } else {
-            const __half h = __float2half(v);
-            kv[i] = __half2float(h);
+            scratch[tid] = 0.0f;
         }
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        const float amax = fmaxf(scratch[0], 1.0e-4f);
+        const float fp8_scale = exp2f(ceilf(log2f(amax / 448.0f)));
+        if (i < n_nope) {
+            const float scaled = fmaxf(-448.0f, fminf(448.0f, v / fp8_scale));
+            const __nv_fp8_e4m3 fp8(scaled);
+            kv[i] = __half2float((__half)fp8) * fp8_scale;
+        }
+        __syncthreads();
     }
+    /* Rotated tail: leave kv[n_nope..head_dim-1] untouched (Metal's src->dst
+     * copy is a no-op when called in place, which is the engine's usage). */
 }
 
-/* Fused FP8 quantise + raw store.  Equivalent to running the FP8 quantise on
- * a working KV vector then writing F16-rounded copy into raw_cache[row, :]. */
+/* Fused FP8 quantise (nope prefix, with per-64-element scaling) + raw cache
+ * F16 round-trip store.  Mirrors metal/dsv4_kv.metal::kernel_dsv4_kv_fp8_store_f32:
+ *  - nope prefix: rescale + FP8 round-trip, write back to kv[] (in place) AND
+ *    write F16-rounded copy into raw_cache[row, :].
+ *  - rotated tail: F16 round-trip from kv[] into raw_cache[row, :] only
+ *    (kv[] is not rewritten for the tail).
+ * Launch with blockDim.x == 64. */
 __global__ void ds4_cuda_kernel_kv_fp8_store_raw_f32(
-        const float *kv, float *raw_cache,
+        float *kv, float *raw_cache,
         uint32_t head_dim, uint32_t n_rot, uint32_t row) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= head_dim) return;
-    const float v = kv[i];
-    float out;
-    if (i < head_dim - n_rot) {
-        const __nv_fp8_e4m3 fp8(v);
-        out = __half2float((__half)fp8);
-    } else {
-        const __half h = __float2half(v);
-        out = __half2float(h);
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t tid = threadIdx.x;
+    if (tid >= 64) return;
+    float *raw = raw_cache + (uint64_t)row * head_dim;
+
+    __shared__ float scratch[64];
+
+    for (uint32_t off = 0; off < n_nope; off += 64) {
+        const uint32_t i = off + tid;
+        float v = 0.0f;
+        if (i < n_nope) {
+            v = kv[i];
+            scratch[tid] = fabsf(v);
+        } else {
+            scratch[tid] = 0.0f;
+        }
+        __syncthreads();
+        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+            if (tid < stride) scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            __syncthreads();
+        }
+        const float amax = fmaxf(scratch[0], 1.0e-4f);
+        const float fp8_scale = exp2f(ceilf(log2f(amax / 448.0f)));
+        if (i < n_nope) {
+            const float scaled = fmaxf(-448.0f, fminf(448.0f, v / fp8_scale));
+            const __nv_fp8_e4m3 fp8(scaled);
+            const float q = __half2float((__half)fp8) * fp8_scale;
+            kv[i] = q;
+            raw[i] = __half2float(__float2half(q));
+        }
+        __syncthreads();
     }
-    raw_cache[(uint64_t)row * head_dim + i] = out;
+    /* Rotated tail: F16 round-trip from kv[] into raw cache (kv unchanged). */
+    for (uint32_t i = n_nope + tid; i < head_dim; i += 64) {
+        raw[i] = __half2float(__float2half(kv[i]));
+    }
 }
 
 #endif /* DS4_CUDA_KV_CUH */

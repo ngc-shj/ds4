@@ -662,10 +662,10 @@ int ds4_metal_head_rms_norm_tensor(ds4_metal_tensor *x, uint32_t nt, uint32_t nh
 
 int ds4_metal_dsv4_fp8_kv_quantize_tensor(ds4_metal_tensor *x, uint32_t nt, uint32_t hd, uint32_t nr) {
     if (!x || nt == 0 || hd == 0 || nr > hd) return 0;
-    /* One block per token, head_dim threads (capped at 256). */
-    const uint32_t BLK = hd < 256 ? hd : 256;
+    /* Always 64 threads (Metal's kernel uses 64-element chunks with a
+     * block-wide max reduction for the per-chunk FP8 scale). */
     for (uint32_t t = 0; t < nt; t++) {
-        ds4_cuda_kernel_fp8_kv_quantize_f32<<<1, BLK, 0, ds4_cuda_stream>>>(
+        ds4_cuda_kernel_fp8_kv_quantize_f32<<<1, 64, 0, ds4_cuda_stream>>>(
             tensor_fptr(x) + (uint64_t)t * hd, hd, nr);
     }
     return 1;
@@ -686,9 +686,10 @@ int ds4_metal_rope_tail_tensor(ds4_metal_tensor *x, uint32_t nt, uint32_t nh, ui
 int ds4_metal_kv_fp8_store_raw_tensor(ds4_metal_tensor *kv, ds4_metal_tensor *cache,
         uint32_t cap, uint32_t row, uint32_t hd, uint32_t nr) {
     if (!kv || !cache || cap == 0 || row >= cap || hd == 0 || nr > hd) return 0;
-    const int BLK = 128;
-    ds4_cuda_kernel_kv_fp8_store_raw_f32<<<ds4_cuda_ceil_div((int)hd, BLK), BLK, 0, ds4_cuda_stream>>>(
-        tensor_cfptr(kv), tensor_fptr(cache), hd, nr, row);
+    /* Always 64 threads (per-chunk scaling + raw cache write).  The kernel
+     * mutates kv (FP8 round-tripped values overwrite the nope prefix). */
+    ds4_cuda_kernel_kv_fp8_store_raw_f32<<<1, 64, 0, ds4_cuda_stream>>>(
+        tensor_fptr(kv), tensor_fptr(cache), hd, nr, row);
     return 1;
 }
 
