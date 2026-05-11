@@ -116,6 +116,21 @@ the CUDA path keeps x as F32 (matching Metal).  These are different
 algorithms and their results legitimately diverge by ~3-7%; bit-exact
 agreement with CPU would require quantising x to q8_K in CUDA too.
 
+### Empirical inference quality (after Rounds 1 & 2)
+
+The remaining drift is small enough that **sampled decoding works**: with
+`--temp 0.7 --seed 42 -p "Hello"`, ds4-cuda produces coherent English
+(_"contractors management system expert. Here is the description..."_).
+
+But **greedy decoding (`--temp 0`) falls into a degenerate attractor**:
+the model emits `<|image|>` repeatedly because that token consistently
+wins the top-1 logit by a small margin (~0.18 max diff per logit).
+Some random seeds with temp>0 also fall into BOS-repetition loops.
+
+This means the per-token logit ordering is *almost* correct but a small
+fraction of tokens have slightly inflated logits that win greedy
+selection.  That is the residual structural drift to track down.
+
 ### Key insight: Metal also reads F32 x for Q8_0 matvec
 
 Confirmed by reading `metal/dense.metal::kernel_mul_mv_q8_0_f32_impl`:
