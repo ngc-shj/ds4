@@ -6079,7 +6079,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+        /* On GB10 the register-blocked 4-way kernel below outperforms the
+         * online-softmax variant by ~2x on batched prefill (144 -> 293 t/s)
+         * with no measurable generation regression.  Make it the default
+         * and keep the online kernel as an opt-out for hardware where the
+         * larger register footprint hurts occupancy. */
+        if (getenv("DS4_CUDA_INDEXED_ONLINE") != NULL) {
             attention_indexed_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                         sinks,
                                                                         (const float *)q->ptr,
