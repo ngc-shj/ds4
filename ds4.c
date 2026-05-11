@@ -13643,6 +13643,38 @@ static int metal_graph_decode_at_test(
                     il, teacher_force ? " teacher" : "",
                     m, r, ratio, n_comp, n_raw_cpu);
             if (m > worst_diff) { worst_diff = m; worst_layer = il; }
+
+            /* Optional per-HC-stage diff tap.  CPU's `scratch` already holds
+             * intermediate hc-pre, hc-norm, and hc-post tensors after
+             * layer_forward_raw_swa_one returns; pull the matching CUDA
+             * tensors and report stage-by-stage so we can isolate which HC
+             * stage at which layer is the dominant drift contributor. */
+            if (getenv("DS4_METAL_DECODE_TRACE_HC_STAGES") != NULL) {
+                float *gpu_attn_cur     = xmalloc(DS4_N_EMBD * sizeof(float));
+                float *gpu_attn_norm    = xmalloc(DS4_N_EMBD * sizeof(float));
+                float *gpu_after_attn_hc = xmalloc(hc_dim * sizeof(float));
+                float *gpu_ffn_cur      = xmalloc(DS4_N_EMBD * sizeof(float));
+                float *gpu_ffn_norm     = xmalloc(DS4_N_EMBD * sizeof(float));
+                if (ds4_metal_tensor_read(g.attn_cur,     0, gpu_attn_cur,     DS4_N_EMBD * sizeof(float)) != 0 &&
+                    ds4_metal_tensor_read(g.attn_norm,    0, gpu_attn_norm,    DS4_N_EMBD * sizeof(float)) != 0 &&
+                    ds4_metal_tensor_read(g.after_attn_hc,0, gpu_after_attn_hc,hc_dim * sizeof(float))     != 0 &&
+                    ds4_metal_tensor_read(g.ffn_cur,      0, gpu_ffn_cur,      DS4_N_EMBD * sizeof(float)) != 0 &&
+                    ds4_metal_tensor_read(g.ffn_norm,     0, gpu_ffn_norm,     DS4_N_EMBD * sizeof(float)) != 0) {
+                    fprintf(stderr,
+                            "ds4:   hc-stage layer %2u  attn_cur=%g  attn_norm=%g  after_attn_hc=%g  ffn_cur=%g  ffn_norm=%g\n",
+                            il,
+                            max_abs_diff(scratch.attn_cur,      gpu_attn_cur,      DS4_N_EMBD),
+                            max_abs_diff(scratch.attn_norm,     gpu_attn_norm,     DS4_N_EMBD),
+                            max_abs_diff(scratch.after_attn_hc, gpu_after_attn_hc, hc_dim),
+                            max_abs_diff(scratch.ffn_cur,       gpu_ffn_cur,       DS4_N_EMBD),
+                            max_abs_diff(scratch.ffn_norm,      gpu_ffn_norm,      DS4_N_EMBD));
+                }
+                free(gpu_ffn_norm);
+                free(gpu_ffn_cur);
+                free(gpu_after_attn_hc);
+                free(gpu_attn_norm);
+                free(gpu_attn_cur);
+            }
         }
 
         float *t = cpu_cur;

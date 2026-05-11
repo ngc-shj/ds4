@@ -211,6 +211,20 @@ Two env-var modes for finer bisection:
   layer, overwrite the GPU `cur_hc` with the CPU's, so each layer's
   reported diff measures only that single layer's compute drift, not
   the accumulated drift from earlier layers.
+- `DS4_METAL_DECODE_TRACE_HC_STAGES=1` — at each layer print per-HC-stage
+  CPU vs CUDA diffs for `attn_cur` (HC attn pre out), `attn_norm` (RMS
+  norm of attn_cur), `after_attn_hc` (HC attn post out), `ffn_cur`
+  (HC ffn pre out), `ffn_norm`.  CPU intermediates come straight from
+  `ds4_cpu_decode_scratch` so no recomputation is needed.
+
+  **Finding**: with teacher-force the `attn_cur` and `attn_norm` diffs
+  drop to **1e-9..1e-7 at every layer**, i.e. the fused
+  `hc_split_weighted_sum_norm_hc4` kernel is bit-exact against CPU's
+  `hc_pre_from_state_one_scratch` + `layer_attn_norm_one`.  The HC
+  kernels themselves are not a drift source; remaining per-layer drift
+  comes from Q/K/V projections, attention, output projection, and FFN
+  paths (Q8_0 / F16 matmul precision), and only flows through HC as
+  inherited residual_hc.
 
 #### First-run findings (N=16, 19-token prompt)
 
