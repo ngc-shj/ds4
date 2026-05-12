@@ -9799,11 +9799,14 @@ static bool metal_graph_encode_decode_layer(
 }
 
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
-static bool metal_graph_encode_output_head(
-        ds4_gpu_graph *g,
+/* Output-head prefix: everything except the final vocab projection.  Leaves
+ * g->output_norm filled with the normalized residual ready to be projected
+ * to vocab.  Split out so the batched continuous-decode path can run this
+ * per session and then call one fused Q4 vocab matmul over N rows. */
+static bool metal_graph_encode_output_head_prefix(
+        ds4_gpu_graph         *g,
         const ds4_model       *model,
-        const ds4_weights     *weights,
-        uint64_t               vocab_dim) {
+        const ds4_weights     *weights) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     bool ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->output_pre,
@@ -9846,6 +9849,15 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
+    return ok;
+}
+
+static bool metal_graph_encode_output_head(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        uint64_t               vocab_dim) {
+    bool ok = metal_graph_encode_output_head_prefix(g, model, weights);
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->logits,
                                               model->map,
                                               model->size,
@@ -9859,6 +9871,15 @@ static bool metal_graph_encode_output_head(
     }
     return ok;
 }
+
+/* metal_graph_encode_output_head_batched and ensure_engine_batched_scratch
+ * are defined later (after struct ds4_engine) so they can reach into the
+ * engine's lazy batched-output scratch tensors. */
+static bool metal_graph_encode_output_head_batched(
+        ds4_engine    *e,
+        ds4_session  **sessions,
+        int            n_active,
+        uint64_t       vocab_dim);
 
 /* Batched output head for speculative verification.
  *
@@ -14179,6 +14200,14 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+#ifndef DS4_NO_GPU
+    /* Lazy scratch tensors for the batched output head.  Allocated on the
+     * first ds4_session_eval_batched_decode call that takes the batched
+     * Q4-vocab path, then reused for the engine's lifetime.  Single-threaded:
+     * concurrent batched-decode callers on the same engine would race here. */
+    ds4_gpu_tensor *batched_output_norm;
+    ds4_gpu_tensor *batched_logits;
+#endif
 };
 
 static bool cpu_directional_steering_enabled(
@@ -15518,6 +15547,62 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
 };
+
+#ifndef DS4_NO_GPU
+/* Lazy-allocate the engine-level batched output scratch.  Sized for the
+ * worst case (DS4_BATCH_MAX rows) so a single call survives reuse across
+ * varying n_active.  See metal_graph_encode_output_head_batched. */
+static bool ensure_engine_batched_scratch(ds4_engine *e, uint64_t vocab_dim) {
+    if (!e->batched_output_norm) {
+        e->batched_output_norm = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_BATCH_MAX * DS4_N_EMBD * sizeof(float));
+        if (!e->batched_output_norm) return false;
+    }
+    if (!e->batched_logits) {
+        e->batched_logits = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_BATCH_MAX * vocab_dim * sizeof(float));
+        if (!e->batched_logits) return false;
+    }
+    return true;
+}
+
+/* Batched output head: runs the per-session prefix (5 small kernels) for each
+ * row, stages every session's output_norm into engine->batched_output_norm
+ * as a contiguous [n_active, DS4_N_EMBD] f32 tile, then performs a single
+ * Q4 vocab projection that writes [n_active, vocab_dim] into
+ * engine->batched_logits.  Callers read each row out to the corresponding
+ * session's logits buffer.  Returns false if Q4 lazy convert is not
+ * available -- the caller is then expected to fall back to a per-session
+ * output head loop. */
+static bool metal_graph_encode_output_head_batched(
+        ds4_engine    *e,
+        ds4_session  **sessions,
+        int            n_active,
+        uint64_t       vocab_dim) {
+    if (!ensure_engine_batched_scratch(e, vocab_dim)) return false;
+    bool ok = true;
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = metal_graph_encode_output_head_prefix(&sessions[i]->graph,
+                                                   &e->model, &e->weights);
+    }
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = ds4_gpu_tensor_copy(e->batched_output_norm,
+                                  (uint64_t)i * DS4_N_EMBD * sizeof(float),
+                                  sessions[i]->graph.output_norm, 0,
+                                  (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+                    e->batched_logits,
+                    e->model.map,
+                    e->model.size,
+                    e->weights.output->abs_offset,
+                    DS4_N_EMBD,
+                    vocab_dim,
+                    e->batched_output_norm,
+                    (uint64_t)n_active) != 0;
+    return ok;
+}
+#endif /* !DS4_NO_GPU */
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -17083,6 +17168,8 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+    ds4_gpu_tensor_free(e->batched_output_norm);
+    ds4_gpu_tensor_free(e->batched_logits);
     ds4_gpu_cleanup();
 #endif
     ds4_release_instance_lock();
@@ -17603,64 +17690,111 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
         n_active++;
     }
     if (gpu_fast && engine && n_active > 1 && n_active <= DS4_BATCH_MAX) {
+        /* Compact active rows into a contiguous list so the batch path can
+         * index by row instead of slot. */
+        ds4_session *active[DS4_BATCH_MAX];
+        int          active_token[DS4_BATCH_MAX];
+        int          active_slot [DS4_BATCH_MAX];
+        int          row_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (!slots[i].session) continue;
+            active     [row_count] = slots[i].session;
+            active_token[row_count] = slots[i].token;
+            active_slot [row_count] = i;
+            row_count++;
+        }
+
         /* Phase 1b: upload per-row dynamic state to __constant__ memory so
-         * future batched kernels can read it via blockIdx.y dispatch.  Only
+         * batched kernels can read it via blockIdx.y dispatch.  Only
          * token / pos / n_active are filled here; later commits populate the
-         * other fields as kernels start reading them. */
+         * other fields as more kernels start reading them. */
         struct ds4_batch_step_args bargs;
         memset(&bargs, 0, sizeof(bargs));
-        {
-            int row = 0;
-            for (int i = 0; i < n; i++) {
-                ds4_session *s = slots[i].session;
-                if (!s) continue;
-                bargs.token[row] = (uint32_t)slots[i].token;
-                bargs.pos[row]   = (uint32_t)s->checkpoint.len;
-                row++;
-            }
-            bargs.n_active = (uint32_t)n_active;
+        for (int i = 0; i < row_count; i++) {
+            bargs.token[i] = (uint32_t)active_token[i];
+            bargs.pos[i]   = (uint32_t)active[i]->checkpoint.len;
         }
+        bargs.n_active = (uint32_t)row_count;
         if (ds4_gpu_set_batch_args(&bargs) == 0) {
             snprintf(err, errlen, "Metal batch args upload failed");
             return 1;
         }
+
+        /* When the Q4 lazy-convert decode path is active, hand the final
+         * vocab projection to the batched Q4 matmul; otherwise let each
+         * session run its own full output head. */
+        const bool want_batched_output = (getenv("DS4_CUDA_Q4_DECODE") != NULL);
+        const uint64_t vocab_dim = (uint64_t)engine->weights.output->dim[1];
+
         bool ok = ds4_gpu_begin_commands() != 0;
-        for (int i = 0; ok && i < n; i++) {
-            ds4_session *s = slots[i].session;
-            if (!s) continue;
+        for (int i = 0; ok && i < row_count; i++) {
+            ds4_session *s = active[i];
             /* allow_split_flush=false: the in-forward flush is a mid-token
              * cudaDeviceSynchronize on the CUDA backend, which would defeat
              * the whole purpose of batching submissions. */
             ok = metal_graph_encode_token_raw_swa(&s->graph,
                                                   &engine->model,
                                                   &engine->weights,
-                                                  slots[i].token,
+                                                  active_token[i],
                                                   (uint32_t)s->checkpoint.len,
-                                                  /*need_logits=*/true,
+                                                  /*need_logits=*/!want_batched_output,
                                                   /*allow_split_flush=*/false);
             if (!ok) {
                 snprintf(err, errlen,
-                         "Metal batched encode failed for slot %d", i);
+                         "Metal batched encode failed for slot %d",
+                         active_slot[i]);
                 s->checkpoint_valid = false;
             }
         }
+
+        bool batched_output_used = false;
+        if (ok && want_batched_output) {
+            if (metal_graph_encode_output_head_batched(engine, active,
+                                                       row_count, vocab_dim)) {
+                batched_output_used = true;
+            } else {
+                /* Q4 path unavailable -- fall back to per-session output
+                 * heads, re-running the prefix.  Acceptable since this
+                 * happens only when DS4_CUDA_Q4_DECODE is set but the lazy
+                 * Q4 cache cannot be populated. */
+                for (int i = 0; ok && i < row_count; i++) {
+                    ok = metal_graph_encode_output_head(&active[i]->graph,
+                                                        &engine->model,
+                                                        &engine->weights,
+                                                        vocab_dim);
+                    if (!ok) {
+                        snprintf(err, errlen,
+                                 "Metal output head fallback failed for slot %d",
+                                 active_slot[i]);
+                        active[i]->checkpoint_valid = false;
+                    }
+                }
+            }
+        }
+
         if (ok) ok = ds4_gpu_end_commands() != 0;
         if (ok) {
-            for (int i = 0; i < n; i++) {
-                ds4_session *s = slots[i].session;
-                if (!s) continue;
-                if (ds4_gpu_tensor_read(s->graph.logits, 0, s->logits,
+            for (int i = 0; i < row_count; i++) {
+                ds4_session *s = active[i];
+                const ds4_gpu_tensor *src = batched_output_used
+                    ? engine->batched_logits
+                    : s->graph.logits;
+                const uint64_t src_offset = batched_output_used
+                    ? (uint64_t)i * vocab_dim * sizeof(float)
+                    : 0;
+                if (ds4_gpu_tensor_read(src, src_offset, s->logits,
                                         (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
                     snprintf(err, errlen,
-                             "Metal logits readback failed for slot %d", i);
+                             "Metal logits readback failed for slot %d",
+                             active_slot[i]);
                     s->checkpoint_valid = false;
                     return 1;
                 }
-                token_vec_push(&s->checkpoint, slots[i].token);
+                token_vec_push(&s->checkpoint, active_token[i]);
                 s->checkpoint_valid = true;
                 s->mtp_draft_valid = false;
-                if (slots[i].logits) {
-                    memcpy(slots[i].logits, s->logits,
+                if (slots[active_slot[i]].logits) {
+                    memcpy(slots[active_slot[i]].logits, s->logits,
                            (size_t)DS4_N_VOCAB * sizeof(float));
                 }
             }
