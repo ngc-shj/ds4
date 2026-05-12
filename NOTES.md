@@ -95,6 +95,39 @@ Dense matmuls (q\_path + attn\_output + shared\_\*) are ~76 % of layer
 time.  43 layers × ~4 dense matmuls per layer = ~172 matmul call sites
 all running serially-per-session today.
 
+## Where the wall clock actually goes (post-`DS4_METAL_DECODE_STAGE_PROFILE`)
+
+The stage profile inflates totals because each boundary inserts a
+`cudaEventRecord`/sync.  `DS4_METAL_GRAPH_TOKEN_PROFILE=1` on a steady
+single-session decode gives the un-instrumented split:
+
+```
+ds4: metal graph token pos=15 encode=21.9 ms execute=24.6 ms read=0.0 ms total=46.6 ms
+ds4: metal graph token pos=16 encode=19.3 ms execute=25.7 ms read=0.0 ms total=45.1 ms
+ds4: metal graph token pos=17 encode=19.3 ms execute=25.8 ms read=0.0 ms total=45.1 ms
+```
+
+- `encode` = host-side time spent inside
+  `metal_graph_encode_token_raw_swa`.  Default-flushed path takes a
+  cudaDeviceSynchronize after layer 4 (`allow_split_flush=true`), so the
+  ~19 ms includes the GPU stall waiting for layers 0–3.  In the batched
+  API path we already force `allow_split_flush=false`, so this stall
+  isn't in our hot path.  Pure host-side encode (kernel-launch dispatch
+  for all 43 layers + the output head) is much smaller than 19 ms.
+- `execute` = final `cudaDeviceSynchronize` wait, i.e. essentially all
+  GPU compute time per token.  ~25 ms.
+- `total` ≈ 45 ms per token = ~22 t/s, consistent with the
+  ds4-bench-measured 18 t/s once you account for the bench loop's
+  per-iteration argmax + slot fill on the CPU.
+
+Implication: GPU compute is ~25 ms/token at N = 1.  At N = 4 we observe
+~210 ms / 4 tokens = 52 ms/token effective.  That's 4× the GPU compute
+of N = 1 — i.e. the batched path is essentially fully serial on the GPU
+side.  Whatever implicit L2 reuse we get inside the naive Q4 batched
+output head kernel does NOT compound across the layer matmuls because
+those still each run from `cuda_matmul_q8_0_tensor_labeled` at
+`n_tok = 1` per session.
+
 ## The real lever for N batching
 
 To get past +7 % at N = 4–8, the per-layer dense matmuls have to actually
@@ -126,6 +159,53 @@ Two refactor shapes that could deliver the gain:
 Either approach is multi-day.  (1) is more incremental but interleaves
 control flow.  (2) is more disruptive but matches DS4's existing prefill
 shape and the `g_batch_args` infrastructure we already landed.
+
+### Concrete next-session checklist (shape 1, simplest non-trivial slice)
+
+Target the FFN shared expert at every layer because it's the biggest
+single weight read per layer and has no per-row dispatch (KV / attention
+stay per-session).
+
+1. Add engine-level scratch in `struct ds4_engine`:
+   - `batched_ffn_norm` — `DS4_BATCH_MAX × DS4_N_EMBD × f32`
+   - `batched_shared_gate`, `_up`, `_mid` — `DS4_BATCH_MAX × shared_dim × f32`
+   Lazy-allocate in `ensure_engine_batched_scratch` (already there for the
+   batched output head's scratch).
+
+2. Split `metal_graph_encode_decode_layer` in `ds4.c` at the
+   `shared_gate_up` boundary (around line 9703).  Pre half: everything
+   through `g->ffn_norm`.  Post half: `keep_ffn_out` / fused shared down
+   HC expand onwards.
+
+3. Add `metal_graph_encode_shared_ffn_batched(engine, sessions[], n,
+   layer)` that stages N `g->ffn_norm`, calls
+   `ds4_gpu_matmul_q8_0_pair_tensor(batched_gate, batched_up, ...,
+   n_tok = n_active)` — note: at n_tok > 1 this currently routes through
+   cuBLAS f16, which regressed for the output head.  May regress here
+   too; if so we need a custom Q4 batched pair kernel
+   (`matmul_q4_0_pair_preq_batch_warp8_kernel`) — analogous to the
+   existing pair single-row kernel but with the row-major
+   weight-shared shape from our failed templated experiment, except
+   keeping grid.y = ceil(n_tok / SMALL) for occupancy.  Worth testing
+   N = 2 first since occupancy hit there is mild.
+
+4. Loop in `ds4_session_eval_batched_decode`: for each layer, per
+   session run "pre", then batched shared FFN, then per session run
+   "post".  This means the layer loop runs OUTSIDE the per-session
+   encoder.
+
+5. Measurement target: if step 4 shaves anything off N=4 throughput
+   (current 18.97 t/s → 21+ t/s would be a clean win), iterate to do
+   attn_q_a, attn_q_b, attn_output, FFN shared down in the same shape.
+   If it regresses, the shared scratch + cuBLAS f16 path isn't the
+   answer and shape 2 with a custom batched kernel is the only way.
+
+### What NOT to retry without a new theory
+
+Already shown not to help on this hardware / model:
+- Templated weight-shared kernel that collapses grid.y (occupancy loss)
+- cuBLAS f16 GEMM at n_tok > 1 (2× weight HBM vs Q4)
+- Batching only the output head (it's already near-optimal)
 
 ## What is committed and ready for next session
 
