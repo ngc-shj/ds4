@@ -323,12 +323,98 @@ stay per-session).
    If it regresses, the shared scratch + cuBLAS f16 path isn't the
    answer and shape 2 with a custom batched kernel is the only way.
 
+### 5. CUDA Graph capture on the per-layer interleaved batched encoder (shelved)
+
+Hypothesis: `perf/cuda-graph-wip` (5ae22be) showed CUDA Graph capture is
+healthy on GB10 but regresses end-to-end because `cudaGraphExecUpdate`
+over the ~1000-node single-session graph costs ~70 ms / token, one
+parameter rewrite per kernel node.  cuda-graph-wip's "what's left"
+checklist is to lift every per-token scalar (pos / raw_row / n_raw /
+n_comp / top_k / token / …) out of kernel signatures into
+`__constant__` memory; once the captured graph is structurally
+identical across tokens, `cudaGraphExecUpdate` becomes a no-op and the
+~0.2 ms pure-launch path is reachable.
+
+The batched-decode path's per-layer interleaved structure (stable
+sequence of N session × 43 layers × phased kernels) is even more
+graph-friendly: capture once at `n_active = N`, replay forever as long
+as the active session set is stable.
+
+What killed it before opening Phase B:
+
+  - GPU is already 91.8 % busy at N=1, 93.6 % at N=4 (this file,
+    "Where the wall clock actually goes").  The "~19 ms host encode"
+    figure in the single-session profile is GPU-sync-inflated
+    (`allow_split_flush = true` after layer 4) — pure host
+    kernel-launch dispatch is "much smaller than 19 ms" (same
+    section).  Batched API forces `allow_split_flush = false` so the
+    inflated stall isn't in the hot path either.
+  - Capture's upper bound is therefore the ~8 % gap-time slice, not
+    the 30-40 % the naive single-session encode number suggested.
+  - The kernel scalar-lift refactor is ~25-30 hot kernels, 2-3 days.
+    8 % at that cost is bad ROI.
+
+Phase A — routing all 143 kernel launches through `g_kernel_stream`
+and binding cuBLAS to the same stream — landed as 1d7402e because
+it's behavior-preserving infrastructure that any future capture
+experiment will need.  Phase B (kernel scalar lift) and Phase C
+(capture/replay wrapper) are not started.
+
+Re-open when: GPU utilization at the relevant N drops below ~80 %
+(e.g. after Option G / MTP integration accepts ≥50 % of drafts and
+the wall clock per kept-token rises into the host-overhead-visible
+regime), OR a faster `cudaGraphExecUpdate` lands in a CUDA toolkit
+release and the lift refactor can be skipped.
+
+### 6. MTP speculative decode (Option G) — empirically neutral on GB10
+
+Hypothesis: DS4 already has an end-to-end MTP draft-and-verify path
+(`ds4_session_eval_speculative_argmax`, `metal_graph_verify_decode2_exact`,
+the MTP support model `gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`).
+Premise was 1.3-1.5x effective throughput at typical accept rates,
+which could be carried over to the batched path.
+
+Ground-truth measurement on single-session `ds4 --temp 0 --mtp ...
+--mtp-draft 2` (the only mode that engages the speculative path in
+`ds4_cli.c`; default `temperature = 1.0` skips it entirely), mean of
+three runs, `-n 80`:
+
+| Config | gen t/s |
+|---|---|
+| MTP off, temp=0 | 21.07 |
+| MTP on, depth=2, temp=0 (default verifier path) | 20.19 (-4.2 %) |
+| MTP on, depth=2, temp=0, DS4_MTP_STRICT (decode2_exact) | 20.09 (-4.7 %) |
+
+The cost model explains the ceiling: target decode ≈ 25 ms, MTP draft
+(1 MTP layer + output head) ≈ 5 ms, `decode2_exact` verifier (43-layer
+target with `n_tok = 2`) ≈ 30 ms — at *100 % accept* the math gives
+3 tokens / 60 ms ≈ 50 t/s vs baseline 40 t/s = 1.25x, and the
+observed neutral-to-slightly-negative number means accept rate is
+not in the regime where the ceiling pays.  The verifier is essentially
+"another target decode" because dense matmuls are weight-HBM-bound
+regardless of `n_tok ∈ {1, 2}`.
+
+Implication for the batched plan: integrating MTP into
+`ds4_session_eval_batched_decode` is 2-3 days of work (per-row draft
+state, batched `n_tok = 2` verifier across N sessions, per-row
+accept/reject branching, KV-cache divergence handling).  A 2-3 day
+build for a path that is empirically zero-gain at the per-session
+level is bad ROI.  Re-open if a faster MTP-draft kernel lands or if
+the target verifier can be shrunk to fewer layers (e.g. a learned
+short-cut head).
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
 - Templated weight-shared kernel that collapses grid.y (occupancy loss)
 - cuBLAS f16 GEMM at n_tok > 1 (2× weight HBM vs Q4)
 - Batching only the output head (it's already near-optimal)
+- L2 persistence policy with 18 MiB pin (24 MiB L2 too small)
+- Full CUDA Graph capture on this encoder *without* the kernel scalar
+  lift (regression matches cuda-graph-wip; ceiling is ~8 % anyway)
+- MTP speculative decode at default temperature (CLI gates on
+  `temperature == 0`; even with temp = 0 it's empirically neutral on
+  GB10 — see section 6)
 
 ## What is committed and ready for next session
 
