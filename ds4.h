@@ -173,6 +173,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+
+/* Continuous batched decode (Phase 1 PoC).
+ *
+ * Advance up to n sessions by one token each in a single batched forward.
+ * Slots with `session == NULL` are skipped.  Current PoC scope: when all
+ * non-NULL slots reference the SAME session at the SAME position (parallel
+ * sampling from one prompt prefix), takes the fast batched path; mixed
+ * shapes fall back to a serial ds4_session_eval() loop. */
+typedef struct {
+    ds4_session *session;
+    int          token;     /* token to evaluate at session's current pos */
+    float       *logits;    /* DS4_N_VOCAB floats; written on return; may be NULL */
+} ds4_batch_slot;
+int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
+                                    char *err, size_t errlen);
+
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

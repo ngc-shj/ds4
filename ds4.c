@@ -17565,6 +17565,56 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+/* Continuous batched decode (Phase 1 PoC scaffold).
+ *
+ * This is the minimal API entry point.  v0 implementation: serial fallback
+ * that calls ds4_session_eval() for each non-NULL slot and copies logits
+ * back from the underlying session.  Provides a correct baseline against
+ * which a true batched path can later be benchmarked.
+ *
+ * TODO (future work to land here):
+ *   1. Per-row state arrays in __constant__ memory (positions, raw_row,
+ *      n_comp, comp_row, emit, token).  Today's g_step_args refactor in
+ *      perf/cuda-graph-wip is single-slot; arrayize it.
+ *   2. Modify the ~30 g_step_args.<field> readers in ds4_cuda.cu to index
+ *      by blockIdx.y (or analogous batch-row dispatch).
+ *   3. Add Q4 batched matmul kernels (preq_batch_warp8 variants for the
+ *      single / pair / hc_expand / grouped paths) so the n_tok > 1 path
+ *      stays on Q4 instead of falling back to Q8.
+ *   4. Per-row attention KV: each row dispatches to its session's own
+ *      layer_raw_cache slab.  Either pass a `const float * const *` array
+ *      of N KV ptrs, or route through a paged-KV pool.
+ *   5. Wire the new batched layer encoder through
+ *      metal_graph_encode_layer_batch() with per-row pos/RoPE.
+ *
+ * Phase 0 microbench (chunked-prefill proxy on a single growing context)
+ * showed a per-token speedup ceiling of 2.5x at N=8 and 4.8x at N=32 on
+ * GB10 / DGX Spark.  Realistic post-implementation target for
+ * truly-independent N sessions: ~2-3x aggregate at N=8-16 (attention and
+ * per-session overhead do not amortize).
+ *
+ * Returns 0 on success, nonzero on first error (with `err` filled if
+ * errlen > 0). */
+int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
+                                    char *err, size_t errlen) {
+    if (!slots || n <= 0) return 0;
+    for (int i = 0; i < n; i++) {
+        ds4_batch_slot *slot = &slots[i];
+        if (!slot->session) continue;
+        if (ds4_session_eval(slot->session, slot->token, err, errlen) != 0) {
+            return 1;
+        }
+        if (slot->logits) {
+            /* Copy this session's last-decode logits out so the caller can
+             * sample independently.  ds4_session_eval already writes the
+             * session-internal logits buffer; expose it. */
+            memcpy(slot->logits, slot->session->logits,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+        }
+    }
+    return 0;
+}
+
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
  * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;
