@@ -2260,6 +2260,40 @@ __global__ static void matmul_q4_0_preq_warp8_kernel(
     if (lane == 0) out[row] = acc;
 }
 
+/* Batched Q4_0 GEMV: one warp per (out_row, tok).  Activations are
+ * pre-quantized to per-block int8 + per-block fp32 scale, laid out
+ * [n_tok, blocks*32] for the quants and [n_tok, blocks] for the scales.
+ * Weights are shared across toks at the warp level -- but in this naive
+ * variant each (row, tok) pair re-reads the row's nibble blocks from HBM.
+ * Block-shared weight loads come in a later commit. */
+__global__ static void matmul_q4_0_preq_batch_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    (void)in_dim;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim || tok >= n_tok) return;
+    const __half *scales_row     = (const __half *)(w + row * blocks * 18u);
+    const unsigned char *packed_row = w + row * blocks * 18u + blocks * 2u;
+    const int8_t *xqr = xq + tok * blocks * 32u;
+    const float *xsr = xscale + tok * blocks;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        float scale = __half2float(scales_row[b]);
+        int32_t dot = q4_block_dot(packed_row + b * 16u, xqr + b * 32u);
+        acc += scale * xsr[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[tok * out_dim + row] = acc;
+}
+
 /* Q4 variant of matmul_q8_0_pair_preq_warp8_kernel: two Q4 weight matrices,
  * one shared activation, two output buffers. */
 __global__ static void matmul_q4_0_pair_preq_warp8_kernel(
@@ -5756,6 +5790,57 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+/* Batched Q4 matmul entry point for continuous batched decode.
+ *
+ * Unlike ds4_gpu_matmul_q8_0_tensor (which routes n_tok > 1 through cuBLAS
+ * f16 weights), this entry point always uses the lazy Q4_0 weight cache and
+ * the batched warp kernel.  Intended for the vocab-projection step of the
+ * batched output head, where weights are huge and the Q4 path saves nearly
+ * 50% of HBM traffic per token.  Returns 0 if Q4 lazy convert is unavailable
+ * (no dp4a hardware, or the Q4 cache could not be populated). */
+extern "C" int ds4_gpu_matmul_q4_0_batch_warp_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
+    const uint64_t weight_bytes = out_dim * blocks * 34;
+    if (weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < n_tok * in_dim * sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    if (!cuda_q8_use_dp4a()) return 0;
+    const unsigned char *w_q4 = cuda_q4_from_q8_ptr(model_map, weight_offset,
+                                                     weight_bytes, in_dim, out_dim);
+    if (!w_q4) return 0;
+    const uint64_t xq_bytes = n_tok * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q4_0 batch prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "matmul_q4_0 batch quantize launch")) return 0;
+    dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
+    matmul_q4_0_preq_batch_warp8_kernel<<<bgrid, 256>>>(
+            (float *)out->ptr,
+            w_q4,
+            xq,
+            xscale,
+            in_dim,
+            out_dim,
+            n_tok,
+            blocks);
+    return cuda_ok(cudaGetLastError(), "matmul_q4_0 batch warp launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(

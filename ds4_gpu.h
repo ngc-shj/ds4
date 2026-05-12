@@ -174,6 +174,20 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Batched Q4_0 GEMV for continuous batched decode (Phase 1c+).  Always
+ * routes through the lazy Q4_0 weight cache (DS4_CUDA_Q4_DECODE) instead of
+ * cuBLAS f16, saving ~50% of weight HBM traffic per token.  Returns 0 if
+ * the Q4 lazy convert path is unavailable on this device. */
+int ds4_gpu_matmul_q4_0_batch_warp_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
