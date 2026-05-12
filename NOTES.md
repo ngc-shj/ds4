@@ -67,11 +67,46 @@ cuBLAS's compute efficiency does not recover that on a memory-bound
 decode-shape GEMM (one or a few rows on the activation side).  Q4 +
 implicit L2 wins on this shape.
 
+### 3. Tiled weight-shared kernel (TILE=2 per warp, grid.y preserved)
+
+The fix for the first attempt: keep `grid.y = ceil(n_tok / TILE)` so
+occupancy only drops by TILE (not by N), and manually PRMT-unpack the
+row's nibbles once per block iteration before the inner unrolled
+tok loop (don't rely on the compiler hoisting `q4_block_dot`'s unpack
+out of an unrolled call sequence).
+
+Two-run averages on `ds4-bench --ctx-start 2048 --gen-tokens 50`:
+
+| N  | naive | TILE=2 | Δ |
+|----|------:|-------:|---:|
+| 2  | 18.66 | 18.96  | +1.6 % |
+| 4  | 18.95 | 19.13  | +1.0 % |
+| 8  | 19.16 | 17.42  | -9 %   (high run-to-run variance) |
+| 16 | 9.86  | 9.94   | unstable both ways; a fresh single run gave naive 10.92, TILE 6.34 |
+
+Small win at N=2/4, **clear regression at N=16** (the kernel is
+correct, but apparently activation locality / cache pressure flips
+against the tiled layout once n_tok is large).  Output head is only
+~1.5 % of total decode time anyway, so the upper bound for this kernel
+in isolation is ~+1.5 % aggregate — exactly what N=4 measured.
+
+The TILE approach itself is sound and the unpack-once-per-block
+pattern is what a later layer-matmul batched kernel should use.  It
+just isn't worth shipping for the output head in isolation, because
+the win is below noise and the N=16 regression is real.  Reverted.
+
 ### Combined finding
 
 The batched output head matmul is not the bottleneck and is already
-close to optimal for this shape under DS4_CUDA_Q4_DECODE.  Further
-optimization of the output head alone has no measurable headroom.
+close to optimal for this shape under `DS4_CUDA_Q4_DECODE`.  Three
+distinct kernel-level experiments (templated all-tok, cuBLAS f16,
+TILE=2) failed to materially beat the naive `grid.y = n_tok` baseline,
+which gets most of its amortization for free from GB10's L2.  Further
+optimization of the output head alone has no measurable headroom; the
+remaining headroom lives in the layer-internal dense matmuls (Q/K/V,
+FFN gate/up/down, attn_output) where the existing per-session encoder
+runs N matmul calls at `n_tok = 1` and the naive L2 reuse does not
+compound across sessions.
 
 ## Where the actual time goes
 
@@ -119,6 +154,20 @@ ds4: metal graph token pos=17 encode=19.3 ms execute=25.8 ms read=0.0 ms total=4
 - `total` ≈ 45 ms per token = ~22 t/s, consistent with the
   ds4-bench-measured 18 t/s once you account for the bench loop's
   per-iteration argmax + slot fill on the CPU.
+
+`nsys profile` over a 200-decode-token run confirms the same picture
+at the GPU-utilization level:
+
+  | Profile | N=1 | N=4 |
+  |---|---:|---:|
+  | GPU busy / wall | 91.8 % | 93.6 % |
+  | Total kernels | 408,645 | 1,630,548 (4× N=1) |
+
+The GPU is already 90%+ utilized at N = 1, so CUDA-streams parallelism
+across sessions can claim at most the remaining ~8 % of gap time.  The
+batched-decode work has to share weight reads across sessions to gain
+anything beyond that; pure overlap is not going to deliver the missing
+3× to 5× implied by Phase 0's chunked-prefill ceiling.
 
 Implication: GPU compute is ~25 ms/token at N = 1.  At N = 4 we observe
 ~210 ms / 4 tokens = 52 ms/token effective.  That's 4× the GPU compute
