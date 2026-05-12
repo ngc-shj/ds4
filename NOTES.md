@@ -451,6 +451,69 @@ Re-open when: a Q3_K-style scheme is designed for GB10 specifically
 demonstrates a working decode kernel + fast dequant pipeline that the
 dense matmuls can borrow.
 
+### 8. Q3_K_S (256-value super-block, 16-value sub-block) — dead-end
+
+Hypothesis: section 7's quality collapse was the single-scale-per-32-
+values granularity.  Section 7's speed loss was the bit-plane decode's
+scalar fan-out.  Q3_K_S addresses the first by adding sub-block scales
+(simplified-Q3_K: 256-value super-block × 16-value sub-block × uint8
+sub_scale, single fp16 super-scale; 116 bytes per super-block when
+padded to 4-aligned).  The matmul kernel reads the low 2 bits from a
+single qs byte (4 values per byte) and the high bit from 4 hmask bytes
+(one per value at the appropriate layer position) per dp4a pass; the
+4 raw values are byte-wise sign-fixed via `__vsub4(raw, 0x04040404)`
+straight into the dp4a-ready int32 form.  Each warp lane handles half
+a super-block (128 values, 8 sub-blocks, 32 dp4a passes).
+
+Result: failed on both axes again.
+
+- **Quality**: greedy "The capital of France is" produces
+  `freelance<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>…` — better
+  than Q3_0's pure noise, but still wrong from token 1 (special-token
+  emission means the output head's argmax landed nowhere near the
+  intended token).  Likely root cause: the simple
+  `sub_scales[s] = round(sub_max[s] / super_max × 255)` derivation
+  zeros sub-blocks whose magnitude is below ~1/510 of the super-block
+  max.  In DS4 weights with outliers, this happens often enough to
+  corrupt the output head.  ggml's real Q3_K uses iterative refinement
+  of sub-scales (minimize per-block MSE rather than just cover the
+  range) — that closes the quality gap but adds non-trivial convert-
+  time work.
+- **Throughput**: median of three runs at `ctx=2048 gen=50`:
+  - N=1: Q3_K_S 14.43 vs Q4 17.92 = **-19.5 %**.
+  - N=4: Q3_K_S 14.98 vs Q4 19.7 = **-24 %**.
+  Decode is compute-bound just like Q3_0 was, despite different
+  packing.  The structural problem is that 3-bit decode on GB10 needs
+  per-value bit reassembly with no `__byte_perm` shortcut analogous to
+  Q4's nibble pattern, so the kernel chews ~10 ops per dp4a vs Q4's
+  ~5, and the 19 % HBM savings don't cross the gap.
+
+So both Q3 attempts in this session reach the same dead-end via
+different routes: HBM savings can't translate when 3-bit decode is
+the bottleneck on this GPU's warp-throughput.  A working Q3 path
+would need at least one of:
+
+  - Tensor-core MMA-INT4 (Option H) that performs the dot product on
+    a packed integer format directly, eliminating the per-dp4a decode
+    overhead.
+  - A kernel structure that decodes the whole row's weights to int8
+    once into shared memory (one big decode, then dense int8 matmul);
+    this trades L2 pressure for compute-vs-memory balance and may
+    backfire given GB10's 24 MiB L2.
+  - A different decode algorithm exploiting `bfind`/`brev` or warp-
+    shuffle bit fan-out tricks that Q3_0's bit-plane and Q3_K_S's
+    qs/hmask layouts both failed to exploit.
+
+Q3_K_S code lands as section-8 documented dead-end alongside section
+7's Q3_0; both share a `cuda_q3_range` / `cuda_q3k_range` cache and
+parallel `DS4_CUDA_Q3_DECODE` / `DS4_CUDA_Q3K_DECODE` env gates so
+either harness can be picked up by a future attempt without rewriting
+the lazy-convert plumbing.
+
+Re-open when: Option H (Blackwell INT4 MMA) is built first and shows
+a real dense-matmul speedup at decode shape — that becomes the
+substrate any new low-bit packing has to plug into.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
@@ -466,6 +529,9 @@ Already shown not to help on this hardware / model:
 - Q3_0 with a single fp16 scale per 32-value block (quality collapses
   to garbage tokens AND decode is compute-bound below Q4's HBM-bound
   rate — see section 7)
+- Q3_K_S with sub-block scales but simple (non-refined) sub-scale
+  derivation (quality still collapses to broken tokens AND decode is
+  still compute-bound, -19.5 % at N=1 — see section 8)
 
 ## What is committed and ready for next session
 

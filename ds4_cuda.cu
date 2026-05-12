@@ -189,6 +189,30 @@ struct cuda_q3_range {
     unsigned char *device_ptr;
 };
 
+/* Experimental Q3_K_S dense matmul cache.  Per 256-value super-block:
+ *   bytes [0..31]:    hmask  (byte i bit j = high bit of value (i + j*32))
+ *   bytes [32..95]:   qs     (byte i = 4 weights at positions
+ *                              [4i, 4i+1, 4i+2, 4i+3], each as the value's
+ *                              low 2 bits)
+ *   bytes [96..111]:  16 uint8 sub_scales  (one per 16-value sub-block;
+ *                              reconstructed scale = sub * d_super / 255)
+ *   bytes [112..113]: d_super (fp16 super-block scale)
+ *   bytes [114..115]: padding (unused; brings stride to 116 = 4-aligned
+ *                              so per-super-block int32 hmask reads stay
+ *                              naturally aligned across super-blocks)
+ * Total 116 bytes per 256 values vs Q4_0's 144 per 256 values = 81% of Q4_0
+ * HBM.  Sub-block granularity (16 values) is what saves quality vs Q3_0;
+ * the simple uint8 sub_scale (vs ggml Q3_K's packed 6-bit signed) costs
+ * 4 bytes more per super-block but keeps the decode kernel small. */
+struct cuda_q3k_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t weight_bytes_src;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    unsigned char *device_ptr;
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -200,6 +224,8 @@ static std::vector<cuda_q4_range> g_q4_ranges;
 static std::unordered_map<uint64_t, size_t> g_q4_by_offset;
 static std::vector<cuda_q3_range> g_q3_ranges;
 static std::unordered_map<uint64_t, size_t> g_q3_by_offset;
+static std::vector<cuda_q3k_range> g_q3k_ranges;
+static std::unordered_map<uint64_t, size_t> g_q3k_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
@@ -207,6 +233,7 @@ static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_q4_bytes;
 static uint64_t g_q3_bytes;
+static uint64_t g_q3k_bytes;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -857,6 +884,159 @@ static const unsigned char *cuda_q3_from_q8_ptr(
         fprintf(stderr, "ds4: CUDA cached q3 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q3_bytes / 1073741824.0);
+    }
+    return dev;
+}
+
+/* Q8_0 -> Q3_K_S conversion.  One thread per 256-value super-block (= 8
+ * source Q8_0 blocks).  Decodes the source, finds per-sub-block (16-value)
+ * magnitudes, derives the super-block fp16 scale and 16 uint8 sub-scales,
+ * then quantizes each value to 3-bit signed [-4, +3] and packs into the
+ * standard hmask + qs layout described at struct cuda_q3k_range.
+ *
+ * One-shot conversion at first matmul touch; stack usage is acceptable
+ * for the cold path even though 256 floats spill to local memory. */
+__global__ static void q8_to_q3k_convert_kernel(
+        unsigned char *dst,
+        const unsigned char *src,
+        uint64_t super_per_row,
+        uint64_t total_super) {
+    const uint64_t sb_global = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (sb_global >= total_super) return;
+
+    /* Each super-block consumes 8 source Q8_0 blocks (8 * 34 = 272 bytes). */
+    const unsigned char *src_sb = src + sb_global * 8u * 34u;
+
+    /* Dequantize 256 source values to float. */
+    float vals[256];
+    #pragma unroll 1
+    for (int qb = 0; qb < 8; qb++) {
+        const __half *s8 = (const __half *)(src_sb + qb * 34);
+        float scale_q8 = __half2float(*s8);
+        const int8_t *q8 = (const int8_t *)(src_sb + qb * 34 + 2);
+        #pragma unroll
+        for (int k = 0; k < 32; k++) {
+            vals[qb * 32 + k] = (float)q8[k] * scale_q8;
+        }
+    }
+
+    /* Per-sub-block (16 values) magnitudes. */
+    float sub_max[16];
+    #pragma unroll
+    for (int s = 0; s < 16; s++) {
+        float m = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            float a = fabsf(vals[s * 16 + k]);
+            if (a > m) m = a;
+        }
+        sub_max[s] = m;
+    }
+    float super_max = 0.0f;
+    #pragma unroll
+    for (int s = 0; s < 16; s++) if (sub_max[s] > super_max) super_max = sub_max[s];
+
+    /* d_super = max(sub_max) / 3 so that the largest sub-block's scaled
+     * range covers [-3, +3] within the 3-bit signed grid; sub-blocks with
+     * smaller magnitudes get proportionally smaller sub_scales. */
+    float d_super = super_max / 3.0f;
+    if (d_super == 0.0f) d_super = 1.0f;
+
+    uint8_t sub_scales[16];
+    #pragma unroll
+    for (int s = 0; s < 16; s++) {
+        int v = __float2int_rn(sub_max[s] / super_max * 255.0f);
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        sub_scales[s] = (uint8_t)v;
+    }
+
+    /* Quantize and pack into the 114-byte layout. */
+    uint8_t hmask[32] = {0};
+    uint8_t qs[64] = {0};
+    #pragma unroll
+    for (int s = 0; s < 16; s++) {
+        float sub_scale_f = (float)sub_scales[s] * d_super * (1.0f / 255.0f);
+        float inv = (sub_scale_f > 0.0f) ? (1.0f / sub_scale_f) : 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            int p = s * 16 + k;
+            int q = __float2int_rn(vals[p] * inv);
+            if (q >  3) q =  3;
+            if (q < -4) q = -4;
+            uint8_t raw = (uint8_t)(q + 4);   /* 0..7 */
+            uint8_t low2 = raw & 3u;
+            uint8_t hi1  = (raw >> 2) & 1u;
+            qs[p >> 2]   |= (uint8_t)(low2 << ((p & 3u) * 2u));
+            hmask[p & 31u] |= (uint8_t)(hi1 << ((p >> 5) & 7u));
+        }
+    }
+
+    /* Write 114-byte super-block: hmask (32) | qs (64) | sub_scales (16) | d (2). */
+    unsigned char *dst_sb = dst + sb_global * 116u;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) dst_sb[i] = hmask[i];
+    #pragma unroll
+    for (int i = 0; i < 64; i++) dst_sb[32 + i] = qs[i];
+    #pragma unroll
+    for (int i = 0; i < 16; i++) dst_sb[96 + i] = sub_scales[i];
+    *(__half *)(dst_sb + 112) = __float2half(d_super);
+    (void)super_per_row;
+}
+
+/* Lazy-convert + cache: Q8_0 weight bytes -> Q3_K_S device cache. */
+static const unsigned char *cuda_q3k_from_q8_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes_q8,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    /* Q3_K_S requires in_dim % 256 == 0 since the super-block walks along
+     * in_dim.  All DS4 dense matmul dims are multiples of 256, but bail
+     * gracefully on the unexpected case to let the Q4 / Q8 fallback run. */
+    if (in_dim % 256u != 0) return NULL;
+
+    auto exact = g_q3k_by_offset.find(offset);
+    if (exact != g_q3k_by_offset.end()) {
+        const cuda_q3k_range &r = g_q3k_ranges[exact->second];
+        if (r.host_base == model_map && r.weight_bytes_src == weight_bytes_q8 &&
+            r.in_dim == in_dim && r.out_dim == out_dim) {
+            return r.device_ptr;
+        }
+    }
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes_q8, "q8_0_for_q3k");
+    if (!q8) return NULL;
+
+    const uint64_t super_per_row = in_dim / 256u;
+    const uint64_t total_super   = super_per_row * out_dim;
+    const uint64_t out_bytes     = total_super * 116u;
+    unsigned char *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q3k cache alloc failed (%.2f MiB): %s\n",
+                (double)out_bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    const uint32_t threads = 128;
+    const uint64_t grid    = (total_super + threads - 1) / threads;
+    q8_to_q3k_convert_kernel<<<(unsigned)grid, threads, 0, g_kernel_stream>>>(
+        dev, (const unsigned char *)q8, super_per_row, total_super);
+    if (!cuda_ok(cudaGetLastError(), "q8->q3k convert launch")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    if (!cuda_ok(cudaStreamSynchronize(g_kernel_stream), "q8->q3k convert sync")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    g_q3k_ranges.push_back({model_map, offset, weight_bytes_q8, in_dim, out_dim, dev});
+    g_q3k_by_offset[offset] = g_q3k_ranges.size() - 1u;
+    g_q3k_bytes += out_bytes;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached q3k %.2f MiB (total %.2f GiB)\n",
+                (double)out_bytes / 1048576.0,
+                (double)g_q3k_bytes / 1073741824.0);
     }
     return dev;
 }
@@ -2471,6 +2651,100 @@ __global__ static void matmul_q3_0_preq_warp8_kernel(
         float scale = __half2float(scales_row[b]);
         int32_t dot = q3_block_dot(packed_row + b * 12u, xq + b * 32u);
         acc += scale * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
+
+/* Q3_K_S helper: unpack 4 consecutive weights into a dp4a-ready int32 of
+ * 4 sign-extended int8 bytes.  Inputs:
+ *   qs_byte: 4 × 2-bit low fields at bit positions {0-1, 2-3, 4-5, 6-7}
+ *   hmask_4_packed: 4 hmask bytes packed into int32, each holds the
+ *                   value's high bit at bit `layer`
+ *   layer: which bit of each hmask byte holds the high bit (0..7)
+ *
+ * Build raw 3-bit values in [0..7], byte-aligned at byte LSBs, then
+ * __vsub4(raw, 4) byte-wise to land in signed [-4, +3] = [0xFC..0x03]
+ * for dp4a. */
+__device__ __forceinline__ static int32_t q3k_unpack_4(
+        uint8_t qs_byte, uint32_t hmask_4_packed, uint32_t layer) {
+    uint32_t qb = (uint32_t)qs_byte;
+    uint32_t low2 =  (qb & 0x03u)
+                  | ((qb & 0x0Cu) <<  6)   /* bits 2-3 -> byte 1 */
+                  | ((qb & 0x30u) << 12)   /* bits 4-5 -> byte 2 */
+                  | ((qb & 0xC0u) << 18);  /* bits 6-7 -> byte 3 */
+    uint32_t hi1 = (hmask_4_packed >> layer) & 0x01010101u;
+    uint32_t raw = low2 | (hi1 << 2);
+    return (int32_t)__vsub4(raw, 0x04040404u);
+}
+
+/* Q3_K_S GEMV: per row, walk 16-value sub-blocks within 256-value super-
+ * blocks.  Each warp computes one output row; 32 lanes split the row's
+ * super-block halves stride-32 (one half = 128 values = 8 sub-blocks =
+ * 32 dp4a passes).  79% of Q4_0's HBM traffic, 41% of Q8_0's. */
+__global__ static void matmul_q3k_preq_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t super_per_row) {
+    (void)in_dim;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const unsigned char *row_base = w + row * super_per_row * 114u;
+    float acc = 0.0f;
+
+    const uint32_t total_halves = (uint32_t)(2u * super_per_row);
+    for (uint32_t halfid = lane; halfid < total_halves; halfid += 32u) {
+        const uint32_t super_id = halfid >> 1;
+        const uint32_t half_id  = halfid & 1u;
+        const unsigned char *sb = row_base + super_id * 116u;
+        const unsigned char *hmask  = sb;
+        const unsigned char *qs     = sb + 32;
+        const unsigned char *subsc  = sb + 96;
+        const __half *d_h           = (const __half *)(sb + 112);
+        const float d_super         = __half2float(*d_h);
+
+        const uint32_t layer_base   = half_id ? 4u : 0u;
+        const unsigned char *qs_half    = qs    + (half_id ? 32u : 0u);
+        const unsigned char *subsc_half = subsc + (half_id ? 8u  : 0u);
+        const int8_t  *xq_half = xq     + super_id * 256u + (half_id ? 128u : 0u);
+        const float   *xs_half = xscale + super_id * 8u   + (half_id ? 4u   : 0u);
+
+        /* Load hmask once per super-block half (32 bytes = 8 int32). */
+        const uint32_t *hmask32 = (const uint32_t *)hmask;
+        uint32_t hm[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) hm[i] = hmask32[i];
+
+        /* 8 sub-blocks per half, 4 dp4a passes per sub-block. */
+        #pragma unroll
+        for (int s_local = 0; s_local < 8; s_local++) {
+            const uint32_t qs_base          = (uint32_t)s_local * 4u;
+            /* hmask byte range for sub-block: 0..15 or 16..31 depending on
+             * s_local parity; layer offset within byte: layer_base + s_local/2. */
+            const uint32_t hmask_word_base  = (s_local & 1u) ? 4u : 0u;
+            const uint32_t layer            = layer_base + (uint32_t)(s_local >> 1);
+
+            const float sub_scale_f = (float)subsc_half[s_local] * (1.0f / 255.0f);
+            const float act_scale   = xs_half[s_local >> 1];
+            const float combined    = d_super * sub_scale_f * act_scale;
+
+            const int32_t *xq32 = (const int32_t *)(xq_half + (uint32_t)s_local * 16u);
+
+            int32_t dot = 0;
+            #pragma unroll
+            for (int k = 0; k < 4; k++) {
+                uint8_t qs_byte = qs_half[qs_base + (uint32_t)k];
+                uint32_t hm_4   = hm[hmask_word_base + (uint32_t)k];
+                int32_t w4      = q3k_unpack_4(qs_byte, hm_4, layer);
+                dot = __dp4a(w4, xq32[k], dot);
+            }
+            acc += combined * (float)dot;
+        }
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[row] = acc;
@@ -5981,6 +6255,22 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_kernel_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
+        if (use_dp4a && getenv("DS4_CUDA_Q3K_DECODE") != NULL && (in_dim % 256u) == 0) {
+            const unsigned char *w_q3k = cuda_q3k_from_q8_ptr(model_map, weight_offset,
+                                                              weight_bytes, in_dim, out_dim);
+            if (w_q3k) {
+                const uint64_t super_per_row = in_dim / 256u;
+                matmul_q3k_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_kernel_stream>>>(
+                        (float *)out->ptr,
+                        w_q3k,
+                        xq,
+                        xscale,
+                        in_dim,
+                        out_dim,
+                        super_per_row);
+                return cuda_ok(cudaGetLastError(), "matmul_q3k warp launch");
+            }
+        }
         if (use_dp4a && getenv("DS4_CUDA_Q3_DECODE") != NULL) {
             const unsigned char *w_q3 = cuda_q3_from_q8_ptr(model_map, weight_offset,
                                                             weight_bytes, in_dim, out_dim);
