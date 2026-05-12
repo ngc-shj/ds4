@@ -1,11 +1,32 @@
 # DS4 on NVIDIA GB10 — Fork Journey
 
+*Last updated: 2026-05.*
+
 This fork of [`antirez/ds4`](https://github.com/antirez/ds4) is a sustained
 effort to make DeepSeek V4 Flash run well on NVIDIA Grace+Blackwell
 hardware (GB10 / DGX Spark, sm_121), and to keep around the small,
 hardware-specific performance work that does not belong upstream.  The
 narrative below tracks what was tried, what worked, and — perhaps more
 usefully — what didn't.
+
+## Context
+
+- **Hardware**: NVIDIA GB10 / DGX Spark.  Grace ARM CPU + Blackwell GPU
+  (sm_121), unified-memory architecture with a single ~128 GiB pool
+  shared between CPU and GPU.  All numbers in this document are from one
+  GB10 box.
+- **Model**: `gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf`,
+  the 2-bit chat-tuned DS4-Flash quant (referred to as "chat-v2 GGUF"
+  below).  The 86.7 GiB Q2 GGUF in Chapter 1's numbers is the earlier
+  release used during the original CUDA port.
+- **Naming**: upstream renamed the project to *DwarfStar 4* in `ae302c2`;
+  this document keeps the original "DS4" name for continuity with the
+  existing branch names, binaries, headers, and public API.
+- **Throughput numbers**: from `ds4-bench --ctx-start 2048 --ctx-max
+  2048 --gen-tokens 50 --cuda --prompt-file bench/promessi_sposi.txt`
+  (or the analogous chat CLI run for the original port), captured during
+  the work that produced each chapter.  Treat as
+  order-of-magnitude; re-bench before drawing fresh conclusions.
 
 ## At a glance
 
@@ -53,24 +74,23 @@ The port went in roughly this order:
 3. **Five rounds of numerical accuracy fixes**, all bisected against
    the CPU reference with `--metal-graph-test` and per-tensor `dump_diff`:
 
-   | Round | What broke | Effect on `logits` diff |
-   | --- | --- | ---: |
-   | 1 | `sqrt(softplus())` router probs / F32 attention sinks / HC-expand split | 40.6 → 4.5 |
-   | 2 | Hash-mode router used uniform 1/6 weights | 4.5 → 0.18 |
-   | 3 | `cudaHostRegisterDefault` over `ReadOnly` for the mmap (perf, not accuracy) | unchanged |
-   | 4 | Compressor prefill missing post-emit RMSNorm + RoPE pass; FP8 KV missing per-64-element power-of-2 scaling | story prompts ~30 tokens stable |
-   | 5 | `prefill_static_mixed` comp visibility — match Metal's `n_visible = (q+1) / ratio` | story prompts ~50 tokens stable |
+   | Round | Bug | Observable effect |
+   | --- | --- | --- |
+   | 1 | `sqrt(softplus())` router probs / F32 attention sinks / HC-expand split | `logits` diff 40.6 → 4.5 |
+   | 2 | Hash-mode router used uniform 1/6 weights instead of `sqrt(softplus())` renormalised | `logits` diff 4.5 → 0.18; multilingual semi-coherent text |
+   | 3 | `hc_expand_(add_)split` dispatched with `grid.y = nh = 4`, silently dropped batched-prefill rows past row 4 (`layer 1 raw_kv row 4..7` was BLAST) | greedy `-p "Hello"` reaches a normal assistant reply |
+   | 4 | `compressor_prefill` was missing the post-emit RMSNorm + RoPE pass; FP8 KV missing per-64-element power-of-2 scaling | story prompts stable to ~30 tokens |
+   | 5 | `prefill_static_mixed` comp visibility — match Metal's `n_visible = (q+1) / ratio` | story prompts stable to ~50 tokens |
 
-   Diagnostic tools introduced along the way (`a3e7f47`,
-   `b8e1173`, `2408546`) — per-layer CPU/CUDA diff, prefill+decode
-   bisection harness, Metal-vs-CUDA binary tensor dump — outlived the
-   branch and are still the fastest way to localise a kernel-level
-   correctness regression.
+   The pattern recurs: a Metal idiom (`grid.y = nh`, FP8 with a single
+   global scale, a visibility cutoff hard-coded one way) needs
+   re-thinking under CUDA's launch geometry or numeric envelope.
 
-4. **The compressor_prefill grid-y bug** (`9c136e0`).  `hc_expand_*`
-   kernels dispatched with `grid.y = nh = 4`, which silently dropped
-   most batched prefill rows; classic example of a Metal idiom that
-   needed re-thinking in CUDA's launch geometry.
+   Diagnostic tools introduced along the way (`a3e7f47`, `b8e1173`,
+   `2408546`) — per-layer CPU/CUDA diff, prefill+decode bisection
+   harness, Metal-vs-CUDA binary tensor dump — outlived the branch and
+   are still the fastest way to localise a kernel-level correctness
+   regression.
 
 What this chapter cost was buying every layer of the engine, line by
 line, on a different GPU vendor.  What it bought was the working
@@ -175,11 +195,13 @@ software batching is required.
 
 ### Phase 0 (chunked-prefill proxy)
 
-Forcing `DS4_METAL_RESUME_PREFILL_MIN=1` makes the existing chunked
-prefill encoder process `N` consecutive tokens of one session
-together, sharing weight loads.  This is *not* the target workload (it
-assumes a single growing context), but it bounds the achievable per-token
-speedup:
+Before implementing anything, measure the ceiling.  Setting
+`DS4_METAL_RESUME_PREFILL_MIN=1` on `perf/q4-only` forces the chunked
+prefill encoder to process `N` consecutive tokens of **one** session
+together (the existing wide-scratch path), which is the closest existing
+code to a weight-shared batched decode.  This is *not* the target
+workload — it assumes a single growing context, with all N tokens
+sharing one KV cache — but it bounds the achievable per-token speedup:
 
 | N | per-token (ms) | ×N=1 |
 | ---: | ---: | ---: |
@@ -190,8 +212,9 @@ speedup:
 | 32 | 11  | 4.8 |
 
 So the upper bound for ideal weight-shared decode is ~2.5× at N=8,
-~4.8× at N=32.  Our target for *N independent sessions* sits below
-this because attention can't share KV across sessions.
+~4.8× at N=32.  Our target for *N independent sessions* sits **below**
+this because each session has its own KV cache, so attention can't
+share K/V reads across sessions even if every dense matmul does.
 
 ### Phases 1a-1c (what shipped)
 
@@ -284,6 +307,35 @@ concrete 5-step shape-1 checklist (engine-level batched scratch, split
 point in `metal_graph_encode_decode_layer`, kernel-level fallbacks if
 cuBLAS f16 regresses again).
 
+## Current focus
+
+What anyone picking the fork up today should look at first, in order of
+expected payoff:
+
+1. **Bring `perf/q4-only` into the merge path.**  The +52.5 % decode
+   win is real and the two commits are small.  No design questions left
+   — main blocker is just deciding whether to upstream or to keep as a
+   GB10 carry.
+2. **Resume `perf/batched-decode-poc` from
+   [`NOTES.md` § "Concrete next-session checklist"](https://github.com/ngc-shj/ds4/blob/perf/batched-decode-poc/NOTES.md).**
+   The smallest non-trivial slice is to stage the FFN shared expert
+   `ffn_norm` into an engine-level batched scratch, run one batched
+   gate/up matmul, and scatter back.  If that one matmul improves
+   aggregate t/s at N = 4, broaden to attn_q_a / attn_q_b /
+   attn_output / shared_down.  If it doesn't, the cuBLAS f16 path is
+   genuinely useless for this shape and the only way through is a
+   custom Q4 batched-pair kernel that keeps `grid.y` non-trivial.
+3. **Per-row attention KV dispatch.**  Independent of (2), `attention`
+   itself runs serially per session because each KV cache lives at a
+   different VA.  Passing `const float * const *kv_ptrs` into a batched
+   attention kernel that selects by `blockIdx.y` is the canonical
+   shape; the `__constant__ g_batch_args` from Phase 1b is already in
+   place for the per-row `pos` / `n_raw` / `raw_start` fields.
+
+Avoid re-running the experiments listed in
+[`NOTES.md` § "What did NOT help"](https://github.com/ngc-shj/ds4/blob/perf/batched-decode-poc/NOTES.md)
+on this hardware without a new theory of why they would now succeed.
+
 ## Lessons that generalise
 
 A few patterns recur across the branches:
@@ -311,10 +363,18 @@ A few patterns recur across the branches:
 
 ## Pointers
 
-- Bring-up / numerical bisection: `PORT_CUDA.md` on
-  `cuda-gb10-backend`.
-- Live perf branch: `perf/q4-only` (decode 18.8 t/s).
-- Batched decode work-in-progress: `perf/batched-decode-poc`, with the
-  full ledger in `NOTES.md` on that branch.
-- Dormant reference: `perf/cuda-graph-wip` (CUDA Graph + `g_step_args`
-  pattern).
+- Bring-up / numerical bisection on this hardware:
+  [`PORT_CUDA.md`](https://github.com/ngc-shj/ds4/blob/cuda-gb10-backend/PORT_CUDA.md)
+  on `cuda-gb10-backend`.
+- Live perf branch (decode 18.8 t/s):
+  [`perf/q4-only`](https://github.com/ngc-shj/ds4/tree/perf/q4-only).
+- Batched decode work-in-progress with its full ledger:
+  [`perf/batched-decode-poc`](https://github.com/ngc-shj/ds4/tree/perf/batched-decode-poc)
+  + [`NOTES.md`](https://github.com/ngc-shj/ds4/blob/perf/batched-decode-poc/NOTES.md)
+  on that branch.
+- Dormant CUDA-Graph reference (`g_step_args` pattern):
+  [`perf/cuda-graph-wip`](https://github.com/ngc-shj/ds4/tree/perf/cuda-graph-wip).
+- Upstream:
+  [`antirez/ds4`](https://github.com/antirez/ds4).  The fork tracks
+  upstream `main`; everything in this document is on top of `ae302c2`
+  ("Project renamed to DwarfStar 4") or earlier.
