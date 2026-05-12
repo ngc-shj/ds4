@@ -17565,39 +17565,91 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
-/* Continuous batched decode (Phase 1 PoC scaffold).
+/* Continuous batched decode (Phase 1 PoC).
  *
- * This is the minimal API entry point.  v0 implementation: serial fallback
- * that calls ds4_session_eval() for each non-NULL slot and copies logits
- * back from the underlying session.  Provides a correct baseline against
- * which a true batched path can later be benchmarked.
+ * Phase 1a (this commit): submit-amortized serial.  When every non-NULL slot
+ * is a GPU session sharing the same engine, encode all N forwards onto the
+ * default CUDA stream back-to-back, sync once, then read each session's
+ * logits.  This eliminates N-1 cudaDeviceSynchronize calls and N-1 blocking
+ * D2H copies that the per-session serial path would otherwise incur.  No
+ * kernel-level batching yet -- weights are still re-traversed per session,
+ * so this is sync-amortization only.
  *
- * TODO (future work to land here):
- *   1. Per-row state arrays in __constant__ memory (positions, raw_row,
- *      n_comp, comp_row, emit, token).  Today's g_step_args refactor in
- *      perf/cuda-graph-wip is single-slot; arrayize it.
- *   2. Modify the ~30 g_step_args.<field> readers in ds4_cuda.cu to index
- *      by blockIdx.y (or analogous batch-row dispatch).
- *   3. Add Q4 batched matmul kernels (preq_batch_warp8 variants for the
- *      single / pair / hc_expand / grouped paths) so the n_tok > 1 path
- *      stays on Q4 instead of falling back to Q8.
- *   4. Per-row attention KV: each row dispatches to its session's own
- *      layer_raw_cache slab.  Either pass a `const float * const *` array
- *      of N KV ptrs, or route through a paged-KV pool.
- *   5. Wire the new batched layer encoder through
- *      metal_graph_encode_layer_batch() with per-row pos/RoPE.
+ * Phase 1b/c (future commits): __constant__ batch-args plus weight-shared
+ * matmul / MoE kernels with grid.y = batch row, then per-row attention/RoPE
+ * dispatch into per-session KV slabs.  At that point this entry point will
+ * route to metal_graph_encode_token_raw_swa_batched() instead of looping the
+ * per-session encoder.
  *
- * Phase 0 microbench (chunked-prefill proxy on a single growing context)
- * showed a per-token speedup ceiling of 2.5x at N=8 and 4.8x at N=32 on
- * GB10 / DGX Spark.  Realistic post-implementation target for
- * truly-independent N sessions: ~2-3x aggregate at N=8-16 (attention and
- * per-session overhead do not amortize).
+ * MTP drafting is intentionally not run for batched calls (Phase 1).
  *
  * Returns 0 on success, nonzero on first error (with `err` filled if
  * errlen > 0). */
 int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
                                     char *err, size_t errlen) {
     if (!slots || n <= 0) return 0;
+
+#ifndef DS4_NO_GPU
+    /* Decide whether the GPU sync-amortized path applies. */
+    bool gpu_fast = true;
+    ds4_engine *engine = NULL;
+    int n_active = 0;
+    for (int i = 0; i < n; i++) {
+        ds4_session *s = slots[i].session;
+        if (!s) continue;
+        if (ds4_session_is_cpu(s)) { gpu_fast = false; break; }
+        if (!engine) engine = s->engine;
+        else if (s->engine != engine) { gpu_fast = false; break; }
+        n_active++;
+    }
+    if (gpu_fast && engine && n_active > 1) {
+        bool ok = ds4_gpu_begin_commands() != 0;
+        for (int i = 0; ok && i < n; i++) {
+            ds4_session *s = slots[i].session;
+            if (!s) continue;
+            /* allow_split_flush=false: the in-forward flush is a mid-token
+             * cudaDeviceSynchronize on the CUDA backend, which would defeat
+             * the whole purpose of batching submissions. */
+            ok = metal_graph_encode_token_raw_swa(&s->graph,
+                                                  &engine->model,
+                                                  &engine->weights,
+                                                  slots[i].token,
+                                                  (uint32_t)s->checkpoint.len,
+                                                  /*need_logits=*/true,
+                                                  /*allow_split_flush=*/false);
+            if (!ok) {
+                snprintf(err, errlen,
+                         "Metal batched encode failed for slot %d", i);
+                s->checkpoint_valid = false;
+            }
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) {
+            for (int i = 0; i < n; i++) {
+                ds4_session *s = slots[i].session;
+                if (!s) continue;
+                if (ds4_gpu_tensor_read(s->graph.logits, 0, s->logits,
+                                        (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
+                    snprintf(err, errlen,
+                             "Metal logits readback failed for slot %d", i);
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+                token_vec_push(&s->checkpoint, slots[i].token);
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                if (slots[i].logits) {
+                    memcpy(slots[i].logits, s->logits,
+                           (size_t)DS4_N_VOCAB * sizeof(float));
+                }
+            }
+            return 0;
+        }
+        return 1;
+    }
+#endif
+
+    /* Serial fallback: CPU sessions, mixed engines, or n_active <= 1. */
     for (int i = 0; i < n; i++) {
         ds4_batch_slot *slot = &slots[i];
         if (!slot->session) continue;
@@ -17605,9 +17657,6 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
             return 1;
         }
         if (slot->logits) {
-            /* Copy this session's last-decode logits out so the caller can
-             * sample independently.  ds4_session_eval already writes the
-             * session-internal logits buffer; expose it. */
             memcpy(slot->logits, slot->session->logits,
                    (size_t)DS4_N_VOCAB * sizeof(float));
         }
