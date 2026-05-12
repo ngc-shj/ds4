@@ -135,6 +135,35 @@ N ≤ DS4_BATCH_INTERLEAVED_MAX (= 8) and falls back to the older
 sync-amortized per-session encoder loop for higher N, which itself is
 still better than the original per-call sync.
 
+### L2 persistence policy (tried, reverted)
+
+`cudaDeviceGetAttribute(cudaDevAttrL2CacheSize)` reports GB10's L2 at
+**24 MiB**, with a 18 MiB max-persisting cap (75 %).  Hypothesis: the
+per-layer interleaved L2-reuse win could be amplified by explicitly
+arming `cudaStreamAttributeAccessPolicyWindow` on the layer's hot
+weight range (FFN shared expert ~22 MiB).
+
+Result: clear regression.
+
+| N | L2 persist OFF (default) | L2 persist ON | Δ |
+|---|-------------------------:|--------------:|---|
+| 2 | 19.31 | 13.55 | -30 % |
+| 4 | 14.06 | 13.94 | flat |
+| 8 | 17.30 | (crash / no output) | bad |
+
+Diagnosis: 18 MiB pinned for FFN weights leaves only ~6 MiB of L2 for
+*everything else* in the decode step -- per-session scratch
+(g->cur_hc, g->attn_norm, g->qr, g->q, etc.), other dense weight
+matrices (attn_q_a/b, attn_output_a/b, ~5-10 MiB), `cuda_tmp_alloc`
+prequant buffers, and routing tables.  The cache becomes hostile to
+*everything that isn't the FFN shared expert*, so net throughput
+falls.
+
+GB10's L2 is genuinely too small for any "pin one matrix, let
+everything else fight over scraps" strategy.  The natural L2 reuse
+the per-layer interleaved encoder gets *for free* is already close to
+optimal for this cache footprint.
+
 ### Layer-internal FFN batching (still not enough on its own)
 
 The infrastructure also ships an opt-in (`DS4_CUDA_BATCHED_SHARED_FFN=1`)
