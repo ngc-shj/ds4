@@ -17602,7 +17602,28 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
         else if (s->engine != engine) { gpu_fast = false; break; }
         n_active++;
     }
-    if (gpu_fast && engine && n_active > 1) {
+    if (gpu_fast && engine && n_active > 1 && n_active <= DS4_BATCH_MAX) {
+        /* Phase 1b: upload per-row dynamic state to __constant__ memory so
+         * future batched kernels can read it via blockIdx.y dispatch.  Only
+         * token / pos / n_active are filled here; later commits populate the
+         * other fields as kernels start reading them. */
+        struct ds4_batch_step_args bargs;
+        memset(&bargs, 0, sizeof(bargs));
+        {
+            int row = 0;
+            for (int i = 0; i < n; i++) {
+                ds4_session *s = slots[i].session;
+                if (!s) continue;
+                bargs.token[row] = (uint32_t)slots[i].token;
+                bargs.pos[row]   = (uint32_t)s->checkpoint.len;
+                row++;
+            }
+            bargs.n_active = (uint32_t)n_active;
+        }
+        if (ds4_gpu_set_batch_args(&bargs) == 0) {
+            snprintf(err, errlen, "Metal batch args upload failed");
+            return 1;
+        }
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < n; i++) {
             ds4_session *s = slots[i].session;

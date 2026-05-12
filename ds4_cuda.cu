@@ -67,6 +67,28 @@ typedef struct {
 
 #include "ds4_iq2_tables_cuda.inc"
 
+/* Continuous batched decode -- per-step row arguments.
+ *
+ * This struct MUST stay binary-compatible with struct ds4_batch_step_args
+ * in ds4_gpu.h.  We redefine it here rather than include the shared header
+ * because ds4_cuda.cu writes its C-ABI function declarations directly with
+ * extern "C" and does not currently pull in ds4_gpu.h.  The array length
+ * literal 32 must equal DS4_BATCH_MAX in ds4_gpu.h. */
+struct ds4_batch_step_args {
+    uint32_t token       [32];
+    uint32_t pos         [32];
+    uint32_t raw_row     [32];
+    uint32_t n_raw       [32];
+    uint32_t raw_start   [32];
+    uint32_t n_comp      [32];
+    uint32_t n_index_comp[32];
+    uint32_t comp_row    [32];
+    uint8_t  emit        [32];
+    uint32_t n_active;
+    uint32_t top_k;
+};
+__constant__ struct ds4_batch_step_args g_batch_args;
+
 static const void *g_model_host_base;
 static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
@@ -1584,6 +1606,12 @@ extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_end_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "end commands"); }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+
+extern "C" int ds4_gpu_set_batch_args(const struct ds4_batch_step_args *args) {
+    if (!args) return 0;
+    return cuda_ok(cudaMemcpyToSymbol(g_batch_args, args, sizeof(*args)),
+                   "batch args upload");
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;

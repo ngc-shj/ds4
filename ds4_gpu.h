@@ -35,6 +35,41 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* =========================================================================
+ * Continuous batched decode -- per-step row arguments.
+ * =========================================================================
+ *
+ * When the batched decode forward (Phase 1b+) processes N independent
+ * sessions in a single launch, per-row dynamic state (positions, KV row
+ * indices, indexer top-K, etc.) is uploaded once per token into __constant__
+ * memory and read by batched kernels via blockIdx.y (or analogous batch-row
+ * dispatch).  Keeping this state in __constant__ keeps the kernel parameter
+ * list small even at N = DS4_BATCH_MAX, and a single 16-bit sized struct
+ * fits comfortably in CUDA's 64 KB __constant__ window.
+ *
+ * Phase 1b ships the struct + uploader only; no kernel reads from it yet.
+ * Later commits flip readers one at a time (output head first, then dense
+ * matmul, then attention/RoPE/KV-store).  Requests with n > DS4_BATCH_MAX
+ * fall back to the serial loop.
+ */
+#define DS4_BATCH_MAX 32
+
+struct ds4_batch_step_args {
+    uint32_t token       [DS4_BATCH_MAX];  /* token being decoded at this row */
+    uint32_t pos         [DS4_BATCH_MAX];  /* rope_tail pos0 */
+    uint32_t raw_row     [DS4_BATCH_MAX];  /* destination row in rolling raw KV */
+    uint32_t n_raw       [DS4_BATCH_MAX];  /* populated raw rows for attention */
+    uint32_t raw_start   [DS4_BATCH_MAX];  /* attention_decode rolling raw_start */
+    uint32_t n_comp      [DS4_BATCH_MAX];  /* populated compressed rows */
+    uint32_t n_index_comp[DS4_BATCH_MAX];  /* populated indexer-compressed rows */
+    uint32_t comp_row    [DS4_BATCH_MAX];  /* compressor destination slot */
+    uint8_t  emit        [DS4_BATCH_MAX];  /* 1 if this token must emit a compressed row */
+    uint32_t n_active;                     /* number of live rows in this batch */
+    uint32_t top_k;                        /* indexer top-K (uniform across rows) */
+};
+
+int ds4_gpu_set_batch_args(const struct ds4_batch_step_args *args);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
