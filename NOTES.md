@@ -514,6 +514,64 @@ Re-open when: Option H (Blackwell INT4 MMA) is built first and shows
 a real dense-matmul speedup at decode shape — that becomes the
 substrate any new low-bit packing has to plug into.
 
+### 9. INT8 tensor-core GEMV (Option H, decode-shape) — dead-end
+
+Paper analysis flagged this as risky going in: the matmul shape at
+n_tok = 1 is `[out_dim] = W[out_dim, in_dim] × x[in_dim]`, a pure
+GEMV.  WMMA `m16n16k16 INT8` requires the result to be `16 × N`, with
+N = 16; for a single activation column only 1 of the 16 N slots is
+useful so 15/16 of every tensor-core call is wasted.  Even at the
+best-case ratio TC INT8 ≈ 4× dp4a on Blackwell, the effective rate
+becomes `1/16 × 4 = 0.25× dp4a`, and the kernel additionally loses
+Q4_0's HBM advantage because WMMA INT8 reads full Q8_0 weights
+(2× the HBM of the Q4 path).
+
+Empirical PoC (`matmul_q8_0_wmma_int8_kernel` gated on
+`DS4_CUDA_TC_DECODE=1`): one warp per 16 output rows, weights staged
+into 16-byte-aligned shared memory (the on-disk Q8_0 layout has 2-byte
+fp16 scale + 32 int8 values per 34-byte block, so the int8 data is
+only 2-byte aligned and can't feed WMMA directly), activation
+replicated across N=16, two WMMA passes per Q8 block, per-row scale
+applied on column-0 of the staged INT32 c_frag.
+
+Bench (ctx=2048 gen=50 N=1, three runs):
+
+  - TC INT8: 7.72 / 9.19 / 11.11 t/s  (median 9.19)
+  - Q4 dp4a baseline: 17.92 t/s
+  - Regression: **-49 %**
+
+Two stacked penalties show up: (a) the predicted 1/16 utilization
+penalty on the TC compute path itself; (b) the byte-by-byte
+shared-memory staging of unaligned Q8_0 weight bytes (8 sequential
+uint8 loads per lane) doesn't coalesce as well as the Q4 path's
+`__byte_perm` decode does.  Quality is preserved (greedy "Paris" emits
+correctly) because TC INT8 keeps the full Q8 precision — only the
+compute path is different.
+
+A non-decode-shape TC path is gated by upstream work:
+
+  - Increase the n_tok dimension actually fed to the matmul.  At
+    n_tok ≥ 8 the TC utilization approaches 50 % and dp4a no longer
+    wins on compute.  In the batched API path the natural lever is
+    cross-session batching, but the current encoder calls each layer
+    matmul with `n_tok = 1` per session and the GPU's L2 (24 MiB) is
+    too small for the L2-reuse trick to compound past N = 8.  The
+    "real lever" section above already calls out the layer-encoder
+    refactor needed; both that refactor AND a TC kernel are required
+    before any 3-bit / INT4 packing can land usefully.
+  - Or use INT4 wmma `m8n8k32`: 1/8 instead of 1/16 utilization plus
+    nominally 2× INT8 TC throughput buys back to roughly break-even
+    with dp4a, still no win.  Mixed-precision INT4×INT8 wmma isn't
+    available via the C++ API on sm_121 (CUDA 13.0) — it requires
+    inline PTX `mma.sync` and a custom INT4 weight format.  Wouldn't
+    pay before the cross-session batching is fixed.
+
+Re-open when: (a) the layer encoder is refactored so per-layer
+matmuls run at n_tok ≥ 4 per call (cross-session aggregation), AND
+(b) the batched path is stable past N = 8.  Until both hold, no
+tensor-core variant at this matmul shape can compete with the Q4
+dp4a baseline.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
@@ -532,6 +590,9 @@ Already shown not to help on this hardware / model:
 - Q3_K_S with sub-block scales but simple (non-refined) sub-scale
   derivation (quality still collapses to broken tokens AND decode is
   still compute-bound, -19.5 % at N=1 — see section 8)
+- INT8 tensor-core GEMV at decode shape (1/16 N utilization × Q8 HBM
+  regression = -49 % vs Q4 dp4a baseline; pre-gated on cross-session
+  batching + N ≥ 8 stability — see section 9)
 
 ## What is committed and ready for next session
 

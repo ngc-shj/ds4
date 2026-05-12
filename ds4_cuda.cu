@@ -2494,6 +2494,112 @@ __global__ static void matmul_q8_0_preq_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+/* Q8_0 GEMV via INT8 WMMA m16n16k16.  Each warp computes 16 output rows.
+ * The B matrix slot (16 N columns) is wasted at decode shape (n_tok=1)
+ * because only column 0 is meaningful -- this kernel exists to
+ * EMPIRICALLY validate the paper analysis that decode-shape GEMV cannot
+ * benefit from tensor cores on GB10.  Each Q8_0 block (32 K values) is
+ * processed by 2 WMMA passes (k=16+16); per-row per-block scaling is
+ * applied via a shared-memory staged store of the int32 c_frag.
+ *
+ * Gated on DS4_CUDA_TC_DECODE=1.  Expected outcome (per analysis): no
+ * win or regression vs Q4 dp4a baseline; this kernel will join the NOTES
+ * section 9 documented dead-end once measured. */
+__global__ static void matmul_q8_0_wmma_int8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    (void)in_dim;
+    using namespace nvcuda::wmma;
+    const uint64_t tile_row = (uint64_t)blockIdx.x * 16u;
+    if (tile_row >= out_dim) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    /* Reject too-small out_dim tails (would need bounds checks). */
+    if (tile_row + 16u > out_dim) return;
+
+    /* Weight bytes in the Q8_0 layout sit at offset 2 from each 34-byte
+     * block (after the fp16 scale), so the raw weight pointers are only
+     * 2-byte aligned -- WMMA INT8 requires 16-byte alignment for both
+     * matrix operands.  Stage weights into a 16-byte-aligned shared-mem
+     * buffer per K iteration. */
+    __shared__ int8_t a_smem[16 * 16];
+    __shared__ int8_t b_smem[16 * 16];
+    __shared__ int    c_smem[16 * 16];
+
+    float row_acc = 0.0f;
+
+    fragment<matrix_a, 16, 16, 16, signed char, row_major> a_frag;
+    fragment<matrix_b, 16, 16, 16, signed char, col_major> b_frag;
+    fragment<accumulator, 16, 16, 16, int> c_frag;
+
+    const unsigned char *tile_w = w + tile_row * blocks * 34u;
+
+    for (uint64_t block_id = 0; block_id < blocks; block_id++) {
+        fill_fragment(c_frag, 0);
+        const unsigned char *block_w = tile_w + block_id * 34u;
+        const int8_t *block_act = xq + block_id * 32u;
+
+        /* Two K-iterations per Q8 block. */
+        #pragma unroll
+        for (int k_iter = 0; k_iter < 2; k_iter++) {
+            /* Stage 16 rows × 16 int8 values into a_smem.  256 bytes total
+             * = 32 lanes × 8 bytes.  Lane k loads 8 bytes from row k/2
+             * column (k%2)*8 -- a uint64 copy.  Weight pointers are only
+             * 2-byte aligned, so an unaligned uint64 read is technically
+             * UB on the host; GPU global memory tolerates it via the
+             * memory subsystem's byte-level access. */
+            const uint64_t row_off = (block_id * 34u) + 2u + (uint64_t)k_iter * 16u;
+            const int8_t *src_base = (const int8_t *)tile_w + row_off;
+            const uint64_t row_stride = blocks * 34u;
+            const int row_lane = (int)lane >> 1;
+            const int col_lane = ((int)lane & 1) * 8;
+            /* Byte-by-byte copy to avoid alignment issues (8 bytes via
+             * 8 uint8 reads).  Slightly more instructions than a uint64
+             * load but correct for the 2-byte-aligned source. */
+            #pragma unroll
+            for (int b = 0; b < 8; b++) {
+                a_smem[row_lane * 16 + col_lane + b] =
+                    src_base[(uint64_t)row_lane * row_stride + col_lane + b];
+            }
+            __syncwarp();
+            load_matrix_sync(a_frag, a_smem, 16);
+
+            /* Replicate activation [16 values] across 16 N columns. */
+            const int8_t *act = block_act + k_iter * 16;
+            if (lane < 16) {
+                int8_t v_act = act[lane];
+                #pragma unroll
+                for (int n = 0; n < 16; n++) {
+                    b_smem[n * 16 + lane] = v_act;
+                }
+            }
+            __syncwarp();
+            load_matrix_sync(b_frag, b_smem, 16);
+            mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+
+        /* Stage c_frag, then apply per-row weight scale and per-block
+         * activation scale on column 0 only. */
+        store_matrix_sync(c_smem, c_frag, 16, mem_row_major);
+        __syncwarp();
+        if (lane < 16) {
+            int int_sum = c_smem[lane * 16 + 0];
+            const __half *scale_h = (const __half *)(w + (tile_row + lane) * blocks * 34u + block_id * 34u);
+            float w_scale = __half2float(*scale_h);
+            row_acc += w_scale * xscale[block_id] * (float)int_sum;
+        }
+        __syncwarp();
+    }
+
+    if (lane < 16) {
+        out[tile_row + lane] = row_acc;
+    }
+}
+
 __global__ static void matmul_q8_0_preq_warp8_kernel(
         float *out,
         const unsigned char *w,
@@ -6255,6 +6361,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_kernel_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
+        if (getenv("DS4_CUDA_TC_DECODE") != NULL && (out_dim % 16u) == 0 && (in_dim % 32u) == 0) {
+            matmul_q8_0_wmma_int8_kernel<<<((unsigned)out_dim + 15u) / 16u, 32, 0, g_kernel_stream>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq,
+                    xscale,
+                    in_dim,
+                    out_dim,
+                    blocks);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 wmma int8 launch");
+        }
         if (use_dp4a && getenv("DS4_CUDA_Q3K_DECODE") != NULL && (in_dim % 256u) == 0) {
             const unsigned char *w_q3k = cuda_q3k_from_q8_ptr(model_map, weight_offset,
                                                               weight_bytes, in_dim, out_dim);
