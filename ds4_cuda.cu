@@ -174,6 +174,21 @@ struct cuda_q4_range {
     unsigned char *device_ptr;
 };
 
+/* Experimental Q3_0 dense matmul cache.  Per 32-value block: 2 bytes of
+ * fp16 scale + 12 bytes of bit-plane packed 3-bit signed values
+ * (two's-complement, range [-4, +3]).  Split-row layout: all scales
+ * first, then all bit-plane bytes.  18 -> 14 bytes/block = 78% of Q4_0
+ * HBM, 41% of Q8_0 HBM.  Quality is more aggressive than Q4: gated on
+ * DS4_CUDA_Q3_DECODE. */
+struct cuda_q3_range {
+    const void *host_base;
+    uint64_t offset;
+    uint64_t weight_bytes_src;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    unsigned char *device_ptr;
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -183,12 +198,15 @@ static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<cuda_q4_range> g_q4_ranges;
 static std::unordered_map<uint64_t, size_t> g_q4_by_offset;
+static std::vector<cuda_q3_range> g_q3_ranges;
+static std::unordered_map<uint64_t, size_t> g_q3_by_offset;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_q4_bytes;
+static uint64_t g_q3_bytes;
 static uint64_t g_model_load_progress_next;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
@@ -733,6 +751,112 @@ static const unsigned char *cuda_q4_from_q8_ptr(
         fprintf(stderr, "ds4: CUDA cached q4 %.2f MiB (total %.2f GiB)\n",
                 (double)out_bytes / 1048576.0,
                 (double)g_q4_bytes / 1073741824.0);
+    }
+    return dev;
+}
+
+/* Q8_0 -> Q3_0 conversion.  Per 32-value block: rescale so block max(|x|)
+ * maps to 3, round each value to int in [-4, +3] (3-bit two's complement),
+ * then emit 3 bit-planes of 32 bits each (plane k = bit k of every value)
+ * to enable efficient dp4a-style decode without per-element bit shifts in
+ * the matmul kernel. */
+__global__ static void q8_to_q3_convert_kernel(
+        unsigned char *dst,
+        const unsigned char *src,
+        uint64_t blocks_per_row,
+        uint64_t total_blocks) {
+    const uint64_t b_global = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (b_global >= total_blocks) return;
+    const uint64_t row = b_global / blocks_per_row;
+    const uint64_t b   = b_global % blocks_per_row;
+    const unsigned char *sblk = src + b_global * 34u;
+    const uint64_t row_base = row * blocks_per_row * 14u;
+    __half *dscale = (__half *)(dst + row_base + b * 2u);
+    unsigned char *dplanes = dst + row_base + blocks_per_row * 2u + b * 12u;
+
+    __half sh_old = *(const __half *)sblk;
+    float  s_old  = __half2float(sh_old);
+    const int8_t *qs = (const int8_t *)(sblk + 2);
+    int max_abs = 0;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        int v = qs[i];
+        int a = v < 0 ? -v : v;
+        if (a > max_abs) max_abs = a;
+    }
+    /* Map block's max(|q8|) to 3 (the largest non-negative 3-bit value)
+     * so the rescaled distribution mostly lives in [-3, +3] with at most
+     * a single saturated -4 per block.  Matches Q4_0's "max -> 7" scheme
+     * adjusted for the narrower range. */
+    float s_new = (max_abs > 0) ? (s_old * (float)max_abs / 3.0f) : 0.0f;
+    *dscale = __float2half(s_new);
+    const float inv = (max_abs > 0) ? (3.0f / (float)max_abs) : 0.0f;
+    uint32_t p0 = 0u, p1 = 0u, p2 = 0u;
+    #pragma unroll
+    for (int i = 0; i < 32; i++) {
+        int q = __float2int_rn((float)qs[i] * inv);
+        if (q >  3) q =  3;
+        if (q < -4) q = -4;
+        uint32_t e = (uint32_t)(q & 0x7);
+        p0 |= ((e >> 0) & 1u) << i;
+        p1 |= ((e >> 1) & 1u) << i;
+        p2 |= ((e >> 2) & 1u) << i;
+    }
+    uint32_t *dst_planes = (uint32_t *)dplanes;
+    dst_planes[0] = p0;
+    dst_planes[1] = p1;
+    dst_planes[2] = p2;
+}
+
+/* Lazy-convert + cache: Q8_0 weight bytes -> Q3_0 device cache.  Mirrors
+ * cuda_q4_from_q8_ptr; only invoked when the env var gates the Q3 path. */
+static const unsigned char *cuda_q3_from_q8_ptr(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t weight_bytes_q8,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    auto exact = g_q3_by_offset.find(offset);
+    if (exact != g_q3_by_offset.end()) {
+        const cuda_q3_range &r = g_q3_ranges[exact->second];
+        if (r.host_base == model_map && r.weight_bytes_src == weight_bytes_q8 &&
+            r.in_dim == in_dim && r.out_dim == out_dim) {
+            return r.device_ptr;
+        }
+    }
+    const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes_q8, "q8_0_for_q3");
+    if (!q8) return NULL;
+
+    const uint64_t blocks_per_row = (in_dim + 31u) / 32u;
+    const uint64_t total_blocks   = blocks_per_row * out_dim;
+    const uint64_t out_bytes      = total_blocks * 14u;
+    unsigned char *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)out_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA q3 cache alloc failed (%.2f MiB): %s\n",
+                (double)out_bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    const uint32_t threads = 256;
+    const uint64_t grid    = (total_blocks + threads - 1) / threads;
+    q8_to_q3_convert_kernel<<<(unsigned)grid, threads, 0, g_kernel_stream>>>(
+        dev, (const unsigned char *)q8, blocks_per_row, total_blocks);
+    if (!cuda_ok(cudaGetLastError(), "q8->q3 convert launch")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    if (!cuda_ok(cudaStreamSynchronize(g_kernel_stream), "q8->q3 convert sync")) {
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    g_q3_ranges.push_back({model_map, offset, weight_bytes_q8, in_dim, out_dim, dev});
+    g_q3_by_offset[offset] = g_q3_ranges.size() - 1u;
+    g_q3_bytes += out_bytes;
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA cached q3 %.2f MiB (total %.2f GiB)\n",
+                (double)out_bytes / 1048576.0,
+                (double)g_q3_bytes / 1073741824.0);
     }
     return dev;
 }
@@ -2269,6 +2393,88 @@ __device__ __forceinline__ static int32_t q4_block_dot(const uint8_t *packed, co
     return dot;
 }
 
+
+/* Q3_0 helper: unpack 4 consecutive 3-bit values from bit-planes into a
+ * dp4a-ready int32 of 4 sign-extended int8 bytes.  bit_base is the lowest
+ * bit position to read; we read bits [bit_base, bit_base+3] from each of
+ * the three planes.  Values are 3-bit two's-complement (range [-4, +3])
+ * sign-extended to int8 via the `signbit * 0x1E` carry-safe trick (an
+ * 0x04 byte multiplied by 0x1E becomes 0xF8 within byte; OR'ing it onto
+ * the 3-bit value extends the sign to bits 3..7).
+ *
+ * The intermediate `un` packs 4 already-3-bit values into byte 0..3 of an
+ * int32.  Each value's bit 0 comes from plane0 at the corresponding bit
+ * position, bit 1 from plane1, bit 2 from plane2; the three contributions
+ * are OR-combined byte-wise. */
+__device__ __forceinline__ static int32_t q3_unpack4(
+        uint32_t p0, uint32_t p1, uint32_t p2, uint32_t bit_base) {
+    /* Take 4 bits starting at bit_base from each plane: 4-bit field in
+     * bits 0-3 of each temporary.  Then fan each bit out to its own byte
+     * via the unrolled scalar loop below; NVCC pipelines this well. */
+    uint32_t b0 = (p0 >> bit_base) & 0xFu;
+    uint32_t b1 = (p1 >> bit_base) & 0xFu;
+    uint32_t b2 = (p2 >> bit_base) & 0xFu;
+    uint32_t un = 0u;
+    #pragma unroll
+    for (uint32_t k = 0; k < 4; k++) {
+        uint32_t v = ((b0 >> k) & 1u)
+                   | (((b1 >> k) & 1u) << 1)
+                   | (((b2 >> k) & 1u) << 2);
+        un |= v << (k * 8u);
+    }
+    /* Sign-extend each 3-bit value (bit 2 = sign) to int8.  `un & 0x04..`
+     * isolates the sign bits; multiplying by 0x1E spreads each 0x04 to
+     * 0xF8 within its byte (4 * 30 = 120 < 256, no inter-byte carry). */
+    uint32_t signbit = un & 0x04040404u;
+    uint32_t signext = signbit * 0x1Eu;
+    return (int32_t)(un | signext);
+}
+
+/* Q3_0 block dot product: 32 weight values × 32 int8 activations -> int32.
+ * Block packed layout: 12 bytes = 3 int32 words (plane0/1/2).  8 dp4a
+ * passes per block, each pass decoding 4 values via q3_unpack4. */
+__device__ __forceinline__ static int32_t q3_block_dot(const uint8_t *packed, const int8_t *xqb) {
+    const uint32_t *p32 = (const uint32_t *)packed;
+    uint32_t p0 = p32[0];
+    uint32_t p1 = p32[1];
+    uint32_t p2 = p32[2];
+    const int32_t *xq32 = (const int32_t *)xqb;
+    int32_t dot = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int32_t qa = q3_unpack4(p0, p1, p2, (uint32_t)(i * 4));
+        dot = __dp4a(qa, xq32[i], dot);
+    }
+    return dot;
+}
+
+/* Q3_0 GEMV (split-row layout): per row, all fp16 scales come first then
+ * all 12-byte bit-plane groups.  Each warp computes one output row; 32
+ * lanes split the in_dim blocks stride-32 (same shape as the Q4_0 warp8
+ * kernel).  78% of Q4_0's HBM traffic, 41% of Q8_0's. */
+__global__ static void matmul_q3_0_preq_warp8_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks) {
+    (void)in_dim;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+    const __half *scales_row     = (const __half *)(w + row * blocks * 14u);
+    const unsigned char *packed_row = w + row * blocks * 14u + blocks * 2u;
+    float acc = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        float scale = __half2float(scales_row[b]);
+        int32_t dot = q3_block_dot(packed_row + b * 12u, xq + b * 32u);
+        acc += scale * xscale[b] * (float)dot;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0) out[row] = acc;
+}
 
 /* Q4_0 GEMV (split-row layout): per row, all fp16 scales come first then
  * all 16-byte packed nibble groups.  Each warp computes one output row;
@@ -5775,6 +5981,21 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_kernel_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
+        if (use_dp4a && getenv("DS4_CUDA_Q3_DECODE") != NULL) {
+            const unsigned char *w_q3 = cuda_q3_from_q8_ptr(model_map, weight_offset,
+                                                            weight_bytes, in_dim, out_dim);
+            if (w_q3) {
+                matmul_q3_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_kernel_stream>>>(
+                        (float *)out->ptr,
+                        w_q3,
+                        xq,
+                        xscale,
+                        in_dim,
+                        out_dim,
+                        blocks);
+                return cuda_ok(cudaGetLastError(), "matmul_q3_0 warp launch");
+            }
+        }
         if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL) {
             const unsigned char *w_q4 = cuda_q4_from_q8_ptr(model_map, weight_offset,
                                                             weight_bytes, in_dim, out_dim);

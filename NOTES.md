@@ -403,6 +403,54 @@ level is bad ROI.  Re-open if a faster MTP-draft kernel lands or if
 the target verifier can be shrunk to fewer layers (e.g. a learned
 short-cut head).
 
+### 7. Q3_0 dense matmul (custom 32-value bit-plane) — dead-end
+
+Hypothesis (Option A' minimal slice): mirror the existing Q4_0 lazy-
+convert + dp4a matmul path but drop one bit per weight.  Format used:
+32-value block, split-row layout, 2 bytes fp16 scale + 12 bytes bit-
+plane packing (3 int32 words = LSB plane / mid plane / sign plane).
+14 bytes / block vs Q4's 18 = 22 % HBM reduction.  Decode in the warp8
+matmul kernel walks 8 dp4a passes per block, each unpacking 4
+consecutive 3-bit values from the bit-planes into a dp4a-ready int32
+of 4 sign-extended int8 bytes.
+
+PoC enables Q3 in `ds4_gpu_matmul_q8_0_tensor` (n_tok = 1 path) ahead
+of the existing Q4 dispatch when `DS4_CUDA_Q3_DECODE` is set.
+
+Result: failed on both axes.
+
+- **Quality**: greedy "The capital of France is" produces garbage
+  tokens (`asarangang Ginhadi насељени насељени …`).  A single fp16
+  scale per 32-value block can't carry the dynamic range Q8 source
+  weights need at 3 bits — the quantization grid is too coarse.
+- **Throughput**: N=1 bench `ctx=2048 gen=30` lands at 13.58 t/s vs
+  Q4 baseline 17.42 t/s = -22 %.  The bit-plane decode (8 scalar
+  bit extractions × 8 dp4a passes per block) is compute-bound at
+  this footprint, so the 22 % HBM savings don't translate.
+
+So the simple "Q4 → Q3 by analogy" loses both the precision AND the
+speed it was supposed to buy.  A real Q3 path on this hardware would
+need:
+
+  - Sub-block scales (Q3_K-style: 256-value super-block, 16-value
+    sub-blocks with 6-bit shared scales) to recover quality; this is
+    substantially more code than the PoC.
+  - A faster decode than the bit-plane scalar fan-out — likely a
+    table-lookup or a __byte_perm-based shuffle that exploits the
+    sub-block structure.
+
+That's a multi-day rewrite, not a "drop one bit and reuse Q4's path"
+extension.  Code landed in this commit as a documented dead-end so
+the Q3 PoC harness (cache, convert kernel, matmul kernel, dispatch
+gate, env var) is available if a future Q3_K-style attempt wants to
+start from somewhere closer than scratch.
+
+Re-open when: a Q3_K-style scheme is designed for GB10 specifically
+(fast decode that doesn't fight the 24 MiB L2), OR if a routed-expert
+2-bit scheme (IQ2_XXS-style, already used by DS4 routed weights)
+demonstrates a working decode kernel + fast dequant pipeline that the
+dense matmuls can borrow.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
@@ -415,6 +463,9 @@ Already shown not to help on this hardware / model:
 - MTP speculative decode at default temperature (CLI gates on
   `temperature == 0`; even with temp = 0 it's empirically neutral on
   GB10 — see section 6)
+- Q3_0 with a single fp16 scale per 32-value block (quality collapses
+  to garbage tokens AND decode is compute-bound below Q4's HBM-bound
+  rate — see section 7)
 
 ## What is committed and ready for next session
 
