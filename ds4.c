@@ -9050,7 +9050,25 @@ static bool metal_graph_matmul_plain_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-static bool metal_graph_encode_decode_layer(
+/* Phase bit flags for metal_graph_encode_decode_layer_phased.  The decode
+ * layer naturally splits at the FFN shared expert's gate/up matmul: the
+ * PRE phase ends with g->ffn_norm and g->routed_out filled, the SHARED
+ * phase computes g->shared_mid via the per-session shared_gate_up_swiglu
+ * fused call, and the POST phase runs the shared_down (fused with HC
+ * expand) through the layer's final HC swap.
+ *
+ * The batched-decode path runs PRE for each session, then a single fused
+ * batched gate/up swiglu across N sessions into engine-level scratch,
+ * scatters back, and runs POST per session -- so it calls
+ * metal_graph_encode_decode_layer_phased with DS4_DECODE_LAYER_PRE and
+ * DS4_DECODE_LAYER_POST separately, skipping DS4_DECODE_LAYER_SHARED. */
+#define DS4_DECODE_LAYER_PRE     1u
+#define DS4_DECODE_LAYER_SHARED  2u
+#define DS4_DECODE_LAYER_POST    4u
+#define DS4_DECODE_LAYER_ALL     \
+    (DS4_DECODE_LAYER_PRE | DS4_DECODE_LAYER_SHARED | DS4_DECODE_LAYER_POST)
+
+static bool metal_graph_encode_decode_layer_phased(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -9060,7 +9078,8 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_cap,
         uint32_t                raw_row,
         uint32_t                n_raw,
-        int                     token) {
+        int                     token,
+        unsigned                phases) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -9092,6 +9111,10 @@ static bool metal_graph_encode_decode_layer(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
+
+    /* === PRE phase: HC pre-attn norm, Q/KV/attn output, MoE routed expert,
+     * FFN HC pre.  Ends with g->ffn_norm and g->routed_out filled. === */
+    if (phases & DS4_DECODE_LAYER_PRE) {
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
@@ -9710,6 +9733,14 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
+    } /* === end PRE phase === */
+
+    /* === SHARED phase: FFN shared expert gate/up + swiglu fusion.
+     * Reads g->ffn_norm, writes g->shared_mid (and intermediate gate/up).
+     * Batched-decode skips this and fills g->shared_mid via an engine-
+     * level batched matmul that fans out N sessions; see
+     * metal_graph_encode_shared_ffn_batched. === */
+    if (phases & DS4_DECODE_LAYER_SHARED) {
     const bool fuse_shared_gate_up =
         !g->quality &&
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
@@ -9736,6 +9767,13 @@ static bool metal_graph_encode_decode_layer(
         if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+    } /* === end SHARED phase === */
+
+    /* === POST phase: shared_down (Q8/Q4) fused with HC expand, optional
+     * ffn_out store + directional steering, final HC expand_add_split or
+     * expand depending on the steering/fusion combination.  Writes the
+     * layer's g->after_ffn_hc.  Expects g->shared_mid filled. === */
+    if (phases & DS4_DECODE_LAYER_POST) {
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
@@ -9791,11 +9829,31 @@ static bool metal_graph_encode_decode_layer(
                                                   DS4_N_HC) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
-#undef DS4_METAL_PROFILE_DECODE_STAGE
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
+    } /* === end POST phase === */
+#undef DS4_METAL_PROFILE_DECODE_STAGE
     return ok;
+}
+
+/* Backward-compatible wrapper: existing callers continue to run the full
+ * decode layer (all phases).  Batched-decode is the only path that calls
+ * the _phased variant directly with a subset of phases. */
+static bool metal_graph_encode_decode_layer(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        ds4_gpu_tensor       *raw_cache,
+        uint32_t                raw_cap,
+        uint32_t                raw_row,
+        uint32_t                n_raw,
+        int                     token) {
+    return metal_graph_encode_decode_layer_phased(g, model, layer, il, pos,
+                                                  raw_cache, raw_cap, raw_row, n_raw,
+                                                  token, DS4_DECODE_LAYER_ALL);
 }
 
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
@@ -14207,6 +14265,16 @@ struct ds4_engine {
      * concurrent batched-decode callers on the same engine would race here. */
     ds4_gpu_tensor *batched_output_norm;
     ds4_gpu_tensor *batched_logits;
+    /* Per-layer FFN shared-expert scratch.  When the batched-decode path
+     * interleaves N sessions at the layer's shared gate/up boundary, each
+     * session's g->ffn_norm is staged into batched_ffn_norm, one batched
+     * Q4 matmul pair runs gate+up into batched_shared_gate/_up, swiglu
+     * fuses them into batched_shared_mid, and rows scatter back to per-
+     * session g->shared_mid for the (still per-session) shared_down. */
+    ds4_gpu_tensor *batched_ffn_norm;
+    ds4_gpu_tensor *batched_shared_gate;
+    ds4_gpu_tensor *batched_shared_up;
+    ds4_gpu_tensor *batched_shared_mid;
 #endif
 };
 
@@ -15566,6 +15634,33 @@ static bool ensure_engine_batched_scratch(ds4_engine *e, uint64_t vocab_dim) {
     return true;
 }
 
+/* Per-layer FFN shared-expert scratch.  `shared_dim` is constant across
+ * layers (DS4_N_FF_EXP) for the DS4 architecture, so we lazy-allocate
+ * once based on the first call's value. */
+static bool ensure_engine_batched_ffn_scratch(ds4_engine *e, uint64_t shared_dim) {
+    if (!e->batched_ffn_norm) {
+        e->batched_ffn_norm = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_BATCH_MAX * DS4_N_EMBD * sizeof(float));
+        if (!e->batched_ffn_norm) return false;
+    }
+    if (!e->batched_shared_gate) {
+        e->batched_shared_gate = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_BATCH_MAX * shared_dim * sizeof(float));
+        if (!e->batched_shared_gate) return false;
+    }
+    if (!e->batched_shared_up) {
+        e->batched_shared_up = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_BATCH_MAX * shared_dim * sizeof(float));
+        if (!e->batched_shared_up) return false;
+    }
+    if (!e->batched_shared_mid) {
+        e->batched_shared_mid = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_BATCH_MAX * shared_dim * sizeof(float));
+        if (!e->batched_shared_mid) return false;
+    }
+    return true;
+}
+
 /* Batched output head: runs the per-session prefix (5 small kernels) for each
  * row, stages every session's output_norm into engine->batched_output_norm
  * as a contiguous [n_active, DS4_N_EMBD] f32 tile, then performs a single
@@ -15600,6 +15695,154 @@ static bool metal_graph_encode_output_head_batched(
                     vocab_dim,
                     e->batched_output_norm,
                     (uint64_t)n_active) != 0;
+    return ok;
+}
+
+/* Batched shared FFN gate/up/swiglu: stages N sessions' g->ffn_norm into
+ * engine-level batched scratch, performs two batched Q4 matmuls (gate
+ * and up) with n_tok = n_active, applies swiglu element-wise across the
+ * batched buffers, and scatters the result back into each session's
+ * g->shared_mid so the per-session POST-shared decode_layer phase can
+ * consume it.  Returns false on any failure -- caller should then run
+ * the per-session SHARED phase for each session as fallback. */
+static bool metal_graph_encode_shared_ffn_batched(
+        ds4_engine              *e,
+        ds4_session            **sessions,
+        int                      n_active,
+        const ds4_layer_weights *layer) {
+    const uint64_t shared_dim = (uint64_t)layer->ffn_gate_shexp->dim[1];
+    if (!ensure_engine_batched_ffn_scratch(e, shared_dim)) return false;
+    bool ok = true;
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = ds4_gpu_tensor_copy_async(e->batched_ffn_norm,
+                                       (uint64_t)i * DS4_N_EMBD * sizeof(float),
+                                       sessions[i]->graph.ffn_norm, 0,
+                                       (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+    }
+    if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+                    e->batched_shared_gate,
+                    e->model.map, e->model.size,
+                    layer->ffn_gate_shexp->abs_offset,
+                    DS4_N_EMBD, shared_dim,
+                    e->batched_ffn_norm, (uint64_t)n_active) != 0;
+    if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+                    e->batched_shared_up,
+                    e->model.map, e->model.size,
+                    layer->ffn_up_shexp->abs_offset,
+                    DS4_N_EMBD, shared_dim,
+                    e->batched_ffn_norm, (uint64_t)n_active) != 0;
+    /* Swiglu is element-wise: collapse the [n_active, shared_dim] tile
+     * to one 1-D length so a single launch covers all rows. */
+    if (ok) ok = ds4_gpu_swiglu_tensor(e->batched_shared_mid,
+                                        e->batched_shared_gate,
+                                        e->batched_shared_up,
+                                        (uint32_t)((uint64_t)n_active * shared_dim),
+                                        0.0f, 1.0f) != 0;
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = ds4_gpu_tensor_copy_async(sessions[i]->graph.shared_mid, 0,
+                                       e->batched_shared_mid,
+                                       (uint64_t)i * shared_dim * sizeof(float),
+                                       (uint64_t)shared_dim * sizeof(float)) != 0;
+    }
+    return ok;
+}
+
+/* Per-layer interleaved batched decode encoder.
+ *
+ * For each of the 43 decode layers, runs the PRE phase per session, then
+ * either the batched SHARED FFN fusion (if want_batched_shared_ffn) or
+ * the per-session SHARED phase, then the POST phase per session followed
+ * by the per-session HC swap.  After all layers, optionally runs the
+ * per-session output head (callers using the batched output head pass
+ * need_logits=false here and call metal_graph_encode_output_head_batched
+ * themselves).
+ *
+ * Equivalent to N back-to-back metal_graph_encode_token_raw_swa calls
+ * when want_batched_shared_ffn is false. */
+static bool metal_graph_encode_token_raw_swa_batched_n_sessions(
+        ds4_engine    *engine,
+        ds4_session  **sessions,
+        const int     *tokens,
+        int            n_active,
+        bool           want_batched_shared_ffn,
+        bool           need_logits) {
+    const ds4_model   *model   = &engine->model;
+    const ds4_weights *weights = &engine->weights;
+    bool ok = true;
+    /* Initial token embeddings into each session's g->cur_hc. */
+    for (int i = 0; ok && i < n_active; i++) {
+        ds4_session *s = sessions[i];
+        if (s->graph.raw_cap == 0) {
+            fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
+            return false;
+        }
+        ok = ds4_gpu_embed_token_hc_tensor(s->graph.cur_hc,
+                                            model->map, model->size,
+                                            weights->token_embd->abs_offset,
+                                            (uint32_t)weights->token_embd->dim[1],
+                                            (uint32_t)tokens[i],
+                                            DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        /* PRE phase per session. */
+        for (int i = 0; ok && i < n_active; i++) {
+            ds4_session *s = sessions[i];
+            const uint32_t pos = (uint32_t)s->checkpoint.len;
+            const uint32_t raw_row = pos % s->graph.raw_cap;
+            const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
+            ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
+                                                       il, pos,
+                                                       s->graph.layer_raw_cache[il],
+                                                       s->graph.raw_cap, raw_row, n_raw,
+                                                       tokens[i],
+                                                       DS4_DECODE_LAYER_PRE);
+        }
+        /* SHARED phase: batched fusion or per-session. */
+        bool used_batched_shared = false;
+        if (ok && want_batched_shared_ffn) {
+            if (metal_graph_encode_shared_ffn_batched(engine, sessions, n_active, layer)) {
+                used_batched_shared = true;
+            }
+        }
+        if (ok && !used_batched_shared) {
+            for (int i = 0; ok && i < n_active; i++) {
+                ds4_session *s = sessions[i];
+                const uint32_t pos = (uint32_t)s->checkpoint.len;
+                const uint32_t raw_row = pos % s->graph.raw_cap;
+                const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
+                ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
+                                                          il, pos,
+                                                          s->graph.layer_raw_cache[il],
+                                                          s->graph.raw_cap, raw_row, n_raw,
+                                                          tokens[i],
+                                                          DS4_DECODE_LAYER_SHARED);
+            }
+        }
+        /* POST phase + HC swap per session. */
+        for (int i = 0; ok && i < n_active; i++) {
+            ds4_session *s = sessions[i];
+            const uint32_t pos = (uint32_t)s->checkpoint.len;
+            const uint32_t raw_row = pos % s->graph.raw_cap;
+            const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
+            ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
+                                                      il, pos,
+                                                      s->graph.layer_raw_cache[il],
+                                                      s->graph.raw_cap, raw_row, n_raw,
+                                                      tokens[i],
+                                                      DS4_DECODE_LAYER_POST);
+            ds4_gpu_tensor *tmp = s->graph.cur_hc;
+            s->graph.cur_hc      = s->graph.after_ffn_hc;
+            s->graph.after_ffn_hc = tmp;
+        }
+    }
+    if (ok && need_logits) {
+        for (int i = 0; ok && i < n_active; i++) {
+            ds4_session *s = sessions[i];
+            ok = metal_graph_encode_output_head(&s->graph, model, weights,
+                                                weights->output->dim[1]);
+        }
+    }
     return ok;
 }
 #endif /* !DS4_NO_GPU */
@@ -17170,6 +17413,10 @@ void ds4_engine_close(ds4_engine *e) {
 #ifndef DS4_NO_GPU
     ds4_gpu_tensor_free(e->batched_output_norm);
     ds4_gpu_tensor_free(e->batched_logits);
+    ds4_gpu_tensor_free(e->batched_ffn_norm);
+    ds4_gpu_tensor_free(e->batched_shared_gate);
+    ds4_gpu_tensor_free(e->batched_shared_up);
+    ds4_gpu_tensor_free(e->batched_shared_mid);
     ds4_gpu_cleanup();
 #endif
     ds4_release_instance_lock();
@@ -17689,6 +17936,13 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
         else if (s->engine != engine) { gpu_fast = false; break; }
         n_active++;
     }
+    /* The per-layer interleaved batched encoder gives a measurable L2-
+     * reuse win at N = 2..8 but becomes unstable past N = 8 on this
+     * hardware (high run-to-run variance, occasional crashes -- likely
+     * working-set / cuda_tmp_alloc contention at high session count).
+     * For N > 8 the GPU fast path stays on the older sync-amortized
+     * serial loop, which is itself an improvement over per-call sync. */
+    const int DS4_BATCH_INTERLEAVED_MAX = 8;
     if (gpu_fast && engine && n_active > 1 && n_active <= DS4_BATCH_MAX) {
         /* Compact active rows into a contiguous list so the batch path can
          * index by row instead of slot. */
@@ -17726,24 +17980,51 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
         const bool want_batched_output = (getenv("DS4_CUDA_Q4_DECODE") != NULL);
         const uint64_t vocab_dim = (uint64_t)engine->weights.output->dim[1];
 
+        /* Per-layer interleaved encode: at each of the 43 layers, run the
+         * PRE phase per session and the POST phase per session.  The
+         * SHARED FFN gate/up step has both a per-session path (the
+         * existing fused shared_gate_up_swiglu pair matmul) and an
+         * engine-level batched-N path; the batched path is gated behind
+         * DS4_CUDA_BATCHED_SHARED_FFN=1 because the naive Q4 batched
+         * matmul kernel does not beat the fused per-session pair matmul
+         * at this layer's small out_dim (DS4_N_FF_EXP=2048) -- see
+         * NOTES.md for the experiment that established this.  The
+         * scaffolding is kept so a future custom Q4 batched-pair kernel
+         * can flip the default. */
+        const bool want_batched_shared_ffn =
+            (getenv("DS4_CUDA_BATCHED_SHARED_FFN") != NULL);
         bool ok = ds4_gpu_begin_commands() != 0;
-        for (int i = 0; ok && i < row_count; i++) {
-            ds4_session *s = active[i];
-            /* allow_split_flush=false: the in-forward flush is a mid-token
-             * cudaDeviceSynchronize on the CUDA backend, which would defeat
-             * the whole purpose of batching submissions. */
-            ok = metal_graph_encode_token_raw_swa(&s->graph,
-                                                  &engine->model,
-                                                  &engine->weights,
-                                                  active_token[i],
-                                                  (uint32_t)s->checkpoint.len,
-                                                  /*need_logits=*/!want_batched_output,
-                                                  /*allow_split_flush=*/false);
+        if (ok && row_count <= DS4_BATCH_INTERLEAVED_MAX) {
+            ok = metal_graph_encode_token_raw_swa_batched_n_sessions(
+                    engine, active, active_token, row_count,
+                    want_batched_shared_ffn,
+                    /*need_logits=*/!want_batched_output);
             if (!ok) {
                 snprintf(err, errlen,
-                         "Metal batched encode failed for slot %d",
-                         active_slot[i]);
-                s->checkpoint_valid = false;
+                         "Metal batched per-layer forward failed");
+                for (int i = 0; i < row_count; i++) {
+                    active[i]->checkpoint_valid = false;
+                }
+            }
+        } else if (ok) {
+            /* High-N fallback: per-session encoder loop (older sync-
+             * amortized serial path).  Avoids the per-layer interleaved
+             * encoder's instability past N = DS4_BATCH_INTERLEAVED_MAX. */
+            for (int i = 0; ok && i < row_count; i++) {
+                ds4_session *s = active[i];
+                ok = metal_graph_encode_token_raw_swa(&s->graph,
+                                                      &engine->model,
+                                                      &engine->weights,
+                                                      active_token[i],
+                                                      (uint32_t)s->checkpoint.len,
+                                                      /*need_logits=*/!want_batched_output,
+                                                      /*allow_split_flush=*/false);
+                if (!ok) {
+                    snprintf(err, errlen,
+                             "Metal batched encode failed for slot %d",
+                             active_slot[i]);
+                    s->checkpoint_valid = false;
+                }
             }
         }
 

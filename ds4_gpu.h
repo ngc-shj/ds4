@@ -29,6 +29,9 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                const ds4_gpu_tensor *src, uint64_t src_offset,
+                                uint64_t bytes);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);

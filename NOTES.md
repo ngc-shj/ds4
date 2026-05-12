@@ -108,6 +108,51 @@ FFN gate/up/down, attn_output) where the existing per-session encoder
 runs N matmul calls at `n_tok = 1` and the naive L2 reuse does not
 compound across sessions.
 
+## What DOES help: per-layer interleaved batched-decode encoder
+
+Splitting `metal_graph_encode_decode_layer` into PRE / SHARED / POST
+phases and running the outer loop as "layer 0 (all N sessions) → layer
+1 (all N sessions) → ..." instead of "session 0 (all 43 layers) →
+session 1 (all 43 layers) → ..." turns out to give a real win at low N
+purely from implicit L2 reuse: when all N sessions touch layer L's
+weights back-to-back, the second through Nth session hit L2 instead of
+re-reading from HBM.
+
+`ds4-bench --ctx-start 2048 --gen-tokens 50` aggregate throughput:
+
+| N | B-3 baseline | per-layer interleaved | Δ |
+|---|-------------:|----------------------:|--:|
+| 1 | 18.12 | 18.05 | noise |
+| 2 | 18.75 | 19.25 | +2.7 % |
+| 4 | 18.97 | 19.82 | +4.5 % |
+| 8 | 19.36 | 14–21 (high variance) | up to +9 % when stable |
+
+At N > 8 the interleaved path becomes unstable on this hardware (high
+run-to-run variance, occasional `Metal batched per-layer forward
+failed` crashes -- likely working-set / `cuda_tmp_alloc` contention
+at high session count).  The shipped code caps the interleaved path at
+N ≤ DS4_BATCH_INTERLEAVED_MAX (= 8) and falls back to the older
+sync-amortized per-session encoder loop for higher N, which itself is
+still better than the original per-call sync.
+
+### Layer-internal FFN batching (still not enough on its own)
+
+The infrastructure also ships an opt-in (`DS4_CUDA_BATCHED_SHARED_FFN=1`)
+batched FFN shared expert: stage N sessions' `g->ffn_norm` into engine
+scratch, two Q4 batched matmuls for gate and up, one batched swiglu,
+scatter back to per-session `g->shared_mid`.  At N = 2/4 this is
+within noise of the per-session fused `shared_gate_up_swiglu` pair
+matmul; at N = 8 it slightly regresses.  Why: the FFN `out_dim =
+DS4_N_FF_EXP = 2048` is small enough that the per-session fused pair
+matmul saturates the GPU on a single call, while the batched path
+costs an extra stage + scatter + uses the non-fused 2-matmul-plus-
+swiglu shape.
+
+The path off this plateau is a custom Q4 batched-pair kernel
+(`matmul_q4_0_pair_preq_batch_warp8_kernel`-style) that loads both
+gate and up rows once across N toks.  Without it, batched FFN does
+not pay; with it, all the staging/scatter wiring is already in place.
+
 ## Where the actual time goes
 
 `DS4_METAL_DECODE_STAGE_PROFILE=1` (one decode step, layer-by-layer; the
