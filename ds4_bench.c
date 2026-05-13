@@ -392,6 +392,7 @@ int main(int argc, char **argv) {
         }
         if (rc) break;
 
+        const bool print_tokens = getenv("DS4_BENCH_PRINT_TOKENS") != NULL;
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens && rc == 0; i++) {
             for (int k = 0; k < batch_n; k++) {
@@ -404,6 +405,15 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "ds4-bench: argmax failed for session %d at frontier %d\n", k, frontier);
                     rc = 1; break;
                 }
+                if (print_tokens && k == 0) {
+                    if (i == 0) fprintf(stderr, "text[s=0]: ");
+                    size_t piece_len = 0;
+                    char *piece = ds4_token_text(engine, token, &piece_len);
+                    if (piece) {
+                        fwrite(piece, 1, piece_len, stderr);
+                        free(piece);
+                    }
+                }
                 slots[k].session = sessions[k];
                 slots[k].token   = token;
                 slots[k].logits  = NULL;
@@ -415,6 +425,7 @@ int main(int argc, char **argv) {
                 break;
             }
         }
+        if (print_tokens) fprintf(stderr, "\n");
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
 
