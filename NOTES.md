@@ -1460,6 +1460,64 @@ variance).  N=1 empty-KV warm-up still sometimes collapses to BOS
 -- that is the section-19.1 known follow-up bug, not new
 regression from D5-2/D5-4.
 
+### 19.3. Day-5 D5-3 land: prefill PRE_A2 batched substitute (scaffolding only)
+
+Adds `metal_graph_encode_prefill_qkv_batched`, the prefill-side analog
+of decode's `metal_graph_encode_qkv_batched` (ds4.c:16060).  Gathers
+per-session `g->batch_attn_norm` rows into engine-level
+`batched_prefill_attn_norm`, runs one pair of Q8 matmuls (attn_q_a +
+attn_kv) + one fused `dsv4_qkv_rms_norm_rows` across `n_active * n_tok`
+rows, then scatters back to per-session `batch_qr_norm` / `batch_kv`.
+
+A new `ensure_engine_scratch_resizable` helper allocates and clears
+each prefill scratch tensor on demand (sized for the current
+`n_active * n_tok`, resized when a bigger workload arrives so memory
+matches the actual peak rather than reserving the worst case).
+
+The substitute is opt-in behind `DS4_CUDA_BATCHED_PREFILL_QKV=1` and
+fires from `metal_graph_prefill_layer_major_batched_n_sessions` only
+when (a) the env var is set, (b) `n_active >= 2`, and (c) all
+sessions have the same `n_tok`.
+
+**Empirical wall-clock impact: net negative on cold N=2 today.**  In
+practice the substitute slows prefill: per-session prefill already
+runs at `n_tok ~= 944-2048` rows per matmul, large enough that one
+batched matmul of `N * n_tok` rows is no faster than N back-to-back
+matmuls (each weight is L2-hot across the back-to-back calls; the
+GPU is already saturated).  The substitute's gather + scatter add
+~30 MiB of memory copies per layer per request that the per-session
+path does not pay, and the larger batched matmul's reduction order
+differs enough to widen the FP-variance band into the BOS-attractor
+zone at temperature=0 (caller-visible as "first N tokens coherent
+then BOS" in the substitute-on smoke).
+
+In short: the section-19 recon estimate of 2-5% per substitute does
+not generalize to substitutes that replace already-amortized
+per-session matmuls.  Decode-side wins came from collapsing
+*degenerate* (n_rows=1) matmuls into batched (n_rows=N) ones;
+prefill's per-session matmul is not degenerate, so collapsing N of
+them does not pay.
+
+**Why land it anyway.**  The code is the pattern D5-5+ substitutes
+on the FFN side will copy (shared FFN gate+up, routed MoE) -- those
+*are* per-session amortization-limited (smaller per-row matmuls or
+expert-sized) and have a real shot at wall-clock wins.  Landing the
+scaffolding (engine struct fields, the resizable scratch helper,
+the two-pass phased call inside the outer loop, the env-var-gated
+substitute fork) means D5-5+ work can re-use it directly instead
+of rebuilding it.  The substitute itself stays opt-in and OFF by
+default; no user is affected.
+
+**Known follow-up.**  The substitute also exhibits the
+section-19.1 single-session BOS-attractor more often than the
+per-session path.  Whether that is purely the reduction-order FP
+variance or a missed clear/sync in the gather-matmul-scatter chain
+is unresolved; a bit-exact comparison against per-session output
+on a small fixed input is the next step.  Until then, keep the env
+var off for any run whose output is consumed (warm-up curls that
+only populate KV are fine to flip it on for, since the bad output
+is discarded).
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:

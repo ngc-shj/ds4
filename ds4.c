@@ -14452,6 +14452,21 @@ struct ds4_engine {
     ds4_gpu_tensor *batched_heads;
     ds4_gpu_tensor *batched_attn_low;
     ds4_gpu_tensor *batched_attn_out;
+    /* Per-layer PREFILL qkv scratch (Day-5 D5-3).  When the batched
+     * prefill path collapses PRE_A2 (q_a + attn_kv + dsv4_qkv_rms_norm)
+     * across N sessions x n_tok rows, each session's g->batch_attn_norm
+     * is gathered into batched_prefill_attn_norm with one row per
+     * (session, token); two Q8 matmuls fill batched_prefill_qr and
+     * batched_prefill_kv_raw; one fused dsv4_qkv_rms_norm_rows fills
+     * batched_prefill_qr_norm and batched_prefill_kv; rows scatter back
+     * to per-session g->batch_qr_norm and g->batch_kv.  These are sized
+     * lazily on first use based on n_active * n_tok rows so they grow
+     * with workload rather than reserving the worst case up front. */
+    ds4_gpu_tensor *batched_prefill_attn_norm;
+    ds4_gpu_tensor *batched_prefill_qr;
+    ds4_gpu_tensor *batched_prefill_qr_norm;
+    ds4_gpu_tensor *batched_prefill_kv_raw;
+    ds4_gpu_tensor *batched_prefill_kv;
 #endif
 };
 
@@ -15851,6 +15866,44 @@ static bool ensure_engine_batched_attn_output_scratch(ds4_engine *e,
         && ensure_engine_scratch(&e->batched_attn_out, DS4_N_EMBD);
 }
 
+/* Variable-sized resizable engine scratch (Day-5 D5-3 prefill substitutes).
+ * Unlike ensure_engine_scratch (sized for DS4_BATCH_MAX rows up front), the
+ * prefill paths size scratch by n_active * n_tok which grows with workload,
+ * so we resize-on-demand: keep the existing buffer if it already has enough
+ * bytes, otherwise free and reallocate.  Cleared on each (re)allocation so
+ * the matmul kernels do not see tile-padding garbage (sibling fix to the
+ * decode-side engine scratch clear). */
+static bool ensure_engine_scratch_resizable(ds4_gpu_tensor **slot, uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    if (*slot && ds4_gpu_tensor_bytes(*slot) >= bytes) return true;
+    if (*slot) {
+        ds4_gpu_tensor_free(*slot);
+        *slot = NULL;
+    }
+    *slot = ds4_gpu_tensor_alloc(bytes);
+    if (!*slot) return false;
+    (void)ds4_gpu_tensor_clear(*slot);
+    return true;
+}
+
+/* Per-(layer, n_active, n_tok) prefill qkv scratch.  Sized for total_rows =
+ * n_active * n_tok and resized whenever a bigger workload arrives. */
+static bool ensure_engine_batched_prefill_qkv_scratch(ds4_engine *e,
+                                                      uint64_t total_rows,
+                                                      uint64_t q_rank) {
+    const uint64_t f = sizeof(float);
+    return ensure_engine_scratch_resizable(&e->batched_prefill_attn_norm,
+                                           total_rows * DS4_N_EMBD * f)
+        && ensure_engine_scratch_resizable(&e->batched_prefill_qr,
+                                           total_rows * q_rank * f)
+        && ensure_engine_scratch_resizable(&e->batched_prefill_qr_norm,
+                                           total_rows * q_rank * f)
+        && ensure_engine_scratch_resizable(&e->batched_prefill_kv_raw,
+                                           total_rows * DS4_N_HEAD_DIM * f)
+        && ensure_engine_scratch_resizable(&e->batched_prefill_kv,
+                                           total_rows * DS4_N_HEAD_DIM * f);
+}
+
 /* Per-layer qkv scratch.  DS4_N_EMBD / DS4_N_HEAD_DIM are constants;
  * q_rank passes through to share batched_qr_norm with the q_b path. */
 static bool ensure_engine_batched_qkv_scratch(ds4_engine *e, uint64_t q_rank) {
@@ -16059,6 +16112,92 @@ static bool metal_graph_encode_qkv_batched(
                                        e->batched_qr_norm,
                                        (uint64_t)i * q_rank * sizeof(float),
                                        q_rank * sizeof(float)) != 0;
+    }
+    return ok;
+}
+
+/* Day-5 D5-3: prefill-side analog of metal_graph_encode_qkv_batched above.
+ * Substitutes the whole PRE_A2 phase (attn_q_a + attn_kv + dsv4_qkv_rms_
+ * norm_rows) across N sessions, where each session contributes n_tok rows.
+ * Gathers per-session g->batch_attn_norm into batched_prefill_attn_norm
+ * with one row per (session, token), runs two Q8 matmuls + one fused
+ * qkv_rms_norm over the n_active*n_tok-row tile, then scatters
+ * batched_prefill_qr_norm and batched_prefill_kv back to per-session
+ * g->batch_qr_norm / g->batch_kv so PRE_B and PRE_C1 keep their
+ * per-session inputs.
+ *
+ * Requires all sessions to contribute the same n_tok (caller verifies);
+ * matmul reduction order is the only thing that shifts vs the per-session
+ * path, and the small numerical drift is already in the section-15
+ * variance band the bench tolerates.
+ *
+ * Returns false on any failure (resize, gather, matmul, scatter) so the
+ * caller can fall back to per-session phased(PRE_A2). */
+static bool metal_graph_encode_prefill_qkv_batched(
+        ds4_engine              *e,
+        ds4_session            **sessions,
+        int                      n_active,
+        const ds4_layer_weights *layer,
+        uint32_t                 n_tok) {
+    if (n_active <= 0 || n_tok == 0) return false;
+    if (metal_graph_use_reference_qkv_norm()) return false;
+    const uint64_t q_rank = layer->attn_q_a->dim[1];
+    const uint64_t total_rows = (uint64_t)n_active * n_tok;
+    if (!ensure_engine_batched_prefill_qkv_scratch(e, total_rows, q_rank)) return false;
+    /* Always clear before staging so a row count that shrinks below a
+     * previous call's total_rows does not leave stale tail rows the
+     * tile-padded matmul could fold into reductions. */
+    (void)ds4_gpu_tensor_clear(e->batched_prefill_attn_norm);
+    bool ok = true;
+    const uint64_t embd_row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t qrank_row_bytes = q_rank * sizeof(float);
+    const uint64_t headdim_row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    /* Gather: each session's batch_attn_norm (n_tok rows x N_EMBD) into
+     * batched_prefill_attn_norm at row offset i * n_tok. */
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = ds4_gpu_tensor_copy_async(e->batched_prefill_attn_norm,
+                                       (uint64_t)i * n_tok * embd_row_bytes,
+                                       sessions[i]->graph.batch_attn_norm, 0,
+                                       (uint64_t)n_tok * embd_row_bytes) != 0;
+    }
+    /* Two big Q8 matmuls: attn_q_a + attn_kv, each fanned across all N*n_tok rows. */
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(e->batched_prefill_qr,
+                                            e->model.map, e->model.size,
+                                            layer->attn_q_a->abs_offset,
+                                            DS4_N_EMBD, q_rank,
+                                            e->batched_prefill_attn_norm,
+                                            total_rows) != 0;
+    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(e->batched_prefill_kv_raw,
+                                            e->model.map, e->model.size,
+                                            layer->attn_kv->abs_offset,
+                                            DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                            e->batched_prefill_attn_norm,
+                                            total_rows) != 0;
+    /* Fused qkv_rms_norm over the whole tile. */
+    if (ok) ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(e->batched_prefill_qr_norm,
+                                                       e->batched_prefill_qr,
+                                                       e->model.map, e->model.size,
+                                                       layer->attn_q_a_norm->abs_offset,
+                                                       (uint32_t)q_rank,
+                                                       e->batched_prefill_kv,
+                                                       e->batched_prefill_kv_raw,
+                                                       layer->attn_kv_a_norm->abs_offset,
+                                                       DS4_N_HEAD_DIM,
+                                                       (uint32_t)total_rows,
+                                                       DS4_RMS_EPS) != 0;
+    /* Scatter batched_prefill_qr_norm rows back to per-session g->batch_qr_norm. */
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = ds4_gpu_tensor_copy_async(sessions[i]->graph.batch_qr_norm, 0,
+                                       e->batched_prefill_qr_norm,
+                                       (uint64_t)i * n_tok * qrank_row_bytes,
+                                       (uint64_t)n_tok * qrank_row_bytes) != 0;
+    }
+    /* Scatter batched_prefill_kv rows back to per-session g->batch_kv. */
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = ds4_gpu_tensor_copy_async(sessions[i]->graph.batch_kv, 0,
+                                       e->batched_prefill_kv,
+                                       (uint64_t)i * n_tok * headdim_row_bytes,
+                                       (uint64_t)n_tok * headdim_row_bytes) != 0;
     }
     return ok;
 }
@@ -19267,14 +19406,74 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
 
     if (ok) ok = ds4_gpu_begin_commands() != 0;
 
-    /* Interleaved layer loop: encode each layer for all sessions before
-     * advancing.  Sessions iterate inside; layers outside. */
+    /* D5-3: opt-in PRE_A2 batched substitute.  Requires same n_tok across
+     * all sessions and at least 2 active sessions (the substitute's only
+     * payoff is L2 weight reuse across N sessions, so N=1 just adds
+     * gather/scatter overhead). */
+    const bool want_batched_prefill_qkv =
+        (getenv("DS4_CUDA_BATCHED_PREFILL_QKV") != NULL);
+    uint32_t same_n_tok = (uint32_t)prompts[0]->len;
+    bool all_same_n_tok = true;
+    for (int i = 1; i < n_active; i++) {
+        if ((uint32_t)prompts[i]->len != same_n_tok) {
+            all_same_n_tok = false;
+            break;
+        }
+    }
+    const bool use_prefill_qkv_substitute =
+        want_batched_prefill_qkv && all_same_n_tok && n_active > 1;
+
+    /* Interleaved layer loop.  Without the substitute this is just
+     * sessions-inside layers-outside; with the substitute the inner
+     * session loop is split around the PRE_A2 boundary so the engine-
+     * level batched matmul can replace the per-session q_a/kv/qkv_norm. */
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        for (int i = 0; ok && i < n_active; i++) {
-            ok = metal_graph_encode_layer_batch(&sessions[i]->graph,
-                                                model, &weights->layer[il],
-                                                il, 0,
-                                                (uint32_t)prompts[i]->len);
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (use_prefill_qkv_substitute) {
+            /* Pass 1: PRE_A1 per session (writes batch_attn_norm). */
+            for (int i = 0; ok && i < n_active; i++) {
+                ok = metal_graph_encode_layer_attention_batch_phased(
+                        &sessions[i]->graph, model, layer, il, 0,
+                        same_n_tok, DS4_PREFILL_LAYER_PRE_A1);
+            }
+            /* Batched PRE_A2 substitute. */
+            bool used_substitute = false;
+            if (ok && metal_graph_encode_prefill_qkv_batched(e, sessions,
+                                                              n_active, layer,
+                                                              same_n_tok)) {
+                used_substitute = true;
+            }
+            /* Pass 2: rest of attention; if substitute failed, run PRE_A2
+             * per session as a safety fallback so g is internally
+             * consistent for PRE_B. */
+            uint32_t pass2 = DS4_PREFILL_LAYER_PRE_B |
+                             DS4_PREFILL_LAYER_PRE_C1 |
+                             DS4_PREFILL_LAYER_PRE_C2 |
+                             DS4_PREFILL_LAYER_PRE_C3;
+            if (!used_substitute) pass2 |= DS4_PREFILL_LAYER_PRE_A2;
+            for (int i = 0; ok && i < n_active; i++) {
+                ok = metal_graph_encode_layer_attention_batch_phased(
+                        &sessions[i]->graph, model, layer, il, 0,
+                        same_n_tok, pass2);
+            }
+            /* FFN half + HC swap, still per session. */
+            for (int i = 0; ok && i < n_active; i++) {
+                ok = metal_graph_encode_layer_ffn_batch(&sessions[i]->graph,
+                                                        model, layer, il, 0,
+                                                        same_n_tok);
+                if (ok) {
+                    ds4_gpu_tensor *tmp = sessions[i]->graph.batch_cur_hc;
+                    sessions[i]->graph.batch_cur_hc = sessions[i]->graph.batch_next_hc;
+                    sessions[i]->graph.batch_next_hc = tmp;
+                }
+            }
+        } else {
+            for (int i = 0; ok && i < n_active; i++) {
+                ok = metal_graph_encode_layer_batch(&sessions[i]->graph,
+                                                    model, layer,
+                                                    il, 0,
+                                                    (uint32_t)prompts[i]->len);
+            }
         }
     }
 
