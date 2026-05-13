@@ -1153,6 +1153,89 @@ slot corruption.
 4. Per-session KV cache continued-store DURING batched decode (not
    only post-decode); requires per-batched-session progress callbacks.
 
+### 17. Day-3 outcomes: N=8 stable, engine batched prefill scoped as Day-4+
+
+**D3-1 (DS4_SERVER_BATCH_MAX 4 -> 8, commit 8542d34).**  Section 14's
+flagged Shared-FFN fatal failures at N>=4 were caused by the
+default-stream race that D2-4 (f0e1248) closed.  Under the tighter
+stream discipline N=8 is stable end-to-end:
+
+- 8 parallel curls collapse to one batched(n=8) lockstep
+- `ctx=batched(n=8) ... kv_cached=2048 ... 22.97s` x 8 in server log
+- All 8 responses coherent, 0 errors
+- Aggregate throughput at N=8 ~10.4 t/s on this 2466p + 30c smoke,
+  matching N=2 (10.1) and N=4 (10.6) -- L2 working-set saturates
+  around N=2-4 (sharing-factor peak ~1.6x).  N=8's value at this
+  geometry is queue-depth headroom for high request rates, not
+  per-request latency reduction.
+
+| N | wall-clock | aggregate t/s | sharing factor vs N=1 |
+|---|----------:|--------------:|----------------------:|
+| 1 | 6.70 s    | 4.5           | 1.00x baseline        |
+| 2 | 5.97 s    | 10.1          | 2.25x                 |
+| 4 | 11.34 s   | 10.6          | 2.36x                 |
+| 8 | 22.97 s   | 10.4          | 2.32x                 |
+
+The N=2 row showing the lowest wall-clock means single users sending
+a request to a non-loaded server see the same response time as 2-user
+parallel.  Above N=2, aggregate is the only metric that improves, and
+even that flattens by N=4.
+
+**D3-2 (engine-level batched prefill) -- NOT FEASIBLE in this scope.**
+Reconnaissance found two architectural options:
+
+- **Option A** (token-wise lockstep using existing batched-decode
+  encoder): wrap the per-session prefill loop so all N sessions
+  advance one prefill token per step in the same lockstep encoder
+  that already powers batched decode.  Cheap to write (~150 LoC) but
+  a **hard wall-clock regression**: the layer-major prefill encoder
+  (`metal_graph_prefill_layer_major` at ds4.c:13164) achieves
+  ~400 t/s per session by amortizing layer setup across a chunk of
+  2048 tokens, while the decode encoder processes 1 token per layer
+  per step at ~18.5 t/s single-session.  Token-wise prefill at N=4
+  would take 4 x 2466 / 30 t/s = 328 s vs ~24 s sequential prefill --
+  unusable.
+- **Option B** (new multi-session prefill encoder): a real batched
+  layer-major prefill that processes N sessions x n_tok tokens per
+  layer in one kernel.  Mirrors `metal_graph_prefill_layer_major` but
+  with `sessions[]` plumbing and per-session cur/next tensors.  Needs
+  new kernel dispatch patterns (no existing batched prefill kernels
+  on the GPU side).  Estimate 200-300+ LoC and multi-week scope.
+
+Sequential prefill therefore stays the largest residual wall-clock
+cost for cache-miss batched requests on this branch.  Day-4 work.
+
+**D3-3 (OpenAI live-stream structured flow in batched mode) -- low
+marginal value at this scope.**  The "live" flow's main differentiator
+over plain SSE is tool-call streaming and reasoning_content
+structured deltas.  request_is_batchable already excludes has_tools
+and ds4_think_mode_enabled, so the only payload remaining is plain
+content deltas -- which the simple sse_chunk path covers.  Real
+OpenAI chat clients work with the current Day-2 D2-3 streaming.
+Defer until tool-using agents are admitted into the batched path.
+
+**D3-4 (KV continued-store during batched decode) -- not relevant at
+typical generation lengths.**  `kv_cache_continued_store_target`
+fires at multiples of `continued_interval_tokens` (default 10240).
+Typical decode is 50-500 tokens; the session never crosses the
+threshold during decode.  Defer until very long generations (>10k
+tokens) become a workload.
+
+**Day-4 starting points (in order of expected impact):**
+1. Option B engine batched prefill -- the real cure for sequential
+   prefill cost; biggest remaining wall-clock lever for cache-miss
+   N>1 workloads.  ~2-week exploration.
+2. Re-measure sections 11-13 bench numbers under D2-4's tighter
+   stream discipline (cold-boot + 5-run median protocol) to confirm
+   the +29.9 % / +57.5 % wins hold or improve.
+3. OpenAI live-stream + tool-using requests in batched mode (D3-3
+   gated on this).
+4. Output head and routed-MoE batched substitutes (sections 11-13
+   already covered most of attention; FFN side has the shared-FFN
+   experiment in section 14 that needs the stream consistency fix
+   to be re-evaluated; routed MoE is its own scope because each
+   session selects its own experts).
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
@@ -1204,6 +1287,11 @@ Day-2 follow-ups on top of the Day-1 MVP (section 16):
 - f0e1248 ds4_gpu_tensor_copy_async routed through g_kernel_stream
 - 435e966 per-session KV cache in generate_batched (N=2 wall-clock
   with KV hit dropped from 17.4 s to 5.97 s, -66 %)
+
+Day-3 land (section 17):
+- 8542d34 DS4_SERVER_BATCH_MAX 4 -> 8 (N=8 stable under D2-4 stream
+  discipline; 8 parallel curls collapse to one batched(n=8) lockstep,
+  22.97 s wall-clock for 8x cache-hit requests, aggregate flat ~10 t/s)
 
 Phase A infrastructure (kernel stream plumbing, sections 1-10):
 - 1d7402e all kernel launches threaded through g_kernel_stream
