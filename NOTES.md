@@ -641,6 +641,56 @@ across N sessions (analogous to how attention's KV cache is shared
 within a session but private across sessions).  The substrate also
 unblocks the Option H upstream described in section 9.
 
+### 11. Batched attn_q_b (DS4_CUDA_BATCHED_Q_B) — first measurable layer-encoder N-aware win
+
+The per-layer interleaved encoder was calling `attn_q_b` (the layer's
+single biggest dense matmul, q_rank=1024 → q_dim=32768) once per
+session at n_tok = 1, so each session re-read the same weight matrix
+from HBM with no L2 reuse compounding across sessions on this 24 MiB
+cache.  This commit splits the phased decode-layer encoder's PRE
+phase into PRE_A / PRE_B / PRE_C sub-phases (a behaviour-preserving
+refactor) and adds an opt-in batched substitute for PRE_B:
+
+- New env var `DS4_CUDA_BATCHED_Q_B` enables `metal_graph_encode_q_b_batched`,
+  which stages N sessions' `qr_norm` into engine-level
+  `batched_qr_norm`, runs one `ds4_gpu_matmul_q4_0_batch_warp_tensor`
+  call with `n_tok = N` to write `batched_q`, and scatters rows back
+  to per-session `g->q`.
+- The batched encoder runs PRE_A per session, then `q_b_batched`,
+  then PRE_C per session (head_rms_norm + rope + kv_store + attention
+  + attn_output + HC expand + FFN HC pre + router + MoE).
+- If the batched call fails (Q4 lazy convert unavailable, etc.), the
+  PRE_C-per-session loop falls back to PRE_B|PRE_C so g->q gets a
+  valid per-session fill before head_rms_norm reads it.
+
+Measured (`ds4-bench --ctx-start 2048 --gen-tokens 50 --batch N`,
+median of 5 runs with 5 s cooldown):
+
+| N | baseline median | BATCHED_Q_B median | Δ |
+|---|----------------:|-------------------:|--:|
+| 4 | 19.78  (range 19.10 – 19.85) | **20.49** (range 20.46 – 20.63) | **+3.6 %** |
+| 8 | 20.03  (range 12.12 – 20.12; 2 thermal outliers) | **21.10** (range 21.08 – 21.11) | **+5.3 %** |
+
+The throughput delta is meaningful but the more striking change is
+the *variance collapse* at N = 8: baseline runs swing 12-20 t/s with
+intermittent low outliers (consistent with HBM contention as N
+sessions all race for the same `attn_q_b` weights through L2);
+batched runs hold a 0.03 t/s spread across 5 measurements.
+
+This is the first successful "real lever for N batching" PoC -- the
+shape that NOTES.md section "The real lever for N batching" Option 2
+named earlier in this file.  attn_q_b is the easiest of the dense
+matmuls to batch (single matmul with a clean qr_norm → q boundary;
+no per-row pos baked into the inputs).  The same pattern can extend
+to attn_q_a + attn_kv (which feed qkv_rms_norm, so they batch jointly
+with the norm), the attn_output_a/b pair, and a fused gate/up shared
+FFN.  Each one is now a small follow-up commit instead of a
+multi-day project.
+
+Re-open when: extending to the next dense matmul.  The infrastructure
+piece (PRE_A/B/C split + engine batched scratch + `metal_graph_encode_*_batched`
+pattern) is reusable.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
