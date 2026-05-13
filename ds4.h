@@ -189,6 +189,28 @@ typedef struct {
 int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
                                     char *err, size_t errlen);
 
+/* Multi-session batched prefill (Day-4 scaffolding for future batched
+ * implementation).
+ *
+ * Synchronize N sessions to their respective prompt prefixes in one
+ * call.  Slots with sessions[k] == NULL are skipped.  Returns 0 on
+ * success; on the first session failure returns nonzero and fills err.
+ *
+ * Today the body is a sequential loop over ds4_session_sync() (same
+ * wall-clock as N back-to-back per-session syncs), but the API surface
+ * is in place so a Day-5+ batched implementation can replace the body
+ * without changing callers.  The batched implementation will require a
+ * phase split inside metal_graph_encode_layer_attention_batch
+ * (analogous to the decode-side DS4_DECODE_LAYER_PRE_* bitmask of
+ * sections 11-13) plus an outer per-layer interleaved loop driving N
+ * sessions in lockstep, letting future batched substitutes (attn_q_a,
+ * qkv, attn_output for prefill) hook in between phases.  See NOTES
+ * section 19. */
+int ds4_sessions_sync_batched(ds4_session **sessions,
+                              const ds4_tokens **prompts,
+                              int n,
+                              char *err, size_t errlen);
+
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

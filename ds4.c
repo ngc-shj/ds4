@@ -19107,6 +19107,40 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #endif
 }
 
+/* Day-4 D4-2 scaffolding: multi-session batched prefill API surface.
+ * Today this is a sequential loop over ds4_session_sync() -- equivalent
+ * to N back-to-back per-session syncs, the engine-side per-layer
+ * interleaved batched encoder is NOT exercised on the prefill path
+ * yet.  The API is in place so a Day-5+ batched implementation can
+ * replace this body without changing callers.
+ *
+ * The batched implementation will require:
+ *  1. Splitting metal_graph_encode_layer_attention_batch into phases
+ *     analogous to the decode-side DS4_DECODE_LAYER_PRE_A1/A2/B/C
+ *     bitmask used in sections 11-13.
+ *  2. An outer per-layer interleaved loop that drives N sessions
+ *     through each phase in lockstep, like
+ *     metal_graph_encode_token_raw_swa_batched_n_sessions does for
+ *     decode.
+ *  3. Per-phase batched substitutes (attn_q_a, qkv, attn_output for
+ *     prefill) that gather N sessions' rows into engine-level scratch,
+ *     run one larger matmul, and scatter back.
+ *
+ * See NOTES section 19 for the full Day-5+ design and the recon trail
+ * (sections 11-17 for the decode-side analog). */
+int ds4_sessions_sync_batched(ds4_session **sessions,
+                              const ds4_tokens **prompts,
+                              int n,
+                              char *err, size_t errlen) {
+    if (!sessions || !prompts || n <= 0) return 0;
+    for (int k = 0; k < n; k++) {
+        if (!sessions[k]) continue;
+        int rc = ds4_session_sync(sessions[k], prompts[k], err, errlen);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
 void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;

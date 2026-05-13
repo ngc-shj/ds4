@@ -1236,6 +1236,128 @@ tokens) become a workload.
    to be re-evaluated; routed MoE is its own scope because each
    session selects its own experts).
 
+### 18. Day-4 D4-1: SHARED_FFN re-evaluation post-D2-4 — kernel broken, not stream race
+
+Section 14 hypothesized that `DS4_CUDA_BATCHED_SHARED_FFN`'s
+intermittent fatal failures (2/15 runs with corrupted error strings)
+were caused by the `ds4_gpu_tensor_copy_async` default-stream race
+that Day-2 D2-4 (f0e1248) closed.  Day-4 D4-1 tested this hypothesis
+directly: start the post-D2-4 server with `DS4_CUDA_BATCHED_SHARED_FFN=1`
+in env, run the same N=2/4/8 smoke that produced coherent Italian
+under D3-1, and check for both crashes and content quality.
+
+Result (warm-up + N=2 smoke, 2466p + 30c):
+- **No crashes** — the fatal-failure path that section 14 saw is
+  closed.  Server stayed up; both responses came back with valid
+  HTTP+JSON envelopes and `completion_tokens=30`.
+- **Silent numerical corruption** — the generated content was
+  `<｜begin▁of▁sentence｜><｜begin▁of▁sentence｜>...` repeating.  This
+  is the canonical symptom of logits collapsing to ~zero across the
+  vocabulary, leaving argmax stuck on the BOS token.
+
+D2-4 did help with the **stream consistency** part of section 14's
+hypothesis (no more error-string corruption / crashes), but the
+**numerical correctness** part is independent: the batched Q4 matmul
+itself produces wrong output at the SHARED FFN geometry
+(`DS4_N_EMBD -> DS4_N_FF_EXP = 2048`).  Section 14's original verdict
+("naive Q4 batch matmul doesn't beat fused per-session pair matmul
+at this layer's small out_dim") stands as definitive AND more severe
+than originally diagnosed: the naive batch path is not just slow at
+this geometry, it is **broken** (silent corruption).
+
+`DS4_CUDA_BATCHED_SHARED_FFN` therefore remains NOT shippable.
+Shipping a real SHARED_FFN substitute requires a **new fused
+gate+up Q4 pair kernel**, not just a refactor of the call site --
+this is the multi-day shared-FFN v2 work originally scoped in
+section 14 and now formally re-confirmed.
+
+### 19. Day-4 D4-2: engine batched prefill scaffolding (API in place, sequential body for now)
+
+Scope: add the `ds4_sessions_sync_batched` public API to the engine so
+future commits can replace the body with a true per-layer interleaved
+multi-session prefill, without disturbing callers.  This is Day-4
+close-out scaffolding; the real wall-clock win comes Day-5+ when the
+body is replaced.
+
+**What changed.**
+- `ds4.h`: added `ds4_sessions_sync_batched(sessions[], prompts[], n,
+  err, errlen)`.
+- `ds4.c`: added the implementation -- a sequential loop calling
+  `ds4_session_sync` per slot.  Equivalent wall-clock to the existing
+  per-session loop; the engine's per-layer interleaved batched encoder
+  is NOT exercised here yet.
+- No caller change: `ds4-server`'s generate_batched still drives
+  `ds4_session_sync` directly per slot.  Day-5+ switches it to the new
+  API once the batched body is in place (so the caller-side error
+  handling can be adjusted in lockstep with the new semantics).
+
+**Why the body is sequential today, not batched.**  The prefill
+encoder `metal_graph_encode_layer_attention_batch` (ds4.c:11119) is a
+monolithic ~250-line function that walks all attention sub-ops
+(rms_norm -> hc_attn_fn -> attn_norm -> attn_q_a -> attn_kv -> qkv_rms
+-> attn_q_b -> head_rms -> rope -> KV store -> attention compute ->
+attn_output) in one shot for one session.  Sections 11-13's
+batched-decode substitutes work by splitting the decode encoder into
+phases (DS4_DECODE_LAYER_PRE_A1/A2/B/C bitmask) and inserting
+multi-session batched substitutes between phases; prefill has no such
+split.  Building one is the Day-5 prerequisite for any substitute
+that wants to pool N sessions' rows.
+
+**Day-5 design (split into committable units).**
+
+D5-1: **Phase-split metal_graph_encode_layer_attention_batch** into a
+`_phased(g, ..., phases)` variant taking the same bitmask shape as the
+decode side.  The existing `metal_graph_encode_layer_attention_batch`
+becomes a thin wrapper that calls the phased version with ALL phases.
+Pure refactor, no behavior change.  Suggested phase boundaries:
+- PREFILL_HC_PRE      : rms_norm_plain_rows + hc_attn_fn + hc_split/weighted_sum
+- PREFILL_ATTN_NORM   : rms_norm_weight_rows (attn_norm)
+- PREFILL_Q_A         : attn_q_a matmul
+- PREFILL_KV          : attn_kv matmul
+- PREFILL_QKV_NORM    : dsv4_qkv_rms_norm_rows (fused or split)
+- PREFILL_Q_B         : attn_q_b matmul + head_rms
+- PREFILL_ROPE_KV     : rope_tail (Q+KV) + KV store + fp8 quantize
+- PREFILL_ATTN_COMP   : compressor path (if ratio != 0)
+- PREFILL_ATTENTION   : attention_prefill_raw_heads
+- PREFILL_ATTN_OUTPUT : attn_output_a + attn_output_b matmuls
+Estimated 200-300 LoC of variable hoisting and gate wrapping.
+
+D5-2: **Outer batched prefill loop** -- a new
+`metal_graph_prefill_layer_major_batched_n_sessions(sessions[], n_active,
+prompts[], ...)` that iterates layers and (for now) within each layer
+calls per-session phased(ALL) sequentially across sessions.  Sets the
+stage for substitutes to slot in between phases.  Estimated 100-150
+LoC.  Wires this into `ds4_sessions_sync_batched`'s body, replacing
+the sequential per-session loop.
+
+D5-3: **First batched substitute** -- `metal_graph_encode_attn_q_a_batched`
+(per the recon agent's MVP estimate).  Gathers N sessions' batch_attn_norm
+into engine-level scratch, runs one larger `ds4_gpu_matmul_q8_0_tensor`
+(n_rows = n_active x n_tokens), scatters back to each session's
+batch_qr.  Gated on `DS4_CUDA_BATCHED_PREFILL_Q_A` env var initially.
+Estimated 120-150 LoC.
+
+D5-4: **Server hookup** -- ds4_server.c generate_batched switches its
+sequential prefill loop to `ds4_sessions_sync_batched`.  Error
+handling adapts: on batched failure, fall back to per-session sync to
+identify which slot broke (so other slots still finish).  Estimated
+30-50 LoC.
+
+D5-5+: **Stack more substitutes** (qkv, attn_output for prefill) the
+same way sections 12-13 stacked on top of section 11's first
+substitute.  Each subsequent substitute is a separate commit.
+
+**Expected wall-clock impact.**  Day-3 D3-2 recon estimated 2-5 % per
+substitute on the 2466p+30c geometry where prefill already dominates
+(the per-session matmul is at n_tok=2048, so within-session weight
+amortization is mostly there already).  Stacking 3-4 substitutes is
+the realistic ceiling without Option B's full multi-session prefill
+encoder rewrite.  For cache-miss N=4 workloads (sequential prefill
+~24 s today), a 5-10 % win = 1-2 s saved.  Small but measurable; the
+larger contribution is unblocking the same pattern for Day-6+ work
+on the FFN side once the SHARED_FFN naive-Q4 kernel is replaced
+(section 14 / 18).
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
@@ -1292,6 +1414,15 @@ Day-3 land (section 17):
 - 8542d34 DS4_SERVER_BATCH_MAX 4 -> 8 (N=8 stable under D2-4 stream
   discipline; 8 parallel curls collapse to one batched(n=8) lockstep,
   22.97 s wall-clock for 8x cache-hit requests, aggregate flat ~10 t/s)
+
+Day-4 (sections 18, 19):
+- D4-1 (no commit): SHARED_FFN re-evaluation post-D2-4 confirmed silent
+  numerical corruption -- D2-4 closed the crash path but the naive Q4
+  batch matmul is fundamentally broken at the SHARED FFN's
+  DS4_N_FF_EXP=2048 geometry.  Section 14's verdict re-confirmed.
+- D4-2: ds4_sessions_sync_batched API added to ds4.h + ds4.c (engine
+  scaffolding for Day-5+ batched prefill; today the body is sequential
+  per-session, equivalent to the existing pattern).
 
 Phase A infrastructure (kernel stream plumbing, sections 1-10):
 - 1d7402e all kernel launches threaded through g_kernel_stream
