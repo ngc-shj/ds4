@@ -1518,6 +1518,118 @@ var off for any run whose output is consumed (warm-up curls that
 only populate KV are fine to flip it on for, since the bad output
 is discarded).
 
+### 20. Reproducible server smoke recipe (consolidated)
+
+This section consolidates the build + run + verify recipe that
+sessions 1-19 have been using ad-hoc.  Future sessions can reach
+this in one place instead of stitching together commands from
+sections 11-19.
+
+**1. Build for GB10.**
+
+```
+make cuda-spark
+```
+
+That target expands to `make ds4 ds4-server ds4-bench CUDA_ARCH=`,
+which compiles ds4.o with the default C flags and `ds4_cuda.o` with
+nvcc's `--use_fast_math` (CUDA_ARCH= lets nvcc auto-detect sm_121
+for GB10).  Optional `make cuda-regression` runs the long-context
+correctness test; not required for a perf smoke.
+
+**2. Start the server with the bench env-var combo.**
+
+The handoff bench workflow uses all four opt-in batched-decode
+substitutes plus the Q4 lazy-convert cache.  Empty KV-disk-cache
+dir on the first run is fine; subsequent runs benefit from the
+on-disk KV that the warm-up populates.
+
+```
+mkdir -p /tmp/ds4-kv
+DS4_CUDA_Q4_DECODE=1 \
+DS4_CUDA_BATCHED_QKV=1 \
+DS4_CUDA_BATCHED_Q_B=1 \
+DS4_CUDA_BATCHED_ATTN_OUTPUT=1 \
+  ./ds4-server --cuda --warm-weights --port 8000 --ctx 4096 \
+               --kv-disk-dir /tmp/ds4-kv \
+               > /tmp/ds4-server.log 2>&1 &
+disown
+until ss -tlnp 2>/dev/null | grep -q 8000; do sleep 2; done
+```
+
+Env-var reference (full table in `docs/GB10_JOURNEY.md` lines
+321-340; per-substitute land in sections 11-13):
+
+| Env var | Phase replaced | Section |
+|---|---|---|
+| `DS4_CUDA_Q4_DECODE=1` | Q4 lazy weight cache + batched output head | baseline gate |
+| `DS4_CUDA_BATCHED_Q_B=1` | decode PRE_B (attn_q_b) | 11 |
+| `DS4_CUDA_BATCHED_QKV=1` | decode PRE_A2 (attn_q_a + attn_kv + qkv_rms_norm) | 12 |
+| `DS4_CUDA_BATCHED_ATTN_OUTPUT=1` | decode PRE_C2 (attn_output) | 13 |
+| `DS4_CUDA_BATCHED_PREFILL_QKV=1` | prefill PRE_A2 (D5-3 scaffolding; **leave off by default**) | 19.3 |
+| `DS4_CUDA_BATCHED_SHARED_FFN=1` | broken Q4 batched matmul at FFN gate/up (**do not set**) | 14, 18 |
+
+**3. Verification curls.**
+
+```
+PROMPT=$(head -c 8000 speed-bench/promessi_sposi.txt)
+BODY=$(jq -nc --arg p "$PROMPT" \
+  '{messages:[{role:"user",content:$p}],max_tokens:30,thinking:{type:"disabled"}}')
+
+# Warm-up populates /tmp/ds4-kv with a coherent KV file for the prompt.
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" -d "$BODY" -o /tmp/r-warm.json
+
+# Parallel KV-hit smokes (each slot should return Italian Manzoni text).
+for N in 2 4 8; do
+  time (for i in $(seq 1 $N); do
+    curl -s http://localhost:8000/v1/chat/completions \
+      -H "Content-Type: application/json" -d "$BODY" \
+      -o /tmp/r-$N-$i.json &
+  done; wait)
+  for i in $(seq 1 $N); do
+    jq -r '.choices[0].message.content[0:100]' /tmp/r-$N-$i.json
+  done
+done
+```
+
+**4. Expected output shape.**
+
+Each KV-hit slot returns a sensible Italian opener referencing
+*I Promessi Sposi* / *Promessi sposi* / Alessandro Manzoni /
+*Introduzione*, often paraphrasing the prompt's first paragraph.
+Acceptable FP-noise tokens (section 15): occasional Arabic /
+Cebuano / Filipino / fictional fragments mixed into otherwise
+correct Italian -- the cuBLAS f16 TC reduction order varies enough
+to flip the argmax on near-tied tokens.  **Full BOS-attractor
+collapse** (`<｜begin▁of▁sentence｜>` repeating after a few
+coherent tokens) is **not** the expected variance; it indicates
+a real bug.
+
+**5. Known empty-KV caveat (section 19.1).**
+
+The very first warm-up curl (empty KV, full zero_prefix prefill of
+the prompt) sometimes collapses to BOS even on HEAD code.  At least
+one uninitialized-read source remains on the single-session decode
+path (the engine-batched-scratch fix in commit `2974421` handles
+the substitute side, but not all of it).  If the warm-up fails this
+way, the KV file written to disk is still usable (decode reads back
+correctly when prefill skipped via KV hit), so re-running curls
+without the warm-up still produces coherent output.  Treat single-
+run cold-prefill smokes as advisory only.
+
+**6. Server log sanity checks.**
+
+```
+grep "ctx=batched(n=" /tmp/ds4-server.log
+```
+
+Each parallel run should emit one `ctx=batched(n=N)` line per slot
+with `gen=<max_tokens> finish=length kv_cached=<>`.  The
+`kv_cached=2048` field after warm-up confirms that the
+KV-disk-cache hit is fully consumed and only the tail
+(prompt.len - 2048) tokens go through fresh prefill.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
