@@ -745,6 +745,74 @@ versus q_b's 29 % and qkv's ~10 %); shared FFN gate/up has the same
 shape but its dimensions are too small for the batched warp kernel
 to saturate (see "Layer-internal FFN batching" earlier in this file).
 
+### 13. Batched attn_output (DS4_CUDA_BATCHED_ATTN_OUTPUT) — biggest single win
+
+attn_output is the layer's largest stage at 39 % of decode time
+(NOTES "Where the actual time goes").  It comprises grouped output_a
+(reduces N_HEAD attention heads into N_OUT_GROUP groups × LoRA rank)
+plus output_b (LoRA rank * n_groups -> N_EMBD), and in production it
+runs as one fused single-token kernel
+(`ds4_gpu_attention_output_low_q8_tensor` + Q8 hc_expand fusion).
+That fusion forecloses any batched-N path.
+
+This commit:
+- Splits PRE_C into PRE_C1 (head_norm + rope + kv_store + compressor +
+  attention -> writes g->heads), PRE_C2 (attn_output -> writes
+  g->attn_out and, when fused, g->after_attn_hc), and PRE_C3
+  (steering + hc_expand + FFN HC pre + router + MoE).  Behaviour-
+  preserving (PRE_C = PRE_C1|PRE_C2|PRE_C3, default callers see no
+  change).
+- Adds Q4 dispatch inside `ds4_gpu_attention_output_q8_batch_tensor`
+  at n_tokens in (1, 32]: output_a uses the existing-but-previously-
+  gated-only-at-n_tok=1 `grouped_q4_0_a_preq_warp8_kernel`; output_b
+  uses `ds4_gpu_matmul_q4_0_batch_warp_tensor` directly instead of
+  routing through the cuBLAS f16 fallback.  Prefill (n_tokens ~ 2048)
+  still goes through cuBLAS f16 since the TC-friendly path beats the
+  Q4 warp kernel at that shape.
+- Adds engine-level batched_heads / batched_attn_low / batched_attn_out
+  scratch, and `metal_graph_encode_attn_output_batched` (stage N
+  sessions' heads, one n_tokens = N call to the batched output
+  tensor, scatter rows back to per-session g->attn_out).
+- PRE_C3 now runs hc_expand whenever PRE_C2 was substituted (not just
+  when `fuse_attn_out_hc` was off), so the batched path's
+  non-fused-equivalent semantics flow through correctly.
+
+DS4_CUDA_BATCHED_ATTN_OUTPUT=1 selects the batched substitute for
+PRE_C2.  Stacking with DS4_CUDA_BATCHED_QKV and DS4_CUDA_BATCHED_Q_B
+splits the per-session work into three loop passes around the three
+batched calls (qkv between PRE_A1 and PRE_B; q_b between qkv and
+PRE_C1; attn_output between PRE_C1 and PRE_C3).  Any batched call
+that fails at runtime falls back to per-session phased() with the
+corresponding sub-phase, so the graph result stays equivalent.
+
+Measured at N = 4 (median of 3 runs, GPU cooled to <55 °C between
+runs, ctx = 2048, gen = 50):
+
+| Config                    | N=4 median | Δ vs baseline |
+|---------------------------|-----------:|--------------:|
+| baseline                  | 19.67      | —             |
+| ATTN_OUTPUT only          | 23.30      | +18.5 %       |
+| QKV + Q_B + ATTN_OUTPUT   | **24.97**  | **+26.9 %**   |
+
+This is the largest single batched-substitute win so far; ATTN_OUTPUT
+alone moves N=4 throughput from ~19.7 to ~23.3 t/s.  Combining all
+three batched substitutes brings N=4 to 25 t/s, a 27 % aggregate
+gain vs the per-session baseline.
+
+N = 8 was measured at +12 % (median baseline 19.31 vs 21.71 with all
+substitutes) but the GPU was thermally noisy during that sweep --
+treat as a soft lower bound until a fresh-boot N=8 re-measurement.
+
+Re-open when: the remaining dense matmul candidates are the
+shared-FFN gate+up pair (small dims, NOTES section "Layer-internal
+FFN batching" suggests this needs a custom Q4 pair kernel to actually
+pay) and the routed-MoE experts (per-session expert selection makes
+batching non-trivial).  Output head is already engine-batched in
+production via metal_graph_encode_output_head_batched.  So the
+section-12 + section-13 pair has effectively captured the bulk of the
+layer-encoder N-aware refactor named earlier in this file under "The
+real lever for N batching".
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:

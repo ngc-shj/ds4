@@ -8137,6 +8137,31 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 dispatched_q4 = true;
             }
         }
+        /* When n_tokens > 1 and Q4 lazy convert is available, the grouped
+         * Q4 kernel above already supports the n_tokens dimension via
+         * blockIdx.y -- use it instead of falling to the f16 cuBLAS path
+         * that gets the cublas branch above.  Restricted to n_tokens <= 32
+         * so prefill (n_tokens ~ 2048) still uses the TC-friendly cuBLAS
+         * f16 path. */
+        if (!dispatched_q4 &&
+            use_dp4a && n_tokens > 1 && n_tokens <= 32 &&
+            getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+            const unsigned char *out_a_q4 = cuda_q4_from_q8_ptr(model_map, out_a_offset,
+                                                                  out_a_bytes, group_dim, low_dim);
+            if (out_a_q4) {
+                grouped_q4_0_a_preq_warp8_kernel<<<grid_a, 256, 0, g_kernel_stream>>>((float *)low->ptr,
+                                                                  out_a_q4,
+                                                                  xq,
+                                                                  xscale,
+                                                                  group_dim,
+                                                                  rank,
+                                                                  n_groups,
+                                                                  n_tokens,
+                                                                  blocks_a);
+                if (!cuda_ok(cudaGetLastError(), "attention_output_q4_a preq batch launch")) return 0;
+                dispatched_q4 = true;
+            }
+        }
         if (!dispatched_q4) {
             grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256, 0, g_kernel_stream>>>((float *)low->ptr,
                                                               out_a,
@@ -8153,6 +8178,22 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     }
 
     (void)out_b;
+    /* When n_tokens > 1 and Q4 lazy convert is available, use the Q4
+     * batched warp matmul directly instead of routing through
+     * cuda_matmul_q8_0_tensor_labeled (which would dispatch to cuBLAS
+     * f16 -- 2x HBM vs Q4 and a known regression at decode shape per
+     * NOTES.md "What does NOT help #2").  Restricted to n_tokens <= 32
+     * so prefill still uses cuBLAS f16's tensor-core path. */
+    if (cuda_q8_use_dp4a() && n_tokens > 1 && n_tokens <= 32 &&
+        getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+        if (ds4_gpu_matmul_q4_0_batch_warp_tensor(out, model_map, model_size,
+                                                  out_b_offset,
+                                                  low_dim, out_dim,
+                                                  low, n_tokens) != 0) {
+            return 1;
+        }
+        /* Fall through to the labeled path on failure. */
+    }
     return cuda_matmul_q8_0_tensor_labeled(out,
                                            model_map,
                                            model_size,
