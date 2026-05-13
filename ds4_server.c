@@ -7569,41 +7569,54 @@ static bool request_is_batchable(const server *s, const request *r) {
     if (r->has_tools) return false;
     if (ds4_think_mode_enabled(r->think_mode)) return false;
     if (r->api != API_OPENAI) return false;
-    if (r->stream) return false;
     if (s->kv.enabled) return false;
     if (r->stops.max_len > 0) return false;
     if (r->temperature <= 0.0f) return false;
+    /* Day-2 D2-3: streaming is supported via the simple plain-SSE path
+     * (sse_chunk delta + sse_done).  The structured OpenAI live-stream
+     * flow (role chunks, tool-call deltas) is NOT exercised in batched
+     * mode -- has_tools and think_mode are already excluded above, so
+     * the remaining stream payload is a sequence of plain content
+     * deltas which the simple path handles correctly. */
     return true;
 }
 
 /* Generate N batchable requests in lockstep through the per-layer
  * interleaved batched decode encoder.  All jobs MUST satisfy
  * request_is_batchable() and n must be in [2, DS4_SERVER_BATCH_MAX].
- * No KV cache reuse / no streaming / no DSML tools / no MTP -- the
- * response is built once at the end and sent via final_response(). */
+ * No KV cache reuse / no DSML tools / no MTP -- streaming is plain
+ * SSE deltas (no OpenAI live structured stream, no Anthropic). */
 static void generate_batched(server *s, job **jobs, int n) {
     ds4_session *sess[DS4_SERVER_BATCH_MAX];
-    char         err          [DS4_SERVER_BATCH_MAX][160];
-    int          prompt_tokens[DS4_SERVER_BATCH_MAX];
-    int          max_tokens   [DS4_SERVER_BATCH_MAX];
-    int          completion   [DS4_SERVER_BATCH_MAX];
-    bool         done         [DS4_SERVER_BATCH_MAX];
-    const char  *finish       [DS4_SERVER_BATCH_MAX];
-    char         id           [DS4_SERVER_BATCH_MAX][96];
-    uint64_t     rng          [DS4_SERVER_BATCH_MAX];
-    buf          text         [DS4_SERVER_BATCH_MAX];
+    char         err              [DS4_SERVER_BATCH_MAX][160];
+    int          prompt_tokens    [DS4_SERVER_BATCH_MAX];
+    int          max_tokens       [DS4_SERVER_BATCH_MAX];
+    int          completion       [DS4_SERVER_BATCH_MAX];
+    bool         done             [DS4_SERVER_BATCH_MAX];
+    const char  *finish           [DS4_SERVER_BATCH_MAX];
+    char         id               [DS4_SERVER_BATCH_MAX][96];
+    uint64_t     rng              [DS4_SERVER_BATCH_MAX];
+    buf          text             [DS4_SERVER_BATCH_MAX];
+    bool         stream_send      [DS4_SERVER_BATCH_MAX];
+    bool         stream_headers_ok[DS4_SERVER_BATCH_MAX];
+    bool         stream_failed    [DS4_SERVER_BATCH_MAX];
+    size_t       plain_stream_pos [DS4_SERVER_BATCH_MAX];
 
     for (int k = 0; k < n; k++) {
         sess[k] = s->batched_sessions[k];
         err[k][0] = '\0';
-        prompt_tokens[k] = 0;
-        max_tokens[k]    = 0;
-        completion[k]    = 0;
-        done[k]          = false;
-        finish[k]        = "length";
-        id[k][0]         = '\0';
-        rng[k]           = 0;
+        prompt_tokens[k]      = 0;
+        max_tokens[k]         = 0;
+        completion[k]         = 0;
+        done[k]               = false;
+        finish[k]             = "length";
+        id[k][0]              = '\0';
+        rng[k]                = 0;
         memset(&text[k], 0, sizeof(text[k]));
+        stream_send[k]        = jobs[k]->req.stream;
+        stream_headers_ok[k]  = false;
+        stream_failed[k]      = false;
+        plain_stream_pos[k]   = 0;
     }
     const int eos = ds4_token_eos(s->engine);
     const double t0 = now_sec();
@@ -7632,6 +7645,26 @@ static void generate_batched(server *s, job **jobs, int n) {
         rng[k] = req->seed ? req->seed :
             (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1)
              ^ (uint64_t)(uintptr_t)jobs[k]);
+    }
+
+    /* SSE headers + initial role chunk (for chat) per slot.  Stream
+     * failures are isolated per slot: the slot is marked done with
+     * finish="error" but the lockstep loop keeps running for the rest. */
+    for (int k = 0; k < n; k++) {
+        if (done[k] || !stream_send[k]) continue;
+        if (!sse_headers(jobs[k]->fd)) {
+            stream_failed[k] = true;
+            done[k] = true;
+            finish[k] = "error";
+            continue;
+        }
+        stream_headers_ok[k] = true;
+        if (jobs[k]->req.kind == REQ_CHAT &&
+            !sse_chunk(jobs[k]->fd, &jobs[k]->req, id[k], NULL, NULL)) {
+            stream_failed[k] = true;
+            done[k] = true;
+            finish[k] = "error";
+        }
     }
 
     while (!g_stop_requested) {
@@ -7684,6 +7717,25 @@ static void generate_batched(server *s, job **jobs, int n) {
                 buf_append(&text[k], piece, piece_len);
                 free(piece);
             }
+            /* Per-slot SSE delta: write whatever new content this slot
+             * has accumulated since the last delta. */
+            if (stream_send[k] && !stream_failed[k] &&
+                text[k].len > plain_stream_pos[k]) {
+                char *delta = xstrndup(text[k].ptr + plain_stream_pos[k],
+                                       text[k].len - plain_stream_pos[k]);
+                bool ok = sse_chunk(jobs[k]->fd, &jobs[k]->req,
+                                    id[k], delta, NULL);
+                free(delta);
+                if (ok) {
+                    plain_stream_pos[k] = text[k].len;
+                } else {
+                    stream_failed[k] = true;
+                    done[k] = true;
+                    finish[k] = "error";
+                    snprintf(err[k], sizeof(err[k]),
+                             "client stream write failed");
+                }
+            }
         }
     }
 
@@ -7696,17 +7748,31 @@ static void generate_batched(server *s, job **jobs, int n) {
 
     for (int k = 0; k < n; k++) {
         const request *req = &jobs[k]->req;
-        const char *content = text[k].ptr ? text[k].ptr : "";
-        final_response(jobs[k]->fd, req, id[k], content,
-                       NULL, NULL, finish[k],
-                       prompt_tokens[k], completion[k]);
+        if (stream_send[k]) {
+            if (stream_headers_ok[k] && !stream_failed[k]) {
+                if (!sse_chunk(jobs[k]->fd, req, id[k], NULL, finish[k]) ||
+                    !sse_done(jobs[k]->fd, req, id[k],
+                              prompt_tokens[k], completion[k])) {
+                    stream_failed[k] = true;
+                }
+            }
+            /* If stream_headers_ok was never reached, the client got an
+             * error before any SSE bytes -- nothing further to send. */
+        } else {
+            const char *content = text[k].ptr ? text[k].ptr : "";
+            final_response(jobs[k]->fd, req, id[k], content,
+                           NULL, NULL, finish[k],
+                           prompt_tokens[k], completion[k]);
+        }
     }
 
     for (int k = 0; k < n; k++) {
         server_log(DS4_LOG_GENERATION,
-                   "ds4-server: %s ctx=batched(n=%d) gen=%d finish=%s %.3fs",
+                   "ds4-server: %s ctx=batched(n=%d) gen=%d finish=%s "
+                   "stream=%d %.3fs",
                    jobs[k]->req.kind == REQ_CHAT ? "chat" : "completion",
-                   n, completion[k], finish[k], now_sec() - t0);
+                   n, completion[k], finish[k],
+                   stream_send[k] ? 1 : 0, now_sec() - t0);
         buf_free(&text[k]);
     }
 }
