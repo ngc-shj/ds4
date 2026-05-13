@@ -4714,15 +4714,23 @@ typedef struct {
     uint64_t scan_clock;
 } tool_memory;
 
+/* Day-2 D2-2: maximum batched-decode pool depth.  Engine caps the
+ * batched-decode encoder at 8 (DS4_BATCH_INTERLEAVED_MAX, see
+ * ds4.c:18341); section 14 documented occasional N>8 instability,
+ * so 4 is the conservative ceiling that still hits the +29.9 % N=4
+ * aggregate win measured under sections 11-13. */
+#define DS4_SERVER_BATCH_MAX 4
+
 struct server {
     ds4_engine *engine;
     ds4_session *session;
-    /* Day-1 continuous-batching scheduler: a 2-slot session pool used by
-     * generate_batched() when two batchable requests are paired off the
-     * queue.  See request_is_batchable() for the qualifying conditions
-     * (plain non-stream OpenAI chat/completion, no tools, no thinking,
-     * no stops, no KV disk cache, temperature > 0). */
-    ds4_session *batched_sessions[2];
+    /* Continuous-batching scheduler: a pool of up to DS4_SERVER_BATCH_MAX
+     * sessions used by generate_batched() when multiple batchable
+     * requests are gathered off the queue.  See request_is_batchable()
+     * for the qualifying conditions (plain non-stream OpenAI
+     * chat/completion, no tools, no thinking, no stops, no KV disk
+     * cache, temperature > 0). */
+    ds4_session *batched_sessions[DS4_SERVER_BATCH_MAX];
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -7568,31 +7576,44 @@ static bool request_is_batchable(const server *s, const request *r) {
     return true;
 }
 
-/* Generate two batchable requests in lockstep through the per-layer
- * interleaved batched decode encoder.  Both jobs MUST satisfy
- * request_is_batchable().  No KV cache reuse / no streaming / no DSML
- * tools / no MTP -- the response is built once at the end and sent via
- * final_response().  This is the Day-1 MVP; richer features (streaming,
- * KV cache, tools) follow in later phases. */
-static void generate_batched(server *s, job *j1, job *j2) {
-    job *jobs[2] = {j1, j2};
-    ds4_session *sess[2] = {s->batched_sessions[0], s->batched_sessions[1]};
-    char err[2][160] = {{0}, {0}};
+/* Generate N batchable requests in lockstep through the per-layer
+ * interleaved batched decode encoder.  All jobs MUST satisfy
+ * request_is_batchable() and n must be in [2, DS4_SERVER_BATCH_MAX].
+ * No KV cache reuse / no streaming / no DSML tools / no MTP -- the
+ * response is built once at the end and sent via final_response(). */
+static void generate_batched(server *s, job **jobs, int n) {
+    ds4_session *sess[DS4_SERVER_BATCH_MAX];
+    char         err          [DS4_SERVER_BATCH_MAX][160];
+    int          prompt_tokens[DS4_SERVER_BATCH_MAX];
+    int          max_tokens   [DS4_SERVER_BATCH_MAX];
+    int          completion   [DS4_SERVER_BATCH_MAX];
+    bool         done         [DS4_SERVER_BATCH_MAX];
+    const char  *finish       [DS4_SERVER_BATCH_MAX];
+    char         id           [DS4_SERVER_BATCH_MAX][96];
+    uint64_t     rng          [DS4_SERVER_BATCH_MAX];
+    buf          text         [DS4_SERVER_BATCH_MAX];
+
+    for (int k = 0; k < n; k++) {
+        sess[k] = s->batched_sessions[k];
+        err[k][0] = '\0';
+        prompt_tokens[k] = 0;
+        max_tokens[k]    = 0;
+        completion[k]    = 0;
+        done[k]          = false;
+        finish[k]        = "length";
+        id[k][0]         = '\0';
+        rng[k]           = 0;
+        memset(&text[k], 0, sizeof(text[k]));
+    }
     const int eos = ds4_token_eos(s->engine);
     const double t0 = now_sec();
 
-    int          prompt_tokens[2] = {0, 0};
-    int          max_tokens   [2] = {0, 0};
-    int          completion   [2] = {0, 0};
-    bool         done         [2] = {false, false};
-    const char  *finish       [2] = {"length", "length"};
-    char         id           [2][96];
-    uint64_t     rng          [2] = {0, 0};
-    buf          text         [2] = {{0}, {0}};
-
-    /* Per-slot prefill from scratch (no cross-request KV cache reuse
-     * in this MVP). */
-    for (int k = 0; k < 2; k++) {
+    /* Per-slot prefill from scratch.  Sequential per session because
+     * ds4_session_sync touches engine-wide state (g_kernel_stream,
+     * __constant__ batch args, scratch buffers) that is not safe to
+     * drive from two concurrent threads (see Day-2 D2-1 revert note in
+     * NOTES section 15). */
+    for (int k = 0; k < n; k++) {
         const request *req = &jobs[k]->req;
         ds4_session_invalidate(sess[k]);
         if (ds4_session_sync(sess[k], &req->prompt, err[k], sizeof(err[k])) != 0) {
@@ -7614,9 +7635,10 @@ static void generate_batched(server *s, job *j1, job *j2) {
     }
 
     while (!g_stop_requested) {
-        ds4_batch_slot slots[2] = {{0}, {0}};
+        ds4_batch_slot slots[DS4_SERVER_BATCH_MAX];
+        memset(slots, 0, sizeof(slots));
         int active = 0;
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < n; k++) {
             if (done[k]) continue;
             if (completion[k] >= max_tokens[k] ||
                 ds4_session_pos(sess[k]) >= ds4_session_ctx(sess[k])) {
@@ -7640,9 +7662,9 @@ static void generate_batched(server *s, job *j1, job *j2) {
         if (active == 0) break;
 
         char eval_err[160] = {0};
-        if (ds4_session_eval_batched_decode(slots, 2, eval_err,
+        if (ds4_session_eval_batched_decode(slots, n, eval_err,
                                             sizeof(eval_err)) != 0) {
-            for (int k = 0; k < 2; k++) {
+            for (int k = 0; k < n; k++) {
                 if (slots[k].session) {
                     done[k] = true;
                     finish[k] = "error";
@@ -7652,7 +7674,7 @@ static void generate_batched(server *s, job *j1, job *j2) {
             break;
         }
 
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < n; k++) {
             if (!slots[k].session) continue;
             int token = slots[k].token;
             size_t piece_len = 0;
@@ -7666,13 +7688,13 @@ static void generate_batched(server *s, job *j1, job *j2) {
     }
 
     if (g_stop_requested) {
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < n; k++) {
             if (strcmp(finish[k], "error") != 0) finish[k] = "error";
             if (!err[k][0]) snprintf(err[k], sizeof(err[k]), "shutdown requested");
         }
     }
 
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < n; k++) {
         const request *req = &jobs[k]->req;
         const char *content = text[k].ptr ? text[k].ptr : "";
         final_response(jobs[k]->fd, req, id[k], content,
@@ -7680,39 +7702,65 @@ static void generate_batched(server *s, job *j1, job *j2) {
                        prompt_tokens[k], completion[k]);
     }
 
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < n; k++) {
         server_log(DS4_LOG_GENERATION,
-                   "ds4-server: %s ctx=batched gen=%d finish=%s %.3fs",
+                   "ds4-server: %s ctx=batched(n=%d) gen=%d finish=%s %.3fs",
                    jobs[k]->req.kind == REQ_CHAT ? "chat" : "completion",
-                   completion[k], finish[k], now_sec() - t0);
+                   n, completion[k], finish[k], now_sec() - t0);
         buf_free(&text[k]);
     }
 }
 
+/* Day-2 D2-2 worker loop: gather up to DS4_SERVER_BATCH_MAX batchable
+ * requests off the queue (50 ms initial wait for the first pair-mate,
+ * then non-blocking grabs for the rest -- subsequent jobs that are
+ * already queued cost nothing more in latency, but waiting longer
+ * starves the first request).  A non-batchable spillover request found
+ * mid-gather is processed on the legacy path after the batched run. */
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
         job *j1 = dequeue(s);
         if (!j1) break;
-        if (request_is_batchable(s, &j1->req)) {
-            job *j2 = dequeue_pair_wait(s, 50);
-            if (j2) {
-                if (request_is_batchable(s, &j2->req)) {
-                    generate_batched(s, j1, j2);
-                    signal_done(j1);
-                    signal_done(j2);
-                    continue;
-                }
-                /* j2 not batchable -- fall back to legacy for both. */
-                generate_job(s, j1);
-                signal_done(j1);
-                generate_job(s, j2);
-                signal_done(j2);
-                continue;
-            }
+        if (!request_is_batchable(s, &j1->req)) {
+            generate_job(s, j1);
+            signal_done(j1);
+            continue;
         }
-        generate_job(s, j1);
-        signal_done(j1);
+
+        job *gathered[DS4_SERVER_BATCH_MAX];
+        int  n_gathered = 1;
+        gathered[0] = j1;
+        job *spillover = NULL;
+        /* Time-budget gather: total wait across all gather steps is
+         * capped at 50 ms so single-request latency adds at most
+         * 5 % on a 1-second turn while leaving room for up to N-1
+         * additional parallel arrivals to ride along. */
+        const double gather_t0 = now_sec();
+        while (n_gathered < DS4_SERVER_BATCH_MAX) {
+            int elapsed_ms   = (int)((now_sec() - gather_t0) * 1000.0);
+            int remaining_ms = 50 - elapsed_ms;
+            if (remaining_ms <= 0) break;
+            job *jx = dequeue_pair_wait(s, remaining_ms);
+            if (!jx) break;
+            if (!request_is_batchable(s, &jx->req)) {
+                spillover = jx;
+                break;
+            }
+            gathered[n_gathered++] = jx;
+        }
+
+        if (n_gathered >= 2) {
+            generate_batched(s, gathered, n_gathered);
+            for (int k = 0; k < n_gathered; k++) signal_done(gathered[k]);
+        } else {
+            generate_job(s, gathered[0]);
+            signal_done(gathered[0]);
+        }
+        if (spillover) {
+            generate_job(s, spillover);
+            signal_done(spillover);
+        }
     }
     return NULL;
 }
@@ -8068,7 +8116,7 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < DS4_SERVER_BATCH_MAX; k++) {
         if (s->batched_sessions[k]) {
             ds4_session_free(s->batched_sessions[k]);
             s->batched_sessions[k] = NULL;
@@ -8317,12 +8365,15 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
 
-    /* Day-1 batched scheduler: 2-slot session pool used by
-     * generate_batched().  These mirror s->session's ctx_size; total
-     * extra memory is ~ 2 * (per-session context buffers).  Failure to
-     * create either pool entry disables the batched path -- the worker
-     * keeps using s->session via generate_job(). */
-    for (int k = 0; k < 2; k++) {
+    /* Continuous-batching scheduler: up to DS4_SERVER_BATCH_MAX
+     * session pool used by generate_batched().  These mirror
+     * s->session's ctx_size; total extra memory is
+     * DS4_SERVER_BATCH_MAX * (per-session context buffers).  Failure
+     * to create any pool entry releases the partial pool and disables
+     * the batched path -- the worker keeps using s->session via
+     * generate_job() (request_is_batchable() guards on
+     * batched_sessions[0] && batched_sessions[1]). */
+    for (int k = 0; k < DS4_SERVER_BATCH_MAX; k++) {
         if (ds4_session_create(&s.batched_sessions[k], engine, cfg.ctx_size) != 0) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: failed to create batched session %d -- "
