@@ -829,9 +829,22 @@ alone moves N=4 throughput from ~19.7 to ~23.3 t/s.  Combining all
 three batched substitutes brings N=4 to 25 t/s, a 27 % aggregate
 gain vs the per-session baseline.
 
-N = 8 was measured at +12 % (median baseline 19.31 vs 21.71 with all
-substitutes) but the GPU was thermally noisy during that sweep --
-treat as a soft lower bound until a fresh-boot N=8 re-measurement.
+Fresh-boot N=8 re-measurement (5 runs each, cooldown to <55 °C between
+runs, ctx=2048, gen=50):
+
+| Config   | runs                                  | median  | mean  | range          | CoV   |
+|----------|---------------------------------------|--------:|------:|----------------|------:|
+| baseline | 17.31 / 15.62 / 11.16 / 14.19 / 18.82 | 15.62   | 15.42 | 11.16 – 18.82  | ~17 % |
+| ALL ON   | 24.60 / 22.42 / 19.03 / 25.00 / 24.77 | 24.60   | 23.16 | 19.03 – 25.00  | ~10 % |
+
+Δ median +57.5 %, Δ mean +50.2 % — substantially above the earlier
+thermally-noisy +12 % single-shot.  Baseline variance stays high
+because per-session serial kernel-launch latency on N=8 sits in the
+unfortunate zone where small scheduling jitter dominates throughput;
+ALL ON tightens up because batched substitutes amortize most of that
+serial overhead.  ALL ON median 24.60 is within noise of the N=4
+median (24.97), so the batched substitutes effectively flatten the
+N=4 → N=8 throughput cliff.
 
 Re-open when: the remaining dense matmul candidates are the
 shared-FFN gate+up pair (small dims, NOTES section "Layer-internal
