@@ -572,6 +572,75 @@ matmuls run at n_tok ≥ 4 per call (cross-session aggregation), AND
 tensor-core variant at this matmul shape can compete with the Q4
 dp4a baseline.
 
+### 10. N > 8 batched stability — diagnosis update (no fix)
+
+Earlier comment on `DS4_BATCH_INTERLEAVED_MAX = 8` attributed the
+instability past N = 8 to "cuda_tmp_alloc contention at high session
+count" (see ds4.c around the cap definition prior to this commit).
+That diagnosis was untested.
+
+This session traced cuda_tmp_alloc with `DS4_CUDA_TMP_TRACE=1` and
+ran the per-layer interleaved encoder at various N.  Findings:
+
+- The scratch allocator does NOT thrash during decode.  During a
+  three-token N = 16 run, the trace records exactly **two** realloc
+  events, both at prefill time (`f16 gemm activations` 64 MiB,
+  `attention output a cublas` 192 MiB); decode itself produces zero.
+- N = 16 does NOT deterministically crash.  Five back-to-back runs
+  completed without error, with high variance (5.86 – 11.21 t/s).
+- A fresh-GPU sweep, 5 runs per N with 8 s cooldown between runs
+  (ctx=2048, gen=50, GPU starting from idle 49-53 °C):
+
+  | N  | min    | median | max   | range  |
+  |----|--------|--------|-------|--------|
+  |  8 | 13.90  | 16.73  | 20.23 | 6.33   |
+  |  9 | 15.98  | 19.43  | 20.12 | 4.14   |
+  | 10 |  8.99  | 14.59  | 18.66 | 9.67   |
+  | 11 | 11.66  | 14.76  | 17.49 | 5.83   |
+  | 12 | 14.76  | 18.60  | 19.48 | 4.72   |
+  | 16 |  5.86  | (n=5 too noisy to median) | 15.12 | 9.26 |
+  | 24 |  4.28  |  ─     |  ─    |        |
+  | 32 | hang on every run                  |        |
+
+  The per-N range is 4-9 t/s wide -- bigger than the inter-N gaps.
+  The single-shot sweep earlier in this session that suggested "N=8
+  is the clean peak" did not survive 5x repetition: N=9 and N=12
+  medians both edge past N=8, but only inside the noise band, and the
+  ordering across N is not monotonic.  Likely culprits for variance
+  include thermal modulation (prefill_tps fluctuates 185-345 between
+  back-to-back runs) and KV-cache fill state on the first decode
+  after model load.
+
+  Aggregate clearly DOES collapse past N = 16 (worst-case run never
+  exceeds 15 t/s; best run is below N = 8's median).  The N = 8 → 12
+  region looks noise-flat at this measurement budget; raising the
+  cap would trade the stability of the documented N = 8 path for a
+  noise-dominated upside.  Cap stays at 8.
+
+- Per-stage profile at N = 16 (`DS4_METAL_DECODE_STAGE_PROFILE = 1`,
+  decode steps only): dense matmuls (`attn_output 39 %`, `q_path
+  29 %`, `shared_gate_up 11 %`, `shared_down 6 %`) account for 86 %
+  of decode wall time; attention is just 1 %.  Within a layer,
+  session 0 of each stage takes ~150 ms while sessions 1-15 take
+  ~0.5 ms each — the "session 0 cold-fetches, sessions 1-N hit L2"
+  amortization is still working at N = 16 (for THE LAYERS THAT FIT),
+  but the per-session scratch + per-session active expert weights
+  push the working set past GB10's 24 MiB L2 around N = 12-14, after
+  which the cold-miss pattern repeats more often and per-session
+  throughput collapses.
+
+So the cap stays at 8 — the right cap, the wrong reason in the old
+comment.  The path to lift it isn't an allocator fix; it's the
+"real lever" layer-encoder refactor that shares per-layer scratch
+across sessions (so per-session working set stops scaling with N).
+The hang at N = 32 is uninvestigated; reproducing it long enough to
+catch in a debugger would be its own session.
+
+Re-open when: someone designs a per-layer scratch layout that shares
+across N sessions (analogous to how attention's KV cache is shared
+within a session but private across sessions).  The substrate also
+unblocks the Option H upstream described in section 9.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:

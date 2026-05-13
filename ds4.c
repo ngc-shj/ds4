@@ -17937,11 +17937,30 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
         n_active++;
     }
     /* The per-layer interleaved batched encoder gives a measurable L2-
-     * reuse win at N = 2..8 but becomes unstable past N = 8 on this
-     * hardware (high run-to-run variance, occasional crashes -- likely
-     * working-set / cuda_tmp_alloc contention at high session count).
-     * For N > 8 the GPU fast path stays on the older sync-amortized
-     * serial loop, which is itself an improvement over per-call sync. */
+     * reuse win at N = 2..8 on this hardware but flattens past N = 8
+     * (high run-to-run variance, occasional hangs at N >= 32).  The
+     * earlier suspicion that this was cuda_tmp_alloc contention was
+     * traced and disproved (NOTES.md section 10): the scratch allocator
+     * never reallocates during decode.  The real cap is L2 working-set:
+     * per-session scratch + active expert weights for N sessions
+     * approach GB10's 24 MiB L2, after which the "session 0 cold-
+     * fetches, sessions 1-N hit L2" pattern breaks down and per-session
+     * throughput drops faster than aggregate t/s grows.  Measured
+     * aggregate (ctx=2048 gen=50, median of 5 runs, 8 s cooldown):
+     *   N=8  : 16.73 t/s  (range 13.90 - 20.23)
+     *   N=9  : 19.43      (range 15.98 - 20.12)
+     *   N=10 : 14.59      (range  8.99 - 18.66)
+     *   N=11 : 14.76      (range 11.66 - 17.49)
+     *   N=12 : 18.60      (range 14.76 - 19.48)
+     *   N=16 :  6.8 - 15.1 (no median, very high variance)
+     *   N=24 :  4.28
+     *   N=32 : hang
+     * Variance per-N (4-9 t/s wide) exceeds the inter-N gaps, so no
+     * specific cap above 8 has a measured aggregate win; raising the
+     * cap trades stability for noise-dominated upside.
+     * So the cap stays at 8: higher Ns are not a stable win, fixing
+     * them needs the "real lever" layer-encoder refactor that shares
+     * per-layer scratch across sessions. */
     const int DS4_BATCH_INTERLEAVED_MAX = 8;
     if (gpu_fast && engine && n_active > 1 && n_active <= DS4_BATCH_MAX) {
         /* Compact active rows into a contiguous list so the batch path can
