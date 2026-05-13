@@ -1413,6 +1413,53 @@ There is at least one more uninitialized-read source somewhere on
 the single-session path; it does not affect the batched substitutes
 post-fix, but it should be tracked and fixed.
 
+### 19.2. Day-5 D5-2 + D5-4 land: outer batched loop + server wire-up
+
+D5-2 adds `metal_graph_prefill_layer_major_batched_n_sessions`
+(ds4.c) which drives N sessions through each layer in lockstep, then
+runs the output head per session.  The per-session work is the same
+`metal_graph_encode_layer_batch` the single-session path uses; the
+only difference is that all sessions process layer `il` before any
+session moves to layer `il+1`, so the layer weight takes one L2
+sweep across the batch instead of N.  No batched substitutes
+slot in yet -- that is D5-3+'s job, and the phase split from D5-1
+is in place to support it.
+
+D5-4 wires `ds4_sessions_sync_batched` into `ds4_server.c`'s
+`generate_batched` path by splitting the prefill loop into three
+phases:
+  1. per-slot KV-disk-cache try-load + prompt collection
+  2. one `ds4_sessions_sync_batched()` call across all slots
+     (falls back to a per-slot `ds4_session_sync` loop on failure
+     so the broken slot is identified without poisoning the others)
+  3. per-slot post-sync bookkeeping (prompt_tokens, max_tokens,
+     request id, rng seed)
+
+**Eligibility today (silent per-session fallback).**  The batched
+fast path bails on the first check that fails:
+  - any session on a CPU backend
+  - any session bound to a different engine
+  - any prompt longer than that session's prefill_cap
+  - any session with a live checkpoint (i.e. KV-disk-cache hit
+    landed during phase 1 -- which is the common bench case)
+The last check is the most consequential: in the handoff bench
+workflow (warm-up curl + N=2/4/8 parallel) every parallel slot has
+a KV-hit checkpoint, so the fast path falls back and the slots are
+synced sequentially via `ds4_session_sync` (= the pre-D5-4
+behavior).  The fast path does fire on the warm-up's empty-KV
+N=1 case, where it is operationally equivalent to the single-
+session prefill it replaces.  Lifting the checkpoint-resume
+restriction is on the D5-5+ list -- it requires a batched analog
+to `metal_graph_prefill_chunked_range`.
+
+**Verification.**  Handoff bench workflow against
+promessi_sposi.txt (warm-up + N=2 parallel + N=4 parallel): all
+six KV-hit slots return grammatically-correct Italian Manzoni
+discussion (occasional FP-noise tokens within Section-15
+variance).  N=1 empty-KV warm-up still sometimes collapses to BOS
+-- that is the section-19.1 known follow-up bug, not new
+regression from D5-2/D5-4.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:

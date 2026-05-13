@@ -7656,16 +7656,23 @@ static void generate_batched(server *s, job **jobs, int n) {
     const int eos = ds4_token_eos(s->engine);
     const double t0 = now_sec();
 
-    /* Per-slot prefill.  Sequential per session because ds4_session_sync
-     * touches engine-wide state (g_kernel_stream, __constant__ batch
-     * args, scratch buffers) that is not safe to drive from two
-     * concurrent threads (Day-2 D2-1 revert note in NOTES section 15).
-     *
-     * Day-2 D2-5: try the disk KV cache per slot before invalidating.
-     * Each batched session has its own continued-store frontier counter
-     * in s->kv.continued_last_store_tokens[1+k].  Successful hits set
-     * effective_prompt[k] to the tokenized text-suffix after the
-     * cached byte prefix; sync proceeds from there. */
+    /* Three-phase prefill (D5-4 wires up the D5-2 engine batched API):
+     *   Phase 1: per-slot KV-disk-cache try-load + collect prompts.
+     *   Phase 2: single ds4_sessions_sync_batched() call across all
+     *            eligible slots.  On any failure, fall back to a
+     *            per-slot ds4_session_sync() loop so the broken slot
+     *            is identified without poisoning the others.
+     *   Phase 3: per-slot post-sync bookkeeping (prompt_tokens,
+     *            max_tokens, request id, rng seed).
+     * Sequential constraint from Day-2 D2-1 still holds for Phase 2:
+     * the batched API drives a single engine and a single
+     * g_kernel_stream; only the host-side nesting changes (layers
+     * outside, sessions inside) so the layer weights take one L2
+     * sweep across N sessions instead of N. */
+    const ds4_tokens *batch_prompts[DS4_SERVER_BATCH_MAX];
+    for (int k = 0; k < n; k++) batch_prompts[k] = NULL;
+
+    /* Phase 1: per-slot KV-disk-cache try-load + prompt selection. */
     for (int k = 0; k < n; k++) {
         const request *req = &jobs[k]->req;
         const int kv_idx = server_session_kv_index(s, sess[k]);
@@ -7686,11 +7693,26 @@ static void generate_batched(server *s, job **jobs, int n) {
         } else {
             ds4_session_invalidate(sess[k]);
         }
-        if (ds4_session_sync(sess[k], prompt_for_sync, err[k], sizeof(err[k])) != 0) {
-            done[k] = true;
-            finish[k] = "error";
-            continue;
+        batch_prompts[k] = prompt_for_sync;
+    }
+
+    /* Phase 2: batched sync; on failure fall back per-slot. */
+    char batched_err[256] = { 0 };
+    int batched_rc = ds4_sessions_sync_batched(sess, batch_prompts, n,
+                                                batched_err, sizeof(batched_err));
+    if (batched_rc != 0) {
+        for (int k = 0; k < n; k++) {
+            if (ds4_session_sync(sess[k], batch_prompts[k], err[k], sizeof(err[k])) != 0) {
+                done[k] = true;
+                finish[k] = "error";
+            }
         }
+    }
+
+    /* Phase 3: per-slot post-sync bookkeeping. */
+    for (int k = 0; k < n; k++) {
+        if (done[k]) continue;
+        const request *req = &jobs[k]->req;
         prompt_tokens[k] = req->prompt.len;
         int room = ds4_session_ctx(sess[k]) - ds4_session_pos(sess[k]);
         max_tokens[k] = req->max_tokens;
