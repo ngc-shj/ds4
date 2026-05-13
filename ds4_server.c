@@ -4717,6 +4717,12 @@ typedef struct {
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    /* Day-1 continuous-batching scheduler: a 2-slot session pool used by
+     * generate_batched() when two batchable requests are paired off the
+     * queue.  See request_is_batchable() for the qualifying conditions
+     * (plain non-stream OpenAI chat/completion, no tools, no thinking,
+     * no stops, no KV disk cache, temperature > 0). */
+    ds4_session *batched_sessions[2];
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -7507,16 +7513,206 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* Short-timed pair wait: returns the next queued job if one arrives
+ * within `timeout_ms`, NULL otherwise.  Used by the batched scheduler
+ * to try to pair the freshly-dequeued job with another batchable
+ * request -- HTTP parse + enqueue typically takes 1-5 ms, so a 50 ms
+ * window catches near-simultaneous parallel requests without adding
+ * meaningful latency to true single-request workloads. */
+static job *dequeue_pair_wait(server *s, int timeout_ms) {
+    pthread_mutex_lock(&s->mu);
+    if (!s->head && !s->stopping && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)timeout_ms * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec  += ts.tv_nsec / 1000000000L;
+            ts.tv_nsec %= 1000000000L;
+        }
+        while (!s->head && !s->stopping) {
+            if (pthread_cond_timedwait(&s->cv, &s->mu, &ts) != 0) break;
+        }
+    }
+    if (!s->head) {
+        pthread_mutex_unlock(&s->mu);
+        return NULL;
+    }
+    job *j = s->head;
+    s->head = j->next;
+    if (!s->head) s->tail = NULL;
+    pthread_mutex_unlock(&s->mu);
+    j->next = NULL;
+    return j;
+}
+
+static void signal_done(job *j) {
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+/* Day-1 batchable predicate: only the simplest, most common code paths.
+ * Anything that needs DSML tool tracking, thinking mode, structured
+ * streams, KV disk cache, stop strings, or MTP speculative decoding
+ * goes through the legacy generate_job() path on s->session. */
+static bool request_is_batchable(const server *s, const request *r) {
+    if (!s->batched_sessions[0] || !s->batched_sessions[1]) return false;
+    if (r->has_tools) return false;
+    if (ds4_think_mode_enabled(r->think_mode)) return false;
+    if (r->api != API_OPENAI) return false;
+    if (r->stream) return false;
+    if (s->kv.enabled) return false;
+    if (r->stops.max_len > 0) return false;
+    if (r->temperature <= 0.0f) return false;
+    return true;
+}
+
+/* Generate two batchable requests in lockstep through the per-layer
+ * interleaved batched decode encoder.  Both jobs MUST satisfy
+ * request_is_batchable().  No KV cache reuse / no streaming / no DSML
+ * tools / no MTP -- the response is built once at the end and sent via
+ * final_response().  This is the Day-1 MVP; richer features (streaming,
+ * KV cache, tools) follow in later phases. */
+static void generate_batched(server *s, job *j1, job *j2) {
+    job *jobs[2] = {j1, j2};
+    ds4_session *sess[2] = {s->batched_sessions[0], s->batched_sessions[1]};
+    char err[2][160] = {{0}, {0}};
+    const int eos = ds4_token_eos(s->engine);
+    const double t0 = now_sec();
+
+    int          prompt_tokens[2] = {0, 0};
+    int          max_tokens   [2] = {0, 0};
+    int          completion   [2] = {0, 0};
+    bool         done         [2] = {false, false};
+    const char  *finish       [2] = {"length", "length"};
+    char         id           [2][96];
+    uint64_t     rng          [2] = {0, 0};
+    buf          text         [2] = {{0}, {0}};
+
+    /* Per-slot prefill from scratch (no cross-request KV cache reuse
+     * in this MVP). */
+    for (int k = 0; k < 2; k++) {
+        const request *req = &jobs[k]->req;
+        ds4_session_invalidate(sess[k]);
+        if (ds4_session_sync(sess[k], &req->prompt, err[k], sizeof(err[k])) != 0) {
+            done[k] = true;
+            finish[k] = "error";
+            continue;
+        }
+        prompt_tokens[k] = req->prompt.len;
+        int room = ds4_session_ctx(sess[k]) - ds4_session_pos(sess[k]);
+        max_tokens[k] = req->max_tokens;
+        if (max_tokens[k] < 0) max_tokens[k] = 0;
+        if (max_tokens[k] > room) max_tokens[k] = room;
+        snprintf(id[k], sizeof(id[k]), "%s-%llu",
+                 req->kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+                 (unsigned long long)++s->seq);
+        rng[k] = req->seed ? req->seed :
+            (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1)
+             ^ (uint64_t)(uintptr_t)jobs[k]);
+    }
+
+    while (!g_stop_requested) {
+        ds4_batch_slot slots[2] = {{0}, {0}};
+        int active = 0;
+        for (int k = 0; k < 2; k++) {
+            if (done[k]) continue;
+            if (completion[k] >= max_tokens[k] ||
+                ds4_session_pos(sess[k]) >= ds4_session_ctx(sess[k])) {
+                done[k] = true;
+                continue;
+            }
+            const request *req = &jobs[k]->req;
+            int token = ds4_session_sample(sess[k], req->temperature,
+                                           req->top_k, req->top_p,
+                                           req->min_p, &rng[k]);
+            if (token == eos) {
+                done[k] = true;
+                finish[k] = "stop";
+                continue;
+            }
+            slots[k].session = sess[k];
+            slots[k].token   = token;
+            slots[k].logits  = NULL;
+            active++;
+        }
+        if (active == 0) break;
+
+        char eval_err[160] = {0};
+        if (ds4_session_eval_batched_decode(slots, 2, eval_err,
+                                            sizeof(eval_err)) != 0) {
+            for (int k = 0; k < 2; k++) {
+                if (slots[k].session) {
+                    done[k] = true;
+                    finish[k] = "error";
+                    snprintf(err[k], sizeof(err[k]), "%s", eval_err);
+                }
+            }
+            break;
+        }
+
+        for (int k = 0; k < 2; k++) {
+            if (!slots[k].session) continue;
+            int token = slots[k].token;
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(s->engine, token, &piece_len);
+            completion[k]++;
+            if (piece) {
+                buf_append(&text[k], piece, piece_len);
+                free(piece);
+            }
+        }
+    }
+
+    if (g_stop_requested) {
+        for (int k = 0; k < 2; k++) {
+            if (strcmp(finish[k], "error") != 0) finish[k] = "error";
+            if (!err[k][0]) snprintf(err[k], sizeof(err[k]), "shutdown requested");
+        }
+    }
+
+    for (int k = 0; k < 2; k++) {
+        const request *req = &jobs[k]->req;
+        const char *content = text[k].ptr ? text[k].ptr : "";
+        final_response(jobs[k]->fd, req, id[k], content,
+                       NULL, NULL, finish[k],
+                       prompt_tokens[k], completion[k]);
+    }
+
+    for (int k = 0; k < 2; k++) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=batched gen=%d finish=%s %.3fs",
+                   jobs[k]->req.kind == REQ_CHAT ? "chat" : "completion",
+                   completion[k], finish[k], now_sec() - t0);
+        buf_free(&text[k]);
+    }
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
-        job *j = dequeue(s);
-        if (!j) break;
-        generate_job(s, j);
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        job *j1 = dequeue(s);
+        if (!j1) break;
+        if (request_is_batchable(s, &j1->req)) {
+            job *j2 = dequeue_pair_wait(s, 50);
+            if (j2) {
+                if (request_is_batchable(s, &j2->req)) {
+                    generate_batched(s, j1, j2);
+                    signal_done(j1);
+                    signal_done(j2);
+                    continue;
+                }
+                /* j2 not batchable -- fall back to legacy for both. */
+                generate_job(s, j1);
+                signal_done(j1);
+                generate_job(s, j2);
+                signal_done(j2);
+                continue;
+            }
+        }
+        generate_job(s, j1);
+        signal_done(j1);
     }
     return NULL;
 }
@@ -7872,6 +8068,12 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    for (int k = 0; k < 2; k++) {
+        if (s->batched_sessions[k]) {
+            ds4_session_free(s->batched_sessions[k]);
+            s->batched_sessions[k] = NULL;
+        }
+    }
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -8114,6 +8316,24 @@ int main(int argc, char **argv) {
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     s.session = session;
+
+    /* Day-1 batched scheduler: 2-slot session pool used by
+     * generate_batched().  These mirror s->session's ctx_size; total
+     * extra memory is ~ 2 * (per-session context buffers).  Failure to
+     * create either pool entry disables the batched path -- the worker
+     * keeps using s->session via generate_job(). */
+    for (int k = 0; k < 2; k++) {
+        if (ds4_session_create(&s.batched_sessions[k], engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create batched session %d -- "
+                       "continuous batching disabled", k);
+            for (int kk = 0; kk < k; kk++) {
+                ds4_session_free(s.batched_sessions[kk]);
+                s.batched_sessions[kk] = NULL;
+            }
+            break;
+        }
+    }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
