@@ -15721,45 +15721,28 @@ struct ds4_session {
 /* Lazy-allocate the engine-level batched output scratch.  Sized for the
  * worst case (DS4_BATCH_MAX rows) so a single call survives reuse across
  * varying n_active.  See metal_graph_encode_output_head_batched. */
+/* Lazy-allocate a single engine scratch slot sized to fit DS4_BATCH_MAX
+ * rows × row_floats floats.  All ensure_engine_batched_*_scratch helpers
+ * below reduce to a chain of these calls. */
+static bool ensure_engine_scratch(ds4_gpu_tensor **slot, uint64_t row_floats) {
+    if (*slot) return true;
+    *slot = ds4_gpu_tensor_alloc((uint64_t)DS4_BATCH_MAX * row_floats * sizeof(float));
+    return *slot != NULL;
+}
+
 static bool ensure_engine_batched_scratch(ds4_engine *e, uint64_t vocab_dim) {
-    if (!e->batched_output_norm) {
-        e->batched_output_norm = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * DS4_N_EMBD * sizeof(float));
-        if (!e->batched_output_norm) return false;
-    }
-    if (!e->batched_logits) {
-        e->batched_logits = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * vocab_dim * sizeof(float));
-        if (!e->batched_logits) return false;
-    }
-    return true;
+    return ensure_engine_scratch(&e->batched_output_norm, DS4_N_EMBD)
+        && ensure_engine_scratch(&e->batched_logits, vocab_dim);
 }
 
 /* Per-layer FFN shared-expert scratch.  `shared_dim` is constant across
  * layers (DS4_N_FF_EXP) for the DS4 architecture, so we lazy-allocate
  * once based on the first call's value. */
 static bool ensure_engine_batched_ffn_scratch(ds4_engine *e, uint64_t shared_dim) {
-    if (!e->batched_ffn_norm) {
-        e->batched_ffn_norm = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * DS4_N_EMBD * sizeof(float));
-        if (!e->batched_ffn_norm) return false;
-    }
-    if (!e->batched_shared_gate) {
-        e->batched_shared_gate = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * shared_dim * sizeof(float));
-        if (!e->batched_shared_gate) return false;
-    }
-    if (!e->batched_shared_up) {
-        e->batched_shared_up = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * shared_dim * sizeof(float));
-        if (!e->batched_shared_up) return false;
-    }
-    if (!e->batched_shared_mid) {
-        e->batched_shared_mid = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * shared_dim * sizeof(float));
-        if (!e->batched_shared_mid) return false;
-    }
-    return true;
+    return ensure_engine_scratch(&e->batched_ffn_norm,    DS4_N_EMBD)
+        && ensure_engine_scratch(&e->batched_shared_gate, shared_dim)
+        && ensure_engine_scratch(&e->batched_shared_up,   shared_dim)
+        && ensure_engine_scratch(&e->batched_shared_mid,  shared_dim);
 }
 
 /* Per-layer q_b scratch.  q_rank = DS4_N_LORA_Q for every layer in DS4,
@@ -15768,17 +15751,8 @@ static bool ensure_engine_batched_ffn_scratch(ds4_engine *e, uint64_t shared_dim
 static bool ensure_engine_batched_q_b_scratch(ds4_engine *e,
                                               uint64_t q_rank,
                                               uint64_t q_dim) {
-    if (!e->batched_qr_norm) {
-        e->batched_qr_norm = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * q_rank * sizeof(float));
-        if (!e->batched_qr_norm) return false;
-    }
-    if (!e->batched_q) {
-        e->batched_q = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * q_dim * sizeof(float));
-        if (!e->batched_q) return false;
-    }
-    return true;
+    return ensure_engine_scratch(&e->batched_qr_norm, q_rank)
+        && ensure_engine_scratch(&e->batched_q,       q_dim);
 }
 
 /* Per-layer attn_output scratch.  q_dim = N_HEAD * N_HEAD_DIM, low_dim
@@ -15787,52 +15761,20 @@ static bool ensure_engine_batched_q_b_scratch(ds4_engine *e,
 static bool ensure_engine_batched_attn_output_scratch(ds4_engine *e,
                                                       uint64_t q_dim,
                                                       uint64_t low_dim) {
-    if (!e->batched_heads) {
-        e->batched_heads = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * q_dim * sizeof(float));
-        if (!e->batched_heads) return false;
-    }
-    if (!e->batched_attn_low) {
-        e->batched_attn_low = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * low_dim * sizeof(float));
-        if (!e->batched_attn_low) return false;
-    }
-    if (!e->batched_attn_out) {
-        e->batched_attn_out = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * DS4_N_EMBD * sizeof(float));
-        if (!e->batched_attn_out) return false;
-    }
-    return true;
+    return ensure_engine_scratch(&e->batched_heads,    q_dim)
+        && ensure_engine_scratch(&e->batched_attn_low, low_dim)
+        && ensure_engine_scratch(&e->batched_attn_out, DS4_N_EMBD);
 }
 
 /* Per-layer qkv scratch.  DS4_N_EMBD / DS4_N_HEAD_DIM are constants;
  * q_rank passes through to share batched_qr_norm with the q_b path. */
 static bool ensure_engine_batched_qkv_scratch(ds4_engine *e, uint64_t q_rank) {
-    if (!ensure_engine_batched_q_b_scratch(e, q_rank,
-                                           (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM)) {
-        return false;
-    }
-    if (!e->batched_attn_norm) {
-        e->batched_attn_norm = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * DS4_N_EMBD * sizeof(float));
-        if (!e->batched_attn_norm) return false;
-    }
-    if (!e->batched_qr) {
-        e->batched_qr = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * q_rank * sizeof(float));
-        if (!e->batched_qr) return false;
-    }
-    if (!e->batched_kv_raw) {
-        e->batched_kv_raw = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * DS4_N_HEAD_DIM * sizeof(float));
-        if (!e->batched_kv_raw) return false;
-    }
-    if (!e->batched_kv) {
-        e->batched_kv = ds4_gpu_tensor_alloc(
-            (uint64_t)DS4_BATCH_MAX * DS4_N_HEAD_DIM * sizeof(float));
-        if (!e->batched_kv) return false;
-    }
-    return true;
+    return ensure_engine_batched_q_b_scratch(e, q_rank,
+                                             (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM)
+        && ensure_engine_scratch(&e->batched_attn_norm, DS4_N_EMBD)
+        && ensure_engine_scratch(&e->batched_qr,        q_rank)
+        && ensure_engine_scratch(&e->batched_kv_raw,    DS4_N_HEAD_DIM)
+        && ensure_engine_scratch(&e->batched_kv,        DS4_N_HEAD_DIM);
 }
 
 /* Batched output head: runs the per-session prefix (5 small kernels) for each
@@ -16099,6 +16041,29 @@ static bool metal_graph_encode_attn_output_batched(
  *
  * Equivalent to N back-to-back metal_graph_encode_token_raw_swa calls
  * when want_batched_shared_ffn is false. */
+static bool metal_graph_encode_phased_per_session(
+        ds4_session         **sessions,
+        const int             *tokens,
+        int                    n_active,
+        const ds4_model       *model,
+        const ds4_layer_weights *layer,
+        uint32_t               il,
+        uint32_t               phases) {
+    bool ok = true;
+    for (int i = 0; ok && i < n_active; i++) {
+        ds4_session *s = sessions[i];
+        const uint32_t pos = (uint32_t)s->checkpoint.len;
+        const uint32_t raw_row = pos % s->graph.raw_cap;
+        const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
+        ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
+                                                   il, pos,
+                                                   s->graph.layer_raw_cache[il],
+                                                   s->graph.raw_cap, raw_row, n_raw,
+                                                   tokens[i], phases);
+    }
+    return ok;
+}
+
 static bool metal_graph_encode_token_raw_swa_batched_n_sessions(
         ds4_engine    *engine,
         ds4_session  **sessions,
@@ -16146,38 +16111,33 @@ static bool metal_graph_encode_token_raw_swa_batched_n_sessions(
         /* Pass 1: PRE_A1, plus anything that runs per-session up to the
          * earliest batched boundary. */
         uint32_t pass1 = DS4_DECODE_LAYER_PRE_A1;
-        if (!want_batched_qkv)         pass1 |= DS4_DECODE_LAYER_PRE_A2;
-        if (!want_batched_qkv && !want_batched_q_b) pass1 |= DS4_DECODE_LAYER_PRE_B;
+        if (!want_batched_qkv) pass1 |= DS4_DECODE_LAYER_PRE_A2;
         if (!want_batched_qkv && !want_batched_q_b) {
-            pass1 |= DS4_DECODE_LAYER_PRE_C1;
+            pass1 |= DS4_DECODE_LAYER_PRE_B | DS4_DECODE_LAYER_PRE_C1;
             if (!want_batched_attn_output) {
                 pass1 |= DS4_DECODE_LAYER_PRE_C2 | DS4_DECODE_LAYER_PRE_C3;
             }
         }
-        for (int i = 0; ok && i < n_active; i++) {
-            ds4_session *s = sessions[i];
-            const uint32_t pos = (uint32_t)s->checkpoint.len;
-            const uint32_t raw_row = pos % s->graph.raw_cap;
-            const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
-            ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
-                                                       il, pos,
-                                                       s->graph.layer_raw_cache[il],
-                                                       s->graph.raw_cap, raw_row, n_raw,
-                                                       tokens[i], pass1);
-        }
+        if (ok) ok = metal_graph_encode_phased_per_session(sessions, tokens,
+                                                           n_active, model, layer,
+                                                           il, pass1);
 
         if (ok && want_batched_qkv) {
             if (metal_graph_encode_qkv_batched(engine, sessions, n_active, layer)) {
                 used_batched_qkv = true;
             }
         }
-        if (ok && want_batched_q_b) {
-            const bool can_batch_q_b = !want_batched_qkv || used_batched_qkv;
-            if (can_batch_q_b) {
-                if (metal_graph_encode_q_b_batched(engine, sessions, n_active,
-                                                   layer, used_batched_qkv)) {
-                    used_batched_q_b = true;
-                }
+        /* Batched q_b needs qr_norm available: either in batched_qr_norm
+         * (qkv succeeded) or in g->qr_norm (qkv not requested -- pass1's
+         * PRE_A2 wrote it).  If qkv was requested but failed, neither is
+         * populated yet (the PRE_A2 fallback runs in pass2 below), so
+         * skip batched q_b in that error path; pass2 will pick up PRE_B
+         * as well. */
+        const bool qr_norm_ready = !want_batched_qkv || used_batched_qkv;
+        if (ok && want_batched_q_b && qr_norm_ready) {
+            if (metal_graph_encode_q_b_batched(engine, sessions, n_active,
+                                               layer, used_batched_qkv)) {
+                used_batched_q_b = true;
             }
         }
 
@@ -16196,17 +16156,9 @@ static bool metal_graph_encode_token_raw_swa_batched_n_sessions(
             }
         }
         if (ok && pass2 != 0) {
-            for (int i = 0; ok && i < n_active; i++) {
-                ds4_session *s = sessions[i];
-                const uint32_t pos = (uint32_t)s->checkpoint.len;
-                const uint32_t raw_row = pos % s->graph.raw_cap;
-                const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
-                ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
-                                                           il, pos,
-                                                           s->graph.layer_raw_cache[il],
-                                                           s->graph.raw_cap, raw_row, n_raw,
-                                                           tokens[i], pass2);
-            }
+            ok = metal_graph_encode_phased_per_session(sessions, tokens,
+                                                      n_active, model, layer,
+                                                      il, pass2);
         }
 
         if (ok && want_batched_attn_output) {
@@ -16222,17 +16174,9 @@ static bool metal_graph_encode_token_raw_swa_batched_n_sessions(
         if (ok && want_batched_attn_output) {
             uint32_t pass3 = DS4_DECODE_LAYER_PRE_C3;
             if (!used_batched_attn_output) pass3 |= DS4_DECODE_LAYER_PRE_C2;
-            for (int i = 0; ok && i < n_active; i++) {
-                ds4_session *s = sessions[i];
-                const uint32_t pos = (uint32_t)s->checkpoint.len;
-                const uint32_t raw_row = pos % s->graph.raw_cap;
-                const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
-                ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
-                                                           il, pos,
-                                                           s->graph.layer_raw_cache[il],
-                                                           s->graph.raw_cap, raw_row, n_raw,
-                                                           tokens[i], pass3);
-            }
+            ok = metal_graph_encode_phased_per_session(sessions, tokens,
+                                                      n_active, model, layer,
+                                                      il, pass3);
         }
         /* SHARED phase: batched fusion or per-session. */
         bool used_batched_shared = false;
@@ -16242,33 +16186,21 @@ static bool metal_graph_encode_token_raw_swa_batched_n_sessions(
             }
         }
         if (ok && !used_batched_shared) {
-            for (int i = 0; ok && i < n_active; i++) {
-                ds4_session *s = sessions[i];
-                const uint32_t pos = (uint32_t)s->checkpoint.len;
-                const uint32_t raw_row = pos % s->graph.raw_cap;
-                const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
-                ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
-                                                          il, pos,
-                                                          s->graph.layer_raw_cache[il],
-                                                          s->graph.raw_cap, raw_row, n_raw,
-                                                          tokens[i],
-                                                          DS4_DECODE_LAYER_SHARED);
-            }
+            ok = metal_graph_encode_phased_per_session(sessions, tokens,
+                                                      n_active, model, layer,
+                                                      il, DS4_DECODE_LAYER_SHARED);
         }
-        /* POST phase + HC swap per session. */
-        for (int i = 0; ok && i < n_active; i++) {
+        /* POST phase per session, then HC swap.  Reordering POST and the
+         * swap as two passes (instead of interleaving them per session)
+         * is safe: each session writes only its own after_ffn_hc and the
+         * swap is purely local to s->graph; no cross-session reads. */
+        if (ok) ok = metal_graph_encode_phased_per_session(sessions, tokens,
+                                                          n_active, model, layer,
+                                                          il, DS4_DECODE_LAYER_POST);
+        for (int i = 0; i < n_active; i++) {
             ds4_session *s = sessions[i];
-            const uint32_t pos = (uint32_t)s->checkpoint.len;
-            const uint32_t raw_row = pos % s->graph.raw_cap;
-            const uint32_t n_raw = metal_graph_raw_span_for_batch(&s->graph, pos, 1);
-            ok = metal_graph_encode_decode_layer_phased(&s->graph, model, layer,
-                                                      il, pos,
-                                                      s->graph.layer_raw_cache[il],
-                                                      s->graph.raw_cap, raw_row, n_raw,
-                                                      tokens[i],
-                                                      DS4_DECODE_LAYER_POST);
             ds4_gpu_tensor *tmp = s->graph.cur_hc;
-            s->graph.cur_hc      = s->graph.after_ffn_hc;
+            s->graph.cur_hc       = s->graph.after_ffn_hc;
             s->graph.after_ffn_hc = tmp;
         }
     }

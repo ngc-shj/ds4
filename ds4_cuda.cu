@@ -72,21 +72,30 @@ typedef struct {
  * This struct MUST stay binary-compatible with struct ds4_batch_step_args
  * in ds4_gpu.h.  We redefine it here rather than include the shared header
  * because ds4_cuda.cu writes its C-ABI function declarations directly with
- * extern "C" and does not currently pull in ds4_gpu.h.  The array length
- * literal 32 must equal DS4_BATCH_MAX in ds4_gpu.h. */
+ * extern "C" and does not currently pull in ds4_gpu.h.  DS4_CUDA_BATCH_MAX
+ * must equal DS4_BATCH_MAX in ds4_gpu.h; mismatch is caught at compile
+ * time via the struct-size static_assert below. */
+#define DS4_CUDA_BATCH_MAX 32
 struct ds4_batch_step_args {
-    uint32_t token       [32];
-    uint32_t pos         [32];
-    uint32_t raw_row     [32];
-    uint32_t n_raw       [32];
-    uint32_t raw_start   [32];
-    uint32_t n_comp      [32];
-    uint32_t n_index_comp[32];
-    uint32_t comp_row    [32];
-    uint8_t  emit        [32];
+    uint32_t token       [DS4_CUDA_BATCH_MAX];
+    uint32_t pos         [DS4_CUDA_BATCH_MAX];
+    uint32_t raw_row     [DS4_CUDA_BATCH_MAX];
+    uint32_t n_raw       [DS4_CUDA_BATCH_MAX];
+    uint32_t raw_start   [DS4_CUDA_BATCH_MAX];
+    uint32_t n_comp      [DS4_CUDA_BATCH_MAX];
+    uint32_t n_index_comp[DS4_CUDA_BATCH_MAX];
+    uint32_t comp_row    [DS4_CUDA_BATCH_MAX];
+    uint8_t  emit        [DS4_CUDA_BATCH_MAX];
     uint32_t n_active;
     uint32_t top_k;
 };
+/* If DS4_BATCH_MAX in ds4_gpu.h ever changes, update DS4_CUDA_BATCH_MAX
+ * above; the size assert catches a stale literal here at compile time. */
+static_assert(sizeof(struct ds4_batch_step_args) ==
+              8 * sizeof(uint32_t) * DS4_CUDA_BATCH_MAX +     /* uint32 arrays */
+              DS4_CUDA_BATCH_MAX +                            /* emit[]       */
+              2 * sizeof(uint32_t),                           /* n_active, top_k */
+              "ds4_batch_step_args layout drift between ds4_cuda.cu and ds4_gpu.h");
 __constant__ struct ds4_batch_step_args g_batch_args;
 
 static const void *g_model_host_base;
