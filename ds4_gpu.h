@@ -192,6 +192,24 @@ int ds4_gpu_matmul_q4_0_batch_warp_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Day-6 D6-1: Q4_0 pair + batch matmul.  Computes out0 and out1 from one
+ * shared activation x using two Q4 weight matrices (w0 @ x, w1 @ x), all
+ * in one kernel launch so the activation is read once per (tok, block)
+ * rather than twice as with two back-to-back batch-warp calls.  Used by
+ * the SHARED FFN gate+up batched substitute. */
+int ds4_gpu_matmul_q4_0_pair_batch_warp_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

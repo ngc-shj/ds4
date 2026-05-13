@@ -2944,6 +2944,74 @@ __global__ static void matmul_q4_0_preq_batch_warp8_kernel(
     if (lane == 0) out[tok * out_dim + row] = acc;
 }
 
+/* Day-6 D6-1: Q4 pair + batch.  Same shape as matmul_q4_0_pair_preq_warp8_
+ * kernel below (two Q4 weight matrices w0/w1 producing two outputs from
+ * one shared activation), generalized over n_tok rows: out0[tok, row] =
+ * sum_b dot(packed0[row, b], xq[tok, b]) * scale0[row, b] * xscale[tok, b]
+ * and same for out1.  The shared activation is read once per (tok, block)
+ * and consumed by both row computations, so this halves the weight-side
+ * HBM traffic vs two back-to-back metal_graph_encode_qkv_batched-style
+ * calls -- the win the section-14/18 SHARED_FFN follow-up wanted from a
+ * "custom Q4 pair kernel".
+ *
+ * Layout per Q4 weight matrix is identical to q8_to_q4_convert_kernel /
+ * cuda_q4_from_q8_ptr: blocks_per_row * 2 bytes of fp16 scales followed
+ * by blocks_per_row * 16 bytes of packed 4-bit data, all rows
+ * concatenated row-major.  out_dim is independent between w0 and w1;
+ * each lane bails out of its half if its row exceeds the corresponding
+ * out_dim, mirroring matmul_q4_0_pair_preq_warp8_kernel. */
+__global__ static void matmul_q4_0_pair_preq_batch_warp_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t n_tok,
+        uint64_t blocks) {
+    (void)in_dim;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (tok >= n_tok) return;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const __half *scales0 = (row < out0_dim)
+        ? (const __half *)(w0 + row * blocks * 18u) : NULL;
+    const __half *scales1 = (row < out1_dim)
+        ? (const __half *)(w1 + row * blocks * 18u) : NULL;
+    const unsigned char *packed0 = (row < out0_dim)
+        ? (w0 + row * blocks * 18u + blocks * 2u) : NULL;
+    const unsigned char *packed1 = (row < out1_dim)
+        ? (w1 + row * blocks * 18u + blocks * 2u) : NULL;
+    const int8_t *xqr = xq + tok * blocks * 32u;
+    const float *xsr = xscale + tok * blocks;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const float xs = xsr[b];
+        const int8_t *xqb = xqr + b * 32u;
+        if (scales0) {
+            float scale = __half2float(scales0[b]);
+            int32_t dot = q4_block_dot(packed0 + b * 16u, xqb);
+            acc0 += scale * xs * (float)dot;
+        }
+        if (scales1) {
+            float scale = __half2float(scales1[b]);
+            int32_t dot = q4_block_dot(packed1 + b * 16u, xqb);
+            acc1 += scale * xs * (float)dot;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        if (row < out0_dim) out0[tok * out0_dim + row] = acc0;
+        if (row < out1_dim) out1[tok * out1_dim + row] = acc1;
+    }
+}
+
 /* Q4 variant of matmul_q8_0_pair_preq_warp8_kernel: two Q4 weight matrices,
  * one shared activation, two output buffers. */
 __global__ static void matmul_q4_0_pair_preq_warp8_kernel(
@@ -6533,6 +6601,79 @@ extern "C" int ds4_gpu_matmul_q4_0_batch_warp_tensor(
             n_tok,
             blocks);
     return cuda_ok(cudaGetLastError(), "matmul_q4_0 batch warp launch");
+}
+
+/* Day-6 D6-1 wrapper: Q4 pair + batch matmul.  See
+ * matmul_q4_0_pair_preq_batch_warp_kernel for the math.  Quantizes the
+ * shared activation once (Q8 with per-block scale), then issues a single
+ * pair-batch kernel that computes both out0 and out1 from the same Q8
+ * activation.  Used by SHARED_FFN gate+up batched substitute (ds4.c
+ * metal_graph_encode_shared_ffn_batched) to replace two back-to-back
+ * ds4_gpu_matmul_q4_0_batch_warp_tensor calls. */
+extern "C" int ds4_gpu_matmul_q4_0_pair_batch_warp_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out0 || !out1 || !x || !model_map ||
+        in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31) / 32;
+    if (weight0_offset > model_size || weight1_offset > model_size ||
+        out0_dim > UINT64_MAX / (blocks * 34) ||
+        out1_dim > UINT64_MAX / (blocks * 34)) {
+        return 0;
+    }
+    const uint64_t weight0_bytes = out0_dim * blocks * 34;
+    const uint64_t weight1_bytes = out1_dim * blocks * 34;
+    if (weight0_bytes > model_size - weight0_offset ||
+        weight1_bytes > model_size - weight1_offset ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out0->bytes < n_tok * out0_dim * sizeof(float) ||
+        out1->bytes < n_tok * out1_dim * sizeof(float)) {
+        return 0;
+    }
+    if (!cuda_q8_use_dp4a()) return 0;
+    const unsigned char *w0_q4 = cuda_q4_from_q8_ptr(model_map, weight0_offset,
+                                                      weight0_bytes, in_dim, out0_dim);
+    const unsigned char *w1_q4 = cuda_q4_from_q8_ptr(model_map, weight1_offset,
+                                                      weight1_bytes, in_dim, out1_dim);
+    if (!w0_q4 || !w1_q4) return 0;
+    const uint64_t xq_bytes = n_tok * blocks * 32u;
+    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+    const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
+    void *tmp = cuda_tmp_alloc(tmp_bytes, "q4_0 pair batch prequant");
+    if (!tmp) return 0;
+    int8_t *xq = (int8_t *)tmp;
+    float *xscale = (float *)((char *)tmp + scale_offset);
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
+    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_kernel_stream>>>(xq, xscale,
+                                                                 (const float *)x->ptr,
+                                                                 in_dim, blocks);
+    if (!cuda_ok(cudaGetLastError(), "matmul_q4_0 pair batch quantize launch")) return 0;
+    const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    dim3 bgrid(((unsigned)max_out + 7u) / 8u, (unsigned)n_tok, 1);
+    matmul_q4_0_pair_preq_batch_warp_kernel<<<bgrid, 256, 0, g_kernel_stream>>>(
+            (float *)out0->ptr,
+            (float *)out1->ptr,
+            w0_q4,
+            w1_q4,
+            xq,
+            xscale,
+            in_dim,
+            out0_dim,
+            out1_dim,
+            n_tok,
+            blocks);
+    return cuda_ok(cudaGetLastError(), "matmul_q4_0 pair batch warp launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(

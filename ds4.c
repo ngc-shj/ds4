@@ -15973,18 +15973,35 @@ static bool metal_graph_encode_shared_ffn_batched(
                                        sessions[i]->graph.ffn_norm, 0,
                                        (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
     }
-    if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+    /* Day-6 D6-1: fuse the gate + up matmul pair into one Q4 pair-batch
+     * kernel launch so the shared activation is read once per (tok,
+     * block) instead of twice (= halves the activation-side HBM traffic
+     * vs two back-to-back batch-warp calls and avoids the launch-pair
+     * overhead).  Falls back to two separate batch-warp calls if the
+     * pair-batch helper rejects the geometry. */
+    if (ok) {
+        if (!ds4_gpu_matmul_q4_0_pair_batch_warp_tensor(
                     e->batched_shared_gate,
-                    e->model.map, e->model.size,
-                    layer->ffn_gate_shexp->abs_offset,
-                    DS4_N_EMBD, shared_dim,
-                    e->batched_ffn_norm, (uint64_t)n_active) != 0;
-    if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
                     e->batched_shared_up,
                     e->model.map, e->model.size,
+                    layer->ffn_gate_shexp->abs_offset,
                     layer->ffn_up_shexp->abs_offset,
-                    DS4_N_EMBD, shared_dim,
-                    e->batched_ffn_norm, (uint64_t)n_active) != 0;
+                    DS4_N_EMBD, shared_dim, shared_dim,
+                    e->batched_ffn_norm, (uint64_t)n_active)) {
+            if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+                            e->batched_shared_gate,
+                            e->model.map, e->model.size,
+                            layer->ffn_gate_shexp->abs_offset,
+                            DS4_N_EMBD, shared_dim,
+                            e->batched_ffn_norm, (uint64_t)n_active) != 0;
+            if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+                            e->batched_shared_up,
+                            e->model.map, e->model.size,
+                            layer->ffn_up_shexp->abs_offset,
+                            DS4_N_EMBD, shared_dim,
+                            e->batched_ffn_norm, (uint64_t)n_active) != 0;
+        }
+    }
     /* Swiglu is element-wise: collapse the [n_active, shared_dim] tile
      * to one 1-D length so a single launch covers all rows. */
     if (ok) ok = ds4_gpu_swiglu_tensor(e->batched_shared_mid,

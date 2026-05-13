@@ -1238,6 +1238,26 @@ tokens) become a workload.
 
 ### 18. Day-4 D4-1: SHARED_FFN re-evaluation post-D2-4 — kernel broken, not stream race
 
+**REVISION (Day-6, post-engine-scratch-zero-init).**  The "kernel
+broken" diagnosis in this section is wrong.  Day-6 retested
+`DS4_CUDA_BATCHED_SHARED_FFN=1` on top of commit `2974421`
+(zero-init for engine batched scratch on alloc) and found the
+substitute produces fully coherent N=2/N=4 KV-hit output.  The
+BOS-attractor failure documented below was caused by uninitialized
+tile-padding rows in `e->batched_ffn_norm` / `batched_shared_gate`
+/ `batched_shared_up` (cudaMalloc returned recycled GPU memory and
+the Q4 batched-warp kernel folded those garbage values into its
+warp-tile reads), not by a fundamentally broken Q4 batched matmul
+at `N_EMBD -> N_FF_EXP = 2048`.
+
+Day-6 D6-1/D6-2 therefore did not need to build a "new fused
+gate+up Q4 pair kernel just to fix correctness" -- it builds one
+for the activation-side traffic reduction it offers vs two
+back-to-back batch-warp calls.  See section 20.
+
+The original Day-4 D4-1 record follows for history:
+
+
 Section 14 hypothesized that `DS4_CUDA_BATCHED_SHARED_FFN`'s
 intermittent fatal failures (2/15 runs with corrupted error strings)
 were caused by the `ds4_gpu_tensor_copy_async` default-stream race
@@ -1518,12 +1538,70 @@ var off for any run whose output is consumed (warm-up curls that
 only populate KV are fine to flip it on for, since the bad output
 is discarded).
 
-### 20. Reproducible server smoke recipe (consolidated)
+### 20. Day-6 D6-1 + D6-2: SHARED_FFN Q4 pair-batch kernel + wire-up
+
+**Background revision: section 18 was wrong about why SHARED_FFN was
+broken.**  Section 18 (Day-4 D4-1) concluded that
+`DS4_CUDA_BATCHED_SHARED_FFN=1` was broken because the Q4 batched
+matmul kernel itself produced silent corruption at
+`N_EMBD -> N_FF_EXP = 2048`.  That diagnosis pre-dates the
+engine-batched-scratch zero-init fix in commit `2974421` (sibling
+fix landed during Day-5 bring-up): cudaMalloc returns whatever GPU
+memory the driver has, so the gather-target tile
+(`e->batched_ffn_norm` etc.) contained garbage in its tile-padding
+rows, the Q4 batch-warp kernel folded those rows into reductions,
+and the resulting bad activations cascaded to all-BOS logits.
+After `2974421` lands, the existing
+`metal_graph_encode_shared_ffn_batched` (ds4.c line ~15962) is
+correctness-clean; section 18's revision note records this.
+
+**D6-1: new Q4 pair-batch kernel.**  Adds
+`matmul_q4_0_pair_preq_batch_warp_kernel` to ds4_cuda.cu plus the
+`ds4_gpu_matmul_q4_0_pair_batch_warp_tensor` wrapper.  Generalizes
+the existing single-token `matmul_q4_0_pair_preq_warp8_kernel`
+(two Q4 weight matrices, one shared activation, two outputs --
+used by per-session shared_gate_up at n_tok=1) over n_tok rows.
+Reads the shared activation once per (tok, block) and emits both
+out0 and out1 from one warp; this halves the activation-side HBM
+traffic vs two back-to-back `matmul_q4_0_batch_warp` calls (the
+gate and up matrices are still read independently because they
+sit at different model-file offsets).
+
+**D6-2: wire-up.**  `metal_graph_encode_shared_ffn_batched`
+(ds4.c) prefers the new pair-batch helper; if it rejects the
+geometry (e.g. dp4a unsupported, oversized weights), it falls
+back to the original two-call pattern so the path is no worse
+than today.  The two ds4_gpu_matmul_q4_0_batch_warp_tensor calls
+stay in the file for the fallback.
+
+**Verified correctness.**  Day-6 D6-2 smoke (warm-up via Q4-only
+to populate KV, then N=4 parallel KV-hit with full env-var combo
++ `DS4_CUDA_BATCHED_SHARED_FFN=1`): all four slots return
+grammatically-correct Italian Manzoni text with the
+section-15 FP-noise band.  No BOS-attractor regression vs the
+zero-init-restored naive double-matmul path.
+
+**Performance: needs cold-boot measurement.**  Same-session
+back-to-back tests showed wall-clock numbers that drift upward
+across runs (12.3s -> 15.9s -> 21.3s for N=4 KV-hit across three
+configs in the same session), matching section-14's "thermal
+envelope" caveat -- the GB10's bench-cumulative thermal floor is
+the dominant variance here, not the kernel choice.  The pair
+kernel's design saving (half the activation-side reads) is real
+on paper but cannot be cleanly quantified in this session.
+Reopen with a cold-boot single-session measurement.
+
+**What this unlocks.**  The pair-batch kernel and its wrapper are
+the building blocks the routed-MoE batched substitutes will also
+want (gate + up per expert at the same offset pattern).  Day-7+
+work can re-use this directly.
+
+### Appendix A. Reproducible server smoke recipe (consolidated)
 
 This section consolidates the build + run + verify recipe that
-sessions 1-19 have been using ad-hoc.  Future sessions can reach
+sections 1-20 have been using ad-hoc.  Future sessions can reach
 this in one place instead of stitching together commands from
-sections 11-19.
+sections 11-20.
 
 **1. Build for GB10.**
 
