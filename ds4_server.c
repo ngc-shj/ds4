@@ -4654,13 +4654,15 @@ typedef struct {
     uint64_t file_size;
 } kv_entry;
 
-/* Day-2 D2-2: maximum batched-decode pool depth.  Engine caps the
- * batched-decode encoder at 8 (DS4_BATCH_INTERLEAVED_MAX, see
- * ds4.c:18341); section 14 documented occasional N>8 instability,
- * so 4 is the conservative ceiling that still hits the +29.9 % N=4
- * aggregate win measured under sections 11-13.  Declared up-front so
- * the kv_disk_cache counters array sizing below can reference it. */
-#define DS4_SERVER_BATCH_MAX 4
+/* Maximum batched-decode pool depth.  Engine caps the batched-decode
+ * encoder at 8 (DS4_BATCH_INTERLEAVED_MAX, see ds4.c:18341); bench
+ * section 13 measured +57.5 % aggregate at N=8 fresh-boot.  Day-3 D3-1
+ * raised this from 4 to 8 after Day-2 D2-4 closed the
+ * tensor_copy_async stream race (section 14 had flagged Shared-FFN
+ * fatal failures at N>=4 that traced back to that race).  Declared
+ * up-front so the kv_disk_cache counters array sizing below can
+ * reference it. */
+#define DS4_SERVER_BATCH_MAX 8
 
 typedef struct {
     int min_tokens;
