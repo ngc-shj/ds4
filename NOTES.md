@@ -35,11 +35,17 @@ second only.  They are NOT user-visible wall-clock speedups in
 `ds4-server` until the request scheduler exercises the batched-decode
 code path.  Until commit a608e4d the scheduler was FIFO serial, so N=4
 parallel HTTP requests took the same wall-clock as N=4 sequential
-requests (~36 s each at ctx=2048+50tok).  Section 15 documents this
+requests (~36 s each at ctx=2048+50tok).  Section 15 documents the
 discovery and the Day-1 2-slot continuous-batching MVP added to
-`ds4-server`.  Sections 11-13 numbers below should be read as
-**upper-bound microbench targets** that the scheduler work makes
-reachable.
+`ds4-server`; section 16 documents the Day-2 follow-ups (N=4 depth +
+per-slot SSE streaming + `g_kernel_stream` consistency + per-session
+KV cache reuse, commits 228b62a..435e966) that close the gap between
+the microbench numbers and what real chat workloads see.  N=2 parallel
+HTTP chats with KV cache hits now take ~6 s wall-clock on the same
+2466p+30c smoke (vs the original 36 s pre-a608e4d).  Sections 11-13
+numbers below remain the **upper-bound microbench targets** for the
+decode region; section 16 documents the per-feature wall-clock land
+points.
 
 Sections 11, 12, and 13 below add three engine-level **batched
 substitutes** for the per-layer interleaved decode encoder:
@@ -1042,6 +1048,111 @@ while prefill stays fixed per request.
    (NOTES top open-followups item 4) -- still applicable, no longer
    the limiting factor for batched server throughput at this scope.
 
+### 16. Day-2 outcomes: continuous batching + KV cache + stream consistency landed
+
+Scope: implement levers 1-5 from section 15 above (or revert + record
+the reason).  All commits land on perf/batched-decode-poc and stack
+cleanly on top of the Day-1 MVP (a608e4d).
+
+**D2-1 (parallel prefill) -- REVERTED.**  Tried spawning a per-session
+pthread that called `ds4_session_sync` concurrently for both batched
+slots, hoping host-side encoder loop overlap would shrink the
+sequential prefill cost (the dominant wall-clock fraction in Day-1).
+CUDA returned "operation not supported on global/shared address space"
+mid-prefill, with corrupted stderr garbage on subsequent error paths
+-- the engine's `__constant__ g_batch_args`, scratch buffers, and
+`g_kernel_stream` are shared state that the bench tool drives from a
+single thread.  Two threads issuing prefill on different sessions of
+the same engine race on every step.  Reverted cleanly (no commit
+made).  The proper fix is **engine-level batched prefill** (a true
+multi-row prefill API mirroring `ds4_session_eval_batched_decode`) --
+that is a Day-3+ scope and not a server-only change.
+
+**D2-2 (N=2 → N=4 depth, commit 228b62a).**  Bumped the pool to
+`DS4_SERVER_BATCH_MAX = 4` (engine caps at 8, section 14 documented
+N>8 instability so 4 is the conservative ceiling that still hits the
++29.9 % N=4 win).  Replaced the original "50 ms then non-blocking"
+gather pattern with a 50 ms total time budget shared across N-1
+gather attempts -- without this, near-simultaneous 4-curl bursts paired
+as 2×N=2 instead of one N=4 because the second pair-mate beat the
+non-blocking re-check by ~5-20 ms.  Verified: 4 parallel curls produce
+`ctx=batched(n=4)` × 4 in the log.  Decode-region aggregate 29.9 t/s
+(per-session 7.5 t/s) matches bench section 13's N=4 +29.9 % within
+noise.
+
+**D2-3 (per-slot SSE streaming, commit 06bfd85).**  Lifted the
+`r->stream` exclusion from `request_is_batchable` and threaded plain
+SSE writes through `generate_batched`.  Per-slot state arrays
+(`stream_send / stream_headers_ok / stream_failed / plain_stream_pos`)
+keep each slot's SSE flow independent -- a write failure on one slot
+marks that slot done with finish=error but the lockstep loop keeps
+running for the rest.  Scope: plain SSE only (sse_chunk delta +
+sse_done).  The OpenAI live-stream structured flow (role chunks
+beyond the initial one, tool-call deltas, openai_live finish) is NOT
+exercised in batched mode -- has_tools and think_mode are already
+excluded, so the remaining stream payload is a sequence of plain
+content deltas which sse_chunk() handles correctly.  Smoke: 2 parallel
+streaming chats land 66-line SSE outputs (role + 30 deltas + finish +
+[DONE]) with `ctx=batched(n=2) ... stream=1` markers.
+
+**D2-4 (`ds4_gpu_tensor_copy_async` -> `g_kernel_stream`, commit
+f0e1248).**  Routed the device-to-device async copy through
+`g_kernel_stream` instead of the default stream (0).  The default
+stream worked through CUDA's legacy default-stream serialization but
+inserted a synchronization gap that section 14 identified as the
+leading cause of intermittent Shared-FFN_batched fatal corruption and
+likely contributed to the wider bench variance under thermal load.
+Smoke: N=1/2/4 all produce coherent Italian responses with no
+corruption.  Sections 11-13 wins should be re-measured under a
+cold-boot bench protocol; expected outcome is no regression and
+possibly small improvement.
+
+**D2-5 (per-session KV cache, commit 435e966).**  Lifted
+`s->kv.enabled` from `request_is_batchable` and threaded
+`ds4_session *` through the full kv_cache_* API so each batched
+session maintains its own continued-store frontier.  Implementation:
+- `kv_disk_cache.continued_last_store_tokens` changed from `int` to
+  `int[1 + DS4_SERVER_BATCH_MAX]`, index 0 = legacy session, indices
+  1..N = batched_sessions[0..N-1].
+- `kv_cache_continued_store_target / kv_cache_note_store` signatures
+  now take the counter explicitly, no longer reading from kc.
+- `kv_cache_store_live_prefix / kv_cache_store_current /
+  kv_cache_maybe_store_continued / kv_cache_try_load_text /
+  kv_cache_try_load` all take an explicit `ds4_session *sess`.
+- generate_batched calls kv_cache_try_load before sync (preserves
+  cache hits) and kv_cache_store_current after decode (preserves
+  state for next-turn hits).
+
+Smoke: N=1 cold-stored 2048 tokens, then N=2 parallel chats both hit
+the cache with `kv_cached=2048` per slot, wall-clock dropped to
+**5.97 s** (vs Day-1 MVP's 17.4 s on the same geometry without KV
+reuse, **-66 % time**).  Per-session KV state correctness confirmed
+via .kv files in /tmp/ds4-kv/ -- cold-from-N=1, batched-continued
+from N=2, batched-continued from N=4 all distinct files, no cross-
+slot corruption.
+
+**Where the wall-clock now goes (post-Day-2, 2466p + 30c smoke):**
+- N=1 cold (legacy + KV cold store):       8.74 s
+- N=2 batched + KV hit (both slots):       5.97 s  (-66 % vs Day-1)
+- N=4 batched + KV hit (all four slots):  11.34 s  (-66 % vs Day-1)
+- Single batched_decode step at N=2:       ~70 ms (decode-bound)
+- Sequential prefill remains the largest residual cost when KV misses
+
+**Day-3 lever shifts after Day-2:**
+1. Engine-level batched prefill API (the real cure for the
+   sequential-prefill cost; D2-1's host-thread attempt failed because
+   the engine's `__constant__` / scratch / `g_kernel_stream` are
+   single-driver-thread shared state).  Mirrors
+   `ds4_session_eval_batched_decode`'s lockstep structure.
+2. N=4 → N=8 cap when L2 working-set lets it (bench section 13
+   showed +57.5 % at N=8, but section 14 flagged instability that
+   needs re-measurement under D2-4's tighter stream discipline).
+3. OpenAI live-stream structured flow in batched mode (role chunks,
+   tool-call deltas) -- needed before batched can handle tool-using
+   agents.
+4. Per-session KV cache continued-store DURING batched decode (not
+   only post-decode); requires per-batched-session progress callbacks.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
@@ -1086,6 +1197,13 @@ Server scheduler (the path from microbench to user, section 15):
   exercising `ds4_session_eval_batched_decode` for the first time
   from a non-bench binary (~3.7 % wall-clock win on 2x parallel curl
   smoke; decode-region throughput +49 % per server log)
+
+Day-2 follow-ups on top of the Day-1 MVP (section 16):
+- 228b62a N=2 -> N=4 batched scheduler depth + time-budget gather
+- 06bfd85 per-slot SSE streaming inside generate_batched
+- f0e1248 ds4_gpu_tensor_copy_async routed through g_kernel_stream
+- 435e966 per-session KV cache in generate_batched (N=2 wall-clock
+  with KV hit dropped from 17.4 s to 5.97 s, -66 %)
 
 Phase A infrastructure (kernel stream plumbing, sections 1-10):
 - 1d7402e all kernel launches threaded through g_kernel_stream
