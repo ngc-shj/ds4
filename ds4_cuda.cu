@@ -1931,12 +1931,23 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
-/* Async variant: queues the D2D copy on the default stream without
- * blocking the host.  Use this when batching many small copies inside
- * one decode step (the sync-per-copy from the blocking variant
- * dominates at high N because each call drains the kernel queue).
- * Subsequent kernels on the default stream see the result; host code
- * reading the destination needs its own sync. */
+/* Async variant: queues the D2D copy on g_kernel_stream so it
+ * sequences naturally with the surrounding batched-decode kernels.
+ * Use this when batching many small copies inside one decode step
+ * (the sync-per-copy from the blocking variant dominates at high N
+ * because each call drains the kernel queue).  Subsequent kernels on
+ * g_kernel_stream see the result; host code reading the destination
+ * needs its own sync.
+ *
+ * Day-2 D2-4 (NOTES top open-followup item 4 / section 14 race
+ * hypothesis): previously this issued on the default stream (0).
+ * That worked through CUDA's legacy default-stream serialization when
+ * no other stream-aware code crossed the call, but the per-layer
+ * batched-decode encoder (sections 11-13) interleaves named-stream
+ * kernels and default-stream copies, opening a race window for the
+ * gather/scatter pair around each batched matmul.  Routing the copy
+ * through g_kernel_stream closes that window and is a prerequisite
+ * for the Shared-FFN v2 work documented in section 14. */
 extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                           const ds4_gpu_tensor *src, uint64_t src_offset,
                                           uint64_t bytes) {
@@ -1949,7 +1960,7 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offse
                                     (const char *)src->ptr + src_offset,
                                     (size_t)bytes,
                                     cudaMemcpyDeviceToDevice,
-                                    0),
+                                    g_kernel_stream),
                    "tensor copy async");
 }
 
