@@ -4654,6 +4654,14 @@ typedef struct {
     uint64_t file_size;
 } kv_entry;
 
+/* Day-2 D2-2: maximum batched-decode pool depth.  Engine caps the
+ * batched-decode encoder at 8 (DS4_BATCH_INTERLEAVED_MAX, see
+ * ds4.c:18341); section 14 documented occasional N>8 instability,
+ * so 4 is the conservative ceiling that still hits the +29.9 % N=4
+ * aggregate win measured under sections 11-13.  Declared up-front so
+ * the kv_disk_cache counters array sizing below can reference it. */
+#define DS4_SERVER_BATCH_MAX 4
+
 typedef struct {
     int min_tokens;
     int cold_max_tokens;
@@ -4668,7 +4676,11 @@ typedef struct {
     uint64_t budget_bytes;
     bool reject_different_quant;
     kv_cache_options opt;
-    int continued_last_store_tokens;
+    /* Day-2 D2-5: continued-store frontiers, one per session.  Index 0
+     * is the legacy server-wide s->session; indices [1..N] correspond
+     * to server.batched_sessions[0..N-1].  See server_session_kv_index()
+     * for the mapping helper. */
+    int continued_last_store_tokens[1 + DS4_SERVER_BATCH_MAX];
     kv_entry *entry;
     int len;
     int cap;
@@ -4714,13 +4726,6 @@ typedef struct {
     uint64_t scan_clock;
 } tool_memory;
 
-/* Day-2 D2-2: maximum batched-decode pool depth.  Engine caps the
- * batched-decode encoder at 8 (DS4_BATCH_INTERLEAVED_MAX, see
- * ds4.c:18341); section 14 documented occasional N>8 instability,
- * so 4 is the conservative ceiling that still hits the +29.9 % N=4
- * aggregate win measured under sections 11-13. */
-#define DS4_SERVER_BATCH_MAX 4
-
 struct server {
     ds4_engine *engine;
     ds4_session *session;
@@ -4729,7 +4734,9 @@ struct server {
      * requests are gathered off the queue.  See request_is_batchable()
      * for the qualifying conditions (plain non-stream OpenAI
      * chat/completion, no tools, no thinking, no stops, no KV disk
-     * cache, temperature > 0). */
+     * cache, temperature > 0).  See server_session_kv_index() for the
+     * session-to-counter mapping used by the per-session KV cache
+     * counters in kv_disk_cache.continued_last_store_tokens[]. */
     ds4_session *batched_sessions[DS4_SERVER_BATCH_MAX];
     int default_tokens;
     kv_disk_cache kv;
@@ -5835,7 +5842,8 @@ static int kv_cache_continued_step(const kv_disk_cache *kc) {
     return step;
 }
 
-static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
+static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens,
+                                           int continued_last) {
     const int step = kv_cache_continued_step(kc);
     if (step <= 0) return 0;
     if (live_tokens < kc->opt.min_tokens) return 0;
@@ -5845,7 +5853,7 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
      * Otherwise an early cold checkpoint can shift the whole schedule and leave
      * long generations with no recent durable restart point. */
     if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    if (live_tokens <= continued_last) return 0;
     return live_tokens;
 }
 
@@ -5932,7 +5940,8 @@ static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *t
     (void)ok;
 }
 
-static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
+static bool kv_cache_store_live_prefix(server *s, ds4_session *sess,
+                                       const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     kv_disk_cache *kc = &s->kv;
     if (!kc->enabled) return false;
@@ -5951,7 +5960,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     /* Disk cache persistence must observe the graph exactly as-is.  If callers
      * want a shorter prefix, they first prefill to that prefix and only then call
      * this function.  This keeps cache population from doing hidden inference. */
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = ds4_session_tokens(sess);
     if (!live_tokens ||
         live_tokens->len != store_tokens.len ||
         !ds4_tokens_starts_with(live_tokens, &store_tokens))
@@ -5965,7 +5974,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         return false;
     }
 
-    uint64_t payload_bytes = ds4_session_payload_bytes(s->session);
+    uint64_t payload_bytes = ds4_session_payload_bytes(sess);
     if (payload_bytes == 0) {
         ds4_tokens_free(&store_tokens);
         return false;
@@ -5985,7 +5994,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     char *path = kv_path_for_sha(kc, sha);
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
-                                     quant_bits, ds4_session_ctx(s->session))) {
+                                     quant_bits, ds4_session_ctx(sess))) {
         kv_cache_rewrite_tool_map(s, path, text);
         free(text);
         free(path);
@@ -6013,7 +6022,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     uint8_t ext_flags = tool_memory_count_dsml_in_text(s, text) > 0 ? KV_EXT_TOOL_MAP : 0;
     kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
                    (uint32_t)store_tokens.len, 0,
-                   (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
+                   (uint32_t)ds4_session_ctx(sess), now, now, payload_bytes);
     uint8_t tb[4];
     le_put32(tb, (uint32_t)text_len);
     uint64_t tool_map_bytes = 0;
@@ -6021,7 +6030,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(s->session, fp, err, sizeof(err)) == 0 &&
+              ds4_session_save_payload(sess, fp, err, sizeof(err)) == 0 &&
               kv_tool_map_write(s, fp, text, &tool_map_bytes) &&
               fflush(fp) == 0;
     int saved_errno = errno;
@@ -6057,25 +6066,40 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     return ok;
 }
 
-static void kv_cache_store_current(server *s, const char *reason) {
-    const ds4_tokens *tokens = ds4_session_tokens(s->session);
-    if (tokens) kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+static void kv_cache_store_current(server *s, ds4_session *sess, const char *reason) {
+    const ds4_tokens *tokens = ds4_session_tokens(sess);
+    if (tokens) kv_cache_store_live_prefix(s, sess, tokens, tokens->len, reason);
 }
 
-static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
-    if (tokens > kc->continued_last_store_tokens) {
-        kc->continued_last_store_tokens = tokens;
+static void kv_cache_note_store(int *continued_last_ptr, int tokens) {
+    if (tokens > *continued_last_ptr) {
+        *continued_last_ptr = tokens;
     }
 }
 
-static void kv_cache_maybe_store_continued(server *s) {
+/* Map a ds4_session pointer to its index into the per-session counter
+ * arrays (kv_disk_cache.continued_last_store_tokens[]).  Index 0 is the
+ * legacy server-wide s->session; indices 1..DS4_SERVER_BATCH_MAX
+ * correspond to server.batched_sessions[0..N-1].  Returns 0 (legacy
+ * slot) for unknown sessions as a safe fallback. */
+static int server_session_kv_index(const server *s, const ds4_session *sess) {
+    if (sess == s->session) return 0;
+    for (int k = 0; k < DS4_SERVER_BATCH_MAX; k++) {
+        if (sess == s->batched_sessions[k]) return 1 + k;
+    }
+    return 0;
+}
+
+static void kv_cache_maybe_store_continued(server *s, ds4_session *sess) {
     kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *tokens = ds4_session_tokens(sess);
     if (!tokens) return;
-    const int target = kv_cache_continued_store_target(kc, tokens->len);
+    const int idx = server_session_kv_index(s, sess);
+    const int target = kv_cache_continued_store_target(kc, tokens->len,
+                                                       kc->continued_last_store_tokens[idx]);
     if (target == 0) return;
-    if (kv_cache_store_live_prefix(s, tokens, target, "continued")) {
-        kv_cache_note_store(kc, target);
+    if (kv_cache_store_live_prefix(s, sess, tokens, target, "continued")) {
+        kv_cache_note_store(&kc->continued_last_store_tokens[idx], target);
     }
 }
 
@@ -6103,7 +6127,8 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
     return best;
 }
 
-static int kv_cache_try_load_text(server *s, const char *prompt_text,
+static int kv_cache_try_load_text(server *s, ds4_session *sess,
+                                  const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out) {
     if (loaded_path_out) *loaded_path_out = NULL;
@@ -6114,7 +6139,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = kv_cache_find_text_prefix(kc, prompt_text, quant_bits,
-                                        ds4_session_ctx(s->session));
+                                        ds4_session_ctx(sess));
     if (idx < 0) return 0;
 
     kv_entry e = kc->entry[idx];
@@ -6156,8 +6181,8 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     }
     char err[160] = {0};
     int loaded = 0;
-    if (header_ok && ds4_session_load_payload(s->session, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
-        const ds4_tokens *loaded_tokens = ds4_session_tokens(s->session);
+    if (header_ok && ds4_session_load_payload(sess, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
+        const ds4_tokens *loaded_tokens = ds4_session_tokens(sess);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
             if (effective_prompt) {
@@ -6171,12 +6196,12 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
             }
             if (hdr.ext_flags & KV_EXT_TOOL_MAP) kv_tool_map_load_from_pos(s, fp, NULL);
         } else {
-            ds4_session_invalidate(s->session);
+            ds4_session_invalidate(sess);
             unlink(path);
             server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt text-prefix payload %s", path);
         }
     } else {
-        if (header_ok) ds4_session_invalidate(s->session);
+        if (header_ok) ds4_session_invalidate(sess);
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache load failed %s: %s load=%.1f ms",
                    path,
@@ -6188,7 +6213,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded > 0) {
         const double load_ms = (now_sec() - load_t0) * 1000.0;
         if (loaded_path_out) *loaded_path_out = xstrdup(path);
-        kc->continued_last_store_tokens = loaded;
+        kc->continued_last_store_tokens[server_session_kv_index(s, sess)] = loaded;
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
             server_log(DS4_LOG_KVCACHE,
@@ -6206,10 +6231,10 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     return loaded;
 }
 
-static int kv_cache_try_load(server *s, const request *req,
+static int kv_cache_try_load(server *s, ds4_session *sess, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out) {
-    return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
+    return kv_cache_try_load_text(s, sess, req ? req->prompt_text : NULL,
                                   effective_prompt, loaded_path_out);
 }
 
@@ -6671,7 +6696,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double now = now_sec();
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+        if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv, p->srv->session);
         return;
     }
     int display_start = p->cached_tokens;
@@ -6707,7 +6732,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv);
+    if (p->srv && current > p->cached_tokens) kv_cache_maybe_store_continued(p->srv, p->srv->session);
 }
 
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
@@ -6787,7 +6812,8 @@ static void canonicalize_thinking_checkpoint(server *s, const job *j, const char
                    ctx, common, live_len, canonical.len, err);
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+        int loaded = kv_cache_try_load_text(s, s->session,
+                                            rendered.ptr ? rendered.ptr : "",
                                             &effective, &path);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
@@ -6894,7 +6920,8 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                    ctx, common, live_len, canonical.len, err);
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+        int loaded = kv_cache_try_load_text(s, s->session,
+                                            rendered.ptr ? rendered.ptr : "",
                                             &effective, &path);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
@@ -6972,15 +6999,15 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
-    if (cached == 0) s->kv.continued_last_store_tokens = 0;
+    if (cached == 0) s->kv.continued_last_store_tokens[0] = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, "evict");
+        kv_cache_store_current(s, s->session, "evict");
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
+        disk_cached = kv_cache_try_load(s, s->session, &j->req, &effective_prompt,
                                         &disk_cache_path);
         if (disk_cached > 0) {
             cached = disk_cached;
@@ -7038,8 +7065,8 @@ static void generate_job(server *s, job *j) {
             http_error(j->fd, 500, err);
             return;
         }
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+        if (kv_cache_store_live_prefix(s, s->session, prompt_for_sync, cold_store_len, "cold")) {
+            kv_cache_note_store(&s->kv.continued_last_store_tokens[0], cold_store_len);
         }
         ds4_tokens_free(&prefix);
     }
@@ -7060,8 +7087,8 @@ static void generate_job(server *s, job *j) {
                req_flags,
                now_sec() - t0);
     if (cold_store_len == prompt_for_sync->len) {
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+        if (kv_cache_store_live_prefix(s, s->session, prompt_for_sync, cold_store_len, "cold")) {
+            kv_cache_note_store(&s->kv.continued_last_store_tokens[0], cold_store_len);
         }
     }
     char id[96];
@@ -7126,7 +7153,7 @@ static void generate_job(server *s, job *j) {
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s);
+            kv_cache_maybe_store_continued(s, s->session);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -7569,7 +7596,6 @@ static bool request_is_batchable(const server *s, const request *r) {
     if (r->has_tools) return false;
     if (ds4_think_mode_enabled(r->think_mode)) return false;
     if (r->api != API_OPENAI) return false;
-    if (s->kv.enabled) return false;
     if (r->stops.max_len > 0) return false;
     if (r->temperature <= 0.0f) return false;
     /* Day-2 D2-3: streaming is supported via the simple plain-SSE path
@@ -7578,6 +7604,9 @@ static bool request_is_batchable(const server *s, const request *r) {
      * mode -- has_tools and think_mode are already excluded above, so
      * the remaining stream payload is a sequence of plain content
      * deltas which the simple path handles correctly. */
+    /* Day-2 D2-5: KV disk cache is now per-session, so s->kv.enabled
+     * no longer blocks batching.  generate_batched calls
+     * kv_cache_try_load + kv_cache_store_current per slot. */
     return true;
 }
 
@@ -7601,6 +7630,8 @@ static void generate_batched(server *s, job **jobs, int n) {
     bool         stream_headers_ok[DS4_SERVER_BATCH_MAX];
     bool         stream_failed    [DS4_SERVER_BATCH_MAX];
     size_t       plain_stream_pos [DS4_SERVER_BATCH_MAX];
+    ds4_tokens   effective_prompt [DS4_SERVER_BATCH_MAX];
+    int          cached_tokens    [DS4_SERVER_BATCH_MAX];
 
     for (int k = 0; k < n; k++) {
         sess[k] = s->batched_sessions[k];
@@ -7617,19 +7648,43 @@ static void generate_batched(server *s, job **jobs, int n) {
         stream_headers_ok[k]  = false;
         stream_failed[k]      = false;
         plain_stream_pos[k]   = 0;
+        memset(&effective_prompt[k], 0, sizeof(effective_prompt[k]));
+        cached_tokens[k]      = 0;
     }
     const int eos = ds4_token_eos(s->engine);
     const double t0 = now_sec();
 
-    /* Per-slot prefill from scratch.  Sequential per session because
-     * ds4_session_sync touches engine-wide state (g_kernel_stream,
-     * __constant__ batch args, scratch buffers) that is not safe to
-     * drive from two concurrent threads (see Day-2 D2-1 revert note in
-     * NOTES section 15). */
+    /* Per-slot prefill.  Sequential per session because ds4_session_sync
+     * touches engine-wide state (g_kernel_stream, __constant__ batch
+     * args, scratch buffers) that is not safe to drive from two
+     * concurrent threads (Day-2 D2-1 revert note in NOTES section 15).
+     *
+     * Day-2 D2-5: try the disk KV cache per slot before invalidating.
+     * Each batched session has its own continued-store frontier counter
+     * in s->kv.continued_last_store_tokens[1+k].  Successful hits set
+     * effective_prompt[k] to the tokenized text-suffix after the
+     * cached byte prefix; sync proceeds from there. */
     for (int k = 0; k < n; k++) {
         const request *req = &jobs[k]->req;
-        ds4_session_invalidate(sess[k]);
-        if (ds4_session_sync(sess[k], &req->prompt, err[k], sizeof(err[k])) != 0) {
+        const int kv_idx = server_session_kv_index(s, sess[k]);
+        s->kv.continued_last_store_tokens[kv_idx] = 0;
+        const ds4_tokens *prompt_for_sync = &req->prompt;
+        if (s->kv.enabled) {
+            char *path_unused = NULL;
+            int disk_cached = kv_cache_try_load(s, sess[k], req,
+                                                &effective_prompt[k],
+                                                &path_unused);
+            free(path_unused);
+            if (disk_cached > 0) {
+                cached_tokens[k] = disk_cached;
+                prompt_for_sync = &effective_prompt[k];
+            } else {
+                ds4_session_invalidate(sess[k]);
+            }
+        } else {
+            ds4_session_invalidate(sess[k]);
+        }
+        if (ds4_session_sync(sess[k], prompt_for_sync, err[k], sizeof(err[k])) != 0) {
             done[k] = true;
             finish[k] = "error";
             continue;
@@ -7766,14 +7821,27 @@ static void generate_batched(server *s, job **jobs, int n) {
         }
     }
 
+    /* Day-2 D2-5: persist the post-generation KV state per slot so the
+     * next turn of the same conversation can hit kv_cache_try_load.
+     * Skipped on error finishes -- the live graph might be torn. */
+    if (s->kv.enabled) {
+        for (int k = 0; k < n; k++) {
+            if (strcmp(finish[k], "error") == 0) continue;
+            if (completion[k] <= 0) continue;
+            kv_cache_store_current(s, sess[k], "continued");
+        }
+    }
+
     for (int k = 0; k < n; k++) {
         server_log(DS4_LOG_GENERATION,
                    "ds4-server: %s ctx=batched(n=%d) gen=%d finish=%s "
-                   "stream=%d %.3fs",
+                   "stream=%d kv_cached=%d %.3fs",
                    jobs[k]->req.kind == REQ_CHAT ? "chat" : "completion",
                    n, completion[k], finish[k],
-                   stream_send[k] ? 1 : 0, now_sec() - t0);
+                   stream_send[k] ? 1 : 0, cached_tokens[k],
+                   now_sec() - t0);
         buf_free(&text[k]);
+        ds4_tokens_free(&effective_prompt[k]);
     }
 }
 
@@ -8548,7 +8616,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+        kv_cache_store_current(&s, s.session, "shutdown");
     }
     server_close_resources(&s);
     return 0;
@@ -10041,23 +10109,19 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
 
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239, 0) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240, 0) == 10240);
 
-    kc.continued_last_store_tokens = 4096;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240, 4096) == 10240);
 
-    kc.continued_last_store_tokens = 24576;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720, 24576) == 30720);
 
-    kc.continued_last_store_tokens = 10240;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432, 10240) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480, 10240) == 20480);
 
     kc.opt.boundary_align_tokens = 0;
-    kc.continued_last_store_tokens = 20480;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999, 20480) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000, 20480) == 30000);
 }
 
 static void test_sha1_bytes_hex_matches_known_vector(void) {
