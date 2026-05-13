@@ -29,6 +29,18 @@ work is.
 
 ## Where we are after sections 11-13 (current head)
 
+**Caveat (2026-05-13):** the percentages in this section are
+`gen_tps_aggregate` from the bench tool -- warm-decode tokens per
+second only.  They are NOT user-visible wall-clock speedups in
+`ds4-server` until the request scheduler exercises the batched-decode
+code path.  Until commit a608e4d the scheduler was FIFO serial, so N=4
+parallel HTTP requests took the same wall-clock as N=4 sequential
+requests (~36 s each at ctx=2048+50tok).  Section 15 documents this
+discovery and the Day-1 2-slot continuous-batching MVP added to
+`ds4-server`.  Sections 11-13 numbers below should be read as
+**upper-bound microbench targets** that the scheduler work makes
+reachable.
+
 Sections 11, 12, and 13 below add three engine-level **batched
 substitutes** for the per-layer interleaved decode encoder:
 
@@ -43,13 +55,12 @@ per-session tensors.  Stacking all three:
 | N | baseline median | ALL substitutes median | Δ |
 |---|----------------:|----------------------:|--:|
 | 4 | 19.62 t/s       | **25.48 t/s**         | **+29.9 %** (range 25.46-25.50, variance 0.04) |
+| 8 | 15.62 t/s       | **24.60 t/s**         | **+57.5 %** (5-run median, fresh-boot, see section 13) |
 
 This is the first time the per-layer dense matmuls actually share weight
 reads across sessions (instead of N back-to-back `n_tok=1` calls), and
 it lifts the N=4 aggregate by ~6 t/s on top of the Phase 1a-1c +5-7 %
-shape ceiling.  N = 8 measurements are noisier under thermal load but
-held at +12 % in the most cooled-down sweep; a fresh-boot N = 8 result
-is left as follow-up.
+shape ceiling.
 
 The +26.5 % win was preserved through an upstream rebase and a
 post-refactor simplification pass (encoder pass1/pass2/pass3 helpers,
@@ -930,6 +941,107 @@ ambient GPU process is a prerequisite, not a nicety.
    input row).  Until 1 + 2 are done, a perfect v2 kernel cannot
    be measured.
 
+### 15. gen_tps vs wall-clock — bench numbers do not reach the user yet, plus Day-1 server scheduler MVP
+
+Scope: this section reframes what sections 11-13 actually deliver,
+documents the `ds4-server` scheduler observation that motivated the
+reframing, and records the Day-1 2-slot continuous-batching MVP that
+landed on top.
+
+**The gen_tps / wall-clock discrepancy.**  Bench tool reports
+`gen_tps_aggregate = cfg.gen_tokens * batch_n / gen_sec` where
+`gen_sec` is the pure decode interval (post-prefill, post-snapshot)
+-- see ds4_bench.c:396-444.  It excludes everything else in the
+process wall-clock.  Measured directly:
+
+| Config                          | gen_tps   | wall-clock | breakdown                                 |
+|---------------------------------|----------:|-----------:|-------------------------------------------|
+| N=1, no flags, batch=1          | 12.48     | 16.14 s    | prefill 5.23s + gen 4.01s + overhead 6.90s|
+| N=1, ALL ON, batch=1            | 18.54     | 17.36 s    | prefill 5.27s + gen 2.70s + overhead 9.39s|
+| N=4, ALL ON, batch=4            | 25.49 agg | 35.37 s    | prefill 20.04s + gen 7.85s + overhead 7.48s|
+
+The N=1 ALL ON row is the killer: `gen_tps` claims +48 % over no-flags
+single, but wall-clock is **+1.22 s WORSE** because the +2.49 s
+initialization overhead (most likely `DS4_CUDA_Q4_DECODE=1` lazy Q4
+conversion of 80 GB of weights -- `ds4-server --warm-weights` logs
+"warmed tensor pages in 2.04s" which matches) eats the gen speedup.
+At 50-token generations the warm-decode win is invisible to a single
+user; only at longer generations does the gen region dominate
+wall-clock.
+
+**The server scheduler discovery.**  Started `ds4-server --cuda
+--warm-weights` (Q4 lazy convert paid once at startup), then measured
+HTTP requests with the same 2466-token prompt + 50-token gen:
+
+- 1 request:                            9.19 s wall-clock
+- 4 parallel HTTP requests:            36.29 s wall-clock total
+- 4 sequential HTTP requests:          36.31 s wall-clock total
+
+The 0.02 s difference between "4 parallel" and "4 sequential" is the
+smoking gun: the request scheduler is FIFO with one worker thread
+processing one global session at a time
+(ds4_server.c:4719+ 8106 + 7510-7522 pre-a608e4d).
+`ds4_session_eval_batched_decode` -- the entry point bench tool uses
+and sections 11-13 measure against -- was **never called from the
+server**.  The +29.9 % / +57.5 % numbers above are therefore upper
+bounds reachable by a future scheduler, not deliverables in their
+current shape.
+
+**Day-1 MVP (commit a608e4d, 2026-05-13).**  Added a 2-slot
+continuous-batching scheduler to `ds4-server`:
+
+- Server gains `batched_sessions[2]` alongside the existing
+  `s->session` (legacy path is unchanged).
+- New helpers `dequeue_pair_wait(50 ms)`, `signal_done`,
+  `request_is_batchable`, `generate_batched` in ds4_server.c.
+- `worker_main` now tries to pair the freshly-dequeued job with a
+  second batchable request that arrives within 50 ms.  If paired,
+  `generate_batched` runs both prompts through per-session prefill
+  (sequential) then decodes both in lockstep via
+  `ds4_session_eval_batched_decode(slots, 2, ...)`.
+
+Predicate `request_is_batchable` is deliberately narrow for Day-1:
+OpenAI API only, non-stream, no tools, no thinking, no stops, no KV
+disk cache, temperature > 0.  Everything else falls through to the
+legacy `generate_job()` path.  This keeps the change shape low-risk:
+DSML tool tracking, MTP speculative decode, Anthropic/OpenAI live
+streams, structured streams, KV disk-cache reuse, and stop-string
+scanning are all untouched.
+
+Smoke (post-commit, GB10 --cuda --warm-weights --ctx 4096 ALL ON):
+- Single non-stream chat:          9.66 s  (legacy path, unchanged)
+- 2 parallel non-stream chats:    17.44 s (both `ctx=batched` markers
+  in server log, batched_decode hit confirmed for both responses)
+- N=2 serial via legacy (control): 18.11 s
+
+Wall-clock saving on this smoke is small (~3.7 %) **because prefill
+is sequential and prefill dominates the wall-clock at this
+short-decode geometry**: 6.9 s prefill #1 + 6.9 s prefill #2 + 3.6 s
+lockstep decode = 17.4 s, vs serial 2 × 9.0 s = 18.1 s.  Inside the
+3.6 s lockstep decode region the per-session rate is 13.8 t/s
+(aggregate 27.55 t/s), versus 18.54 t/s single-session decode -- so
+the +49 % decode-region throughput is the real bench-equivalent win.
+Long-decode workloads (chat with 500+ token responses) will see a
+much larger end-to-end win because the decode region grows linearly
+while prefill stays fixed per request.
+
+**Day-2 levers, in order of expected impact:**
+1. Parallel prefill (issue both sessions' `ds4_session_sync` calls so
+   their kernel launches overlap on `g_kernel_stream`; today they
+   serialize because they share the engine).  Brings the
+   17.4 s smoke closer to 12 s.
+2. N=2 → N=4/8 scheduler depth (queue allows it, batched_decode caps
+   at 8 per ds4.c:18341).
+3. Streaming SSE per slot (currently disabled in
+   `request_is_batchable`; main work is plumbing the
+   `sse_chunk(jobs[k]->fd, ...)` call inside the lockstep loop
+   per-slot).
+4. KV cache reuse for batched sessions (today `request_is_batchable`
+   bails on `s->kv.enabled`; need per-session KV cache state).
+5. `ds4_gpu_tensor_copy_async` stream consistency
+   (NOTES top open-followups item 4) -- still applicable, no longer
+   the limiting factor for batched server throughput at this scope.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
@@ -968,6 +1080,12 @@ Layer-encoder N-aware refactor (the "real lever" — sections 11-13):
 - 319cac8 DS4_BENCH_PRINT_TOKENS correctness hook
 - efa9390 simplify pass: encoder per-session helper, ensure_engine_scratch
   generalization, DS4_CUDA_BATCH_MAX + static_assert (-59 LoC, win preserved)
+
+Server scheduler (the path from microbench to user, section 15):
+- a608e4d 2-slot continuous-batching scheduler MVP in `ds4-server`,
+  exercising `ds4_session_eval_batched_decode` for the first time
+  from a non-bench binary (~3.7 % wall-clock win on 2x parallel curl
+  smoke; decode-region throughput +49 % per server log)
 
 Phase A infrastructure (kernel stream plumbing, sections 1-10):
 - 1d7402e all kernel launches threaded through g_kernel_stream
