@@ -691,6 +691,60 @@ Re-open when: extending to the next dense matmul.  The infrastructure
 piece (PRE_A/B/C split + engine batched scratch + `metal_graph_encode_*_batched`
 pattern) is reusable.
 
+### 12. Batched attn_q_a + attn_kv + qkv_rms_norm (DS4_CUDA_BATCHED_QKV)
+
+The Q_B win (section 11) replaced the single largest dense matmul per
+layer with one engine-level call.  This commit applies the same shape
+to the smaller-but-still-substantial pair: attn_q_a (DS4_N_EMBD ->
+q_rank) + attn_kv (DS4_N_EMBD -> DS4_N_HEAD_DIM), which both consume
+g->attn_norm and feed dsv4_qkv_rms_norm_rows.  PRE_A is sub-split
+into PRE_A1 (HC pre + attn_norm) and PRE_A2 (q_a + kv + qkv_norm).
+DS4_CUDA_BATCHED_QKV substitutes a single
+metal_graph_encode_qkv_batched for PRE_A2: stage N sessions' attn_norm
+into batched_attn_norm, two Q4 batched matmuls (q_a -> batched_qr, kv
+-> batched_kv_raw) at n_tok = N, one batched dsv4_qkv_rms_norm_rows
+that writes batched_qr_norm and batched_kv across N rows, scatter
+batched_kv to per-session g->kv (PRE_C still consumes it per-session
+for rope + kv_store), scatter batched_qr_norm to per-session
+g->qr_norm so PRE_B can read it.
+
+When BATCHED_QKV and BATCHED_Q_B are both on, the q_b path skips its
+qr_norm staging (the engine buffer is already filled by the qkv
+path), and the second per-session pass is just PRE_C; the only
+per-session work in PRE then becomes HC pre + attn_norm + head_norm
++ rope + kv_store + attention + attn_output + HC expand + FFN HC pre
++ router + MoE.
+
+Measured at N = 4 (median of 3 runs, GPU cooled to <55 °C between
+runs, ctx = 2048, gen = 50):
+
+| Config       | N=4 median | Δ vs baseline |
+|--------------|-----------:|--------------:|
+| baseline     | 19.64      | —             |
+| Q_B only     | 20.40      | +3.9 %        |
+| QKV only     | 20.17      | +2.7 %        |
+| QKV + Q_B    | 20.65      | +5.1 %        |
+
+QKV alone gives a smaller win than Q_B alone because the two matmuls
+it batches (q_a and kv) are individually smaller than q_b; together
+they don't quite match q_b's HBM amortization potential.  Stacking
+both adds an extra +1.2 % over Q_B alone, which is consistent with
+"the leftover savings on q_a + kv after Q_B already shaved q_b."
+
+N = 8 measurements proved unreliable during this session because the
+GPU was running hot from the multi-config interleaved sweeps -- the
+prefill_tps column drifted between 200 and 350 t/s across nominally-
+equivalent runs, and the per-condition variance swallowed the
+inter-condition delta.  N = 4 measurements with strict 55 °C
+cooldowns were stable.  A clean N = 8 re-measurement on a fresh-boot
+GPU is left as a follow-up.
+
+Re-open when: extending to the next dense matmul -- attn_output_a +
+attn_output_b is the natural next target (39 % of decode time
+versus q_b's 29 % and qkv's ~10 %); shared FFN gate/up has the same
+shape but its dimensions are too small for the batched warp kernel
+to saturate (see "Layer-internal FFN batching" earlier in this file).
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
