@@ -856,6 +856,80 @@ section-12 + section-13 pair has effectively captured the bulk of the
 layer-encoder N-aware refactor named earlier in this file under "The
 real lever for N batching".
 
+### 14. Shared-FFN v2 — day-1 recon (existing flag is broken; measurement floor is the real blocker)
+
+Scope: re-evaluate the **existing** `DS4_CUDA_BATCHED_SHARED_FFN` flag
+stacked on top of the sections 11-13 wins, then decide whether a v2
+custom Q4 pair kernel is worth designing.
+
+**Handoff doc fact correction.** Shared FFN does *not* live inside
+PRE_C3.  It lives in an independent `SHARED` phase (bitmask `64u`,
+ds4.c:9079-9093), invoked between PRE_C3 and POST per session via
+`metal_graph_encode_decode_layer_phased`.  The existing batched
+function `metal_graph_encode_shared_ffn_batched` (ds4.c:15824-15864)
+already uses `ds4_gpu_matmul_q4_0_batch_warp_tensor` — i.e. it does
+go through the Q4 batch path, contrary to "Q4 dispatch 経路通らない"
+in the handoff prompt.
+
+**Existing flag is broken.** Stacking
+`DS4_CUDA_BATCHED_SHARED_FFN=1` on ALL ON (Q4_DECODE + QKV + Q_B +
+ATTN_OUTPUT) at N=8 produced:
+- 2 fatal failures out of 15 total runs (5 + 10 reproducer pass).
+  First failure printed the clean `Metal batched per-layer forward
+  failed` string; the second printed *garbage bytes* (`(4J\xff…`)
+  where that string should have been — a memory-corruption smoking
+  gun, not just an OOM / driver fault.
+- Throughput in the successful runs sat inside the variance band of
+  ALL ON without the flag (no clean +N% signal at all).
+
+ALL ON itself had **0 fatal failures** across 15 runs in the same
+session, so the corruption is SHARED_FFN-specific, not GPU- or
+thermal-driven.
+
+**Stream-consistency hypothesis (leading, unverified).**  The
+existing `metal_graph_encode_shared_ffn_batched` flow is:
+1. default stream (0): `ds4_gpu_tensor_copy_async` gather of N
+   sessions' `ffn_norm` into `batched_ffn_norm` (ds4_cuda.cu:1948
+   issues `cudaMemcpyAsync(..., 0)` — default stream).
+2. `g_kernel_stream`: matmul gate → matmul up → swiglu (three
+   back-to-back kernels).
+3. default stream (0): scatter copy back into per-session
+   `shared_mid`.
+
+The same default-stream copy_async pattern is used by
+`metal_graph_encode_attn_output_batched` (section 13) without
+visible failures, but attn_output is **one** big kernel between
+gather and scatter; shared_ffn has **three** consecutive kernels,
+widening the race window between the gather write on stream 0 and
+the matmul read on `g_kernel_stream`.  CUDA legacy-default-stream
+synchronization is only guaranteed when nothing else has overridden
+the program's default-stream behavior; with cuBLAS in the picture
+this can break silently.  The follow-up named in NOTES top-of-file
+"4. ds4_gpu_tensor_copy_async stream consistency" is exactly this.
+
+**Measurement environment regression.**  The same ALL ON config
+measured 24.60 t/s median at the start of this session, 21.30 t/s
+an hour later, and 11.94 t/s an hour after that — same N=8, same
+cooldown<55 °C protocol, same binary.  Cumulative thermal envelope
+from the prior bench rounds plus an idle `ollama serve` that briefly
+took GPU during one round are the two known contaminants.  Net: the
++1 % detection threshold required to ship Shared-FFN v2 is **not
+achievable in this measurement environment**.  Cold-boot + zero
+ambient GPU process is a prerequisite, not a nicety.
+
+**Next session prerequisites** before reopening Shared-FFN v2:
+1. Cold-boot bench protocol (full host reboot, kill ollama / any
+   GPU daemon, single bench-only session).
+2. Decide on `ds4_gpu_tensor_copy_async` stream change — either move
+   to `g_kernel_stream` (and re-verify sections 11-13 wins survive)
+   or insert explicit `cudaStreamWaitEvent` synchronization at the
+   boundary.  Without this, even a correct v2 kernel will inherit
+   the same race window.
+3. Only then design the custom Q4 pair kernel (gate + up fused into
+   one launch, sharing the dequantized weight tiles for the same
+   input row).  Until 1 + 2 are done, a perfect v2 kernel cannot
+   be measured.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
