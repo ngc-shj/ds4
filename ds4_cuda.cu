@@ -1906,6 +1906,12 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint
     return cuda_ok(cudaGetLastError(), "tensor fill f32 launch");
 }
 
+extern "C" int ds4_gpu_tensor_clear(ds4_gpu_tensor *tensor) {
+    if (!tensor || !tensor->ptr) return 0;
+    return cuda_ok(cudaMemsetAsync(tensor->ptr, 0, (size_t)tensor->bytes, g_kernel_stream),
+                   "tensor clear");
+}
+
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, data, (size_t)bytes, cudaMemcpyHostToDevice), "tensor write");

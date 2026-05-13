@@ -15727,7 +15727,16 @@ struct ds4_session {
 static bool ensure_engine_scratch(ds4_gpu_tensor **slot, uint64_t row_floats) {
     if (*slot) return true;
     *slot = ds4_gpu_tensor_alloc((uint64_t)DS4_BATCH_MAX * row_floats * sizeof(float));
-    return *slot != NULL;
+    if (!*slot) return false;
+    /* Clear on first allocation so the batched-decode substitutes do not
+     * read uninitialized tile-padding rows beyond n_active when N < DS4_
+     * BATCH_MAX (the matmul kernels are launched with grid.y = n_active,
+     * but staging copies only fill the first n_active rows -- the
+     * remaining rows must read as zero, not as recycled GPU memory).
+     * Stream-ordered so the clear happens before the first substitute
+     * kernel launch on g_kernel_stream. */
+    (void)ds4_gpu_tensor_clear(*slot);
+    return true;
 }
 
 static bool ensure_engine_batched_scratch(ds4_engine *e, uint64_t vocab_dim) {
