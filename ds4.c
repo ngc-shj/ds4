@@ -19192,6 +19192,135 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #endif
 }
 
+/* D5-2: Per-layer interleaved multi-session prefill.
+ *
+ * For each of the DS4_N_LAYER layers, the function encodes the whole
+ * layer (attention half + FFN half + HC swap) for every session before
+ * advancing to the next layer.  This mirrors the decode-side
+ * metal_graph_encode_token_raw_swa_batched_n_sessions (ds4.c:16143);
+ * the only difference vs N back-to-back metal_graph_prefill_layer_major
+ * calls today is the loop nesting (layers outside, sessions inside).
+ *
+ * Per-session work is unchanged -- each call is the same
+ * metal_graph_encode_layer_batch (=phased(ALL_PHASES) + ffn + hc swap)
+ * the single-session path uses.  No batched substitutes hook in yet;
+ * those come in D5-3+ (the phase split landed in D5-1 is the
+ * prerequisite for slotting substitutes between phases).  The immediate
+ * payoff is L2 weight reuse: the layer weight is read into cache once
+ * and consumed by all n_active sessions in turn, instead of being
+ * evicted and re-fetched per session.
+ *
+ * Eligibility (silent fallback to per-session ds4_session_sync):
+ *   - all sessions must share the same engine and be GPU sessions
+ *   - prompts must fit each session's prefill_cap (no chunking yet)
+ *   - no session may have a live checkpoint (no resume-prefill yet)
+ *
+ * Returns true on full success (every session prefilled, logits read,
+ * checkpoints updated).  Returns false on eligibility miss without
+ * writing err -- the caller falls back.  Returns false with err set
+ * on actual GPU failure; caller propagates. */
+#define DS4_PREFILL_BATCHED_MAX 16
+static bool metal_graph_prefill_layer_major_batched_n_sessions(
+        ds4_session     **sessions,
+        const ds4_tokens **prompts,
+        int               n_active,
+        char *err, size_t errlen) {
+    if (n_active <= 0) return false;
+    if (n_active > DS4_PREFILL_BATCHED_MAX) return false;
+    if (!sessions[0]) return false;
+    ds4_engine *e = sessions[0]->engine;
+    if (!e) return false;
+    for (int i = 0; i < n_active; i++) {
+        if (!sessions[i] || ds4_session_is_cpu(sessions[i])) return false;
+        if (sessions[i]->engine != e) return false;
+        if (!prompts[i] || prompts[i]->len <= 0) return false;
+        if ((uint32_t)prompts[i]->len > sessions[i]->graph.prefill_cap) return false;
+        /* Resume-prefill (checkpoint extends into prompt) needs its own
+         * batched path; today this falls back. */
+        if (sessions[i]->checkpoint_valid && sessions[i]->checkpoint.len > 0) return false;
+    }
+
+    const ds4_model   *model   = &e->model;
+    const ds4_weights *weights = &e->weights;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+
+    bool ok = true;
+
+    /* Per-session: upload prompt tokens + embeddings to batch_cur_hc. */
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = metal_graph_upload_prompt_tokens(sessions[i]->graph.prefill_tokens,
+                                              prompts[i], 0, (uint32_t)prompts[i]->len);
+    }
+    if (ok) {
+        uint32_t max_n = 0;
+        for (int i = 0; i < n_active; i++) {
+            if ((uint32_t)prompts[i]->len > max_n) max_n = (uint32_t)prompts[i]->len;
+        }
+        ok = metal_graph_warmup_prefill_kernels(&sessions[0]->graph, model, weights, max_n);
+    }
+    for (int i = 0; ok && i < n_active; i++) {
+        ok = metal_graph_upload_prompt_embeddings_hc(sessions[i]->graph.batch_cur_hc,
+                                                     sessions[i]->graph.prefill_tokens,
+                                                     model, weights, prompts[i],
+                                                     0, (uint32_t)prompts[i]->len);
+    }
+
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+
+    /* Interleaved layer loop: encode each layer for all sessions before
+     * advancing.  Sessions iterate inside; layers outside. */
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (int i = 0; ok && i < n_active; i++) {
+            ok = metal_graph_encode_layer_batch(&sessions[i]->graph,
+                                                model, &weights->layer[il],
+                                                il, 0,
+                                                (uint32_t)prompts[i]->len);
+        }
+    }
+
+    /* Output head per session (using last prompt row's HC vector). */
+    ds4_gpu_tensor *last_hc_views[DS4_PREFILL_BATCHED_MAX] = { NULL };
+    for (int i = 0; ok && i < n_active; i++) {
+        const uint32_t output_row = (uint32_t)prompts[i]->len - 1u;
+        last_hc_views[i] = metal_graph_tensor_row_view(sessions[i]->graph.batch_cur_hc,
+                                                       output_row, hc_dim);
+        if (!last_hc_views[i]) { ok = false; break; }
+        ds4_gpu_tensor *saved_cur = sessions[i]->graph.cur_hc;
+        sessions[i]->graph.cur_hc = last_hc_views[i];
+        ok = metal_graph_encode_output_head(&sessions[i]->graph, model, weights,
+                                            weights->output->dim[1]);
+        sessions[i]->graph.cur_hc = saved_cur;
+    }
+
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+
+    for (int i = 0; i < n_active; i++) {
+        if (last_hc_views[i]) ds4_gpu_tensor_free(last_hc_views[i]);
+    }
+
+    /* Read logits + commit checkpoints. */
+    for (int i = 0; ok && i < n_active; i++) {
+        if (sessions[i]->logits) {
+            ok = ds4_gpu_tensor_read(sessions[i]->graph.logits, 0,
+                                     sessions[i]->logits,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+        }
+        if (ok) {
+            ds4_tokens_copy(&sessions[i]->checkpoint, prompts[i]);
+            sessions[i]->checkpoint_valid = true;
+            sessions[i]->mtp_draft_valid = false;
+            sessions[i]->graph.mtp_n_raw = 0;
+        }
+    }
+
+    if (!ok) {
+        snprintf(err, errlen, "GPU batched prefill (N=%d) failed", n_active);
+        for (int i = 0; i < n_active; i++) {
+            sessions[i]->checkpoint_valid = false;
+        }
+    }
+    return ok;
+}
 /* Day-4 D4-2 scaffolding: multi-session batched prefill API surface.
  * Today this is a sequential loop over ds4_session_sync() -- equivalent
  * to N back-to-back per-session syncs, the engine-side per-layer
@@ -19218,6 +19347,18 @@ int ds4_sessions_sync_batched(ds4_session **sessions,
                               int n,
                               char *err, size_t errlen) {
     if (!sessions || !prompts || n <= 0) return 0;
+#ifndef DS4_NO_GPU
+    /* D5-2 fast path: per-layer interleaved multi-session prefill.
+     * Silently falls back (no err written) when any session is
+     * ineligible (CPU backend, oversized prompt, live checkpoint,
+     * etc.); writes err only on real GPU failure. */
+    if (err && errlen > 0) err[0] = '\0';
+    if (metal_graph_prefill_layer_major_batched_n_sessions(sessions, prompts, n,
+                                                           err, errlen)) {
+        return 0;
+    }
+    if (err && err[0]) return 1;
+#endif
     for (int k = 0; k < n; k++) {
         if (!sessions[k]) continue;
         int rc = ds4_session_sync(sessions[k], prompts[k], err, errlen);
