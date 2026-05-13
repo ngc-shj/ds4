@@ -27,6 +27,36 @@ Phase 1c is structural / API; it does NOT add real kernel-level
 parallelism for the dense layer matmuls, which is where the bulk of the
 work is.
 
+## Where we are after sections 11-13 (current head)
+
+Sections 11, 12, and 13 below add three engine-level **batched
+substitutes** for the per-layer interleaved decode encoder:
+
+  - `DS4_CUDA_BATCHED_Q_B`         replaces PRE_B  (attn_q_b matmul)
+  - `DS4_CUDA_BATCHED_QKV`         replaces PRE_A2 (attn_q_a + attn_kv + qkv_rms_norm)
+  - `DS4_CUDA_BATCHED_ATTN_OUTPUT` replaces PRE_C2 (attn_output_a + output_b)
+
+Each stages N sessions' inputs into engine-level scratch, runs the
+underlying kernel(s) once with `n_tok = N`, and scatters rows back to
+per-session tensors.  Stacking all three:
+
+| N | baseline median | ALL substitutes median | Δ |
+|---|----------------:|----------------------:|--:|
+| 4 | 19.62 t/s       | **25.48 t/s**         | **+29.9 %** (range 25.46-25.50, variance 0.04) |
+
+This is the first time the per-layer dense matmuls actually share weight
+reads across sessions (instead of N back-to-back `n_tok=1` calls), and
+it lifts the N=4 aggregate by ~6 t/s on top of the Phase 1a-1c +5-7 %
+shape ceiling.  N = 8 measurements are noisier under thermal load but
+held at +12 % in the most cooled-down sweep; a fresh-boot N = 8 result
+is left as follow-up.
+
+The +26.5 % win was preserved through an upstream rebase and a
+post-refactor simplification pass (encoder pass1/pass2/pass3 helpers,
+generalized `ensure_engine_scratch`, `DS4_CUDA_BATCH_MAX` macro +
+static_assert).  See sections 11-13 below for per-substitute analysis
+and the most recent simplify commit for the encoder cleanup.
+
 ## What does NOT help (B-4 experiments tried, reverted)
 
 ### 1. Templated weight-sharing matmul kernel
@@ -837,12 +867,42 @@ Already shown not to help on this hardware / model:
 
 ## What is committed and ready for next session
 
+Phase 1a-1c (the original PoC scaffolding):
 - 60664bc Phase 1a — sync amortization (+2-3 %)
 - 1ea0307 Phase 1b — `__constant__` batch args + uploader
 - 635629d Phase 1c-1 — `matmul_q4_0_preq_batch_warp8_kernel` + wrapper
 - 503c725 Phase 1c-2 — batched output head wiring
+- c44c0e6 per-layer interleaved batched decode encoder (+3-5 % at N=2/4)
+
+Layer-encoder N-aware refactor (the "real lever" — sections 11-13):
+- 88f64e3 batched attn_q_b (PRE_B substitute, +3.9 % N=4)
+- 8175c3a batched attn_q_a + attn_kv + qkv_rms_norm (PRE_A2 substitute, +5.1 % stacked)
+- b2be06c batched attn_output (PRE_C2 substitute, +26.9 % combined)
+- 319cac8 DS4_BENCH_PRINT_TOKENS correctness hook
+- efa9390 simplify pass: encoder per-session helper, ensure_engine_scratch
+  generalization, DS4_CUDA_BATCH_MAX + static_assert (-59 LoC, win preserved)
+
+Phase A infrastructure (kernel stream plumbing, sections 1-10):
+- 1d7402e all kernel launches threaded through g_kernel_stream
+- 6412fad, 86e5144 dead-end shelving notes (Option I' / G / N>8 cliff)
+- 2c5da98, 45a5f93, 666b031 Q3_0 / Q3_K_S / INT8 WMMA documented dead-ends
 
 The batched continuous-decode API works correctly at N = 1 – 16, falls
-back cleanly to serial outside that range, and produces bit-equivalent
-output to the per-session path.  Layer-level batching (the real win) is
-the next session's work.
+back cleanly to serial outside that range, and the batched substitutes
+preserve output coherence (verified via DS4_BENCH_PRINT_TOKENS: all
+five env-var combinations produce grammatically-correct Italian text
+on the promessi_sposi.txt prompt; argmax tokens differ in low-confidence
+positions due to FP-accumulation order, not broken kernels).
+
+Open follow-ups in priority order:
+1. Fresh-boot N = 8 re-measurement (current N = 8 is thermally noisy).
+2. Extend the stage→batched→scatter pattern to shared FFN gate+up (NOTES
+   "Layer-internal FFN batching" said this needs a custom Q4 pair kernel
+   to actually pay; revisit with the now-validated infrastructure).
+3. Bench-gate `ds4_gpu_tensor_copy_async` switch to `g_kernel_stream`
+   for stream-consistency with Phase A (section 9 of the local-LLM
+   review, deferred because the +26.5 % win relies on the current
+   serialization order).
+4. Push DS4_BATCH_INTERLEAVED_MAX from 8 to a verified higher value
+   once shared-FFN batching lands and the per-session L2 working set
+   stops scaling with N (section 10 re-open condition).
