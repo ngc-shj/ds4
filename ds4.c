@@ -11116,13 +11116,49 @@ static bool metal_graph_q_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
-static bool metal_graph_encode_layer_attention_batch(
+/* Phase bit flags for metal_graph_encode_layer_attention_batch_phased.
+ * Mirrors the decode-side DS4_DECODE_LAYER_PRE_* bitmask so future batched-
+ * prefill substitutes can slot between phases the same way batched-decode
+ * substitutes do.  See NOTES.md section 19 for the Day-5 design.
+ *
+ * Phase outputs (all in engine-level batch_* scratch):
+ *   PRE_A1 : rms_norm_plain_rows + hc_attn_fn + hc_split/weighted_sum
+ *            + rms_norm_weight_rows (attn_norm)    -> batch_attn_norm
+ *   PRE_A2 : attn_q_a + attn_kv + dsv4_qkv_rms_norm_rows
+ *            (or fallback rms_norm_weight_rows for q only)
+ *                                                  -> batch_qr_norm [+ batch_kv if fused]
+ *   PRE_B  : attn_q_b matmul                        -> batch_q (raw)
+ *   PRE_C1 : head_rms + rope_q + (non-fused kv) + rope_kv + fp8
+ *            kv quantize + raw KV store + compressor + indexer
+ *            + attention                            -> batch_heads
+ *   PRE_C2 : inv_rope + attention_output_q8_batch   -> batch_attn_out
+ *   PRE_C3 : directional steering + hc_expand_split -> batch_after_attn_hc
+ *
+ * The thin wrapper metal_graph_encode_layer_attention_batch below calls
+ * the phased variant with DS4_PREFILL_LAYER_ALL; existing callers are
+ * unchanged.  D5-2 will introduce a multi-session outer loop that
+ * interleaves phases across N sessions; D5-3+ will then slot batched
+ * substitutes gated by DS4_CUDA_BATCHED_PREFILL_* env vars. */
+#define DS4_PREFILL_LAYER_PRE_A1 1u
+#define DS4_PREFILL_LAYER_PRE_A2 2u
+#define DS4_PREFILL_LAYER_PRE_A  (DS4_PREFILL_LAYER_PRE_A1 | DS4_PREFILL_LAYER_PRE_A2)
+#define DS4_PREFILL_LAYER_PRE_B  4u
+#define DS4_PREFILL_LAYER_PRE_C1 8u
+#define DS4_PREFILL_LAYER_PRE_C2 16u
+#define DS4_PREFILL_LAYER_PRE_C3 32u
+#define DS4_PREFILL_LAYER_PRE_C \
+    (DS4_PREFILL_LAYER_PRE_C1 | DS4_PREFILL_LAYER_PRE_C2 | DS4_PREFILL_LAYER_PRE_C3)
+#define DS4_PREFILL_LAYER_ALL \
+    (DS4_PREFILL_LAYER_PRE_A | DS4_PREFILL_LAYER_PRE_B | DS4_PREFILL_LAYER_PRE_C)
+
+static bool metal_graph_encode_layer_attention_batch_phased(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
         uint32_t                il,
         uint32_t                pos0,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        unsigned                phases) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
@@ -11170,6 +11206,8 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             g->batch_after_attn_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+    /* === PRE_A1: HC pre + attn_norm.  Ends with batch_attn_norm filled. === */
+    if (phases & DS4_PREFILL_LAYER_PRE_A1) {
     if (ok) ok = ds4_gpu_rms_norm_plain_rows_tensor(g->batch_flat_hc,
                                                       g->batch_cur_hc,
                                                       (uint32_t)hc_dim,
@@ -11230,6 +11268,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
+    } /* === end PRE_A1 === */
+    /* === PRE_A2: attn_q_a + attn_kv + qkv_rms_norm.  Ends with
+     * batch_qr_norm [+ batch_kv when fused] filled. === */
+    if (phases & DS4_PREFILL_LAYER_PRE_A2) {
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
                                               model->map,
@@ -11288,6 +11330,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a_norm");
+    } /* === end PRE_A2 === */
+    /* === PRE_B: attn_q_b matmul.  Reads batch_qr_norm, writes batch_q
+     * (raw, before head_rms which lives in PRE_C1). === */
+    if (phases & DS4_PREFILL_LAYER_PRE_B) {
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_q,
                                               model->map,
                                               model->size,
@@ -11301,6 +11347,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * q_dim, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_b");
+    } /* === end PRE_B === */
+    /* === PRE_C1: head_rms + rope_q + (non-fused kv path) + rope_kv +
+     * fp8 kv quantize + raw KV store + compressor + indexer + attention.
+     * Ends with batch_heads filled. === */
+    if (phases & DS4_PREFILL_LAYER_PRE_C1) {
     if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
                                                 n_tokens,
                                                 DS4_N_HEAD,
@@ -12359,7 +12410,10 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("attention");
-
+    } /* === end PRE_C1 === */
+    /* === PRE_C2: inv_rope + attention_output_q8_batch.  Ends with
+     * batch_attn_out (+ batch_attn_low scratch) filled. === */
+    if (phases & DS4_PREFILL_LAYER_PRE_C2) {
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->batch_heads,
                                       (uint64_t)n_tokens * q_dim, il, pos0);
@@ -12408,6 +12462,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
+    } /* === end PRE_C2 === */
+    /* === PRE_C3: directional steering + hc_expand_split.  Ends with
+     * batch_after_attn_hc filled (the FFN-half input). === */
+    if (phases & DS4_PREFILL_LAYER_PRE_C3) {
     if (ok && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
@@ -12422,6 +12480,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
+    } /* === end PRE_C3 === */
     ds4_gpu_tensor_free(after_attn_hc_view);
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
@@ -12431,6 +12490,23 @@ static bool metal_graph_encode_layer_attention_batch(
 #undef DS4_METAL_PROFILE_ATTN_STAGE
 #undef DS4_METAL_PROFILE_Q_STAGE
     return ok;
+}
+
+/* Thin wrapper that drives the full attention half of one prefill layer in
+ * one call.  D5-2 will introduce a multi-session outer loop that calls the
+ * phased variant with explicit phase masks so batched substitutes can slot
+ * between phases; this wrapper preserves the today-shape behavior for the
+ * existing callers (the prefill_layer_major and split_profile paths). */
+static bool metal_graph_encode_layer_attention_batch(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos0,
+        uint32_t                n_tokens) {
+    return metal_graph_encode_layer_attention_batch_phased(g, model, layer,
+                                                           il, pos0, n_tokens,
+                                                           DS4_PREFILL_LAYER_ALL);
 }
 
 /* Encode the batched prefill FFN half: HC pre/norm, shared expert, routed

@@ -1358,6 +1358,61 @@ larger contribution is unblocking the same pattern for Day-6+ work
 on the FFN side once the SHARED_FFN naive-Q4 kernel is replaced
 (section 14 / 18).
 
+### 19.1. Day-5 D5-1 land: phase split scaffolding (no behavior change)
+
+The phase split landed exactly as designed above: a new
+`metal_graph_encode_layer_attention_batch_phased(g, ..., phases)`
+wraps the original ~1300-line attention-half encoder body with six
+`if (phases & DS4_PREFILL_LAYER_PRE_<X>) { ... }` gates (PRE_A1/A2/B/
+C1/C2/C3), and the existing
+`metal_graph_encode_layer_attention_batch` becomes a thin wrapper that
+calls the phased variant with `DS4_PREFILL_LAYER_ALL`.  No phase
+boundaries reorder or skip any work today; existing callers (prefill_
+layer_major and the split_profile path) see byte-identical behavior.
+
+**Pre-existing bug found while bringing up D5-1.**  The bring-up
+initially mis-attributed a regression to D5-1 because the smoke
+relied on a single N=1 cold-prefill run and the output collapsed to
+a BOS attractor.  After ruling out D5-1 (HEAD reproduces the same
+failure), the bug was traced to uninitialized GPU memory: the
+engine-level batched scratch (`engine->batched_attn_norm`,
+`batched_qr`, `batched_kv*`, etc.) is sized for `DS4_BATCH_MAX` rows
+and the Q4 warp-tiled matmul reads tile-padded rows beyond the
+caller-supplied `n_active`; those rows must read as zero.  Plain
+`cudaMalloc` does not zero, and when the driver hands back recycled
+GPU memory the substitutes produce nonsense logits.  The fix
+(landed separately as a sibling commit on this branch) adds
+`ds4_gpu_tensor_clear` and calls it from `ensure_engine_scratch`
+with `cudaMemsetAsync` ordered on `g_kernel_stream`.
+
+**Why the failure looked like FP non-determinism.**  cudaMalloc
+returns whatever GPU memory it has, so the garbage value was
+*per-session deterministic* (same across calls within one server
+process) but *per-process non-deterministic* (different across
+server restarts).  A handful of "the bug is non-deterministic"
+observations were just two server processes seeing two different
+garbage values; the section-15 cuBLAS TC reduction-order story does
+not apply.
+
+Verification protocol for D5-2+ on this fixed baseline:
+  1. Start server, run a warm-up curl to populate
+     `/tmp/ds4-kv-fresh`.  The warm-up itself can be Q4-only-no-
+     batched if a clean coherent KV file is desired, but with the
+     scratch-clear fix the full batched env-var combo also produces
+     coherent output on empty KV.
+  2. Run N=1/2/4 parallel curls and verify each slot returns
+     grammatically-correct Italian text discussing I Promessi
+     Sposi.  Minor FP-noise tokens (occasional foreign-language
+     fragments) are within expected variance; full BOS collapse
+     indicates a real bug.
+
+**Known follow-up.**  Even after the engine-scratch fix, the
+Q4-only (no-batched) single-session decode path still occasionally
+collapses to BOS on empty-KV runs (~1 in 3 in current testing).
+There is at least one more uninitialized-read source somewhere on
+the single-session path; it does not affect the batched substitutes
+post-fix, but it should be tracked and fixed.
+
 ### What NOT to retry without a new theory
 
 Already shown not to help on this hardware / model:
