@@ -7069,7 +7069,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 return cuda_ok(cudaGetLastError(), "matmul_q3_0 warp launch");
             }
         }
-        if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+        if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+        getenv("DS4_CUDA_Q8_NO_Q4") == NULL) {
             const unsigned char *w_q4 = cuda_q4_from_q8_ptr(model_map, weight_offset,
                                                             weight_bytes, in_dim, out_dim);
             if (w_q4) {
@@ -7300,7 +7301,8 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_kernel_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
-    if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+    if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+        getenv("DS4_CUDA_Q8_NO_Q4") == NULL) {
         const unsigned char *w0_q4 = cuda_q4_from_q8_ptr(model_map, weight0_offset,
                                                           weight0_bytes, in_dim, out0_dim);
         const unsigned char *w1_q4 = cuda_q4_from_q8_ptr(model_map, weight1_offset,
@@ -7382,7 +7384,8 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     const int use_dp4a = cuda_q8_use_dp4a();
     quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32, 0, g_kernel_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
-    if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+    if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+        getenv("DS4_CUDA_Q8_NO_Q4") == NULL) {
         const unsigned char *w_q4 = cuda_q4_from_q8_ptr(model_map, weight_offset,
                                                          weight_bytes, in_dim, out_dim);
         if (w_q4) {
@@ -8865,7 +8868,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
         dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
         bool dispatched_q4 = false;
-        if (use_dp4a && n_tokens == 1 && getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+        if (use_dp4a && n_tokens == 1 && getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+        getenv("DS4_CUDA_Q8_NO_Q4") == NULL) {
             const unsigned char *out_a_q4 = cuda_q4_from_q8_ptr(model_map, out_a_offset,
                                                                   out_a_bytes, group_dim, low_dim);
             if (out_a_q4) {
@@ -8890,7 +8894,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
          * f16 path. */
         if (!dispatched_q4 &&
             use_dp4a && n_tokens > 1 && n_tokens <= 32 &&
-            getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+            getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+        getenv("DS4_CUDA_Q8_NO_Q4") == NULL) {
             const unsigned char *out_a_q4 = cuda_q4_from_q8_ptr(model_map, out_a_offset,
                                                                   out_a_bytes, group_dim, low_dim);
             if (out_a_q4) {
@@ -8930,7 +8935,8 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
      * NOTES.md "What does NOT help #2").  Restricted to n_tokens <= 32
      * so prefill still uses cuBLAS f16's tensor-core path. */
     if (cuda_q8_use_dp4a() && n_tokens > 1 && n_tokens <= 32 &&
-        getenv("DS4_CUDA_Q4_DECODE") != NULL) {
+        getenv("DS4_CUDA_Q4_DECODE") != NULL &&
+        getenv("DS4_CUDA_Q8_NO_Q4") == NULL) {
         if (ds4_gpu_matmul_q4_0_batch_warp_tensor(out, model_map, model_size,
                                                   out_b_offset,
                                                   low_dim, out_dim,

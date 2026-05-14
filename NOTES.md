@@ -1697,32 +1697,44 @@ collapse** (`<｜begin▁of▁sentence｜>` repeating after a few
 coherent tokens) is **not** the expected variance; it indicates
 a real bug.
 
-**5. Q4 vocab head BOS-bias caveat (section 19.1 follow-up note).**
+**5. Q4 BOS-attractor caveat (section 19.1 follow-up note).**
 
 Post-`6ca93c3` initcheck reports zero uninit reads on the single-
 session decode path, so the historical "warm-up sometimes BOS"
 explanation (uninit GPU memory) no longer applies.  What is still
-true: `DS4_CUDA_Q4_DECODE=1` routes the vocab projection through the
-batched Q4 warp matmul (`metal_graph_encode_output_head_batched` ->
-`ds4_gpu_matmul_q4_0_batch_warp_tensor`) instead of the Q8 path, and
-the Q4 logits are biased enough toward `<|begin_of_sentence|>` that
-greedy decode locks into BOS attractor.  Reproduction on `2026-05-14`
-(both ds4flash.gguf models):
+true: with `DS4_CUDA_Q4_DECODE=1`, greedy decode on chat-templated
+prompts locks into BOS-attractor after a handful of coherent tokens.
+Investigation on `2026-05-14` narrowed the cause to the **Q8 -> Q4**
+re-quantization path specifically, not Q4 in general:
 
-  - Q4_DECODE + temperature 0 (greedy) -- BOS attractor 100% (both
-    imatrix and legacy gguf)
-  - Q4_DECODE + temperature 1 (default) -- coherent Italian output
-  - Q4_DECODE + temperature 1 + the full batched env-var combo
-    (BATCHED_QKV + BATCHED_Q_B + BATCHED_ATTN_OUTPUT) -- BOS
-    attractor returns at N=4 parallel (batched substitutes fire,
-    interact with the Q4 logit bias)
+  - `Q4_DECODE=1` alone, greedy -- BOS attractor at ~3 tokens
+  - `Q4_DECODE=1` + `F16_NO_Q4=1` (only Q8 -> Q4 still active) --
+    BOS attractor at ~15 tokens
+  - `Q4_DECODE=1` + `Q8_NO_Q4=1` (only F16 -> Q4 still active) --
+    fully coherent
+  - `Q4_DECODE=1` + both opt-outs -- baseline (Q4 cache no-op)
 
-Workaround: leave temperature at the default (1.0+) when
-`DS4_CUDA_Q4_DECODE` is on, or unset it for greedy correctness
-testing.  Root cause is the Q4 vocab matmul kernel, not unitialized
-memory; fix likely needs per-row scale-factor calibration in the
-lazy Q8 -> Q4 conversion at `cuda_q4_from_q8_ptr` so the BOS row's
-quantization error doesn't elevate its dot-product.
+So F16 -> Q4 is greedy-safe; the 4-bit quantization error
+accumulated through the Q8 -> Q4 layer matmuls (attention, FFN
+gate/up, attention output) is what destabilizes argmax onto BOS.
+Sampling (temperature >= 1.0) hides the bias because the
+distribution stays wide enough that BOS rarely wins.
+
+Workaround: pair `DS4_CUDA_Q4_DECODE=1` with
+`DS4_CUDA_Q8_NO_Q4=1` for greedy-stable runs (keeps the F16 -> Q4
+HBM savings, drops the lossy Q8 -> Q4 paths).  Granular gates added
+by this branch:
+
+  | Env var                    | Q8 -> Q4 | F16 -> Q4 |
+  |----------------------------|----------|-----------|
+  | `DS4_CUDA_Q4_DECODE=1`     | enabled  | enabled   |
+  | `+ DS4_CUDA_Q8_NO_Q4=1`    | disabled | enabled   |
+  | `+ DS4_CUDA_F16_NO_Q4=1`   | enabled  | disabled  |
+  | both NO_Q4 vars            | disabled | disabled  |
+
+A real fix would address Q8 -> Q4 precision at the conversion or
+matmul level (per-channel scales, mixed-precision accumulators,
+etc.) but that's research-shaped and out of scope here.
 
 **6. Server log sanity checks.**
 
