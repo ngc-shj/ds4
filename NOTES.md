@@ -1748,16 +1748,42 @@ Workaround: pair `DS4_CUDA_Q4_DECODE=1` with
 HBM savings, drops the lossy Q8 -> Q4 paths).  Granular gates added
 by this branch:
 
-  | Env var                    | Q8 -> Q4 | F16 -> Q4 |
-  |----------------------------|----------|-----------|
-  | `DS4_CUDA_Q4_DECODE=1`     | enabled  | enabled   |
-  | `+ DS4_CUDA_Q8_NO_Q4=1`    | disabled | enabled   |
-  | `+ DS4_CUDA_F16_NO_Q4=1`   | enabled  | disabled  |
-  | both NO_Q4 vars            | disabled | disabled  |
+  | Env var                       | Sites disabled (out of 8 Q4 sites)              |
+  |-------------------------------|--------------------------------------------------|
+  | `DS4_CUDA_Q4_DECODE=1`        | none (every Q4 site fires)                       |
+  | `+ DS4_CUDA_Q8_NO_Q4=1`       | all six Q8 -> Q4 sites                           |
+  | `+ DS4_CUDA_F16_NO_Q4=1`      | both F16 -> Q4 sites                             |
+  | `+ DS4_CUDA_Q8_NO_Q4_GENERIC` | three "generic" Q8 -> Q4 sites (single/pair/HC)  |
+  | `+ DS4_CUDA_Q8_NO_Q4_ATTN_OUT`| three attention-output Q8 -> Q4 sites            |
+  | `+ DS4_CUDA_Q8_NO_Q4_SINGLE`  | just `matmul_q8_0_tensor_labeled` (site 7072)    |
+  | `+ DS4_CUDA_Q8_NO_Q4_PAIR`    | just `matmul_q8_0_pair_tensor_labeled` (7304)    |
+  | `+ DS4_CUDA_Q8_NO_Q4_HCEXP`   | just `matmul_q8_0_hc_expand_tensor` (7387)       |
 
-A real fix would address Q8 -> Q4 precision at the conversion or
-matmul level (per-channel scales, mixed-precision accumulators,
-etc.) but that's research-shaped and out of scope here.
+Bisecting the BOS attractor with these gates (`2026-05-14`, imatrix
+gguf, server warm-up curl + greedy temperature 0):
+
+  | Active Q8 -> Q4 site         | Greedy output |
+  |------------------------------|---------------|
+  | ATTN_OUT only                | coherent      |
+  | SINGLE only                  | **BOS**       |
+  | PAIR only                    | coherent      |
+  | HCEXP only                   | coherent      |
+
+So the SINGLE workhorse (`matmul_q8_0_tensor_labeled`) is the lone
+culprit: every other Q8 -> Q4 site is greedy-safe in isolation.
+Callers of this function are the per-layer attention projections
+(attn_q_a, attn_q_b, attn_kv) and the FFN shared-expert matmuls
+(shared_gate, shared_up, shared_out) -- the "decode workhorse"
+matmuls that fire dozens of times per token.  The cumulative Q4
+rounding error from those sites is what destabilizes argmax onto
+BOS; the other Q8 -> Q4 sites are either rarer, smaller, or
+amortized enough to absorb the 4-bit precision loss without
+flipping the top-1.
+
+A real fix would address Q8 -> Q4 precision at this specific site
+(hybrid per-block Q8 fallback for high-max-abs blocks, mixed
+accumulation precision, layer-0 Q8 carve-out, etc.) but that is
+research-shaped and out of scope here.
 
 **6. Server log sanity checks.**
 
