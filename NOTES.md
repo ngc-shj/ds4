@@ -1638,6 +1638,7 @@ on-disk KV that the warm-up populates.
 ```
 mkdir -p /tmp/ds4-kv
 DS4_CUDA_Q4_DECODE=1 \
+DS4_CUDA_Q8_NO_Q4=1 \
 DS4_CUDA_BATCHED_QKV=1 \
 DS4_CUDA_BATCHED_Q_B=1 \
 DS4_CUDA_BATCHED_ATTN_OUTPUT=1 \
@@ -1648,12 +1649,22 @@ disown
 until ss -tlnp 2>/dev/null | grep -q 8000; do sleep 2; done
 ```
 
+`DS4_CUDA_Q8_NO_Q4=1` skips the lossy Q8 -> Q4 layer matmuls (see
+section 20.5).  Without it, greedy decode locks into BOS attractor;
+with it, gen-tps still gains roughly +41 % over the Q8 baseline
+(measured at 16 K ctx, 32 gen tokens: baseline 12.19 t/s,
+`Q4_DECODE` alone 17.41 t/s, `Q4_DECODE + Q8_NO_Q4` 17.22 t/s) -- the
+F16 -> Q4 weight cache alone accounts for almost all of the win, so
+keeping it off costs ~1 % perf and buys greedy stability.
+
 Env-var reference (full table in `docs/GB10_JOURNEY.md` lines
 321-340; per-substitute land in sections 11-13):
 
 | Env var | Phase replaced | Section |
 |---|---|---|
 | `DS4_CUDA_Q4_DECODE=1` | Q4 lazy weight cache + batched output head | baseline gate |
+| `DS4_CUDA_Q8_NO_Q4=1` | opt out of Q8 -> Q4 layer matmuls (greedy safety) | 20.5 |
+| `DS4_CUDA_F16_NO_Q4=1` | opt out of F16 -> Q4 paths (router/pair F16) | 20.5 |
 | `DS4_CUDA_BATCHED_Q_B=1` | decode PRE_B (attn_q_b) | 11 |
 | `DS4_CUDA_BATCHED_QKV=1` | decode PRE_A2 (attn_q_a + attn_kv + qkv_rms_norm) | 12 |
 | `DS4_CUDA_BATCHED_ATTN_OUTPUT=1` | decode PRE_C2 (attn_output) | 13 |
