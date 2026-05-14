@@ -7634,6 +7634,7 @@ static void generate_batched(server *s, job **jobs, int n) {
     size_t       plain_stream_pos [DS4_SERVER_BATCH_MAX];
     ds4_tokens   effective_prompt [DS4_SERVER_BATCH_MAX];
     int          cached_tokens    [DS4_SERVER_BATCH_MAX];
+    bool         prefill_failed   [DS4_SERVER_BATCH_MAX];
 
     for (int k = 0; k < n; k++) {
         sess[k] = s->batched_sessions[k];
@@ -7652,6 +7653,7 @@ static void generate_batched(server *s, job **jobs, int n) {
         plain_stream_pos[k]   = 0;
         memset(&effective_prompt[k], 0, sizeof(effective_prompt[k]));
         cached_tokens[k]      = 0;
+        prefill_failed[k]     = false;
     }
     const int eos = ds4_token_eos(s->engine);
     const double t0 = now_sec();
@@ -7705,6 +7707,7 @@ static void generate_batched(server *s, job **jobs, int n) {
             if (ds4_session_sync(sess[k], batch_prompts[k], err[k], sizeof(err[k])) != 0) {
                 done[k] = true;
                 finish[k] = "error";
+                prefill_failed[k] = true;
             }
         }
     }
@@ -7827,6 +7830,15 @@ static void generate_batched(server *s, job **jobs, int n) {
 
     for (int k = 0; k < n; k++) {
         const request *req = &jobs[k]->req;
+        /* Prefill failed before any HTTP bytes hit the wire -- emit
+         * HTTP 500 to match legacy generate_job()'s prefill failure
+         * path, otherwise a non-streaming client gets a misleading
+         * 200 with empty content and a streaming client gets a
+         * connection that never sent any response at all. */
+        if (prefill_failed[k]) {
+            http_error(jobs[k]->fd, 500, err[k][0] ? err[k] : "prefill failed");
+            continue;
+        }
         if (stream_send[k]) {
             if (stream_headers_ok[k] && !stream_failed[k]) {
                 if (!sse_chunk(jobs[k]->fd, req, id[k], NULL, finish[k]) ||
