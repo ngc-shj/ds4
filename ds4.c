@@ -11020,13 +11020,22 @@ static bool metal_graph_warmup_prefill_kernels(
      * The first batched F16 matmul can pay Metal's one-time pipeline execution
      * cost. Run the same HC attention projection on scratch storage before the
      * measured prefill. The output is overwritten by the real graph.
+     *
+     * batch_flat_hc has just been cudaMalloc'd, so its contents are whatever
+     * the driver hands back -- zero it before the matmul reads it, otherwise
+     * the warmup feeds garbage f32 (potentially NaN / Inf / denormal) through
+     * f32_to_f16_kernel into cuBLAS, and compute-sanitizer initcheck flags
+     * thousands of uninitialized reads here.  Without this clear the warmup
+     * was the only uninit-read source remaining on the single-session decode
+     * path (NOTES.md section 19.1 follow-up).
      */
     if (n_tokens <= 8) return true;
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
 
-    bool ok = ds4_gpu_begin_commands() != 0;
+    bool ok = ds4_gpu_tensor_clear(g->batch_flat_hc) != 0;
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_matmul_f16_tensor(g->batch_hc_mix,
                                          model->map,
