@@ -18542,7 +18542,14 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
     if (!slots || n <= 0) return 0;
 
 #ifndef DS4_NO_GPU
-    /* Decide whether the GPU sync-amortized path applies. */
+    /* Decide whether the GPU sync-amortized path applies.  Distinct-session
+     * requirement is part of the public contract (ds4.h): the batched
+     * encoder writes per-row state into engine-level scratch keyed by
+     * session, and the per-slot logits readback assumes each row reads
+     * from a different `s->graph.logits` buffer.  Slots that point at the
+     * same session would corrupt graph state and double-advance the
+     * checkpoint, so detect duplicates here and fall back to the serial
+     * ds4_session_eval() loop below. */
     bool gpu_fast = true;
     ds4_engine *engine = NULL;
     int n_active = 0;
@@ -18552,6 +18559,10 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
         if (ds4_session_is_cpu(s)) { gpu_fast = false; break; }
         if (!engine) engine = s->engine;
         else if (s->engine != engine) { gpu_fast = false; break; }
+        for (int j = 0; j < i; j++) {
+            if (slots[j].session == s) { gpu_fast = false; break; }
+        }
+        if (!gpu_fast) break;
         n_active++;
     }
     /* The per-layer interleaved batched encoder gives a measurable L2-
@@ -18669,7 +18680,13 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
                     snprintf(err, errlen,
                              "Metal batched encode failed for slot %d",
                              active_slot[i]);
-                    s->checkpoint_valid = false;
+                    /* Earlier iterations had their kernels queued onto the
+                     * same command buffer; once we abort the buffer is
+                     * never flushed so those sessions' KV state is
+                     * indeterminate.  Invalidate all active sessions. */
+                    for (int j = 0; j < row_count; j++) {
+                        active[j]->checkpoint_valid = false;
+                    }
                 }
             }
         }
@@ -18693,41 +18710,65 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
                         snprintf(err, errlen,
                                  "Metal output head fallback failed for slot %d",
                                  active_slot[i]);
-                        active[i]->checkpoint_valid = false;
+                        /* Same reasoning as the high-N fallback above:
+                         * earlier rows' commands are stranded in the
+                         * unflushed command buffer. */
+                        for (int j = 0; j < row_count; j++) {
+                            active[j]->checkpoint_valid = false;
+                        }
                     }
                 }
             }
         }
 
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        if (ok) {
+        if (ok && ds4_gpu_end_commands() == 0) {
+            snprintf(err, errlen, "Metal end_commands failed");
+            /* end_commands flushes the queued forward.  A failure here
+             * means the GPU graph state across the batch is indeterminate
+             * (some kernels may have run, others not), so every active
+             * session has to be marked invalid. */
             for (int i = 0; i < row_count; i++) {
-                ds4_session *s = active[i];
-                const ds4_gpu_tensor *src = batched_output_used
-                    ? engine->batched_logits
-                    : s->graph.logits;
-                const uint64_t src_offset = batched_output_used
-                    ? (uint64_t)i * vocab_dim * sizeof(float)
-                    : 0;
-                if (ds4_gpu_tensor_read(src, src_offset, s->logits,
-                                        (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
-                    snprintf(err, errlen,
-                             "Metal logits readback failed for slot %d",
-                             active_slot[i]);
-                    s->checkpoint_valid = false;
-                    return 1;
-                }
-                token_vec_push(&s->checkpoint, active_token[i]);
-                s->checkpoint_valid = true;
-                s->mtp_draft_valid = false;
-                if (slots[active_slot[i]].logits) {
-                    memcpy(slots[active_slot[i]].logits, s->logits,
-                           (size_t)DS4_N_VOCAB * sizeof(float));
-                }
+                active[i]->checkpoint_valid = false;
             }
-            return 0;
+            return 1;
         }
-        return 1;
+        if (!ok) return 1;
+
+        /* Two-phase readback: first verify every slot's logits transferred
+         * successfully, then commit token_vec_push and per-slot logits
+         * copy-outs.  Without this split, a slot N readback failure would
+         * leave slots 0..N-1 already advanced -- a retry by the caller
+         * would double-advance them. */
+        for (int i = 0; i < row_count; i++) {
+            ds4_session *s = active[i];
+            const ds4_gpu_tensor *src = batched_output_used
+                ? engine->batched_logits
+                : s->graph.logits;
+            const uint64_t src_offset = batched_output_used
+                ? (uint64_t)i * vocab_dim * sizeof(float)
+                : 0;
+            if (ds4_gpu_tensor_read(src, src_offset, s->logits,
+                                    (uint64_t)DS4_N_VOCAB * sizeof(float)) == 0) {
+                snprintf(err, errlen,
+                         "Metal logits readback failed for slot %d",
+                         active_slot[i]);
+                for (int j = 0; j < row_count; j++) {
+                    active[j]->checkpoint_valid = false;
+                }
+                return 1;
+            }
+        }
+        for (int i = 0; i < row_count; i++) {
+            ds4_session *s = active[i];
+            token_vec_push(&s->checkpoint, active_token[i]);
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            if (slots[active_slot[i]].logits) {
+                memcpy(slots[active_slot[i]].logits, s->logits,
+                       (size_t)DS4_N_VOCAB * sizeof(float));
+            }
+        }
+        return 0;
     }
 #endif
 
