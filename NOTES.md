@@ -1811,3 +1811,44 @@ Open follow-ups in priority order:
 4. Push DS4_BATCH_INTERLEAVED_MAX from 8 to a verified higher value
    once shared-FFN batching lands and the per-session L2 working set
    stops scaling with N (section 10 re-open condition).
+
+### Upstream cherry-pick: a464840 "cuda: reduce long-context prefill slope"
+
+antirez landed a much larger CUDA selector / top-k / indexed-
+attention rewrite on `upstream/main` (+633 lines `ds4_cuda.cu`).
+Cherry-picked onto this branch as `898d42c`.  Two conflict zones:
+
+- `indexer_scores` selector: upstream replaced the single
+  `indexer_scores_wmma_kernel` dispatch with a wmma128 → wmma64 →
+  wmma32 → wmma cascade.  Took upstream's cascade and added
+  `, 0, g_kernel_stream` to all four launches to preserve the
+  Phase-A stream invariant.
+- `attention_indexed_mixed_batch_heads_tensor` selector: upstream
+  rewrote `attention_indexed_mixed_heads8_online_kernel` to a
+  templated `<8, 16>` variant with a 16-head grid and 512 threads,
+  and added a topk-index sort prepass (`indexed_topk_sort_512_asc_
+  kernel`).  Took upstream's selector + new online kernel; our
+  earlier `abdf382` env-var flip (`DS4_CUDA_INDEXED_ONLINE`) is
+  silently superseded because the line it modified now reads from
+  the upstream `DS4_CUDA_INDEXED_TWOPASS` selector.  `abdf382`
+  stays in history for traceability; it is a no-op after the
+  cherry-pick.
+
+Four additional new kernel launches added wholesale by upstream
+(`indexer_topk_8192_cub_kernel` x2, `indexer_topk_pow2_u16_kernel`,
+`indexed_topk_sort_512_asc_kernel`) were also routed through
+`g_kernel_stream` so the Phase-A invariant holds across the entire
+new code path.
+
+Measured on this branch with `ds4-bench --cuda --ctx-start 8192
+--ctx-max 32768 --step-mul 2 --gen-tokens 32`:
+
+| ctx   | Before cherry-pick | After   | Δ      |
+|-------|-------------------:|--------:|-------:|
+| 8K    | 328.19 t/s         | 387.10  | +18.0% |
+| 16K   | 286.98             | 374.60  | +30.5% |
+| 32K   | 251.72             | 356.35  | +41.6% |
+
+Generation tps unchanged (within noise).  Regression suite
+(`--server --metal-kernels --tool-call-quality --logprob-vectors`)
+green on the first run.
