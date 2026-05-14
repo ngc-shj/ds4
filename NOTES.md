@@ -1472,20 +1472,30 @@ phases:
 fast path bails on the first check that fails:
   - any session on a CPU backend
   - any session bound to a different engine
-  - any prompt longer than that session's prefill_cap
   - any session whose suffix (prompt minus checkpoint) is empty
-  - any session whose suffix exceeds prefill_cap (no chunked resume yet)
   - any session whose checkpoint is non-empty AND whose suffix is
     below `metal_graph_resume_prefill_min_tokens()` (default 32):
     the per-session path uses decode-shape matmuls below this
     threshold and we want bit-equivalent argmax with the serial
     fallback.
+  - mixed checkpoint + chunked: at least one session has start > 0
+    AND at least one session has suffix > prefill_cap (chunked
+    resume across a non-zero start is a follow-up to D5-6).
 
 D5-5 lifted the "non-empty checkpoint -> always fall back"
-restriction the original D5-2 code carried.  Resume-prefill now
-goes through the batched encoder when every slot's suffix is at
-least `resume_prefill_min_tokens` and fits in a single chunk; the
-short-suffix decode and chunked-resume cases still fall back.
+restriction the original D5-2 code carried.  D5-6 lifted the "suffix
+must fit in one chunk" restriction for the cold-prefill case (all
+starts == 0): the batched layer loop now sits inside a uniform
+chunk loop that processes `min(active remaining)` tokens per
+iteration and drops sessions out as they finish their suffix.  Two
+regressions guard the new paths:
+
+  - `--batched-resume`: multi-turn extension with distinct prompts
+    per slot, suffix >= resume_prefill_min_tokens; verifies the
+    single-chunk resume path matches per-session serial argmax.
+  - `--batched-chunked`: cold prefill of two sessions with
+    suffixes >= prefill_cap (forced small via DS4_METAL_PREFILL_CHUNK=64);
+    verifies the outer chunk loop matches per-session serial argmax.
 
 **Verification.**  Handoff bench workflow against
 promessi_sposi.txt (warm-up + N=2 parallel + N=4 parallel): all

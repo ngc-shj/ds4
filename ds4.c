@@ -19437,28 +19437,35 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
     ds4_engine *e = sessions[0]->engine;
     if (!e) return false;
 
-    /* D5-5: per-session resume-prefill.  start[i] is the position at
-     * which session i needs to begin extending its KV state (= the
-     * committed checkpoint length if valid, else 0).  suffix_len[i] is
-     * how many new tokens this session must prefill.  All slots must
-     * have a non-empty suffix (an all-zero suffix is a no-op the caller
-     * can handle without us) and fit in one chunk; chunked resume across
-     * multiple chunks is a follow-up.
+    /* D5-5 / D5-6: per-session prefill that may span multiple chunks.
+     * start[i] is the position at which session i needs to begin
+     * extending its KV state (= committed checkpoint length if valid,
+     * else 0).  suffix_len[i] is how many new tokens session i must
+     * prefill.
      *
-     * Short suffixes go through ds4_session_sync's per-token decode path
-     * (decode-shape matmuls) by design; running them through the prefill
-     * encoder here would drift argmax via cuBLAS TC reduction order even
-     * when the math is otherwise correct.  Match that threshold so the
-     * batched fast path stays apples-to-apples with the serial fallback. */
+     * Single-chunk path: every suffix fits in one prefill_cap chunk.
+     * Chunked path (D5-6): allowed only when every start[i] == 0 (cold
+     * prefill of N parallel long prompts).  Chunked resume from a
+     * non-zero checkpoint is more delicate (chunk-boundary alignment to
+     * the per-session start) and stays as a follow-up.
+     *
+     * Short resume suffixes go through ds4_session_sync's per-token
+     * decode path (decode-shape matmuls) by design; running them through
+     * the prefill encoder here would drift argmax via the cuBLAS TC
+     * reduction order even when the math is otherwise correct. */
     const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
+    const uint32_t chunk_cap  = sessions[0]->graph.prefill_cap;
+    if (chunk_cap == 0) return false;
     uint32_t start[DS4_PREFILL_BATCHED_MAX];
     uint32_t suffix_len[DS4_PREFILL_BATCHED_MAX];
+    bool any_chunked = false;
+    bool any_resume  = false;
     for (int i = 0; i < n_active; i++) {
         if (!sessions[i] || ds4_session_is_cpu(sessions[i])) return false;
         if (sessions[i]->engine != e) return false;
         if (!prompts[i] || prompts[i]->len <= 0) return false;
+        if (sessions[i]->graph.prefill_cap != chunk_cap) return false;
         const uint32_t prompt_len = (uint32_t)prompts[i]->len;
-        const uint32_t cap        = sessions[i]->graph.prefill_cap;
         uint32_t s_i = 0;
         if (sessions[i]->checkpoint_valid) {
             s_i = (uint32_t)sessions[i]->checkpoint.len;
@@ -19470,47 +19477,44 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
         }
         const uint32_t suf = prompt_len - s_i;
         if (suf == 0) return false;          /* no-op: let caller handle */
-        if (suf > cap)  return false;        /* single-chunk only for now */
         if (s_i > 0 && suf < resume_min) {
             /* Short resume: let per-session sync use the decode-shape path. */
             return false;
         }
+        if (suf > chunk_cap) any_chunked = true;
+        if (s_i > 0)         any_resume  = true;
         start[i]      = s_i;
         suffix_len[i] = suf;
     }
+    /* MVP: chunked resume not yet supported. */
+    if (any_chunked && any_resume) return false;
 
     const ds4_model   *model   = &e->model;
     const ds4_weights *weights = &e->weights;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
 
     bool ok = true;
-
-    /* Per-session: upload suffix tokens (positions [start_i, start_i+suffix_i))
-     * + their embeddings into batch_cur_hc at row offset 0. */
-    for (int i = 0; ok && i < n_active; i++) {
-        ok = metal_graph_upload_prompt_tokens(sessions[i]->graph.prefill_tokens,
-                                              prompts[i], start[i], suffix_len[i]);
-    }
-    if (ok) {
-        uint32_t max_n = 0;
-        for (int i = 0; i < n_active; i++) {
-            if (suffix_len[i] > max_n) max_n = suffix_len[i];
-        }
-        ok = metal_graph_warmup_prefill_kernels(&sessions[0]->graph, model, weights, max_n);
-    }
-    for (int i = 0; ok && i < n_active; i++) {
-        ok = metal_graph_upload_prompt_embeddings_hc(sessions[i]->graph.batch_cur_hc,
-                                                     sessions[i]->graph.prefill_tokens,
-                                                     model, weights, prompts[i],
-                                                     start[i], suffix_len[i]);
+    /* Outer chunked-prefill loop.  cur_pos[i] / done[i] track per-session
+     * progress; chunk_now is the uniform tokens-per-chunk processed by
+     * every still-active session in this iteration (= min of active
+     * remainings, capped at chunk_cap so the batch_*_hc buffers fit).
+     * last_chunk_size[i] is the tokens session i processed in its final
+     * chunk, used to pick the output-head row. */
+    uint32_t cur_pos[DS4_PREFILL_BATCHED_MAX];
+    bool     done   [DS4_PREFILL_BATCHED_MAX];
+    uint32_t last_chunk_size[DS4_PREFILL_BATCHED_MAX];
+    for (int i = 0; i < n_active; i++) {
+        cur_pos[i]         = start[i];
+        done[i]            = false;
+        last_chunk_size[i] = 0;
     }
 
     if (ok) ok = ds4_gpu_begin_commands() != 0;
 
     /* D5-3: opt-in PRE_A2 batched substitute.  Requires same suffix_len
-     * AND same start across all sessions (the substitute does a single
-     * batched matmul whose KV cache pos0 must agree across rows) and at
-     * least 2 active sessions. */
+     * AND same start across all sessions AND single-chunk fit (the
+     * substitute does a single batched matmul whose KV cache pos0 must
+     * agree across rows) and at least 2 active sessions. */
     const bool want_batched_prefill_qkv =
         (getenv("DS4_CUDA_BATCHED_PREFILL_QKV") != NULL);
     uint32_t same_n_tok = suffix_len[0];
@@ -19522,66 +19526,113 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
         if (start[i]      != same_start) all_same_start = false;
     }
     const bool use_prefill_qkv_substitute =
-        want_batched_prefill_qkv && all_same_n_tok && all_same_start && n_active > 1;
+        want_batched_prefill_qkv && !any_chunked && all_same_n_tok &&
+        all_same_start && n_active > 1;
 
-    /* Interleaved layer loop.  Without the substitute this is just
-     * sessions-inside layers-outside; with the substitute the inner
-     * session loop is split around the PRE_A2 boundary so the engine-
-     * level batched matmul can replace the per-session q_a/kv/qkv_norm. */
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        const ds4_layer_weights *layer = &weights->layer[il];
-        if (use_prefill_qkv_substitute) {
-            /* Pass 1: PRE_A1 per session (writes batch_attn_norm). */
-            for (int i = 0; ok && i < n_active; i++) {
-                ok = metal_graph_encode_layer_attention_batch_phased(
-                        &sessions[i]->graph, model, layer, il, same_start,
-                        same_n_tok, DS4_PREFILL_LAYER_PRE_A1);
-            }
-            /* Batched PRE_A2 substitute. */
-            bool used_substitute = false;
-            if (ok && metal_graph_encode_prefill_qkv_batched(e, sessions,
-                                                              n_active, layer,
-                                                              same_n_tok)) {
-                used_substitute = true;
-            }
-            /* Pass 2: rest of attention; if substitute failed, run PRE_A2
-             * per session as a safety fallback so g is internally
-             * consistent for PRE_B. */
-            uint32_t pass2 = DS4_PREFILL_LAYER_PRE_B |
-                             DS4_PREFILL_LAYER_PRE_C1 |
-                             DS4_PREFILL_LAYER_PRE_C2 |
-                             DS4_PREFILL_LAYER_PRE_C3;
-            if (!used_substitute) pass2 |= DS4_PREFILL_LAYER_PRE_A2;
-            for (int i = 0; ok && i < n_active; i++) {
-                ok = metal_graph_encode_layer_attention_batch_phased(
-                        &sessions[i]->graph, model, layer, il, same_start,
-                        same_n_tok, pass2);
-            }
-            /* FFN half + HC swap, still per session. */
-            for (int i = 0; ok && i < n_active; i++) {
-                ok = metal_graph_encode_layer_ffn_batch(&sessions[i]->graph,
-                                                        model, layer, il, same_start,
-                                                        same_n_tok);
-                if (ok) {
-                    ds4_gpu_tensor *tmp = sessions[i]->graph.batch_cur_hc;
-                    sessions[i]->graph.batch_cur_hc = sessions[i]->graph.batch_next_hc;
-                    sessions[i]->graph.batch_next_hc = tmp;
+    while (ok) {
+        bool any_active = false;
+        uint32_t chunk_now = chunk_cap;
+        for (int i = 0; i < n_active; i++) {
+            if (done[i]) continue;
+            any_active = true;
+            const uint32_t remaining = (start[i] + suffix_len[i]) - cur_pos[i];
+            uint32_t local_cap = chunk_cap;
+            if (cur_pos[i] != 0) {
+                const uint32_t mod = cur_pos[i] % chunk_cap;
+                if (mod != 0) {
+                    const uint32_t to_boundary = chunk_cap - mod;
+                    if (to_boundary < local_cap) local_cap = to_boundary;
                 }
             }
-        } else {
-            for (int i = 0; ok && i < n_active; i++) {
-                ok = metal_graph_encode_layer_batch(&sessions[i]->graph,
-                                                    model, layer,
-                                                    il, start[i],
-                                                    suffix_len[i]);
+            const uint32_t local = remaining < local_cap ? remaining : local_cap;
+            if (local < chunk_now) chunk_now = local;
+        }
+        if (!any_active) break;
+        if (chunk_now == 0) { ok = false; break; }
+
+        /* Per-active-session: upload tokens then embeddings for this chunk. */
+        for (int i = 0; ok && i < n_active; i++) {
+            if (done[i]) continue;
+            ok = metal_graph_upload_prompt_tokens(sessions[i]->graph.prefill_tokens,
+                                                  prompts[i], cur_pos[i], chunk_now);
+        }
+        if (ok) ok = metal_graph_warmup_prefill_kernels(&sessions[0]->graph,
+                                                        model, weights, chunk_now);
+        for (int i = 0; ok && i < n_active; i++) {
+            if (done[i]) continue;
+            ok = metal_graph_upload_prompt_embeddings_hc(sessions[i]->graph.batch_cur_hc,
+                                                         sessions[i]->graph.prefill_tokens,
+                                                         model, weights, prompts[i],
+                                                         cur_pos[i], chunk_now);
+        }
+
+        /* Interleaved layer loop -- sessions inside, layers outside, so
+         * each layer's weights take one L2 sweep across the still-active
+         * batch.  When the substitute fires (single-chunk uniform case)
+         * the inner session loop is split around the PRE_A2 boundary. */
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *layer = &weights->layer[il];
+            if (use_prefill_qkv_substitute) {
+                for (int i = 0; ok && i < n_active; i++) {
+                    if (done[i]) continue;
+                    ok = metal_graph_encode_layer_attention_batch_phased(
+                            &sessions[i]->graph, model, layer, il, cur_pos[i],
+                            chunk_now, DS4_PREFILL_LAYER_PRE_A1);
+                }
+                bool used_substitute = false;
+                if (ok && metal_graph_encode_prefill_qkv_batched(e, sessions,
+                                                                  n_active, layer,
+                                                                  chunk_now)) {
+                    used_substitute = true;
+                }
+                uint32_t pass2 = DS4_PREFILL_LAYER_PRE_B |
+                                 DS4_PREFILL_LAYER_PRE_C1 |
+                                 DS4_PREFILL_LAYER_PRE_C2 |
+                                 DS4_PREFILL_LAYER_PRE_C3;
+                if (!used_substitute) pass2 |= DS4_PREFILL_LAYER_PRE_A2;
+                for (int i = 0; ok && i < n_active; i++) {
+                    if (done[i]) continue;
+                    ok = metal_graph_encode_layer_attention_batch_phased(
+                            &sessions[i]->graph, model, layer, il, cur_pos[i],
+                            chunk_now, pass2);
+                }
+                for (int i = 0; ok && i < n_active; i++) {
+                    if (done[i]) continue;
+                    ok = metal_graph_encode_layer_ffn_batch(&sessions[i]->graph,
+                                                            model, layer, il, cur_pos[i],
+                                                            chunk_now);
+                    if (ok) {
+                        ds4_gpu_tensor *tmp = sessions[i]->graph.batch_cur_hc;
+                        sessions[i]->graph.batch_cur_hc = sessions[i]->graph.batch_next_hc;
+                        sessions[i]->graph.batch_next_hc = tmp;
+                    }
+                }
+            } else {
+                for (int i = 0; ok && i < n_active; i++) {
+                    if (done[i]) continue;
+                    ok = metal_graph_encode_layer_batch(&sessions[i]->graph,
+                                                        model, layer,
+                                                        il, cur_pos[i],
+                                                        chunk_now);
+                }
             }
+        }
+
+        for (int i = 0; i < n_active; i++) {
+            if (done[i]) continue;
+            cur_pos[i] += chunk_now;
+            last_chunk_size[i] = chunk_now;
+            if (cur_pos[i] >= start[i] + suffix_len[i]) done[i] = true;
         }
     }
 
-    /* Output head per session (using last suffix row's HC vector). */
+    /* Output head per session (using last chunk's last row in
+     * batch_cur_hc, which the per-session encoder leaves untouched once
+     * the session finishes its final chunk). */
     ds4_gpu_tensor *last_hc_views[DS4_PREFILL_BATCHED_MAX] = { NULL };
     for (int i = 0; ok && i < n_active; i++) {
-        const uint32_t output_row = suffix_len[i] - 1u;
+        if (last_chunk_size[i] == 0) { ok = false; break; }
+        const uint32_t output_row = last_chunk_size[i] - 1u;
         last_hc_views[i] = metal_graph_tensor_row_view(sessions[i]->graph.batch_cur_hc,
                                                        output_row, hc_dim);
         if (!last_hc_views[i]) { ok = false; break; }
