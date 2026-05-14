@@ -1426,12 +1426,25 @@ Verification protocol for D5-2+ on this fixed baseline:
      fragments) are within expected variance; full BOS collapse
      indicates a real bug.
 
-**Known follow-up.**  Even after the engine-scratch fix, the
-Q4-only (no-batched) single-session decode path still occasionally
-collapses to BOS on empty-KV runs (~1 in 3 in current testing).
-There is at least one more uninitialized-read source somewhere on
-the single-session path; it does not affect the batched substitutes
-post-fix, but it should be tracked and fixed.
+**Follow-up resolved.**  The remaining single-session uninit-read
+was pinned down with `compute-sanitizer --tool=initcheck`: every
+report on the no-batched single-session path traced back to
+`metal_graph_warmup_prefill_kernels` -> `ds4_gpu_matmul_f16_tensor`
+-> `f32_to_f16_kernel`, all reading `g->batch_flat_hc` straight off
+a fresh `cudaMalloc`.  The warmup matmul's *output* gets overwritten
+by real prefill (which is why the comment originally claimed "the
+output is overwritten by the real graph"), but the per-process
+deterministic garbage f32 input was perturbing cuBLAS state enough
+to bias the test's sampling trajectory consistently in the same
+direction across runs.  Disabling the warmup via
+`DS4_METAL_NO_PREFILL_KERNEL_WARMUP=1` produced an initcheck-clean
+run end-to-end, confirming this was the only remaining source.
+Commit on this branch zero-inits `batch_flat_hc` before the warmup
+matmul reads it; after the fix `tests/ds4_test.c` `--long-context`
+no longer fails with the same assertion pattern three runs in a
+row.  Residual flakiness on `--long-context` past this point is
+ordinary cuBLAS TC reduction-order FP variance interacting with a
+narrow sampling budget, not a stuck attractor.
 
 ### 19.2. Day-5 D5-2 + D5-4 land: outer batched loop + server wire-up
 
