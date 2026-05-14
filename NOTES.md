@@ -1473,17 +1473,19 @@ fast path bails on the first check that fails:
   - any session on a CPU backend
   - any session bound to a different engine
   - any prompt longer than that session's prefill_cap
-  - any session with a live checkpoint (i.e. KV-disk-cache hit
-    landed during phase 1 -- which is the common bench case)
-The last check is the most consequential: in the handoff bench
-workflow (warm-up curl + N=2/4/8 parallel) every parallel slot has
-a KV-hit checkpoint, so the fast path falls back and the slots are
-synced sequentially via `ds4_session_sync` (= the pre-D5-4
-behavior).  The fast path does fire on the warm-up's empty-KV
-N=1 case, where it is operationally equivalent to the single-
-session prefill it replaces.  Lifting the checkpoint-resume
-restriction is on the D5-5+ list -- it requires a batched analog
-to `metal_graph_prefill_chunked_range`.
+  - any session whose suffix (prompt minus checkpoint) is empty
+  - any session whose suffix exceeds prefill_cap (no chunked resume yet)
+  - any session whose checkpoint is non-empty AND whose suffix is
+    below `metal_graph_resume_prefill_min_tokens()` (default 32):
+    the per-session path uses decode-shape matmuls below this
+    threshold and we want bit-equivalent argmax with the serial
+    fallback.
+
+D5-5 lifted the "non-empty checkpoint -> always fall back"
+restriction the original D5-2 code carried.  Resume-prefill now
+goes through the batched encoder when every slot's suffix is at
+least `resume_prefill_min_tokens` and fits in a single chunk; the
+short-suffix decode and chunked-resume cases still fall back.
 
 **Verification.**  Handoff bench workflow against
 promessi_sposi.txt (warm-up + N=2 parallel + N=4 parallel): all

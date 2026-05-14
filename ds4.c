@@ -19436,14 +19436,47 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
     if (!sessions[0]) return false;
     ds4_engine *e = sessions[0]->engine;
     if (!e) return false;
+
+    /* D5-5: per-session resume-prefill.  start[i] is the position at
+     * which session i needs to begin extending its KV state (= the
+     * committed checkpoint length if valid, else 0).  suffix_len[i] is
+     * how many new tokens this session must prefill.  All slots must
+     * have a non-empty suffix (an all-zero suffix is a no-op the caller
+     * can handle without us) and fit in one chunk; chunked resume across
+     * multiple chunks is a follow-up.
+     *
+     * Short suffixes go through ds4_session_sync's per-token decode path
+     * (decode-shape matmuls) by design; running them through the prefill
+     * encoder here would drift argmax via cuBLAS TC reduction order even
+     * when the math is otherwise correct.  Match that threshold so the
+     * batched fast path stays apples-to-apples with the serial fallback. */
+    const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
+    uint32_t start[DS4_PREFILL_BATCHED_MAX];
+    uint32_t suffix_len[DS4_PREFILL_BATCHED_MAX];
     for (int i = 0; i < n_active; i++) {
         if (!sessions[i] || ds4_session_is_cpu(sessions[i])) return false;
         if (sessions[i]->engine != e) return false;
         if (!prompts[i] || prompts[i]->len <= 0) return false;
-        if ((uint32_t)prompts[i]->len > sessions[i]->graph.prefill_cap) return false;
-        /* Resume-prefill (checkpoint extends into prompt) needs its own
-         * batched path; today this falls back. */
-        if (sessions[i]->checkpoint_valid && sessions[i]->checkpoint.len > 0) return false;
+        const uint32_t prompt_len = (uint32_t)prompts[i]->len;
+        const uint32_t cap        = sessions[i]->graph.prefill_cap;
+        uint32_t s_i = 0;
+        if (sessions[i]->checkpoint_valid) {
+            s_i = (uint32_t)sessions[i]->checkpoint.len;
+            /* Checkpoint must be a strict prefix of the prompt; the
+             * caller (server / engine API) is responsible for invalidating
+             * sessions whose checkpoint diverges from the requested
+             * prompt before reaching this path. */
+            if (s_i > prompt_len) return false;
+        }
+        const uint32_t suf = prompt_len - s_i;
+        if (suf == 0) return false;          /* no-op: let caller handle */
+        if (suf > cap)  return false;        /* single-chunk only for now */
+        if (s_i > 0 && suf < resume_min) {
+            /* Short resume: let per-session sync use the decode-shape path. */
+            return false;
+        }
+        start[i]      = s_i;
+        suffix_len[i] = suf;
     }
 
     const ds4_model   *model   = &e->model;
@@ -19452,15 +19485,16 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
 
     bool ok = true;
 
-    /* Per-session: upload prompt tokens + embeddings to batch_cur_hc. */
+    /* Per-session: upload suffix tokens (positions [start_i, start_i+suffix_i))
+     * + their embeddings into batch_cur_hc at row offset 0. */
     for (int i = 0; ok && i < n_active; i++) {
         ok = metal_graph_upload_prompt_tokens(sessions[i]->graph.prefill_tokens,
-                                              prompts[i], 0, (uint32_t)prompts[i]->len);
+                                              prompts[i], start[i], suffix_len[i]);
     }
     if (ok) {
         uint32_t max_n = 0;
         for (int i = 0; i < n_active; i++) {
-            if ((uint32_t)prompts[i]->len > max_n) max_n = (uint32_t)prompts[i]->len;
+            if (suffix_len[i] > max_n) max_n = suffix_len[i];
         }
         ok = metal_graph_warmup_prefill_kernels(&sessions[0]->graph, model, weights, max_n);
     }
@@ -19468,27 +19502,27 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
         ok = metal_graph_upload_prompt_embeddings_hc(sessions[i]->graph.batch_cur_hc,
                                                      sessions[i]->graph.prefill_tokens,
                                                      model, weights, prompts[i],
-                                                     0, (uint32_t)prompts[i]->len);
+                                                     start[i], suffix_len[i]);
     }
 
     if (ok) ok = ds4_gpu_begin_commands() != 0;
 
-    /* D5-3: opt-in PRE_A2 batched substitute.  Requires same n_tok across
-     * all sessions and at least 2 active sessions (the substitute's only
-     * payoff is L2 weight reuse across N sessions, so N=1 just adds
-     * gather/scatter overhead). */
+    /* D5-3: opt-in PRE_A2 batched substitute.  Requires same suffix_len
+     * AND same start across all sessions (the substitute does a single
+     * batched matmul whose KV cache pos0 must agree across rows) and at
+     * least 2 active sessions. */
     const bool want_batched_prefill_qkv =
         (getenv("DS4_CUDA_BATCHED_PREFILL_QKV") != NULL);
-    uint32_t same_n_tok = (uint32_t)prompts[0]->len;
+    uint32_t same_n_tok = suffix_len[0];
+    uint32_t same_start = start[0];
     bool all_same_n_tok = true;
+    bool all_same_start = true;
     for (int i = 1; i < n_active; i++) {
-        if ((uint32_t)prompts[i]->len != same_n_tok) {
-            all_same_n_tok = false;
-            break;
-        }
+        if (suffix_len[i] != same_n_tok) all_same_n_tok = false;
+        if (start[i]      != same_start) all_same_start = false;
     }
     const bool use_prefill_qkv_substitute =
-        want_batched_prefill_qkv && all_same_n_tok && n_active > 1;
+        want_batched_prefill_qkv && all_same_n_tok && all_same_start && n_active > 1;
 
     /* Interleaved layer loop.  Without the substitute this is just
      * sessions-inside layers-outside; with the substitute the inner
@@ -19500,7 +19534,7 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
             /* Pass 1: PRE_A1 per session (writes batch_attn_norm). */
             for (int i = 0; ok && i < n_active; i++) {
                 ok = metal_graph_encode_layer_attention_batch_phased(
-                        &sessions[i]->graph, model, layer, il, 0,
+                        &sessions[i]->graph, model, layer, il, same_start,
                         same_n_tok, DS4_PREFILL_LAYER_PRE_A1);
             }
             /* Batched PRE_A2 substitute. */
@@ -19520,13 +19554,13 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
             if (!used_substitute) pass2 |= DS4_PREFILL_LAYER_PRE_A2;
             for (int i = 0; ok && i < n_active; i++) {
                 ok = metal_graph_encode_layer_attention_batch_phased(
-                        &sessions[i]->graph, model, layer, il, 0,
+                        &sessions[i]->graph, model, layer, il, same_start,
                         same_n_tok, pass2);
             }
             /* FFN half + HC swap, still per session. */
             for (int i = 0; ok && i < n_active; i++) {
                 ok = metal_graph_encode_layer_ffn_batch(&sessions[i]->graph,
-                                                        model, layer, il, 0,
+                                                        model, layer, il, same_start,
                                                         same_n_tok);
                 if (ok) {
                     ds4_gpu_tensor *tmp = sessions[i]->graph.batch_cur_hc;
@@ -19538,16 +19572,16 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
             for (int i = 0; ok && i < n_active; i++) {
                 ok = metal_graph_encode_layer_batch(&sessions[i]->graph,
                                                     model, layer,
-                                                    il, 0,
-                                                    (uint32_t)prompts[i]->len);
+                                                    il, start[i],
+                                                    suffix_len[i]);
             }
         }
     }
 
-    /* Output head per session (using last prompt row's HC vector). */
+    /* Output head per session (using last suffix row's HC vector). */
     ds4_gpu_tensor *last_hc_views[DS4_PREFILL_BATCHED_MAX] = { NULL };
     for (int i = 0; ok && i < n_active; i++) {
-        const uint32_t output_row = (uint32_t)prompts[i]->len - 1u;
+        const uint32_t output_row = suffix_len[i] - 1u;
         last_hc_views[i] = metal_graph_tensor_row_view(sessions[i]->graph.batch_cur_hc,
                                                        output_row, hc_dim);
         if (!last_hc_views[i]) { ok = false; break; }
