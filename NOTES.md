@@ -1697,17 +1697,32 @@ collapse** (`<｜begin▁of▁sentence｜>` repeating after a few
 coherent tokens) is **not** the expected variance; it indicates
 a real bug.
 
-**5. Known empty-KV caveat (section 19.1).**
+**5. Q4 vocab head BOS-bias caveat (section 19.1 follow-up note).**
 
-The very first warm-up curl (empty KV, full zero_prefix prefill of
-the prompt) sometimes collapses to BOS even on HEAD code.  At least
-one uninitialized-read source remains on the single-session decode
-path (the engine-batched-scratch fix in commit `2974421` handles
-the substitute side, but not all of it).  If the warm-up fails this
-way, the KV file written to disk is still usable (decode reads back
-correctly when prefill skipped via KV hit), so re-running curls
-without the warm-up still produces coherent output.  Treat single-
-run cold-prefill smokes as advisory only.
+Post-`6ca93c3` initcheck reports zero uninit reads on the single-
+session decode path, so the historical "warm-up sometimes BOS"
+explanation (uninit GPU memory) no longer applies.  What is still
+true: `DS4_CUDA_Q4_DECODE=1` routes the vocab projection through the
+batched Q4 warp matmul (`metal_graph_encode_output_head_batched` ->
+`ds4_gpu_matmul_q4_0_batch_warp_tensor`) instead of the Q8 path, and
+the Q4 logits are biased enough toward `<|begin_of_sentence|>` that
+greedy decode locks into BOS attractor.  Reproduction on `2026-05-14`
+(both ds4flash.gguf models):
+
+  - Q4_DECODE + temperature 0 (greedy) -- BOS attractor 100% (both
+    imatrix and legacy gguf)
+  - Q4_DECODE + temperature 1 (default) -- coherent Italian output
+  - Q4_DECODE + temperature 1 + the full batched env-var combo
+    (BATCHED_QKV + BATCHED_Q_B + BATCHED_ATTN_OUTPUT) -- BOS
+    attractor returns at N=4 parallel (batched substitutes fire,
+    interact with the Q4 logit bias)
+
+Workaround: leave temperature at the default (1.0+) when
+`DS4_CUDA_Q4_DECODE` is on, or unset it for greedy correctness
+testing.  Root cause is the Q4 vocab matmul kernel, not unitialized
+memory; fix likely needs per-row scale-factor calibration in the
+lazy Q8 -> Q4 conversion at `cuda_q4_from_q8_ptr` so the BOS row's
+quantization error doesn't elevate its dot-product.
 
 **6. Server log sanity checks.**
 
