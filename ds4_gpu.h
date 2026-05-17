@@ -25,21 +25,62 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
+int ds4_gpu_tensor_clear(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                                const ds4_gpu_tensor *src, uint64_t src_offset,
+                                uint64_t bytes);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* =========================================================================
+ * Continuous batched decode -- per-step row arguments.
+ * =========================================================================
+ *
+ * When the batched decode forward (Phase 1b+) processes N independent
+ * sessions in a single launch, per-row dynamic state (positions, KV row
+ * indices, indexer top-K, etc.) is uploaded once per token into __constant__
+ * memory and read by batched kernels via blockIdx.y (or analogous batch-row
+ * dispatch).  Keeping this state in __constant__ keeps the kernel parameter
+ * list small even at N = DS4_BATCH_MAX, and a single 16-bit sized struct
+ * fits comfortably in CUDA's 64 KB __constant__ window.
+ *
+ * Phase 1b ships the struct + uploader only; no kernel reads from it yet.
+ * Later commits flip readers one at a time (output head first, then dense
+ * matmul, then attention/RoPE/KV-store).  Requests with n > DS4_BATCH_MAX
+ * fall back to the serial loop.
+ */
+#define DS4_BATCH_MAX 32
+
+struct ds4_batch_step_args {
+    uint32_t token       [DS4_BATCH_MAX];  /* token being decoded at this row */
+    uint32_t pos         [DS4_BATCH_MAX];  /* rope_tail pos0 */
+    uint32_t raw_row     [DS4_BATCH_MAX];  /* destination row in rolling raw KV */
+    uint32_t n_raw       [DS4_BATCH_MAX];  /* populated raw rows for attention */
+    uint32_t raw_start   [DS4_BATCH_MAX];  /* attention_decode rolling raw_start */
+    uint32_t n_comp      [DS4_BATCH_MAX];  /* populated compressed rows */
+    uint32_t n_index_comp[DS4_BATCH_MAX];  /* populated indexer-compressed rows */
+    uint32_t comp_row    [DS4_BATCH_MAX];  /* compressor destination slot */
+    uint8_t  emit        [DS4_BATCH_MAX];  /* 1 if this token must emit a compressed row */
+    uint32_t n_active;                     /* number of live rows in this batch */
+    uint32_t top_k;                        /* indexer top-K (uniform across rows) */
+};
+
+int ds4_gpu_set_batch_args(const struct ds4_batch_step_args *args);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+int ds4_gpu_cache_q4_0_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+int ds4_gpu_cache_q4_from_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
@@ -138,6 +179,53 @@ int ds4_gpu_matmul_q8_0_tensor(
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* Single-token dual Q8_0 GEMV with shared activation prequantization.
+ * Computes two projections from the same input without using the pair
+ * accumulation kernels, which are not safe for every decode site. */
+int ds4_gpu_matmul_q8_0_dual_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x);
+
+/* Batched Q4_0 GEMV for continuous batched decode (Phase 1c+).  Always
+ * routes through the lazy Q4_0 weight cache (DS4_CUDA_Q4_DECODE) instead of
+ * cuBLAS f16, saving ~50% of weight HBM traffic per token.  Returns 0 if
+ * the Q4 lazy convert path is unavailable on this device. */
+int ds4_gpu_matmul_q4_0_batch_warp_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+/* Day-6 D6-1: Q4_0 pair + batch matmul.  Computes out0 and out1 from one
+ * shared activation x using two Q4 weight matrices (w0 @ x, w1 @ x), all
+ * in one kernel launch so the activation is read once per (tok, block)
+ * rather than twice as with two back-to-back batch-warp calls.  Used by
+ * the SHARED FFN gate+up batched substitute. */
+int ds4_gpu_matmul_q4_0_pair_batch_warp_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
@@ -495,6 +583,52 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim);
+
+/* Day-10 B.4: multi-session decode attention.  Each session i contributes
+ * one (raw_kv, comp_kv, n_raw, raw_start, n_comp, pos0) tuple; the kernel
+ * runs N attentions in parallel along blockIdx.z, reading q from batched_q
+ * staged at [i * n_head * head_dim] and writing heads into batched_heads
+ * with the same layout.  Caller is responsible for staging Q and
+ * scattering heads afterwards.  Returns 0 on failure. */
+int ds4_gpu_attention_decode_heads_multi_session_tensor(
+        ds4_gpu_tensor              *batched_heads,
+        const void                   *model_map,
+        uint64_t                      model_size,
+        uint64_t                      sinks_offset,
+        const ds4_gpu_tensor        *batched_q,
+        const ds4_gpu_tensor *const *raw_kv,
+        const ds4_gpu_tensor *const *comp_kv,
+        const uint32_t              *n_raw,
+        const uint32_t              *raw_start,
+        const uint32_t              *n_comp,
+        const uint32_t              *pos0,
+        uint32_t                     n_sessions,
+        uint32_t                     raw_cap,
+        uint32_t                     window,
+        uint32_t                     ratio,
+        uint32_t                     n_head,
+        uint32_t                     head_dim);
+
+int ds4_gpu_attention_indexed_mixed_decode_multi_session_tensor(
+        ds4_gpu_tensor              *batched_heads,
+        const void                   *model_map,
+        uint64_t                      model_size,
+        uint64_t                      sinks_offset,
+        const ds4_gpu_tensor        *batched_q,
+        const ds4_gpu_tensor *const *raw_kv,
+        const ds4_gpu_tensor *const *comp_kv,
+        const ds4_gpu_tensor *const *topk,
+        const uint32_t              *n_raw,
+        const uint32_t              *raw_start,
+        const uint32_t              *n_comp,
+        const uint32_t              *pos0,
+        uint32_t                     n_sessions,
+        uint32_t                     raw_cap,
+        uint32_t                     top_k,
+        uint32_t                     window,
+        uint32_t                     ratio,
+        uint32_t                     n_head,
+        uint32_t                     head_dim);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

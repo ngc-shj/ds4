@@ -630,6 +630,196 @@ static void test_tool_call_quality(void) {
     test_close_engine(true);
 }
 
+/* D5-5 regression: two sessions are warmed with distinct prompts, then
+ * extended with distinct suffixes via ds4_sessions_sync_batched.  Verify
+ * the batched call succeeds, both checkpoints commit to the full extended
+ * prompt, and the post-sync argmax matches what the serial path produces
+ * starting from the same initial state.  This is the multi-turn case the
+ * resume-prefill batched path was added for. */
+static void test_batched_resume_prefill(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    /* Each extension must add at least ~32 tokens so the suffix clears
+     * the resume_prefill_min_tokens threshold and the batched fast path
+     * fires (otherwise it falls back to per-session decode shape and we
+     * cannot distinguish the batched-resume vs serial-resume code paths
+     * via this test). */
+    ds4_tokens p1 = {0}, p2 = {0};
+    ds4_tokens e1 = {0}, e2 = {0};
+    ds4_encode_chat_prompt(engine, "",
+                           "Tell me a short fact about Mars.",
+                           DS4_THINK_NONE, &p1);
+    ds4_encode_chat_prompt(engine, "",
+                           "Tell me a short fact about Saturn.",
+                           DS4_THINK_NONE, &p2);
+    ds4_encode_chat_prompt(engine, "",
+                           "Tell me a short fact about Mars. "
+                           "Now please tell me a thorough overview of its two small moons "
+                           "Phobos and Deimos, including their orbital periods around Mars, "
+                           "the chemical and mineral composition of their surfaces, the "
+                           "currently favored theories of how they originated (captured "
+                           "asteroids vs in-situ accretion), the spacecraft missions that "
+                           "have observed them in detail, and the planned future visits "
+                           "that astronomers are looking forward to.",
+                           DS4_THINK_NONE, &e1);
+    ds4_encode_chat_prompt(engine, "",
+                           "Tell me a short fact about Saturn. "
+                           "Now please tell me a thorough overview of its ring system, "
+                           "including ring composition (ice grains, dust, larger fragments), "
+                           "the division of the rings into named bands (A, B, C, D, F, G, E "
+                           "and the Cassini Division), the current best theories of how the "
+                           "rings formed and when, and the spacecraft missions whose data "
+                           "shaped today's understanding of the system.",
+                           DS4_THINK_NONE, &e2);
+    TEST_ASSERT(p1.len > 0 && p2.len > 0);
+    TEST_ASSERT(e1.len - p1.len >= 32);
+    TEST_ASSERT(e2.len - p2.len >= 32);
+
+    char err[160];
+    ds4_session *s1 = NULL, *s2 = NULL;
+    TEST_ASSERT(ds4_session_create(&s1, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&s2, engine, 4096) == 0);
+
+    /* Warm: per-session sync so each session ends up with a non-trivial
+     * checkpoint extending into the suffix-extended prompt.  This is the
+     * "first turn done" state in the multi-turn flow. */
+    TEST_ASSERT(ds4_session_sync(s1, &p1, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(s2, &p2, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(s1) == p1.len);
+    TEST_ASSERT(ds4_session_pos(s2) == p2.len);
+
+    /* Capture the serial-path argmax from independent sessions at the
+     * same final state, to compare against the batched-path argmax. */
+    ds4_session *ref1 = NULL, *ref2 = NULL;
+    TEST_ASSERT(ds4_session_create(&ref1, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_create(&ref2, engine, 4096) == 0);
+    TEST_ASSERT(ds4_session_sync(ref1, &e1, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(ref2, &e2, err, sizeof(err)) == 0);
+    int ref_top1 = ds4_session_argmax(ref1);
+    int ref_top2 = ds4_session_argmax(ref2);
+    TEST_ASSERT(ref_top1 >= 0 && ref_top2 >= 0);
+
+    /* Batched resume: each session has p_i as checkpoint, extended to
+     * e_i via the batched API.  Should commit checkpoints to e_i and
+     * produce logits whose argmax matches the serial reference. */
+    ds4_session *batch[2] = { s1, s2 };
+    const ds4_tokens *prompts[2] = { &e1, &e2 };
+    TEST_ASSERT(ds4_sessions_sync_batched(batch, prompts, 2,
+                                          err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(s1) == e1.len);
+    TEST_ASSERT(ds4_session_pos(s2) == e2.len);
+
+    int got_top1 = ds4_session_argmax(s1);
+    int got_top2 = ds4_session_argmax(s2);
+    if (got_top1 != ref_top1) {
+        fprintf(stderr,
+                "ds4-test: batched resume argmax slot 1 mismatch got=%d ref=%d\n",
+                got_top1, ref_top1);
+    }
+    if (got_top2 != ref_top2) {
+        fprintf(stderr,
+                "ds4-test: batched resume argmax slot 2 mismatch got=%d ref=%d\n",
+                got_top2, ref_top2);
+    }
+    TEST_ASSERT(got_top1 == ref_top1);
+    TEST_ASSERT(got_top2 == ref_top2);
+
+    ds4_session_free(s1);
+    ds4_session_free(s2);
+    ds4_session_free(ref1);
+    ds4_session_free(ref2);
+    ds4_tokens_free(&p1);
+    ds4_tokens_free(&p2);
+    ds4_tokens_free(&e1);
+    ds4_tokens_free(&e2);
+}
+
+/* D5-6 regression: cold-prefill two sessions whose suffixes span
+ * multiple chunks.  Force a tiny prefill_cap via DS4_METAL_PREFILL_CHUNK
+ * so a small synthetic prompt is enough to exercise the outer chunk
+ * loop in metal_graph_prefill_layer_major_batched_n_sessions.  Verify
+ * the batched-chunked path produces slot-for-slot argmax-equivalent
+ * output to the per-session serial path. */
+static void test_batched_chunked_prefill(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine) return;
+
+    /* prefill_cap is computed from this env var per ds4_default_prefill_cap_
+     * for_prompt, so set it BEFORE creating any session in the test and
+     * restore it after.  Existing test_get_engine cached sessions are
+     * unaffected since prefill_cap is per-session. */
+    setenv("DS4_METAL_PREFILL_CHUNK", "64", 1);
+
+    char err[160];
+    ds4_tokens p1 = {0}, p2 = {0};
+    ds4_encode_chat_prompt(engine, "",
+        "Please write a paragraph summarizing the plot of Romeo and Juliet, "
+        "the famous tragedy by William Shakespeare.  Mention the feuding families, "
+        "the secret marriage, the duels, the messenger going astray, and the "
+        "ending in the tomb.  Then add three additional sentences about the play's "
+        "enduring influence on later love stories in literature, theater, opera, "
+        "and modern film adaptations.  Be concrete and avoid filler phrases.",
+        DS4_THINK_NONE, &p1);
+    ds4_encode_chat_prompt(engine, "",
+        "Please write a paragraph summarizing the plot of Hamlet, the famous "
+        "tragedy by William Shakespeare.  Cover the ghost of the king, Hamlet's "
+        "feigned madness, Ophelia, the play within a play, the duel, and the "
+        "final stage of corpses.  Then add three additional sentences about why "
+        "the play's introspection has been quoted by so many later authors and "
+        "screenwriters.  Be concrete and avoid filler phrases.",
+        DS4_THINK_NONE, &p2);
+    /* Both prompts must overshoot the forced 64-row chunk_cap, otherwise
+     * the chunked path doesn't trigger and we end up exercising the
+     * D5-5 single-chunk case again. */
+    TEST_ASSERT(p1.len > 64);
+    TEST_ASSERT(p2.len > 64);
+
+    ds4_session *s1 = NULL, *s2 = NULL;
+    TEST_ASSERT(ds4_session_create(&s1, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&s2, engine, 1024) == 0);
+    ds4_session *ref1 = NULL, *ref2 = NULL;
+    TEST_ASSERT(ds4_session_create(&ref1, engine, 1024) == 0);
+    TEST_ASSERT(ds4_session_create(&ref2, engine, 1024) == 0);
+
+    TEST_ASSERT(ds4_session_sync(ref1, &p1, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_sync(ref2, &p2, err, sizeof(err)) == 0);
+    int ref_top1 = ds4_session_argmax(ref1);
+    int ref_top2 = ds4_session_argmax(ref2);
+    TEST_ASSERT(ref_top1 >= 0 && ref_top2 >= 0);
+
+    ds4_session *batch[2] = { s1, s2 };
+    const ds4_tokens *prompts[2] = { &p1, &p2 };
+    TEST_ASSERT(ds4_sessions_sync_batched(batch, prompts, 2,
+                                          err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_session_pos(s1) == p1.len);
+    TEST_ASSERT(ds4_session_pos(s2) == p2.len);
+
+    int got_top1 = ds4_session_argmax(s1);
+    int got_top2 = ds4_session_argmax(s2);
+    if (got_top1 != ref_top1) {
+        fprintf(stderr,
+                "ds4-test: batched chunked argmax slot 1 mismatch got=%d ref=%d\n",
+                got_top1, ref_top1);
+    }
+    if (got_top2 != ref_top2) {
+        fprintf(stderr,
+                "ds4-test: batched chunked argmax slot 2 mismatch got=%d ref=%d\n",
+                got_top2, ref_top2);
+    }
+    TEST_ASSERT(got_top1 == ref_top1);
+    TEST_ASSERT(got_top2 == ref_top2);
+
+    ds4_session_free(s1);
+    ds4_session_free(s2);
+    ds4_session_free(ref1);
+    ds4_session_free(ref2);
+    ds4_tokens_free(&p1);
+    ds4_tokens_free(&p2);
+
+    unsetenv("DS4_METAL_PREFILL_CHUNK");
+}
+
 #endif
 
 static void test_server_unit_group(void) {
@@ -651,6 +841,8 @@ static const ds4_test_entry test_entries[] = {
     {"--tool-call-quality", "tool-call-quality", "model emits valid DSML tool calls", test_tool_call_quality},
     {"--logprob-vectors", "logprob-vectors", "official API top-logprob vector comparison", test_official_logprob_vectors},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_f16_matvec_fast_nr0_4},
+    {"--batched-resume", "batched-resume", "multi-turn resume via ds4_sessions_sync_batched (D5-5)", test_batched_resume_prefill},
+    {"--batched-chunked", "batched-chunked", "multi-chunk cold prefill via ds4_sessions_sync_batched (D5-6)", test_batched_chunked_prefill},
 #endif
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };

@@ -5769,8 +5769,13 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
+        /* Always drop trailing partial UTF-8 -- even on final flush.
+         * Emitting half a multibyte char inside a JSON delta makes clients
+         * render U+FFFD or reject the chunk; better to lose 1-3 bytes
+         * when max_tokens / eos cuts mid character than to break the wire
+         * format. */
+        limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
 
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
@@ -6466,8 +6471,9 @@ static bool responses_sse_stream_update(int fd, const request *r,
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
+        /* Always drop trailing partial UTF-8 -- see OpenAI path comment. */
+        limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
 
         if (limit > st->emit_pos) {
             if (emit_reasoning) {
@@ -7312,7 +7318,10 @@ static size_t text_stream_safe_limit(const char *raw, size_t start,
             limit = trim_tool_separator_ws(raw, start, limit);
         }
     }
-    return utf8_stream_safe_len(raw, start, limit, final);
+    /* Drop trailing partial UTF-8 even on final flush: emitting half a
+     * multibyte char makes clients render U+FFFD or reject the JSON delta. */
+    (void)final;
+    return utf8_stream_safe_len(raw, start, limit, false);
 }
 
 static bool anthropic_sse_stream_update(int fd, server *s, const request *r, const char *id,
@@ -7343,8 +7352,9 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-            limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
+        /* Always drop trailing partial UTF-8 -- see OpenAI path comment. */
+        limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
 
         if (limit > st->emit_pos) {
             if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
@@ -7540,6 +7550,16 @@ typedef struct {
     uint64_t file_size;
 } kv_entry;
 
+/* Maximum batched-decode pool depth.  Engine caps the batched-decode
+ * encoder at 8 (DS4_BATCH_INTERLEAVED_MAX, see ds4.c:18341); bench
+ * section 13 measured +57.5 % aggregate at N=8 fresh-boot.  Day-3 D3-1
+ * raised this from 4 to 8 after Day-2 D2-4 closed the
+ * tensor_copy_async stream race (section 14 had flagged Shared-FFN
+ * fatal failures at N>=4 that traced back to that race).  Declared
+ * up-front so the kv_disk_cache counters array sizing below can
+ * reference it. */
+#define DS4_SERVER_BATCH_MAX 8
+
 typedef struct {
     int min_tokens;
     int cold_max_tokens;
@@ -7554,7 +7574,11 @@ typedef struct {
     uint64_t budget_bytes;
     bool reject_different_quant;
     kv_cache_options opt;
-    int continued_last_store_tokens;
+    /* Day-2 D2-5: continued-store frontiers, one per session.  Index 0
+     * is the legacy server-wide s->session; indices [1..N] correspond
+     * to server.batched_sessions[0..N-1].  See server_session_kv_index()
+     * for the mapping helper. */
+    int continued_last_store_tokens[1 + DS4_SERVER_BATCH_MAX];
     kv_entry *entry;
     int len;
     int cap;
@@ -7634,6 +7658,25 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    /* Continuous-batching scheduler: a pool of up to DS4_SERVER_BATCH_MAX
+     * sessions used by generate_batched() when multiple batchable
+     * requests are gathered off the queue.  See request_is_batchable()
+     * for the qualifying conditions (plain non-stream OpenAI
+     * chat/completion, no tools, no thinking, no stops, no KV disk
+     * cache, temperature > 0).  See server_session_kv_index() for the
+     * session-to-counter mapping used by the per-session KV cache
+     * counters in kv_disk_cache.continued_last_store_tokens[]. */
+    ds4_session *batched_sessions[DS4_SERVER_BATCH_MAX];
+    int batched_pool_actual;  /* <= DS4_SERVER_BATCH_MAX; runtime cap */
+    /* Day-9 D auto fast-path: when no parallel burst has been seen for
+     * `batched_fast_cooldown_sec`, the worker's gather loop uses a 0 ms
+     * budget so single-user requests do not pay the 50 ms pair-wait
+     * latency.  A successful >= 2-job batch sets `batched_last_parallel_ts`
+     * which re-enables the original 50 ms gather until the cooldown
+     * expires.  Touched only from worker_main, so no mutex needed. */
+    double batched_last_parallel_ts;
+    double batched_fast_cooldown_sec;
+    bool   batched_auto_fast_path_enabled;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -9036,7 +9079,8 @@ static int kv_cache_continued_step(const kv_disk_cache *kc) {
     return step;
 }
 
-static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
+static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens,
+                                           int continued_last) {
     const int step = kv_cache_continued_step(kc);
     if (step <= 0) return 0;
     if (live_tokens < kc->opt.min_tokens) return 0;
@@ -9046,7 +9090,7 @@ static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tok
      * Otherwise an early cold checkpoint can shift the whole schedule and leave
      * long generations with no recent durable restart point. */
     if (live_tokens % step != 0) return 0;
-    if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    if (live_tokens <= continued_last) return 0;
     return live_tokens;
 }
 
@@ -9177,7 +9221,8 @@ static void kv_cache_rewrite_tool_map(server *s, const char *path, const char *t
     (void)ok;
 }
 
-static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
+static bool kv_cache_store_live_prefix_text(server *s, ds4_session *sess,
+                                            const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
@@ -9199,7 +9244,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
     /* Disk cache persistence must observe the graph exactly as-is.  If callers
      * want a shorter prefix, they first prefill to that prefix and only then call
      * this function.  This keeps cache population from doing hidden inference. */
-    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *live_tokens = ds4_session_tokens(sess);
     if (!live_tokens ||
         live_tokens->len != store_tokens.len ||
         !ds4_tokens_starts_with(live_tokens, &store_tokens))
@@ -9213,7 +9258,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
         return false;
     }
 
-    uint64_t payload_bytes = ds4_session_payload_bytes(s->session);
+    uint64_t payload_bytes = ds4_session_payload_bytes(sess);
     if (payload_bytes == 0) {
         ds4_tokens_free(&store_tokens);
         return false;
@@ -9264,7 +9309,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
     char *path = kv_path_for_sha(kc, sha);
 
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
-                                     quant_bits, ds4_session_ctx(s->session))) {
+                                     quant_bits, ds4_session_ctx(sess))) {
         kv_cache_rewrite_tool_map(s, path, text);
         free(text);
         free(path);
@@ -9293,7 +9338,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
     if (text_override) ext_flags |= cache_text_ext;
     kv_fill_header(h, (uint8_t)quant_bits, kv_reason_code(reason), ext_flags,
                    (uint32_t)store_tokens.len, 0,
-                   (uint32_t)ds4_session_ctx(s->session), now, now, payload_bytes);
+                   (uint32_t)ds4_session_ctx(sess), now, now, payload_bytes);
     uint8_t tb[4];
     le_put32(tb, (uint32_t)text_len);
     uint64_t tool_map_bytes = 0;
@@ -9301,7 +9346,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
     bool ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
               fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
               fwrite(text, 1, text_len, fp) == text_len &&
-              ds4_session_save_payload(s->session, fp, err, sizeof(err)) == 0 &&
+              ds4_session_save_payload(sess, fp, err, sizeof(err)) == 0 &&
               kv_tool_map_write(s, fp, text, &tool_map_bytes) &&
               fflush(fp) == 0;
     int saved_errno = errno;
@@ -9358,14 +9403,15 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
     return ok;
 }
 
-static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
+static bool kv_cache_store_live_prefix(server *s, ds4_session *sess,
+                                       const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
-    return kv_cache_store_live_prefix_text(s, tokens, store_len, reason,
+    return kv_cache_store_live_prefix_text(s, sess, tokens, store_len, reason,
                                            NULL, 0, NULL);
 }
 
-static void kv_cache_store_current(server *s, const char *reason) {
-    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+static void kv_cache_store_current(server *s, ds4_session *sess, const char *reason) {
+    const ds4_tokens *tokens = ds4_session_tokens(sess);
     if (!tokens) return;
 
     char *visible_text = NULL;
@@ -9397,43 +9443,61 @@ static void kv_cache_store_current(server *s, const char *reason) {
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
-        kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
+        kv_cache_store_live_prefix_text(s, sess, tokens, tokens->len, reason,
                                         visible_text, visible_ext, visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix(s, sess, tokens, tokens->len, reason);
     }
 }
 
-static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
-    if (tokens > kc->continued_last_store_tokens) {
-        kc->continued_last_store_tokens = tokens;
+static void kv_cache_note_store(int *continued_last_ptr, int tokens) {
+    if (tokens > *continued_last_ptr) {
+        *continued_last_ptr = tokens;
     }
 }
 
-static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
-    if (kv_cache_continued_store_target(kc, tokens) != tokens) return -1;
-    int old = kc->continued_last_store_tokens;
-    kv_cache_note_store(kc, tokens);
+/* Map a ds4_session pointer to its index into the per-session counter
+ * arrays (kv_disk_cache.continued_last_store_tokens[]).  Index 0 is the
+ * legacy server-wide s->session; indices 1..DS4_SERVER_BATCH_MAX
+ * correspond to server.batched_sessions[0..N-1].  Returns 0 (legacy
+ * slot) for unknown sessions as a safe fallback. */
+static int server_session_kv_index(const server *s, const ds4_session *sess) {
+    if (sess == s->session) return 0;
+    for (int k = 0; k < DS4_SERVER_BATCH_MAX; k++) {
+        if (sess == s->batched_sessions[k]) return 1 + k;
+    }
+    return 0;
+}
+
+static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int idx, int tokens) {
+    if (kv_cache_continued_store_target(kc, tokens,
+                                        kc->continued_last_store_tokens[idx]) != tokens) {
+        return -1;
+    }
+    int old = kc->continued_last_store_tokens[idx];
+    kv_cache_note_store(&kc->continued_last_store_tokens[idx], tokens);
     return old;
 }
 
-static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
+static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc, int idx,
                                                   int old_tokens,
                                                   int suppressed_tokens) {
-    if (old_tokens >= 0 && kc->continued_last_store_tokens == suppressed_tokens) {
-        kc->continued_last_store_tokens = old_tokens;
+    if (old_tokens >= 0 && kc->continued_last_store_tokens[idx] == suppressed_tokens) {
+        kc->continued_last_store_tokens[idx] = old_tokens;
     }
 }
 
-static void kv_cache_maybe_store_continued(server *s) {
+static void kv_cache_maybe_store_continued(server *s, ds4_session *sess) {
     kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(s->session);
+    const ds4_tokens *tokens = ds4_session_tokens(sess);
     if (!tokens) return;
-    const int target = kv_cache_continued_store_target(kc, tokens->len);
+    const int idx = server_session_kv_index(s, sess);
+    const int target = kv_cache_continued_store_target(kc, tokens->len,
+                                                       kc->continued_last_store_tokens[idx]);
     if (target == 0) return;
-    if (kv_cache_store_live_prefix(s, tokens, target, "continued")) {
-        kv_cache_note_store(kc, target);
+    if (kv_cache_store_live_prefix(s, sess, tokens, target, "continued")) {
+        kv_cache_note_store(&kc->continued_last_store_tokens[idx], target);
     }
 }
 
@@ -9461,7 +9525,8 @@ static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
     return best;
 }
 
-static int kv_cache_try_load_text(server *s, const char *prompt_text,
+static int kv_cache_try_load_text(server *s, ds4_session *sess,
+                                  const char *prompt_text,
                                   ds4_tokens *effective_prompt,
                                   char **loaded_path_out,
                                   uint8_t *loaded_ext_flags_out,
@@ -9475,7 +9540,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (quant_bits != 2 && quant_bits != 4) return 0;
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = kv_cache_find_text_prefix(kc, prompt_text, quant_bits,
-                                        ds4_session_ctx(s->session));
+                                        ds4_session_ctx(sess));
     if (idx < 0) return 0;
 
     kv_entry e = kc->entry[idx];
@@ -9517,8 +9582,8 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     }
     char err[160] = {0};
     int loaded = 0;
-    if (header_ok && ds4_session_load_payload(s->session, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
-        const ds4_tokens *loaded_tokens = ds4_session_tokens(s->session);
+    if (header_ok && ds4_session_load_payload(sess, fp, hdr.payload_bytes, err, sizeof(err)) == 0) {
+        const ds4_tokens *loaded_tokens = ds4_session_tokens(sess);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
             if (effective_prompt) {
@@ -9532,7 +9597,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
             }
             if (hdr.ext_flags & KV_EXT_TOOL_MAP) kv_tool_map_load_from_pos(s, fp, NULL);
         } else {
-            ds4_session_invalidate(s->session);
+            ds4_session_invalidate(sess);
             unlink(path);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache discarded corrupt text-prefix payload%s%s %s",
@@ -9541,7 +9606,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                        path);
         }
     } else {
-        if (header_ok) ds4_session_invalidate(s->session);
+        if (header_ok) ds4_session_invalidate(sess);
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache load failed%s%s %s: %s load=%.1f ms",
                    responses_protocol ? " " : "",
@@ -9556,7 +9621,7 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
         const double load_ms = (now_sec() - load_t0) * 1000.0;
         if (loaded_path_out) *loaded_path_out = xstrdup(path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = hdr.ext_flags;
-        kc->continued_last_store_tokens = loaded;
+        kc->continued_last_store_tokens[server_session_kv_index(s, sess)] = loaded;
         const char *key_kind = kv_cache_key_kind(hdr.ext_flags);
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
@@ -9579,11 +9644,11 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     return loaded;
 }
 
-static int kv_cache_try_load(server *s, const request *req,
+static int kv_cache_try_load(server *s, ds4_session *sess, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
-    return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
+    return kv_cache_try_load_text(s, sess, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
@@ -10206,7 +10271,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
-            kv_cache_maybe_store_continued(p->srv);
+            kv_cache_maybe_store_continued(p->srv, p->srv->session);
         }
         return;
     }
@@ -10247,7 +10312,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                avg_tps,
                elapsed);
     if (p->srv && current > p->cached_tokens) {
-        kv_cache_maybe_store_continued(p->srv);
+        kv_cache_maybe_store_continued(p->srv, p->srv->session);
     }
 }
 
@@ -10398,7 +10463,8 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
          * a very long conversation from token zero. */
         char *path = NULL;
         ds4_tokens effective = {0};
-        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+        int loaded = kv_cache_try_load_text(s, s->session,
+                                            rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
         if (loaded == 0) ds4_session_invalidate(s->session);
 
@@ -10607,15 +10673,15 @@ static void generate_job(server *s, job *j) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (cached == 0) s->kv.continued_last_store_tokens = 0;
+    if (cached == 0) s->kv.continued_last_store_tokens[0] = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, "evict");
+        kv_cache_store_current(s, s->session, "evict");
     }
     if (cached == 0) {
-        disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
+        disk_cached = kv_cache_try_load(s, s->session, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
         if (disk_cached > 0) {
@@ -10726,7 +10792,7 @@ static void generate_job(server *s, job *j) {
          * sync reaches it; if the cold write fails, restore the old schedule so
          * a later continued write can still try. */
         suppressed_continued_last =
-            kv_cache_suppress_continued_store(&s->kv, cold_store_len);
+            kv_cache_suppress_continued_store(&s->kv, 0, cold_store_len);
     }
 
     if (s->kv.enabled &&
@@ -10739,17 +10805,17 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+            kv_cache_restore_suppressed_continued(&s->kv, 0, suppressed_continued_last,
                                                   cold_store_len);
             trace_event(s, trace_id, "prefill failed: %s", err);
             http_error(j->fd, s->enable_cors, 500, err);
             return;
         }
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+        if (kv_cache_store_live_prefix(s, s->session, prompt_for_sync, cold_store_len, "cold")) {
+            kv_cache_note_store(&s->kv.continued_last_store_tokens[0], cold_store_len);
             suppressed_continued_last = -1;
         } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+            kv_cache_restore_suppressed_continued(&s->kv, 0, suppressed_continued_last,
                                                   cold_store_len);
             suppressed_continued_last = -1;
         }
@@ -10759,7 +10825,7 @@ static void generate_job(server *s, job *j) {
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
-        kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+        kv_cache_restore_suppressed_continued(&s->kv, 0, suppressed_continued_last,
                                               cold_store_len);
         trace_event(s, trace_id, "prefill failed: %s", err);
         http_error(j->fd, s->enable_cors, 500, err);
@@ -10771,7 +10837,7 @@ static void generate_job(server *s, job *j) {
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
-    kv_cache_maybe_store_continued(s);
+    kv_cache_maybe_store_continued(s, s->session);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -10780,11 +10846,11 @@ static void generate_job(server *s, job *j) {
                req_flags,
                now_sec() - t0);
     if (cold_store_len == prompt_for_sync->len) {
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+        if (kv_cache_store_live_prefix(s, s->session, prompt_for_sync, cold_store_len, "cold")) {
+            kv_cache_note_store(&s->kv.continued_last_store_tokens[0], cold_store_len);
             suppressed_continued_last = -1;
         } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+            kv_cache_restore_suppressed_continued(&s->kv, 0, suppressed_continued_last,
                                                   cold_store_len);
         }
     }
@@ -10875,7 +10941,7 @@ static void generate_job(server *s, job *j) {
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            kv_cache_maybe_store_continued(s);
+            kv_cache_maybe_store_continued(s, s->session);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -11379,16 +11445,453 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* Short-timed pair wait: returns the next queued job if one arrives
+ * within `timeout_ms`, NULL otherwise.  Used by the batched scheduler
+ * to try to pair the freshly-dequeued job with another batchable
+ * request -- HTTP parse + enqueue typically takes 1-5 ms, so a 50 ms
+ * window catches near-simultaneous parallel requests without adding
+ * meaningful latency to true single-request workloads. */
+static job *dequeue_pair_wait(server *s, int timeout_ms) {
+    pthread_mutex_lock(&s->mu);
+    if (!s->head && !s->stopping && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)timeout_ms * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec  += ts.tv_nsec / 1000000000L;
+            ts.tv_nsec %= 1000000000L;
+        }
+        while (!s->head && !s->stopping) {
+            if (pthread_cond_timedwait(&s->cv, &s->mu, &ts) != 0) break;
+        }
+    }
+    if (!s->head) {
+        pthread_mutex_unlock(&s->mu);
+        return NULL;
+    }
+    job *j = s->head;
+    s->head = j->next;
+    if (!s->head) s->tail = NULL;
+    pthread_mutex_unlock(&s->mu);
+    j->next = NULL;
+    return j;
+}
+
+static void signal_done(job *j) {
+    pthread_mutex_lock(&j->mu);
+    j->done = true;
+    pthread_cond_signal(&j->cv);
+    pthread_mutex_unlock(&j->mu);
+}
+
+/* Day-1 batchable predicate: only the simplest, most common code paths.
+ * Anything that needs DSML tool tracking, thinking mode, structured
+ * streams, KV disk cache, stop strings, or MTP speculative decoding
+ * goes through the legacy generate_job() path on s->session. */
+static bool request_is_batchable(const server *s, const request *r) {
+    if (!s->batched_sessions[0] || !s->batched_sessions[1]) return false;
+    if (r->has_tools) return false;
+    if (ds4_think_mode_enabled(r->think_mode)) return false;
+    if (r->api != API_OPENAI) return false;
+    if (r->stops.max_len > 0) return false;
+    if (r->temperature <= 0.0f) return false;
+    /* Day-2 D2-3: streaming is supported via the simple plain-SSE path
+     * (sse_chunk delta + sse_done).  The structured OpenAI live-stream
+     * flow (role chunks, tool-call deltas) is NOT exercised in batched
+     * mode -- has_tools and think_mode are already excluded above, so
+     * the remaining stream payload is a sequence of plain content
+     * deltas which the simple path handles correctly. */
+    /* Day-2 D2-5: KV disk cache is now per-session, so s->kv.enabled
+     * no longer blocks batching.  generate_batched calls
+     * kv_cache_try_load + kv_cache_store_current per slot. */
+    return true;
+}
+
+/* Generate N batchable requests in lockstep through the per-layer
+ * interleaved batched decode encoder.  All jobs MUST satisfy
+ * request_is_batchable() and n must be in [2, DS4_SERVER_BATCH_MAX].
+ * No KV cache reuse / no DSML tools / no MTP -- streaming is plain
+ * SSE deltas (no OpenAI live structured stream, no Anthropic). */
+static void generate_batched(server *s, job **jobs, int n) {
+    ds4_session *sess[DS4_SERVER_BATCH_MAX];
+    char         err              [DS4_SERVER_BATCH_MAX][160];
+    int          prompt_tokens    [DS4_SERVER_BATCH_MAX];
+    int          max_tokens       [DS4_SERVER_BATCH_MAX];
+    int          completion       [DS4_SERVER_BATCH_MAX];
+    bool         done             [DS4_SERVER_BATCH_MAX];
+    const char  *finish           [DS4_SERVER_BATCH_MAX];
+    char         id               [DS4_SERVER_BATCH_MAX][96];
+    uint64_t     rng              [DS4_SERVER_BATCH_MAX];
+    buf          text             [DS4_SERVER_BATCH_MAX];
+    bool         stream_send      [DS4_SERVER_BATCH_MAX];
+    bool         stream_headers_ok[DS4_SERVER_BATCH_MAX];
+    bool         stream_failed    [DS4_SERVER_BATCH_MAX];
+    size_t       plain_stream_pos [DS4_SERVER_BATCH_MAX];
+    ds4_tokens   effective_prompt [DS4_SERVER_BATCH_MAX];
+    int          cached_tokens    [DS4_SERVER_BATCH_MAX];
+    bool         prefill_failed   [DS4_SERVER_BATCH_MAX];
+
+    for (int k = 0; k < n; k++) {
+        sess[k] = s->batched_sessions[k];
+        err[k][0] = '\0';
+        prompt_tokens[k]      = 0;
+        max_tokens[k]         = 0;
+        completion[k]         = 0;
+        done[k]               = false;
+        finish[k]             = "length";
+        id[k][0]              = '\0';
+        rng[k]                = 0;
+        memset(&text[k], 0, sizeof(text[k]));
+        stream_send[k]        = jobs[k]->req.stream;
+        stream_headers_ok[k]  = false;
+        stream_failed[k]      = false;
+        plain_stream_pos[k]   = 0;
+        memset(&effective_prompt[k], 0, sizeof(effective_prompt[k]));
+        cached_tokens[k]      = 0;
+        prefill_failed[k]     = false;
+    }
+    const int eos = ds4_token_eos(s->engine);
+    const double t0 = now_sec();
+
+    /* Three-phase prefill (D5-4 wires up the D5-2 engine batched API):
+     *   Phase 1: per-slot KV-disk-cache try-load + collect prompts.
+     *   Phase 2: single ds4_sessions_sync_batched() call across all
+     *            eligible slots.  On any failure, fall back to a
+     *            per-slot ds4_session_sync() loop so the broken slot
+     *            is identified without poisoning the others.
+     *   Phase 3: per-slot post-sync bookkeeping (prompt_tokens,
+     *            max_tokens, request id, rng seed).
+     * Sequential constraint from Day-2 D2-1 still holds for Phase 2:
+     * the batched API drives a single engine and a single
+     * g_kernel_stream; only the host-side nesting changes (layers
+     * outside, sessions inside) so the layer weights take one L2
+     * sweep across N sessions instead of N. */
+    const ds4_tokens *batch_prompts[DS4_SERVER_BATCH_MAX];
+    for (int k = 0; k < n; k++) batch_prompts[k] = NULL;
+
+    /* Phase 1: per-slot KV-disk-cache try-load + prompt selection. */
+    for (int k = 0; k < n; k++) {
+        const request *req = &jobs[k]->req;
+        const int kv_idx = server_session_kv_index(s, sess[k]);
+        s->kv.continued_last_store_tokens[kv_idx] = 0;
+        const ds4_tokens *prompt_for_sync = &req->prompt;
+        if (s->kv.enabled) {
+            char *path_unused = NULL;
+            int disk_cached = kv_cache_try_load(s, sess[k], req,
+                                                &effective_prompt[k],
+                                                &path_unused, NULL);
+            free(path_unused);
+            if (disk_cached > 0) {
+                cached_tokens[k] = disk_cached;
+                prompt_for_sync = &effective_prompt[k];
+            } else {
+                ds4_session_invalidate(sess[k]);
+            }
+        } else {
+            ds4_session_invalidate(sess[k]);
+        }
+        batch_prompts[k] = prompt_for_sync;
+    }
+
+    /* Phase 2: batched sync; on failure fall back per-slot. */
+    char batched_err[256] = { 0 };
+    int batched_rc = ds4_sessions_sync_batched(sess, batch_prompts, n,
+                                                batched_err, sizeof(batched_err));
+    if (batched_rc != 0) {
+        for (int k = 0; k < n; k++) {
+            if (ds4_session_sync(sess[k], batch_prompts[k], err[k], sizeof(err[k])) != 0) {
+                done[k] = true;
+                finish[k] = "error";
+                prefill_failed[k] = true;
+            }
+        }
+    }
+
+    /* Phase 3: per-slot post-sync bookkeeping. */
+    for (int k = 0; k < n; k++) {
+        if (done[k]) continue;
+        const request *req = &jobs[k]->req;
+        prompt_tokens[k] = req->prompt.len;
+        int room = ds4_session_ctx(sess[k]) - ds4_session_pos(sess[k]);
+        max_tokens[k] = req->max_tokens;
+        if (max_tokens[k] < 0) max_tokens[k] = 0;
+        if (max_tokens[k] > room) max_tokens[k] = room;
+        snprintf(id[k], sizeof(id[k]), "%s-%llu",
+                 req->kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+                 (unsigned long long)++s->seq);
+        rng[k] = req->seed ? req->seed :
+            (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1)
+             ^ (uint64_t)(uintptr_t)jobs[k]);
+    }
+
+    /* SSE headers + initial role chunk (for chat) per slot.  Stream
+     * failures are isolated per slot: the slot is marked done with
+     * finish="error" but the lockstep loop keeps running for the rest. */
+    for (int k = 0; k < n; k++) {
+        if (done[k] || !stream_send[k]) continue;
+        if (!sse_headers(jobs[k]->fd, s->enable_cors)) {
+            stream_failed[k] = true;
+            done[k] = true;
+            finish[k] = "error";
+            continue;
+        }
+        stream_headers_ok[k] = true;
+        if (jobs[k]->req.kind == REQ_CHAT &&
+            !sse_chunk(jobs[k]->fd, &jobs[k]->req, id[k], NULL, NULL)) {
+            stream_failed[k] = true;
+            done[k] = true;
+            finish[k] = "error";
+        }
+    }
+
+    while (!g_stop_requested) {
+        ds4_batch_slot slots[DS4_SERVER_BATCH_MAX];
+        memset(slots, 0, sizeof(slots));
+        int active = 0;
+        for (int k = 0; k < n; k++) {
+            if (done[k]) continue;
+            if (completion[k] >= max_tokens[k] ||
+                ds4_session_pos(sess[k]) >= ds4_session_ctx(sess[k])) {
+                done[k] = true;
+                continue;
+            }
+            const request *req = &jobs[k]->req;
+            int token = ds4_session_sample(sess[k], req->temperature,
+                                           req->top_k, req->top_p,
+                                           req->min_p, &rng[k]);
+            if (token == eos) {
+                done[k] = true;
+                finish[k] = "stop";
+                continue;
+            }
+            slots[k].session = sess[k];
+            slots[k].token   = token;
+            slots[k].logits  = NULL;
+            active++;
+        }
+        if (active == 0) break;
+
+        char eval_err[160] = {0};
+        if (ds4_session_eval_batched_decode(slots, n, eval_err,
+                                            sizeof(eval_err)) != 0) {
+            for (int k = 0; k < n; k++) {
+                if (slots[k].session) {
+                    done[k] = true;
+                    finish[k] = "error";
+                    snprintf(err[k], sizeof(err[k]), "%s", eval_err);
+                }
+            }
+            break;
+        }
+
+        for (int k = 0; k < n; k++) {
+            if (!slots[k].session) continue;
+            int token = slots[k].token;
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(s->engine, token, &piece_len);
+            completion[k]++;
+            if (piece) {
+                buf_append(&text[k], piece, piece_len);
+                free(piece);
+            }
+            /* Per-slot SSE delta: write whatever new content this slot
+             * has accumulated since the last delta.  Hold back any trailing
+             * incomplete UTF-8 byte sequence -- some clients replace it with
+             * U+FFFD and feed the corrupted text back, breaking KV cache
+             * prefix matches and confusing SDK parsers (mirrors the
+             * single-session path's utf8_stream_safe_len guard). */
+            if (stream_send[k] && !stream_failed[k] &&
+                text[k].len > plain_stream_pos[k]) {
+                size_t safe_len = utf8_stream_safe_len(text[k].ptr,
+                                                       plain_stream_pos[k],
+                                                       text[k].len, false);
+                if (safe_len > plain_stream_pos[k]) {
+                    char *delta = xstrndup(text[k].ptr + plain_stream_pos[k],
+                                           safe_len - plain_stream_pos[k]);
+                    bool ok = sse_chunk(jobs[k]->fd, &jobs[k]->req,
+                                        id[k], delta, NULL);
+                    free(delta);
+                    if (ok) {
+                        plain_stream_pos[k] = safe_len;
+                    } else {
+                        stream_failed[k] = true;
+                        done[k] = true;
+                        finish[k] = "error";
+                        snprintf(err[k], sizeof(err[k]),
+                                 "client stream write failed");
+                    }
+                }
+            }
+        }
+    }
+
+    if (g_stop_requested) {
+        for (int k = 0; k < n; k++) {
+            if (strcmp(finish[k], "error") != 0) finish[k] = "error";
+            if (!err[k][0]) snprintf(err[k], sizeof(err[k]), "shutdown requested");
+        }
+    }
+
+    for (int k = 0; k < n; k++) {
+        const request *req = &jobs[k]->req;
+        /* Prefill failed before any HTTP bytes hit the wire -- emit
+         * HTTP 500 to match legacy generate_job()'s prefill failure
+         * path, otherwise a non-streaming client gets a misleading
+         * 200 with empty content and a streaming client gets a
+         * connection that never sent any response at all. */
+        if (prefill_failed[k]) {
+            http_error(jobs[k]->fd, s->enable_cors, 500, err[k][0] ? err[k] : "prefill failed");
+            continue;
+        }
+        if (stream_send[k]) {
+            if (stream_headers_ok[k] && !stream_failed[k]) {
+                /* Flush any trailing bytes that were held back for UTF-8
+                 * safety during the per-token loop.  Generation usually
+                 * ends on a valid boundary, but max_tokens can cut mid
+                 * character. */
+                if (text[k].len > plain_stream_pos[k]) {
+                    char *tail = xstrndup(text[k].ptr + plain_stream_pos[k],
+                                          text[k].len - plain_stream_pos[k]);
+                    if (!sse_chunk(jobs[k]->fd, &jobs[k]->req,
+                                   id[k], tail, NULL)) {
+                        stream_failed[k] = true;
+                    } else {
+                        plain_stream_pos[k] = text[k].len;
+                    }
+                    free(tail);
+                }
+                if (!stream_failed[k] &&
+                    (!sse_chunk(jobs[k]->fd, req, id[k], NULL, finish[k]) ||
+                     !sse_done(jobs[k]->fd, req, id[k],
+                               prompt_tokens[k], completion[k]))) {
+                    stream_failed[k] = true;
+                }
+            }
+            /* If stream_headers_ok was never reached, the client got an
+             * error before any SSE bytes -- nothing further to send. */
+        } else {
+            const char *content = text[k].ptr ? text[k].ptr : "";
+            final_response(jobs[k]->fd, s->enable_cors, req, id[k], content,
+                           NULL, NULL, finish[k],
+                           prompt_tokens[k], completion[k]);
+        }
+    }
+
+    /* Day-2 D2-5: persist the post-generation KV state per slot so the
+     * next turn of the same conversation can hit kv_cache_try_load.
+     * Skipped on error finishes -- the live graph might be torn. */
+    if (s->kv.enabled) {
+        for (int k = 0; k < n; k++) {
+            if (strcmp(finish[k], "error") == 0) continue;
+            if (completion[k] <= 0) continue;
+            kv_cache_store_current(s, sess[k], "continued");
+        }
+    }
+
+    for (int k = 0; k < n; k++) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=batched(n=%d) gen=%d finish=%s "
+                   "stream=%d kv_cached=%d %.3fs",
+                   jobs[k]->req.kind == REQ_CHAT ? "chat" : "completion",
+                   n, completion[k], finish[k],
+                   stream_send[k] ? 1 : 0, cached_tokens[k],
+                   now_sec() - t0);
+        buf_free(&text[k]);
+        ds4_tokens_free(&effective_prompt[k]);
+    }
+}
+
+/* Day-2 D2-2 worker loop: gather up to DS4_SERVER_BATCH_MAX batchable
+ * requests off the queue (50 ms initial wait for the first pair-mate,
+ * then non-blocking grabs for the rest -- subsequent jobs that are
+ * already queued cost nothing more in latency, but waiting longer
+ * starves the first request).  A non-batchable spillover request found
+ * mid-gather is processed on the legacy path after the batched run. */
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
-        job *j = dequeue(s);
-        if (!j) break;
-        generate_job(s, j);
-        pthread_mutex_lock(&j->mu);
-        j->done = true;
-        pthread_cond_signal(&j->cv);
-        pthread_mutex_unlock(&j->mu);
+        job *j1 = dequeue(s);
+        if (!j1) break;
+        if (!request_is_batchable(s, &j1->req)) {
+            generate_job(s, j1);
+            signal_done(j1);
+            continue;
+        }
+
+        job *gathered[DS4_SERVER_BATCH_MAX];
+        int  n_gathered = 1;
+        gathered[0] = j1;
+        job *spillover = NULL;
+        /* Gather budget: 50 ms when parallel traffic is recent (within
+         * cooldown), 0 ms otherwise.  With 0 ms, `dequeue_pair_wait`
+         * still drains whatever's already in the queue but does not
+         * wait for new arrivals -- so single-user dispatch matches
+         * pool=1 throughput while still capturing simultaneous
+         * N-curl bursts whose siblings are already enqueued by the
+         * time the worker checks. */
+        const double gather_t0 = now_sec();
+        const int pool_cap = s->batched_pool_actual > 0
+                                ? s->batched_pool_actual : DS4_SERVER_BATCH_MAX;
+        int gather_budget_ms = 50;
+        if (s->batched_auto_fast_path_enabled) {
+            bool in_cooldown = (gather_t0 - s->batched_last_parallel_ts)
+                                   < s->batched_fast_cooldown_sec;
+            gather_budget_ms = in_cooldown ? 50 : 0;
+        }
+        while (n_gathered < pool_cap) {
+            int elapsed_ms   = (int)((now_sec() - gather_t0) * 1000.0);
+            int remaining_ms = gather_budget_ms - elapsed_ms;
+            if (remaining_ms < 0) remaining_ms = 0;
+            job *jx = dequeue_pair_wait(s, remaining_ms);
+            if (!jx) break;
+            if (!request_is_batchable(s, &jx->req)) {
+                spillover = jx;
+                break;
+            }
+            gathered[n_gathered++] = jx;
+        }
+
+        if (n_gathered >= 2) {
+            s->batched_last_parallel_ts = now_sec();
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: dispatched batch n=%d", n_gathered);
+            generate_batched(s, gathered, n_gathered);
+            for (int k = 0; k < n_gathered; k++) signal_done(gathered[k]);
+        } else {
+            generate_job(s, gathered[0]);
+            signal_done(gathered[0]);
+            /* Burst-detection bootstrap.  Section 29's auto fast-path
+             * uses gather_budget=0 outside cooldown, which means the
+             * very first parallel burst arriving on a freshly-started
+             * server (or after >cooldown idle) races the HTTP parser:
+             * if siblings finish their 1-5 ms parse after we have
+             * already entered dequeue_pair_wait(0), n_gathered stays
+             * at 1 and `batched_last_parallel_ts` never advances --
+             * so the next iteration also gets budget=0, and so on.
+             * Section 33b's N-sweep observed N=8 scaling at only 1.26x
+             * (vs section 22 baseline 5.05x) because of this trap.
+             *
+             * Resolution: after dispatching j1 alone, peek at the
+             * queue.  If siblings landed during the seconds-long
+             * generate_job(), it was a burst all along -- prime
+             * parallel_ts so the very next iteration uses the 50 ms
+             * gather budget and catches the rest of the burst.  Pure
+             * single-user traffic (queue stays empty post-dispatch)
+             * is unaffected: parallel_ts is not advanced and the
+             * fast-path keeps pool=1-equivalent latency. */
+            if (s->batched_auto_fast_path_enabled) {
+                pthread_mutex_lock(&s->mu);
+                bool has_more = (s->head != NULL);
+                pthread_mutex_unlock(&s->mu);
+                if (has_more) {
+                    s->batched_last_parallel_ts = now_sec();
+                }
+            }
+        }
+        if (spillover) {
+            generate_job(s, spillover);
+            signal_done(spillover);
+        }
     }
     return NULL;
 }
@@ -11763,6 +12266,12 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    for (int k = 0; k < DS4_SERVER_BATCH_MAX; k++) {
+        if (s->batched_sessions[k]) {
+            ds4_session_free(s->batched_sessions[k]);
+            s->batched_sessions[k] = NULL;
+        }
+    }
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
@@ -12018,6 +12527,68 @@ int main(int argc, char **argv) {
     memset(&s, 0, sizeof(s));
     s.engine = engine;
     s.session = session;
+
+    /* Continuous-batching scheduler: up to DS4_SERVER_BATCH_MAX
+     * session pool used by generate_batched().  These mirror
+     * s->session's ctx_size; total extra memory is
+     * DS4_SERVER_BATCH_MAX * (per-session context buffers).  Failure
+     * to create any pool entry releases the partial pool and disables
+     * the batched path -- the worker keeps using s->session via
+     * generate_job() (request_is_batchable() guards on
+     * batched_sessions[0] && batched_sessions[1]). */
+    /* Section 28: per-layer state buffers (raw_cache, comp_cache,
+     * attn_state_{kv,score}) are now lazy-allocated, dropping the
+     * session-create alloc count by 4 * N_LAYER per session.  With
+     * that, pool=8 + ctx=32K no longer trips the driver allocator
+     * regime that sections 25/26 documented, so the ctx-adaptive cap
+     * is removed and DS4_SERVER_BATCH_MAX (= 8) is the default again.
+     * The env override is retained for operators who want to cap
+     * lower for any reason. */
+    int dbg_pool_cap = DS4_SERVER_BATCH_MAX;
+    const char *dbg_env = getenv("DS4_SERVER_BATCH_MAX_RUNTIME");
+    if (dbg_env && dbg_env[0]) {
+        int v = atoi(dbg_env);
+        if (v >= 1 && v <= DS4_SERVER_BATCH_MAX) dbg_pool_cap = v;
+    }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: batched pool size %d (cap %d, env %s)",
+               dbg_pool_cap, DS4_SERVER_BATCH_MAX,
+               dbg_env && dbg_env[0] ? dbg_env : "default");
+    s.batched_pool_actual = dbg_pool_cap;
+    /* Auto fast-path config: skip the 50 ms pair-wait when no parallel
+     * burst has been seen for `cooldown` seconds.  Section 16 D2-2
+     * introduced the 50 ms wait to capture near-simultaneous N-curl
+     * bursts; this gate keeps that win for parallel traffic while
+     * giving single-user dispatch the same throughput as pool=1. */
+    {
+        const char *fast_env = getenv("DS4_SERVER_AUTO_FAST_PATH");
+        s.batched_auto_fast_path_enabled =
+            !(fast_env && fast_env[0] && strcmp(fast_env, "0") == 0);
+        double cooldown = 5.0;
+        const char *cooldown_env = getenv("DS4_SERVER_AUTO_FAST_COOLDOWN_SEC");
+        if (cooldown_env && cooldown_env[0]) {
+            double v = atof(cooldown_env);
+            if (v >= 0.0) cooldown = v;
+        }
+        s.batched_fast_cooldown_sec = cooldown;
+        s.batched_last_parallel_ts  = 0.0;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: auto fast-path %s (cooldown %.1f s)",
+                   s.batched_auto_fast_path_enabled ? "on" : "off",
+                   s.batched_fast_cooldown_sec);
+    }
+    for (int k = 0; k < dbg_pool_cap; k++) {
+        if (ds4_session_create(&s.batched_sessions[k], engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create batched session %d -- "
+                       "continuous batching disabled", k);
+            for (int kk = 0; kk < k; kk++) {
+                ds4_session_free(s.batched_sessions[kk]);
+                s.batched_sessions[kk] = NULL;
+            }
+            break;
+        }
+    }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -12116,7 +12687,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+        kv_cache_store_current(&s, s.session, "shutdown");
     }
     server_close_resources(&s);
     return 0;
@@ -14727,23 +15298,19 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
 
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239, 0) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240, 0) == 10240);
 
-    kc.continued_last_store_tokens = 4096;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240, 4096) == 10240);
 
-    kc.continued_last_store_tokens = 24576;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720, 24576) == 30720);
 
-    kc.continued_last_store_tokens = 10240;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432, 10240) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480, 10240) == 20480);
 
     kc.opt.boundary_align_tokens = 0;
-    kc.continued_last_store_tokens = 20480;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999, 20480) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000, 20480) == 30000);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -14751,12 +15318,12 @@ static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(voi
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
 
-    int old = kv_cache_suppress_continued_store(&kc, 10240);
+    int old = kv_cache_suppress_continued_store(&kc, 0, 10240);
     TEST_ASSERT(old == 0);
     TEST_ASSERT(kc.continued_last_store_tokens == 10240);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 0);
 
-    kv_cache_restore_suppressed_continued(&kc, old, 10240);
+    kv_cache_restore_suppressed_continued(&kc, 0, old, 10240);
     TEST_ASSERT(kc.continued_last_store_tokens == 0);
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 }
