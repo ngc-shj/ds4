@@ -5017,6 +5017,9 @@ static const char *openai_tool_stream_id(server *s, openai_tool_stream *ts,
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final);
+static size_t think_stream_safe_limit(const char *raw, size_t start,
+                                      size_t raw_len, const char *close,
+                                      bool final);
 
 static bool sse_chat_delta_n(int fd, const request *r, const char *id,
                              const char *field, const char *text, size_t len) {
@@ -5761,21 +5764,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
-        size_t limit;
-        if (close) {
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            limit = raw_len;
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-        }
-        /* Always drop trailing partial UTF-8 -- even on final flush.
-         * Emitting half a multibyte char inside a JSON delta makes clients
-         * render U+FFFD or reject the chunk; better to lose 1-3 bytes
-         * when max_tokens / eos cuts mid character than to break the wire
-         * format. */
-        limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        size_t limit = think_stream_safe_limit(raw, st->emit_pos, raw_len, close, final);
 
         if (limit > st->emit_pos) {
             if (!sse_chat_delta_n(fd, r, id, "reasoning_content",
@@ -6463,17 +6452,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
-        size_t limit;
-        if (close) {
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            limit = raw_len;
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-        }
-        /* Always drop trailing partial UTF-8 -- see OpenAI path comment. */
-        limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        size_t limit = think_stream_safe_limit(raw, st->emit_pos, raw_len, close, final);
 
         if (limit > st->emit_pos) {
             if (emit_reasoning) {
@@ -7280,6 +7259,28 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
     return true;
 }
 
+/* Boundary policy for the THINKING (<think>...</think>) stream variant.
+ * Three SSE backends (OpenAI / Responses / Anthropic) used to inline the
+ * same limit calculation; centralized here so the "drop partial UTF-8
+ * even on final flush" policy lives in one place, mirroring
+ * text_stream_safe_limit. */
+static size_t think_stream_safe_limit(const char *raw, size_t start,
+                                      size_t raw_len, const char *close,
+                                      bool final) {
+    size_t limit;
+    if (close) {
+        limit = (size_t)(close - raw);
+    } else if (final) {
+        limit = raw_len;
+    } else {
+        const size_t hold = strlen("</think>") - 1;
+        limit = raw_len > hold ? raw_len - hold : start;
+    }
+    /* Drop trailing partial UTF-8 even on final flush: emitting half a
+     * multibyte char makes clients render U+FFFD or reject the JSON delta. */
+    return utf8_stream_safe_len(raw, start, limit, false);
+}
+
 static size_t text_stream_safe_limit(const char *raw, size_t start,
                                      size_t raw_len, bool has_tools,
                                      bool final) {
@@ -7344,17 +7345,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
-        size_t limit;
-        if (close) {
-            limit = (size_t)(close - raw);
-        } else if (final) {
-            limit = raw_len;
-        } else {
-            const size_t hold = strlen("</think>") - 1;
-            limit = raw_len > hold ? raw_len - hold : st->emit_pos;
-        }
-        /* Always drop trailing partial UTF-8 -- see OpenAI path comment. */
-        limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
+        size_t limit = think_stream_safe_limit(raw, st->emit_pos, raw_len, close, final);
 
         if (limit > st->emit_pos) {
             if (!anthropic_sse_open_block(fd, st, ANTH_BLOCK_THINKING)) return false;
@@ -11745,20 +11736,27 @@ static void generate_batched(server *s, job **jobs, int n) {
         }
         if (stream_send[k]) {
             if (stream_headers_ok[k] && !stream_failed[k]) {
-                /* Flush any trailing bytes that were held back for UTF-8
-                 * safety during the per-token loop.  Generation usually
-                 * ends on a valid boundary, but max_tokens can cut mid
-                 * character. */
+                /* Flush any trailing bytes held back for UTF-8 safety
+                 * during the per-token loop.  Even on this final flush
+                 * we drop any incomplete multibyte (max_tokens can cut
+                 * mid character) -- same policy as the structured
+                 * stream paths (see think_stream_safe_limit /
+                 * text_stream_safe_limit). */
                 if (text[k].len > plain_stream_pos[k]) {
-                    char *tail = xstrndup(text[k].ptr + plain_stream_pos[k],
-                                          text[k].len - plain_stream_pos[k]);
-                    if (!sse_chunk(jobs[k]->fd, &jobs[k]->req,
-                                   id[k], tail, NULL)) {
-                        stream_failed[k] = true;
-                    } else {
-                        plain_stream_pos[k] = text[k].len;
+                    size_t safe_len = utf8_stream_safe_len(text[k].ptr,
+                                                           plain_stream_pos[k],
+                                                           text[k].len, false);
+                    if (safe_len > plain_stream_pos[k]) {
+                        char *tail = xstrndup(text[k].ptr + plain_stream_pos[k],
+                                              safe_len - plain_stream_pos[k]);
+                        if (!sse_chunk(jobs[k]->fd, &jobs[k]->req,
+                                       id[k], tail, NULL)) {
+                            stream_failed[k] = true;
+                        } else {
+                            plain_stream_pos[k] = safe_len;
+                        }
+                        free(tail);
                     }
-                    free(tail);
                 }
                 if (!stream_failed[k] &&
                     (!sse_chunk(jobs[k]->fd, req, id[k], NULL, finish[k]) ||

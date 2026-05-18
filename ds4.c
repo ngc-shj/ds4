@@ -13507,7 +13507,20 @@ static bool imatrix_collector_save(
 }
 
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
+    /* Per-layer compressed-cache row counts.  Both the attention and
+     * indexer paths advance their own n_comp counter as rows are emitted
+     * (see metal_graph_encode_decode_layer_phased); if the previous
+     * conversation left a non-zero count, the next prefill emits fresh
+     * rows while the kernels still believe earlier slots hold valid
+     * data, mixing stale state into the new attention output. */
+    memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
+    /* Speculation prefix1 counters mirror layer_n_*; reset for parity
+     * even when capture is currently off, so a later spec capture starts
+     * clean. */
+    memset(g->spec_prefix1_n_comp, 0, sizeof(g->spec_prefix1_n_comp));
+    memset(g->spec_prefix1_n_index_comp, 0, sizeof(g->spec_prefix1_n_index_comp));
+    g->spec_capture_prefix1 = false;
     g->mtp_n_raw = 0;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -16313,34 +16326,42 @@ static bool metal_graph_encode_shared_ffn_batched(
                                        sessions[i]->graph.ffn_norm, 0,
                                        (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
     }
-    /* Day-6 D6-1: fuse the gate + up matmul pair into one Q4 pair-batch
-     * kernel launch so the shared activation is read once per (tok,
-     * block) instead of twice (= halves the activation-side HBM traffic
-     * vs two back-to-back batch-warp calls and avoids the launch-pair
-     * overhead).  Falls back to two separate batch-warp calls if the
-     * pair-batch helper rejects the geometry. */
-    if (ok) {
-        if (!ds4_gpu_matmul_q4_0_pair_batch_warp_tensor(
-                    e->batched_shared_gate,
-                    e->batched_shared_up,
-                    e->model.map, e->model.size,
-                    layer->ffn_gate_shexp->abs_offset,
-                    layer->ffn_up_shexp->abs_offset,
-                    DS4_N_EMBD, shared_dim, shared_dim,
-                    e->batched_ffn_norm, (uint64_t)n_active)) {
-            if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
-                            e->batched_shared_gate,
-                            e->model.map, e->model.size,
-                            layer->ffn_gate_shexp->abs_offset,
-                            DS4_N_EMBD, shared_dim,
-                            e->batched_ffn_norm, (uint64_t)n_active) != 0;
-            if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
-                            e->batched_shared_up,
-                            e->model.map, e->model.size,
-                            layer->ffn_up_shexp->abs_offset,
-                            DS4_N_EMBD, shared_dim,
-                            e->batched_ffn_norm, (uint64_t)n_active) != 0;
-        }
+    /* Day-6 D6-1 originally fused gate+up via the Q4 pair-batch kernel
+     * (one launch reads the shared activation once instead of twice).
+     * Section 30 (D8-3) later established that the interleaved-acc pair
+     * structure drifts under --use_fast_math FMA reorder at long ctx and
+     * cascades into a SwiGLU NaN; the single-session shared_gate_up
+     * helper was switched to two sequential single-Q4 matmuls as a
+     * result.  Mirror that policy here: default to the two-single path
+     * and gate the pair-batch behind an explicit opt-in for diagnosis.
+     * DS4_CUDA_ENABLE_BATCHED_SHARED_GATE_UP_PAIR=1 restores the old
+     * pair-batch (faster but precision-unsafe at long ctx). */
+    const bool enable_pair_batch =
+        getenv("DS4_CUDA_ENABLE_BATCHED_SHARED_GATE_UP_PAIR") != NULL;
+    bool used_pair_batch = false;
+    if (ok && enable_pair_batch) {
+        used_pair_batch = ds4_gpu_matmul_q4_0_pair_batch_warp_tensor(
+                e->batched_shared_gate,
+                e->batched_shared_up,
+                e->model.map, e->model.size,
+                layer->ffn_gate_shexp->abs_offset,
+                layer->ffn_up_shexp->abs_offset,
+                DS4_N_EMBD, shared_dim, shared_dim,
+                e->batched_ffn_norm, (uint64_t)n_active);
+    }
+    if (ok && !used_pair_batch) {
+        ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+                e->batched_shared_gate,
+                e->model.map, e->model.size,
+                layer->ffn_gate_shexp->abs_offset,
+                DS4_N_EMBD, shared_dim,
+                e->batched_ffn_norm, (uint64_t)n_active) != 0;
+        if (ok) ok = ds4_gpu_matmul_q4_0_batch_warp_tensor(
+                        e->batched_shared_up,
+                        e->model.map, e->model.size,
+                        layer->ffn_up_shexp->abs_offset,
+                        DS4_N_EMBD, shared_dim,
+                        e->batched_ffn_norm, (uint64_t)n_active) != 0;
     }
     /* Swiglu is element-wise: collapse the [n_active, shared_dim] tile
      * to one 1-D length so a single launch covers all rows. */
@@ -18935,6 +18956,19 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return 0;
     }
 
+    /* Fresh prefill: reset per-layer state accumulators
+     * (layer_attn_state_kv/score, layer_index_state_kv/score).  These
+     * buffers are read+write across compressed-attention boundaries; if
+     * we leave the previous conversation's accumulated state in them the
+     * new attention reads contaminated initial values and the model
+     * drifts (English -> wrong language / byte tokens) once the slot is
+     * reused.  The imatrix collection path already does this; the
+     * regular request handling path was missing it. */
+    if (!metal_graph_reset_prefill_state(&s->graph)) {
+        snprintf(err, errlen, "%s prefill state reset failed", backend_name);
+        s->checkpoint_valid = false;
+        return 1;
+    }
     bool ok;
     if (s->prefill_cap < (uint32_t)prompt->len) {
         ds4_sync_progress progress = {
@@ -20207,6 +20241,23 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
 
     bool ok = true;
+    /* Fresh-prefill state reset.  Per-session state accumulators
+     * (layer_attn_state_kv/score, layer_index_state_kv/score) are
+     * read+write across compressed-attention boundaries; if we leave the
+     * previous conversation's accumulated values in them, the new
+     * attention reads contaminated state and the model drifts once the
+     * session slot is reused (English -> wrong language / byte tokens).
+     * Single-session ds4_session_sync resets these for fresh prefill;
+     * mirror that here for the batched path.  Resume sessions
+     * (start[i] > 0) keep their state, by design. */
+    for (int i = 0; ok && i < n_active; i++) {
+        if (start[i] == 0 && !metal_graph_reset_prefill_state(&sessions[i]->graph)) {
+            if (err && errlen > 0) {
+                snprintf(err, errlen, "prefill state reset failed for session %d", i);
+            }
+            ok = false;
+        }
+    }
     /* Outer chunked-prefill loop.  cur_pos[i] / done[i] track per-session
      * progress; chunk_now is the uniform tokens-per-chunk processed by
      * every still-active session in this iteration (= min of active
