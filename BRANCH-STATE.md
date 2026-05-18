@@ -81,7 +81,7 @@ DS4_CUDA_BATCHED_Q_B=1 \
 DS4_CUDA_BATCHED_ATTN_OUTPUT=1 \
 DS4_CUDA_BATCHED_SHARED_FFN=1 \
 DS4_CUDA_BATCHED_ROUTED_MOE=1 \
-  ./ds4-server --cuda --warm-weights --port 8000 --ctx 2048 \
+  ./ds4-server --cuda --warm-weights --port 8000 --ctx 65536 \
     --kv-disk-dir /tmp/ds4-kv
 ```
 
@@ -93,18 +93,19 @@ Caveats:
 - `DS4_CUDA_BATCHED_DECODE_ATTENTION=1` (B.4) is **default OFF**.
   Correctness is confirmed at N>=2 burst, but perf delta is not yet
   established (section 33b needs re-measurement).
-- **Effective ctx limit on this Q4 quant is ~131,072 (128K).**  The
-  model's YARN-scaled theoretical max is 1,048,576 (65,536 × 16x), and
-  `--ctx 1048576` boots and routes the KV cache through cudaMallocManaged
-  ("CUDA using managed KV cache" log line), but at ctx >= 262,144
-  decode output drifts off-language (English → Chinese → Polish-like
-  byte sequences) and the rendered bytes are not valid UTF-8 when
-  concatenated, which causes streaming SDKs to throw
+- **Effective ctx limit on this Q4 quant is 65,536 (= native training
+  context, no YARN scaling).**  The model's YARN-scaled theoretical
+  max is 1,048,576 (65,536 × 16x), and `--ctx 1048576` boots and
+  routes the KV cache through cudaMallocManaged ("CUDA using managed
+  KV cache" log line), but YARN-extended positions show precision
+  degradation on this Q4 quant: under sustained use at `--ctx 131072`
+  or above, decode output drifts off-language (English → Chinese →
+  Polish-like byte sequences) and the rendered bytes are not valid
+  UTF-8 when concatenated, which causes streaming SDKs to throw
   `'utf-8' codec can't decode bytes ... invalid continuation byte` and
-  abort.  This is precision degradation in the Q4 quant + YARN
-  extension, not an SSE framing bug.  Use `--ctx 131072` (or below)
-  for production; `--ctx 262144`+ is currently for experimentation
-  only.
+  abort.  Native `--ctx 65536` runs are stable under the same
+  workload.  Use `--ctx 65536` for production; `--ctx 131072` and
+  above are currently for experimentation only.
 
 ---
 
