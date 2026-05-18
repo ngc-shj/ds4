@@ -10672,6 +10672,7 @@ static void generate_job(server *s, job *j) {
         kv_cache_store_current(s, s->session, "evict");
     }
     if (cached == 0) {
+        ds4_session_invalidate(s->session);
         disk_cached = kv_cache_try_load(s, s->session, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -11566,6 +11567,7 @@ static void generate_batched(server *s, job **jobs, int n) {
         const int kv_idx = server_session_kv_index(s, sess[k]);
         s->kv.continued_last_store_tokens[kv_idx] = 0;
         const ds4_tokens *prompt_for_sync = &req->prompt;
+        ds4_session_invalidate(sess[k]);
         if (s->kv.enabled) {
             char *path_unused = NULL;
             int disk_cached = kv_cache_try_load(s, sess[k], req,
@@ -11575,11 +11577,7 @@ static void generate_batched(server *s, job **jobs, int n) {
             if (disk_cached > 0) {
                 cached_tokens[k] = disk_cached;
                 prompt_for_sync = &effective_prompt[k];
-            } else {
-                ds4_session_invalidate(sess[k]);
             }
-        } else {
-            ds4_session_invalidate(sess[k]);
         }
         batch_prompts[k] = prompt_for_sync;
     }
