@@ -1,6 +1,6 @@
 # DS4 on NVIDIA GB10 — Fork Journey
 
-*Last updated: 2026-05.*
+*Last updated: 2026-05 (post layer-encoder N-aware refactor).*
 
 This fork of [`antirez/ds4`](https://github.com/antirez/ds4) is a sustained
 effort to make DeepSeek V4 Flash run well on NVIDIA Grace+Blackwell
@@ -36,7 +36,7 @@ usefully — what didn't.
 | 2 | `perf/cuda-hostregister-fallback` | GB10 needs `cudaHostRegisterDefault` (not `ReadOnly`) for the GGUF mmap, and indexed-attention is faster register-blocked on Blackwell. | Two surgical fixes.  Base for every later perf branch. |
 | 3 | `perf/q4-only` | Lazy `Q8 / f16 → Q4_0` weight cache + `dp4a` matmul variants for decode, then faster nibble unpack via `__byte_perm` + int32-batched loads. | Decode **12.33 → 18.80 t/s (+52.5 %)** on the chat-v2 GGUF.  Merge candidate. |
 | 4 | `perf/cuda-graph-wip` | CUDA Graph capture for the per-token decode step, with `__constant__ g_step_args` carrying the per-token mutable state. | **Net negative on GB10** (capture / launch overhead dominates).  Dormant; kept as a reference implementation of the `g_step_args` pattern. |
-| 5 | `perf/batched-decode-poc` | True N-session continuous batched decode (the prerequisite for `ds4-server` continuous batching). | Phase 1a-1c shipped: API + scaffolding + batched output head.  Layer-internal matmul batching is multi-day work, deferred; current ceiling **~+7 % aggregate at N = 8** without that surgery.  See the branch's `NOTES.md`. |
+| 5 | `perf/batched-decode-poc` | True N-session continuous batched decode (the prerequisite for `ds4-server` continuous batching). | Phase 1a-1c shipped (API + scaffolding + batched output head, +5-7 % at N≤8).  Layer-encoder N-aware refactor landed in sections 11-13: three opt-in batched substitutes (attn_q_b, qkv, attn_output) replace per-session matmuls with engine-level fan-out.  **N = 4 aggregate: baseline 19.6 → ALL substitutes 25.5 t/s = +29.9 %.**  See the branch's `NOTES.md` sections 11-13. |
 
 All four `perf/*` branches stack linearly on top of upstream `main`:
 
@@ -307,6 +307,62 @@ concrete 5-step shape-1 checklist (engine-level batched scratch, split
 point in `metal_graph_encode_decode_layer`, kernel-level fallbacks if
 cuBLAS f16 regresses again).
 
+### Layer-encoder N-aware refactor (the real lever, landed)
+
+The "next session's work" referenced above eventually landed as
+sections 11-13 in the branch's `NOTES.md`.  The phased decode encoder
+`metal_graph_encode_decode_layer_phased` was split into finer sub-phases
+(PRE_A1 / PRE_A2 / PRE_B / PRE_C1 / PRE_C2 / PRE_C3) so that three
+specific sub-phases can each be replaced by a single engine-level
+batched call that fans the work across N sessions:
+
+| Env var                       | Replaces | Underlying batched call                                | Section |
+| --- | --- | --- | --- |
+| `DS4_CUDA_BATCHED_Q_B`         | PRE_B    | attn_q_b matmul at `n_tok = N`                         | 11 |
+| `DS4_CUDA_BATCHED_QKV`         | PRE_A2   | attn_q_a + attn_kv + fused qkv_rms_norm at `n_tok = N` | 12 |
+| `DS4_CUDA_BATCHED_ATTN_OUTPUT` | PRE_C2   | `attention_output_q8_batch_tensor` at `n_tok = N` plus a new Q4 dispatch ahead of cuBLAS f16 | 13 |
+
+Each substitute stages N sessions' inputs into engine-level scratch
+(`batched_qr_norm`, `batched_attn_norm`, `batched_heads`, ...), runs
+the underlying kernel(s) once with `n_tok = N`, and scatters rows back
+to per-session graph tensors.  Falls back to per-session phased() if
+the batched call returns false at runtime, so the graph result stays
+equivalent regardless of env-var combinations.
+
+`ds4-bench --ctx-start 2048 --gen-tokens 50 --batch 4`, median of 3
+runs with GPU cooled to <55 °C between runs:
+
+| Config                                      | t/s aggregate | Δ vs baseline |
+| --- | ---: | ---: |
+| `DS4_CUDA_Q4_DECODE=1` (baseline)           | 19.62 | — |
+| + `DS4_CUDA_BATCHED_Q_B=1`                  | 20.40 | +3.9 % |
+| + `DS4_CUDA_BATCHED_QKV=1`                  | 20.17 | +2.7 % |
+| + `DS4_CUDA_BATCHED_ATTN_OUTPUT=1`          | 23.30 | +18.5 % |
+| + **all three**                             | **25.48** | **+29.9 %** |
+
+Variance with all three on collapses to ~0.04 t/s across 5 runs
+(20.85 → 0.04 spread).  N = 8 measurements are noisier under thermal
+load but held at +12 % in the most cooled-down sweep — a fresh-boot
+N = 8 re-measurement is the open follow-up.
+
+The substitutes preserve output coherence: a `DS4_BENCH_PRINT_TOKENS=1`
+hook added to `ds4-bench` (commit `319cac8`) streams decoded text for
+session 0; all five env-var combinations produce grammatically-correct
+Italian text on the promessi_sposi.txt prompt.  Argmax tokens differ
+in low-confidence positions because FP-accumulation order in cuBLAS
+f16 prefill is non-deterministic, not because the kernels are broken.
+
+After landing, the encoder body went through a simplification pass
+(commit `efa9390`): extracted `metal_graph_encode_phased_per_session`
+(eliminates 5 identical 9-line per-session loops), generalized the four
+`ensure_engine_batched_*_scratch` helpers around one
+`ensure_engine_scratch(slot, row_floats)` primitive, dedup'd the
+`!qkv && !q_b` predicate, renamed `can_batch_q_b` → `qr_norm_ready`,
+and replaced the hard-coded literal 32 in `struct ds4_batch_step_args`
+with `DS4_CUDA_BATCH_MAX` + a `static_assert` against silent ABI drift
+with `DS4_BATCH_MAX` in `ds4_gpu.h`.  Net −59 LoC; the +26.5 % win was
+re-measured at 25.48 t/s post-refactor (was 25.09).
+
 ## Current focus
 
 What anyone picking the fork up today should look at first, in order of
@@ -316,21 +372,29 @@ expected payoff:
    win is real and the two commits are small.  No design questions left
    — main blocker is just deciding whether to upstream or to keep as a
    GB10 carry.
-2. **Resume `perf/batched-decode-poc` from
-   [`NOTES.md` § "Concrete next-session checklist"](https://github.com/ngc-shj/ds4/blob/perf/batched-decode-poc/NOTES.md).**
-   The smallest non-trivial slice is to stage the FFN shared expert
-   `ffn_norm` into an engine-level batched scratch, run one batched
-   gate/up matmul, and scatter back.  If that one matmul improves
-   aggregate t/s at N = 4, broaden to attn_q_a / attn_q_b /
-   attn_output / shared_down.  If it doesn't, the cuBLAS f16 path is
-   genuinely useless for this shape and the only way through is a
-   custom Q4 batched-pair kernel that keeps `grid.y` non-trivial.
-3. **Per-row attention KV dispatch.**  Independent of (2), `attention`
-   itself runs serially per session because each KV cache lives at a
-   different VA.  Passing `const float * const *kv_ptrs` into a batched
-   attention kernel that selects by `blockIdx.y` is the canonical
-   shape; the `__constant__ g_batch_args` from Phase 1b is already in
-   place for the per-row `pos` / `n_raw` / `raw_start` fields.
+2. **Fresh-boot N = 8 re-measurement of the batched substitutes on
+   `perf/batched-decode-poc`.**  The N = 4 win (+29.9 %) is reproducible
+   across runs.  N = 8 was measured at +12 % in the cleanest sweep but
+   the GPU was thermally noisy from earlier multi-config interleaving.
+   Cold-boot the box, take 5 runs each of baseline vs all-three-on at
+   N = 8, and update `NOTES.md` section 13 with the median + range.
+3. **Extend the stage→batched→scatter pattern to the shared-FFN
+   gate+up pair.**  This was the original "concrete next-session
+   checklist" target in the old `NOTES.md`, deprioritized while the
+   bigger q_b / qkv / attn_output substitutes landed.  The
+   infrastructure is now validated; the remaining open question is
+   whether the FFN's small `out_dim = N_FF_EXP = 2048` saturates the
+   batched warp kernel at N ≥ 8 (an earlier attempt under PR #?? said
+   no without a custom Q4 pair kernel; revisit with the now-mature
+   `metal_graph_encode_*_batched` scaffold).
+4. **Per-row attention KV dispatch.**  `attention` itself still runs
+   serially per session because each KV cache lives at a different VA.
+   Passing `const float * const *kv_ptrs` into a batched attention
+   kernel that selects by `blockIdx.y` is the canonical shape; the
+   `__constant__ g_batch_args` from Phase 1b carries the per-row `pos`
+   / `n_raw` / `raw_start` fields.  After the q_b / qkv / attn_output
+   refactor, attention is the largest stage left unbatched, and
+   anything past N = 8 will need this to keep scaling.
 
 Avoid re-running the experiments listed in
 [`NOTES.md` § "What did NOT help"](https://github.com/ngc-shj/ds4/blob/perf/batched-decode-poc/NOTES.md)
@@ -360,6 +424,26 @@ A few patterns recur across the branches:
   batched launch structurally identical across tokens, which is what
   enables either CUDA-Graph replay or per-row dispatch in batched
   kernels.
+- **`stage → batched-N → scatter` is the right shape for layer-encoder
+  batching.**  Once the encoder is phase-split finely enough, each
+  dense matmul (or matmul pair, with a fused norm in the middle)
+  collapses to "copy N rows of input into engine scratch, call the
+  underlying kernel with `n_tok = N`, copy N rows of output back."
+  The opt-in env-var gating + per-substitute fallback means the same
+  encoder serves the unbatched code path (env unset, identical to
+  before) and the batched one — no API split, no second graph runtime.
+  When the next opt-in batched substitute lands, the cost is one
+  ensure-scratch helper, one `metal_graph_encode_<X>_batched`
+  function, one extra `want_<X>` parameter on the encoder, and one
+  conditional in the encoder's three-pass loop.
+- **Token-level diffs are unreliable correctness checks under FP
+  non-determinism.**  cuBLAS f16 prefill on GB10 picks slightly
+  different argmaxes across runs because of TC reduction order.  A
+  batched-decode correctness check that compares token IDs across
+  configs will see "diverged at token 3" even when both configs are
+  correct.  Decode to text and check coherence (the
+  `DS4_BENCH_PRINT_TOKENS` hook); for stronger checks, compare logit
+  distributions or perplexity.
 
 ## Pointers
 
