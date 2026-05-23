@@ -1496,10 +1496,10 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
                         strstr(name, ".hc_attn_fn.weight") != NULL ||
                         strstr(name, ".hc_ffn_fn.weight") != NULL ||
                         strcmp(name, "output_hc_fn.weight") == 0)) {
-                /* Section 33g: preload F16 indexer weights to Q4 cache so
-                 * decode-time cuda_q4_from_f16_ptr is a cache hit, which is
-                 * required for CUDA Graph capture safety (no lazy
-                 * cudaMalloc / cudaDeviceSynchronize during capture). */
+                /* Preload F16 indexer weights to Q4 cache so decode-time
+                 * cuda_q4_from_f16_ptr is a cache hit, which is required
+                 * for CUDA Graph capture safety (no lazy cudaMalloc /
+                 * cudaDeviceSynchronize during capture). */
                 char label[160];
                 snprintf(label, sizeof(label), "q4f16:%s", name);
                 if (ds4_gpu_cache_q4_from_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
@@ -8754,9 +8754,9 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
 /* Lazy allocators for per-(session, layer) state buffers.  Eager alloc
  * at session create scales as N_sessions * N_LAYER * 8 buffers and
  * pushes the GB10 driver memory allocator into a degraded regime at
- * ctx > 8K with pool >= 6 (see NOTES section 26 / 27).  Defer per-
- * layer allocation to first use so the cold-scratch footprint of a
- * just-spun-up session is near zero.
+ * ctx > 8K with pool >= 6.  Defer per-layer allocation to first use
+ * so the cold-scratch footprint of a just-spun-up session is near
+ * zero.
  *
  * Each helper is idempotent: returns the existing pointer if already
  * allocated, otherwise allocates (and zero/-inf-fills where the kernel
@@ -8975,8 +8975,8 @@ static bool metal_graph_alloc_raw_cap(
     g->kv = ds4_gpu_tensor_alloc((uint64_t)DS4_N_HEAD_DIM * sizeof(float));
     bool state_init_ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        /* Section 27 fix: lazy alloc -- raw_cache, comp_cache, state_kv,
-         * state_score all NULL until first use; see *_ensure() helpers. */
+        /* Lazy alloc: raw_cache, comp_cache, state_kv, state_score all
+         * NULL until first use; see *_ensure() helpers. */
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio != 0) {
             const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -8992,8 +8992,8 @@ static bool metal_graph_alloc_raw_cap(
             (void)state_init_ok;
 
             if (ratio == 4) {
-                /* Section 28 phase-3: lazy alloc for layer_index_* via
-                 * *_ensure() helpers; MTP siblings stay eager. */
+                /* Lazy alloc for layer_index_* via *_ensure() helpers;
+                 * MTP siblings stay eager. */
                 const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
                 const uint64_t index_rows = (uint64_t)coff * ratio;
                 if (enable_mtp) {
@@ -9102,9 +9102,9 @@ static bool metal_graph_alloc_raw_cap(
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
-        /* Lazy-alloc (section 27/28): raw/comp/state-kv/state-score
-         * are NULL until first use.  Health check now consults the
-         * shape parameters that ensure() would feed instead. */
+        /* Lazy-alloc: raw/comp/state-kv/state-score are NULL until
+         * first use.  Health check now consults the shape parameters
+         * that ensure() would feed instead. */
         layer_cache_ok = g->raw_cap != 0u;
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (layer_cache_ok && ratio != 0) {
@@ -9409,8 +9409,8 @@ static bool metal_graph_matmul_plain_tensor(
 #define DS4_DECODE_LAYER_PRE_A2  2u
 #define DS4_DECODE_LAYER_PRE_A   (DS4_DECODE_LAYER_PRE_A1 | DS4_DECODE_LAYER_PRE_A2)
 #define DS4_DECODE_LAYER_PRE_B   4u
-/* Day-10 B.4: PRE_C1 splits into three sub-phases so the attention kernel
- * call can be batched-substituted with a multi-session call.  PRE_C1_PRE_ATTN
+/* PRE_C1 splits into three sub-phases so the attention kernel call
+ * can be batched-substituted with a multi-session call.  PRE_C1_PRE_ATTN
  * = head_rms + rope_q + kv path + kv_store + compressor + indexer top-k
  * (everything up to but not including the attention call); PRE_C1_ATTN
  * = the attention call itself; PRE_C1_POST_ATTN = the back-rope on heads.
@@ -9602,8 +9602,8 @@ static bool metal_graph_encode_decode_layer_phased(
      * compressor + attention.  Ends with g->heads filled and ready for
      * attn_output.
      *
-     * Split into three sub-phases (Day-10 B.4) so the attention sub-phase
-     * can be batched-substituted with a multi-session call:
+     * Split into three sub-phases so the attention sub-phase can be
+     * batched-substituted with a multi-session call:
      *   PRE_C1_PRE_ATTN  -- head_rms + rope_q + kv path + kv_store +
      *                       compressor + indexer top-k
      *   PRE_C1_ATTN      -- attention kernel call
@@ -11418,7 +11418,7 @@ static bool metal_graph_warmup_prefill_kernels(
      * f32_to_f16_kernel into cuBLAS, and compute-sanitizer initcheck flags
      * thousands of uninitialized reads here.  Without this clear the warmup
      * was the only uninit-read source remaining on the single-session decode
-     * path (NOTES.md section 19.1 follow-up).
+     * path.
      */
     if (n_tokens <= 8) return true;
 
@@ -11519,7 +11519,7 @@ static bool metal_graph_q_stage_profile_boundary(
 /* Phase bit flags for metal_graph_encode_layer_attention_batch_phased.
  * Mirrors the decode-side DS4_DECODE_LAYER_PRE_* bitmask so future batched-
  * prefill substitutes can slot between phases the same way batched-decode
- * substitutes do.  See NOTES.md section 19 for the Day-5 design.
+ * substitutes do.
  *
  * Phase outputs (all in engine-level batch_* scratch):
  *   PRE_A1 : rms_norm_plain_rows + hc_attn_fn + hc_split/weighted_sum
@@ -11536,9 +11536,9 @@ static bool metal_graph_q_stage_profile_boundary(
  *
  * The thin wrapper metal_graph_encode_layer_attention_batch below calls
  * the phased variant with DS4_PREFILL_LAYER_ALL; existing callers are
- * unchanged.  D5-2 will introduce a multi-session outer loop that
- * interleaves phases across N sessions; D5-3+ will then slot batched
- * substitutes gated by DS4_CUDA_BATCHED_PREFILL_* env vars. */
+ * unchanged.  A multi-session outer loop that interleaves phases across
+ * N sessions, plus batched substitutes gated by DS4_CUDA_BATCHED_PREFILL_*
+ * env vars, slot on top of this skeleton. */
 #define DS4_PREFILL_LAYER_PRE_A1 1u
 #define DS4_PREFILL_LAYER_PRE_A2 2u
 #define DS4_PREFILL_LAYER_PRE_A  (DS4_PREFILL_LAYER_PRE_A1 | DS4_PREFILL_LAYER_PRE_A2)
@@ -12919,11 +12919,12 @@ static bool metal_graph_encode_layer_attention_batch_phased(
     return ok;
 }
 
-/* Thin wrapper that drives the full attention half of one prefill layer in
- * one call.  D5-2 will introduce a multi-session outer loop that calls the
- * phased variant with explicit phase masks so batched substitutes can slot
- * between phases; this wrapper preserves the today-shape behavior for the
- * existing callers (the prefill_layer_major and split_profile paths). */
+/* Thin wrapper that drives the full attention half of one prefill layer
+ * in one call.  A multi-session outer loop (see ds4_sessions_prefill_*)
+ * calls the phased variant with explicit phase masks so batched
+ * substitutes can slot between phases; this wrapper preserves the
+ * single-session behavior for the existing callers (the
+ * prefill_layer_major and split_profile paths). */
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -14893,7 +14894,7 @@ struct ds4_engine {
     ds4_gpu_tensor *batched_heads;
     ds4_gpu_tensor *batched_attn_low;
     ds4_gpu_tensor *batched_attn_out;
-    /* Per-layer PREFILL qkv scratch (Day-5 D5-3).  When the batched
+    /* Per-layer PREFILL qkv scratch.  When the batched
      * prefill path collapses PRE_A2 (q_a + attn_kv + dsv4_qkv_rms_norm)
      * across N sessions x n_tok rows, each session's g->batch_attn_norm
      * is gathered into batched_prefill_attn_norm with one row per
@@ -16355,7 +16356,7 @@ static bool ensure_engine_batched_attn_output_scratch(ds4_engine *e,
         && ensure_engine_scratch(&e->batched_attn_out, DS4_N_EMBD);
 }
 
-/* Variable-sized resizable engine scratch (Day-5 D5-3 prefill substitutes).
+/* Variable-sized resizable engine scratch (prefill substitutes).
  * Unlike ensure_engine_scratch (sized for DS4_BATCH_MAX rows up front), the
  * prefill paths size scratch by n_active * n_tok which grows with workload,
  * so we resize-on-demand: keep the existing buffer if it already has enough
@@ -16462,15 +16463,15 @@ static bool metal_graph_encode_shared_ffn_batched(
                                        sessions[i]->graph.ffn_norm, 0,
                                        (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
     }
-    /* Day-6 D6-1 originally fused gate+up via the Q4 pair-batch kernel
-     * (one launch reads the shared activation once instead of twice).
-     * Section 30 (D8-3) later established that the interleaved-acc pair
-     * structure drifts under --use_fast_math FMA reorder at long ctx and
-     * cascades into a SwiGLU NaN; the single-session shared_gate_up
-     * helper was switched to two sequential single-Q4 matmuls as a
-     * result.  Mirror that policy here: default to the two-single path
-     * and gate the pair-batch behind an explicit opt-in for diagnosis.
-     * DS4_CUDA_ENABLE_BATCHED_SHARED_GATE_UP_PAIR=1 restores the old
+    /* The Q4 pair-batch kernel (one launch reads the shared activation
+     * once instead of twice) was the original gate+up implementation,
+     * but the interleaved-acc pair structure drifts under
+     * --use_fast_math FMA reorder at long ctx and cascades into a
+     * SwiGLU NaN.  The single-session shared_gate_up helper was
+     * switched to two sequential single-Q4 matmuls as a result;
+     * mirror that policy here.  Default to the two-single path and
+     * gate the pair-batch behind an explicit opt-in for diagnosis.
+     * DS4_CUDA_ENABLE_BATCHED_SHARED_GATE_UP_PAIR=1 restores the
      * pair-batch (faster but precision-unsafe at long ctx). */
     const bool enable_pair_batch =
         getenv("DS4_CUDA_ENABLE_BATCHED_SHARED_GATE_UP_PAIR") != NULL;
@@ -16544,10 +16545,10 @@ static bool metal_graph_encode_q_b_batched(
         }
     }
     /* Q8 path only when explicitly requested via Q8_NO_Q4.  The N>=2 Q4
-     * NaN cascade documented in section 21 was actually an intermittent
-     * scatter-completion race; the device sync at the bottom of this
-     * function closes that window so Q4 batch matmul is safe at N>=2.
-     * (See section 24.) */
+     * NaN cascade that originally motivated the Q8 fallback was an
+     * intermittent scatter-completion race; the device sync at the
+     * bottom of this function closes that window so the Q4 batch
+     * matmul is safe at N>=2. */
     const bool use_q8 = getenv("DS4_CUDA_Q8_NO_Q4") != NULL;
     if (ok) {
         if (use_q8)
@@ -16574,7 +16575,7 @@ static bool metal_graph_encode_q_b_batched(
     /* Scatter-completion fence: pass2 (per-session PRE_C1) consumes
      * sessions[i]->graph.q, and at N>=2 we have observed intermittent
      * NaN cascades when the consumer launches before our async scatter
-     * lands.  Forcing a device sync here closes the window (section 24). */
+     * lands.  Forcing a device sync here closes the window. */
     if (ok && n_active > 1) ok = ds4_gpu_synchronize() != 0;
     return ok;
 }
@@ -16599,7 +16600,7 @@ static bool metal_graph_encode_qkv_batched(
         const ds4_layer_weights *layer) {
     if (metal_graph_use_reference_qkv_norm()) return false;
     /* See metal_graph_encode_q_b_batched: scatter-completion sync below
-     * makes the Q4 batch path safe at N>=2.  Section 24. */
+     * makes the Q4 batch path safe at N>=2. */
     const bool q8_no_q4 = getenv("DS4_CUDA_Q8_NO_Q4") != NULL;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     if (!ensure_engine_batched_qkv_scratch(e, q_rank)) return false;
@@ -16610,7 +16611,7 @@ static bool metal_graph_encode_qkv_batched(
                                        sessions[i]->graph.attn_norm, 0,
                                        (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
     }
-    /* Use Q8 batch matmul when Q8_NO_Q4 is set (see section 21). */
+    /* Use Q8 batch matmul when Q8_NO_Q4 is set. */
     if (ok) {
         if (q8_no_q4)
             ok = ds4_gpu_matmul_q8_0_tensor(
@@ -16677,7 +16678,7 @@ static bool metal_graph_encode_qkv_batched(
     return ok;
 }
 
-/* Day-5 D5-3: prefill-side analog of metal_graph_encode_qkv_batched above.
+/* Prefill-side analog of metal_graph_encode_qkv_batched above.
  * Substitutes the whole PRE_A2 phase (attn_q_a + attn_kv + dsv4_qkv_rms_
  * norm_rows) across N sessions, where each session contributes n_tok rows.
  * Gathers per-session g->batch_attn_norm into batched_prefill_attn_norm
@@ -16689,8 +16690,8 @@ static bool metal_graph_encode_qkv_batched(
  *
  * Requires all sessions to contribute the same n_tok (caller verifies);
  * matmul reduction order is the only thing that shifts vs the per-session
- * path, and the small numerical drift is already in the section-15
- * variance band the bench tolerates.
+ * path, and the small numerical drift is well within the bench's
+ * accepted variance band.
  *
  * Returns false on any failure (resize, gather, matmul, scatter) so the
  * caller can fall back to per-session phased(PRE_A2). */
@@ -16814,10 +16815,10 @@ static bool metal_graph_encode_attn_output_batched(
     return ok;
 }
 
-/* Day-10 B.4: multi-session decode attention.  Stages each session's
- * post-rope g->q (PRE_C1_PRE_ATTN has already run) into engine
- * batched_q, calls the multi-session attention kernel (one per layer),
- * and scatters batched_heads back to per-session g->heads.  PRE_C1_POST_ATTN
+/* Multi-session decode attention.  Stages each session's post-rope
+ * g->q (PRE_C1_PRE_ATTN has already run) into engine batched_q, calls
+ * the multi-session attention kernel (one per layer), and scatters
+ * batched_heads back to per-session g->heads.  PRE_C1_POST_ATTN
  * (rope-back on heads) still runs per-session afterwards.
  *
  * Layer dispatch: for ratio==4 layers when every session has
@@ -16925,14 +16926,14 @@ static bool metal_graph_encode_decode_attention_multi_session(
                 decode_top_k, raw_window, ratio,
                 DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
     } else {
-        /* Day-10 B.4: the single-session attention_decode_heads_tensor
-         * wrapper (ds4_cuda.cu line 8533) passes window=0, ratio=0 to the
-         * decode kernel unconditionally.  That forces single_all=true so
-         * raw_count and visible_comp use the simple branch.  Passing the
-         * layer's actual ratio/window here would take the else-if branch
-         * which produces the same value but via a different fp32
-         * reduction order under --use_fast_math, drifting the residual
-         * stream over decode steps. */
+        /* The single-session attention_decode_heads_tensor wrapper
+         * passes window=0, ratio=0 to the decode kernel
+         * unconditionally.  That forces single_all=true so raw_count
+         * and visible_comp use the simple branch.  Passing the layer's
+         * actual ratio/window here would take the else-if branch which
+         * produces the same value but via a different fp32 reduction
+         * order under --use_fast_math, drifting the residual stream
+         * over decode steps. */
         ok = ds4_gpu_attention_decode_heads_multi_session_tensor(
                 e->batched_heads,
                 e->model.map, e->model.size,
@@ -16948,16 +16949,15 @@ static bool metal_graph_encode_decode_attention_multi_session(
 
     /* Scatter batched_heads back to per-session g->heads.
      *
-     * Day-10 B.4 note: section 24 added an explicit
-     * `ds4_gpu_synchronize()` after the analogous scatter in the
-     * batched QKV/Q_B encoders to close a "pass-2 per-session reads
-     * launch before async scatter lands" race on GB10.  I tried the
-     * same shape here (sync at end when n_active > 1) but it did not
-     * change the cross-restart variance pattern: variance is still
-     * tied to the GB10 unified-memory allocator's degraded regime
-     * documented in sections 25-28, not to a scatter race in this
-     * helper.  Within a single fresh server, multi-session attention
-     * is deterministically clean across 48+ burst iterations even
+     * The batched QKV/Q_B encoders add an explicit
+     * `ds4_gpu_synchronize()` after the analogous scatter to close a
+     * "pass-2 per-session reads launch before async scatter lands"
+     * race on GB10.  The same shape was tried here (sync at end when
+     * n_active > 1) but did not change the cross-restart variance
+     * pattern: variance is tied to the GB10 unified-memory allocator's
+     * degraded regime, not to a scatter race in this helper.  Within
+     * a single fresh server, multi-session attention is
+     * deterministically clean across 48+ burst iterations even
      * without the extra sync, because stream ordering on
      * g_kernel_stream already serialises scatter -> rope_back. */
     for (int i = 0; ok && i < n_active; i++) {
@@ -17172,8 +17172,8 @@ static bool metal_graph_encode_token_raw_swa_batched_n_sessions(
          * failed.  This pass is skipped only when neither qkv nor q_b
          * was requested (everything was already in pass1).
          *
-         * Day-10 B.4: when want_batched_decode_attention is set, pass2
-         * runs PRE_C1_PRE_ATTN (head_rms + rope_q + kv_path + kv_store +
+         * When want_batched_decode_attention is set, pass2 runs
+         * PRE_C1_PRE_ATTN (head_rms + rope_q + kv_path + kv_store +
          * compressor + indexer) per-session; the attention sub-phase is
          * then handled by metal_graph_encode_decode_attention_multi_session
          * across all N sessions; PRE_C1_POST_ATTN (rope-back on heads)
@@ -19421,8 +19421,8 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
      * reuse win at N = 2..8 on this hardware but flattens past N = 8
      * (high run-to-run variance, occasional hangs at N >= 32).  The
      * earlier suspicion that this was cuda_tmp_alloc contention was
-     * traced and disproved (NOTES.md section 10): the scratch allocator
-     * never reallocates during decode.  The real cap is L2 working-set:
+     * traced and disproved: the scratch allocator never reallocates
+     * during decode.  The real cap is L2 working-set:
      * per-session scratch + active expert weights for N sessions
      * approach GB10's 24 MiB L2, after which the "session 0 cold-
      * fetches, sessions 1-N hit L2" pattern breaks down and per-session
@@ -19494,10 +19494,9 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
          * engine-level batched-N path; the batched path is gated behind
          * DS4_CUDA_BATCHED_SHARED_FFN=1 because the naive Q4 batched
          * matmul kernel does not beat the fused per-session pair matmul
-         * at this layer's small out_dim (DS4_N_FF_EXP=2048) -- see
-         * NOTES.md for the experiment that established this.  The
-         * scaffolding is kept so a future custom Q4 batched-pair kernel
-         * can flip the default. */
+         * at this layer's small out_dim (DS4_N_FF_EXP=2048) in
+         * empirical testing.  The scaffolding is kept so a future
+         * custom Q4 batched-pair kernel can flip the default. */
         const bool want_batched_shared_ffn =
             (getenv("DS4_CUDA_BATCHED_SHARED_FFN") != NULL);
         const bool want_batched_q_b =
@@ -19506,10 +19505,10 @@ int ds4_session_eval_batched_decode(ds4_batch_slot *slots, int n,
             (getenv("DS4_CUDA_BATCHED_QKV") != NULL);
         const bool want_batched_attn_output =
             (getenv("DS4_CUDA_BATCHED_ATTN_OUTPUT") != NULL);
-        /* Day-10 B.4: multi-session attention kernel.  Replaces the
-         * per-session attention call inside PRE_C1 (which fundamentally
-         * has to read each session's own KV cache) with one kernel
-         * launch parameterized by an N-entry descriptor array.  Requires
+        /* Multi-session attention kernel.  Replaces the per-session
+         * attention call inside PRE_C1 (which fundamentally has to
+         * read each session's own KV cache) with one kernel launch
+         * parameterized by an N-entry descriptor array.  Requires
          * batched attn_output to be active so the dispatch already
          * splits PRE_C into PRE_C1 / PRE_C2 / PRE_C3 with batched
          * substitutes at the right boundaries. */
@@ -20266,23 +20265,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 #endif
 }
 
-/* D5-2: Per-layer interleaved multi-session prefill.
+/* Per-layer interleaved multi-session prefill.
  *
  * For each of the DS4_N_LAYER layers, the function encodes the whole
  * layer (attention half + FFN half + HC swap) for every session before
  * advancing to the next layer.  This mirrors the decode-side
- * metal_graph_encode_token_raw_swa_batched_n_sessions (ds4.c:16143);
- * the only difference vs N back-to-back metal_graph_prefill_layer_major
- * calls today is the loop nesting (layers outside, sessions inside).
+ * metal_graph_encode_token_raw_swa_batched_n_sessions; the only
+ * difference vs N back-to-back metal_graph_prefill_layer_major calls
+ * is the loop nesting (layers outside, sessions inside).
  *
  * Per-session work is unchanged -- each call is the same
  * metal_graph_encode_layer_batch (=phased(ALL_PHASES) + ffn + hc swap)
- * the single-session path uses.  No batched substitutes hook in yet;
- * those come in D5-3+ (the phase split landed in D5-1 is the
- * prerequisite for slotting substitutes between phases).  The immediate
- * payoff is L2 weight reuse: the layer weight is read into cache once
- * and consumed by all n_active sessions in turn, instead of being
- * evicted and re-fetched per session.
+ * the single-session path uses.  The phase split is the prerequisite
+ * for slotting batched substitutes between phases at the call sites
+ * below.  The immediate payoff is L2 weight reuse: the layer weight
+ * is read into cache once and consumed by all n_active sessions in
+ * turn, instead of being evicted and re-fetched per session.
  *
  * Eligibility (silent fallback to per-session ds4_session_sync):
  *   - all sessions must share the same engine and be GPU sessions
@@ -20305,14 +20303,14 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
     ds4_engine *e = sessions[0]->engine;
     if (!e) return false;
 
-    /* D5-5 / D5-6: per-session prefill that may span multiple chunks.
+    /* Per-session prefill that may span multiple chunks.
      * start[i] is the position at which session i needs to begin
      * extending its KV state (= committed checkpoint length if valid,
      * else 0).  suffix_len[i] is how many new tokens session i must
      * prefill.
      *
      * Single-chunk path: every suffix fits in one prefill_cap chunk.
-     * Chunked path (D5-6): allowed only when every start[i] == 0 (cold
+     * Chunked path: allowed only when every start[i] == 0 (cold
      * prefill of N parallel long prompts).  Chunked resume from a
      * non-zero checkpoint is more delicate (chunk-boundary alignment to
      * the per-session start) and stays as a follow-up.
@@ -20379,7 +20377,7 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
 
     if (ok) ok = ds4_gpu_begin_commands() != 0;
 
-    /* D5-3: opt-in PRE_A2 batched substitute.  Requires same suffix_len
+    /* Opt-in PRE_A2 batched substitute.  Requires same suffix_len
      * AND same start across all sessions AND single-chunk fit (the
      * substitute does a single batched matmul whose KV cache pos0 must
      * agree across rows) and at least 2 active sessions. */
@@ -20540,34 +20538,29 @@ static bool metal_graph_prefill_layer_major_batched_n_sessions(
     }
     return ok;
 }
-/* Day-4 D4-2 scaffolding: multi-session batched prefill API surface.
- * Today this is a sequential loop over ds4_session_sync() -- equivalent
- * to N back-to-back per-session syncs, the engine-side per-layer
- * interleaved batched encoder is NOT exercised on the prefill path
- * yet.  The API is in place so a Day-5+ batched implementation can
- * replace this body without changing callers.
+/* Multi-session batched prefill API surface.  Dispatches to the
+ * batched layer-major encoder when eligible, otherwise falls back to
+ * a sequential loop of ds4_session_sync() calls (= N back-to-back
+ * per-session syncs).
  *
- * The batched implementation will require:
- *  1. Splitting metal_graph_encode_layer_attention_batch into phases
+ * The batched path requires:
+ *  1. metal_graph_encode_layer_attention_batch split into phases
  *     analogous to the decode-side DS4_DECODE_LAYER_PRE_A1/A2/B/C
- *     bitmask used in sections 11-13.
+ *     bitmask.
  *  2. An outer per-layer interleaved loop that drives N sessions
  *     through each phase in lockstep, like
  *     metal_graph_encode_token_raw_swa_batched_n_sessions does for
  *     decode.
  *  3. Per-phase batched substitutes (attn_q_a, qkv, attn_output for
  *     prefill) that gather N sessions' rows into engine-level scratch,
- *     run one larger matmul, and scatter back.
- *
- * See NOTES section 19 for the full Day-5+ design and the recon trail
- * (sections 11-17 for the decode-side analog). */
+ *     run one larger matmul, and scatter back. */
 int ds4_sessions_sync_batched(ds4_session **sessions,
                               const ds4_tokens **prompts,
                               int n,
                               char *err, size_t errlen) {
     if (!sessions || !prompts || n <= 0) return 0;
 #ifndef DS4_NO_GPU
-    /* D5-2 fast path: per-layer interleaved multi-session prefill.
+    /* Fast path: per-layer interleaved multi-session prefill.
      * Silently falls back (no err written) when any session is
      * ineligible (CPU backend, oversized prompt, live checkpoint,
      * etc.); writes err only on real GPU failure. */

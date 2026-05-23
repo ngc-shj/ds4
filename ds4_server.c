@@ -7539,9 +7539,8 @@ static void server_log(ds4_log_type type, const char *fmt, ...) {
 
 typedef struct job job;
 
-/* Maximum batched-decode pool depth.  Engine caps the batched-decode
- * encoder at 8 (DS4_BATCH_INTERLEAVED_MAX, see ds4.c:18341); bench
- * section 13 measured +57.5 % aggregate at N=8 fresh-boot. */
+/* Maximum batched-decode pool depth.  Capped at DS4_BATCH_INTERLEAVED_MAX
+ * from the engine. */
 #define DS4_SERVER_BATCH_MAX 8
 
 typedef ds4_kvstore_entry kv_entry;
@@ -7632,7 +7631,7 @@ struct server {
      * counters in kv_disk_cache.continued_last_store_tokens. */
     ds4_session *batched_sessions[DS4_SERVER_BATCH_MAX];
     int batched_pool_actual;  /* <= DS4_SERVER_BATCH_MAX; runtime cap */
-    /* Day-9 D auto fast-path: when no parallel burst has been seen for
+    /* Auto fast-path: when no parallel burst has been seen for
      * `batched_fast_cooldown_sec`, the worker's gather loop uses a 0 ms
      * budget so single-user requests do not pay the 50 ms pair-wait
      * latency.  A successful >= 2-job batch sets `batched_last_parallel_ts`
@@ -10668,10 +10667,12 @@ static void signal_done(job *j) {
     pthread_mutex_unlock(&j->mu);
 }
 
-/* Day-1 batchable predicate: only the simplest, most common code paths.
+/* Batchable predicate: only the simplest, most common code paths.
  * Anything that needs DSML tool tracking, thinking mode, structured
- * streams, KV disk cache, stop strings, or MTP speculative decoding
- * goes through the legacy generate_job() path on s->session. */
+ * streams, stop strings, or MTP speculative decoding goes through the
+ * legacy generate_job() path on s->session.  Streaming is supported
+ * via the plain-SSE path (sse_chunk delta + sse_done); the structured
+ * OpenAI live-stream flow is excluded above via has_tools / think_mode. */
 static bool request_is_batchable(const server *s, const request *r) {
     if (!s->batched_sessions[0] || !s->batched_sessions[1]) return false;
     if (r->has_tools) return false;
@@ -10679,15 +10680,6 @@ static bool request_is_batchable(const server *s, const request *r) {
     if (r->api != API_OPENAI) return false;
     if (r->stops.max_len > 0) return false;
     if (r->temperature <= 0.0f) return false;
-    /* Day-2 D2-3: streaming is supported via the simple plain-SSE path
-     * (sse_chunk delta + sse_done).  The structured OpenAI live-stream
-     * flow (role chunks, tool-call deltas) is NOT exercised in batched
-     * mode -- has_tools and think_mode are already excluded above, so
-     * the remaining stream payload is a sequence of plain content
-     * deltas which the simple path handles correctly. */
-    /* Day-2 D2-5: KV disk cache is now per-session, so s->kv.enabled
-     * no longer blocks batching.  generate_batched calls
-     * kv_cache_try_load + kv_cache_store_current per slot. */
     return true;
 }
 
@@ -10737,7 +10729,7 @@ static void generate_batched(server *s, job **jobs, int n) {
     const int eos = ds4_token_eos(s->engine);
     const double t0 = now_sec();
 
-    /* Three-phase prefill (D5-4 wires up the D5-2 engine batched API):
+    /* Three-phase prefill:
      *   Phase 1: per-slot KV-disk-cache try-load + collect prompts.
      *   Phase 2: single ds4_sessions_sync_batched() call across all
      *            eligible slots.  On any failure, fall back to a
@@ -10745,11 +10737,10 @@ static void generate_batched(server *s, job **jobs, int n) {
      *            is identified without poisoning the others.
      *   Phase 3: per-slot post-sync bookkeeping (prompt_tokens,
      *            max_tokens, request id, rng seed).
-     * Sequential constraint from Day-2 D2-1 still holds for Phase 2:
-     * the batched API drives a single engine and a single
-     * g_kernel_stream; only the host-side nesting changes (layers
-     * outside, sessions inside) so the layer weights take one L2
-     * sweep across N sessions instead of N. */
+     * Phase 2 drives a single engine and a single g_kernel_stream;
+     * only the host-side nesting changes (layers outside, sessions
+     * inside) so the layer weights take one L2 sweep across N
+     * sessions instead of N. */
     const ds4_tokens *batch_prompts[DS4_SERVER_BATCH_MAX];
     for (int k = 0; k < n; k++) batch_prompts[k] = NULL;
 
@@ -10964,9 +10955,9 @@ static void generate_batched(server *s, job **jobs, int n) {
         }
     }
 
-    /* Day-2 D2-5: persist the post-generation KV state per slot so the
-     * next turn of the same conversation can hit kv_cache_try_load.
-     * Skipped on error finishes -- the live graph might be torn. */
+    /* Persist the post-generation KV state per slot so the next turn of
+     * the same conversation can hit kv_cache_try_load.  Skipped on
+     * error finishes -- the live graph might be torn. */
     if (s->kv.enabled) {
         for (int k = 0; k < n; k++) {
             if (strcmp(finish[k], "error") == 0) continue;
@@ -10988,12 +10979,12 @@ static void generate_batched(server *s, job **jobs, int n) {
     }
 }
 
-/* Day-2 D2-2 worker loop: gather up to DS4_SERVER_BATCH_MAX batchable
- * requests off the queue (50 ms initial wait for the first pair-mate,
- * then non-blocking grabs for the rest -- subsequent jobs that are
- * already queued cost nothing more in latency, but waiting longer
- * starves the first request).  A non-batchable spillover request found
- * mid-gather is processed on the legacy path after the batched run. */
+/* Worker loop: gather up to DS4_SERVER_BATCH_MAX batchable requests
+ * off the queue (50 ms initial wait for the first pair-mate, then
+ * non-blocking grabs for the rest -- subsequent jobs that are already
+ * queued cost nothing more in latency, but waiting longer starves the
+ * first request).  A non-batchable spillover request found mid-gather
+ * is processed on the legacy path after the batched run. */
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
@@ -11047,16 +11038,14 @@ static void *worker_main(void *arg) {
         } else {
             generate_job(s, gathered[0]);
             signal_done(gathered[0]);
-            /* Burst-detection bootstrap.  Section 29's auto fast-path
-             * uses gather_budget=0 outside cooldown, which means the
-             * very first parallel burst arriving on a freshly-started
-             * server (or after >cooldown idle) races the HTTP parser:
-             * if siblings finish their 1-5 ms parse after we have
-             * already entered dequeue_pair_wait(0), n_gathered stays
-             * at 1 and `batched_last_parallel_ts` never advances --
-             * so the next iteration also gets budget=0, and so on.
-             * Section 33b's N-sweep observed N=8 scaling at only 1.26x
-             * (vs section 22 baseline 5.05x) because of this trap.
+            /* Burst-detection bootstrap.  The auto fast-path uses
+             * gather_budget=0 outside cooldown, which means the very
+             * first parallel burst arriving on a freshly-started server
+             * (or after >cooldown idle) races the HTTP parser: if
+             * siblings finish their 1-5 ms parse after we have already
+             * entered dequeue_pair_wait(0), n_gathered stays at 1 and
+             * `batched_last_parallel_ts` never advances -- so the next
+             * iteration also gets budget=0, and so on.
              *
              * Resolution: after dispatching j1 alone, peek at the
              * queue.  If siblings landed during the seconds-long
@@ -11723,14 +11712,10 @@ int main(int argc, char **argv) {
      * the batched path -- the worker keeps using s->session via
      * generate_job() (request_is_batchable() guards on
      * batched_sessions[0] && batched_sessions[1]). */
-    /* Section 28: per-layer state buffers (raw_cache, comp_cache,
-     * attn_state_{kv,score}) are now lazy-allocated, dropping the
-     * session-create alloc count by 4 * N_LAYER per session.  With
-     * that, pool=8 + ctx=32K no longer trips the driver allocator
-     * regime that sections 25/26 documented, so the ctx-adaptive cap
-     * is removed and DS4_SERVER_BATCH_MAX (= 8) is the default again.
-     * The env override is retained for operators who want to cap
-     * lower for any reason. */
+    /* Per-layer state buffers are lazy-allocated so pool=8 at ctx>=32K
+     * does not trip the GB10 unified-memory allocator into a degraded
+     * regime.  DS4_SERVER_BATCH_MAX_RUNTIME caps the pool lower if an
+     * operator wants. */
     int dbg_pool_cap = DS4_SERVER_BATCH_MAX;
     const char *dbg_env = getenv("DS4_SERVER_BATCH_MAX_RUNTIME");
     if (dbg_env && dbg_env[0]) {
@@ -11743,10 +11728,9 @@ int main(int argc, char **argv) {
                dbg_env && dbg_env[0] ? dbg_env : "default");
     s.batched_pool_actual = dbg_pool_cap;
     /* Auto fast-path config: skip the 50 ms pair-wait when no parallel
-     * burst has been seen for `cooldown` seconds.  Section 16 D2-2
-     * introduced the 50 ms wait to capture near-simultaneous N-curl
-     * bursts; this gate keeps that win for parallel traffic while
-     * giving single-user dispatch the same throughput as pool=1. */
+     * burst has been seen for `cooldown` seconds.  Keeps the gather win
+     * for parallel traffic while giving single-user dispatch the same
+     * throughput as pool=1. */
     {
         const char *fast_env = getenv("DS4_SERVER_AUTO_FAST_PATH");
         s.batched_auto_fast_path_enabled =

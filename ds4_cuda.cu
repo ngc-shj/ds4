@@ -134,11 +134,11 @@ static int g_capture_active = 0;
 static int g_skip_update = 0;
 static int g_skip_update_armed = 0;
 
-/* Section 33g: ported from perf/cuda-graph-wip (5ae22be).  Per-decode-
- * step scalar arguments held in __constant__ memory.  When CUDA Graph
- * capture is active, the host updates this symbol once per token via
- * cudaMemcpyToSymbolAsync, which the capture records as a memcpy node.
- * Default behavior is unchanged (capture off); DS4_CUDA_GRAPH=1 enables. */
+/* CUDA Graph capture scaffolding: per-decode-step scalar arguments
+ * held in __constant__ memory.  When capture is active (DS4_CUDA_GRAPH=1),
+ * the host updates this symbol once per token via cudaMemcpyToSymbolAsync,
+ * which the capture records as a memcpy node.  Default behavior is
+ * unchanged (capture off). */
 struct ds4_step_args {
     uint32_t token;
     uint32_t pos;
@@ -1179,11 +1179,10 @@ static const unsigned char *cuda_q4_from_f16_ptr(
     const char *f16_src = cuda_model_range_ptr(model_map, offset, weight_bytes_f16, "f16_for_q4");
     if (!f16_src) return NULL;
 
-    /* Diagnostic for capture-safety debugging (section 33g preload audit):
-     * if a lazy build happens during graph capture, the preload missed
-     * a tensor and we'll crash with "operation not permitted when stream
-     * is capturing".  DS4_CUDA_Q4_F16_TRACE=1 enables the trace outside
-     * capture too. */
+    /* Diagnostic for capture-safety debugging: if a lazy build happens
+     * during graph capture, the preload missed a tensor and we'll crash
+     * with "operation not permitted when stream is capturing".
+     * DS4_CUDA_Q4_F16_TRACE=1 enables the trace outside capture too. */
     if (g_capture_active || getenv("DS4_CUDA_Q4_F16_TRACE") != NULL) {
         fprintf(stderr, "ds4: CUDA q4-from-f16 LAZY BUILD offset=%llu in_dim=%llu out_dim=%llu bytes=%llu\n",
                 (unsigned long long)offset,
@@ -2074,15 +2073,10 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
  * g_kernel_stream see the result; host code reading the destination
  * needs its own sync.
  *
- * Day-2 D2-4 (NOTES top open-followup item 4 / section 14 race
- * hypothesis): previously this issued on the default stream (0).
- * That worked through CUDA's legacy default-stream serialization when
- * no other stream-aware code crossed the call, but the per-layer
- * batched-decode encoder (sections 11-13) interleaves named-stream
- * kernels and default-stream copies, opening a race window for the
- * gather/scatter pair around each batched matmul.  Routing the copy
- * through g_kernel_stream closes that window and is a prerequisite
- * for the Shared-FFN v2 work documented in section 14. */
+ * Issued on g_kernel_stream rather than the default stream (0) so the
+ * per-layer batched-decode encoder's interleaved named-stream kernels
+ * and these copies do not race around the gather/scatter pair of each
+ * batched matmul. */
 extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                           const ds4_gpu_tensor *src, uint64_t src_offset,
                                           uint64_t bytes) {
@@ -2099,7 +2093,7 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offse
                    "tensor copy async");
 }
 
-/* Section 33g: capture-aware begin/end/sync.  DS4_CUDA_GRAPH=1 enables. */
+/* Capture-aware begin/end/sync.  DS4_CUDA_GRAPH=1 enables. */
 extern "C" int ds4_gpu_begin_commands(void) {
     if (cuda_capture_init() && !g_capture_active) {
         cudaError_t err = cudaStreamBeginCapture(g_capture_stream,
@@ -2387,8 +2381,8 @@ extern "C" int ds4_gpu_cache_q4_0_range(const void *model_map, uint64_t model_si
     return 1;
 }
 
-/* Section 33g: preload F16->Q4 cache for tensors that the F16 decode
- * path quantizes lazily.  Without this, the first decode token's
+/* Preload F16->Q4 cache for tensors that the F16 decode path
+ * quantizes lazily.  Without this, the first decode token's
  * cuda_q4_from_f16_ptr() call triggers cudaMalloc + cudaDeviceSynchronize
  * inside the matmul wrapper -- which is fine in non-capture mode but
  * crashes CUDA Graph capture ("operation not permitted when stream is
@@ -2783,8 +2777,8 @@ __global__ static void matmul_q8_0_preq_kernel(
  * applied via a shared-memory staged store of the int32 c_frag.
  *
  * Gated on DS4_CUDA_TC_DECODE=1.  Expected outcome (per analysis): no
- * win or regression vs Q4 dp4a baseline; this kernel will join the NOTES
- * section 9 documented dead-end once measured. */
+ * win or regression vs Q4 dp4a baseline; kept as an explicit measurable
+ * dead-end. */
 __global__ static void matmul_q8_0_wmma_int8_kernel(
         float *out,
         const unsigned char *w,
@@ -3165,13 +3159,12 @@ __global__ static void matmul_q4_0_preq_warp8_kernel(
 }
 
 
-/* Section 33f: shared_gate_up_swiglu Q4_0 fused kernel.  Two sequential
- * passes (gate then up) keep each accumulator's FMA order identical to
- * the standalone matmul_q4_0_preq_warp8_kernel -- so this preserves the
- * section 30 D8-3 fix (which banned the interleaved-acc pair kernel for
- * shared FFN at long context).  The win vs dual_tensor + swiglu is
- * purely kernel-launch overhead: 4 launches (prequant + gate + up +
- * swiglu) become 2 launches (prequant + this fused kernel). */
+/* shared_gate_up_swiglu Q4_0 fused kernel.  Two sequential passes
+ * (gate then up) keep each accumulator's FMA order identical to the
+ * standalone matmul_q4_0_preq_warp8_kernel, preserving the
+ * default-skip-pair policy needed at long context.  Win vs
+ * dual_tensor + swiglu is kernel-launch overhead: 4 launches
+ * (prequant + gate + up + swiglu) become 2 (prequant + this fused). */
 __global__ static void shared_gate_up_swiglu_q4_0_preq_warp8_kernel(
         float *out,
         const unsigned char *gate_w,
@@ -3282,9 +3275,9 @@ __global__ static void matmul_q4_0_preq_batch_warp8_kernel(
     if (lane == 0) out[tok * out_dim + row] = acc;
 }
 
-/* Day-6 D6-1: Q4 pair + batch.  Same shape as matmul_q4_0_pair_preq_warp8_
- * kernel below (two Q4 weight matrices w0/w1 producing two outputs from
- * one shared activation), generalized over n_tok rows: out0[tok, row] =
+/* Q4 pair + batch matmul.  Same shape as matmul_q4_0_pair_preq_warp8_kernel
+ * below (two Q4 weight matrices w0/w1 producing two outputs from one
+ * shared activation), generalized over n_tok rows: out0[tok, row] =
  * sum_b dot(packed0[row, b], xq[tok, b]) * scale0[row, b] * xscale[tok, b]
  * and same for out1.  The shared activation is read once per (tok, block)
  * and consumed by both row computations, so this halves the weight-side
@@ -3444,11 +3437,11 @@ __global__ static void matmul_q4_0_hc_expand_preq_warp8_kernel(
     }
 }
 
-/* Q4 variant of grouped_q8_0_a_preq_warp8_kernel for attention output. */
-/* Section 33h (from perf/single-decode-30): fused prequant + Q4 matmul
- * for attn_output_a (grouped) single-decode path.  Replaces 2 launches
- * (quantize_q8_0_f32_kernel + grouped_q4_0_a_preq_warp8_kernel) + one
- * cuda_tmp_alloc with a single launch using shared memory for xq/xscale. */
+/* Q4 variant of grouped_q8_0_a_preq_warp8_kernel for attention output.
+ * Fused prequant + Q4 matmul for attn_output_a (grouped) single-decode
+ * path.  Replaces 2 launches (quantize_q8_0_f32_kernel +
+ * grouped_q4_0_a_preq_warp8_kernel) + one cuda_tmp_alloc with a single
+ * launch using shared memory for xq/xscale. */
 __global__ static void grouped_q4_0_a_fused_quant_warp8_kernel(
         float *low,
         const unsigned char *w,
@@ -4065,10 +4058,10 @@ __device__ static DS4_CUDA_UNUSED void rope_tail_one_dev(float *x, uint32_t head
     }
 }
 
-/* Section 33h (from perf/single-decode-30): fused FP8 quantize + store_raw
- * for the single-token decode path.  Replaces two kernel launches
- * (fp8_kv_quantize_kernel + store_raw_kv_batch_kernel) with one, saving
- * ~1 kernel launch overhead per layer per decode token (60 launches/token). */
+/* Fused FP8 quantize + store_raw for the single-token decode path.
+ * Replaces two kernel launches (fp8_kv_quantize_kernel +
+ * store_raw_kv_batch_kernel) with one, saving ~1 kernel launch
+ * overhead per layer per decode token (60 launches/token). */
 __global__ static void kv_fp8_store_raw_one_kernel(
         float *kv,
         float *raw,
@@ -4482,8 +4475,8 @@ __global__ static void attention_unpack_group_low_kernel(
     low[(uint64_t)t * low_dim + (uint64_t)g * rank + r] = tmp[gid];
 }
 
-/* Day-10 B.4: per-session descriptor for the multi-session decode attention
- * kernels.  Each session contributes one block along grid.z; the kernel reads
+/* Per-session descriptor for the multi-session decode attention kernels.
+ * Each session contributes one block along grid.z; the kernel reads
  * its own raw_cache, comp_cache, topk pointer plus its own (n_raw, raw_start,
  * n_comp, pos0) scalars from this struct.  Q is staged into engine-level
  * batched_q [n_sessions, n_head * head_dim] and heads are written into
@@ -4562,13 +4555,13 @@ __global__ static void attention_decode_mixed_multi_session_kernel(
     __syncthreads();
     uint32_t n_score = raw_count + visible_comp;
     float local_max = sinks[h];
-    /* Day-10 B.4: match the single-session attention_decode_mixed_kernel's
+    /* Match the single-session attention_decode_mixed_kernel's
      * n_tokens=1 path -- always per-thread serial dot, never the heads-8
      * warp-cooperative reduction.  The cooperative path computes the same
      * value algebraically but with --use_fast_math FMA contraction it
      * produces a slightly different fp32 result; that drift compounds
      * through the residual stream over many decode steps and shows up as
-     * "Hello! Rebellion prouduhà"-style token drift. */
+     * token drift in the output. */
     for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
         const float *kvrow = raw_kv + (uint64_t)raw_rows[r] * head_dim;
         float dot = 0.0f;
@@ -8111,12 +8104,12 @@ extern "C" int ds4_gpu_matmul_q4_0_batch_warp_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q4_0 batch warp launch");
 }
 
-/* Day-6 D6-1 wrapper: Q4 pair + batch matmul.  See
+/* Q4 pair + batch matmul wrapper.  See
  * matmul_q4_0_pair_preq_batch_warp_kernel for the math.  Quantizes the
  * shared activation once (Q8 with per-block scale), then issues a single
  * pair-batch kernel that computes both out0 and out1 from the same Q8
- * activation.  Used by SHARED_FFN gate+up batched substitute (ds4.c
- * metal_graph_encode_shared_ffn_batched) to replace two back-to-back
+ * activation.  Used by SHARED_FFN gate+up batched substitute
+ * (metal_graph_encode_shared_ffn_batched) to replace two back-to-back
  * ds4_gpu_matmul_q4_0_batch_warp_tensor calls. */
 extern "C" int ds4_gpu_matmul_q4_0_pair_batch_warp_tensor(
         ds4_gpu_tensor *out0,
@@ -8710,10 +8703,9 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         uint32_t          raw_row,
         uint32_t          head_dim,
         uint32_t          n_rot) {
-    /* Section 33h: fused FP8 quantize + store_raw kernel (from
-     * perf/single-decode-30).  Replaces 2 kernel launches with 1.
-     * Opt-out: DS4_CUDA_NO_FUSED_FP8_STORE=1 falls back to the
-     * historical 2-kernel path. */
+    /* Fused FP8 quantize + store_raw kernel.  Replaces 2 kernel
+     * launches with 1.  Opt-out: DS4_CUDA_NO_FUSED_FP8_STORE=1 falls
+     * back to the two-kernel path. */
     if (!raw_cache || !kv || raw_cap == 0 || n_rot > head_dim ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
@@ -9187,7 +9179,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 
-/* Day-10 B.4: multi-session decode attention (non-indexed).  Stages a small
+/* Multi-session decode attention (non-indexed).  Stages a small
  * descriptor array on the device for blockIdx.z to index.  Each session's
  * raw_kv / comp_kv / n_raw / etc. are independent; the kernel reads them
  * directly from the per-session pointer in the descriptor.  Caller has
@@ -10051,9 +10043,9 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     /* When n_tokens > 1 and Q4 lazy convert is available, use the Q4
      * batched warp matmul directly instead of routing through
      * cuda_matmul_q8_0_tensor_labeled (which would dispatch to cuBLAS
-     * f16 -- 2x HBM vs Q4 and a known regression at decode shape per
-     * NOTES.md "What does NOT help #2").  Restricted to n_tokens <= 32
-     * so prefill still uses cuBLAS f16's tensor-core path. */
+     * f16 -- 2x HBM vs Q4 and a known regression at this decode shape).
+     * Restricted to n_tokens <= 32 so prefill still uses cuBLAS f16's
+     * tensor-core path. */
     if (cuda_q8_use_dp4a() && n_tokens > 1 && n_tokens <= 32 &&
         getenv("DS4_CUDA_Q4_DECODE") != NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
@@ -10102,11 +10094,11 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     if (!out_a) return 0;
 
     const int use_dp4a = cuda_q8_use_dp4a();
-    /* Section 33h (from perf/single-decode-30): single-launch fused
-     * prequant + Q4 matmul.  Sits above 33e's Q4 dispatch -- saves an
-     * extra kernel launch and the cuda_tmp_alloc by carrying xq/xscale
-     * in shared memory.  Opt-out: DS4_CUDA_NO_ATTN_OUT_A_FUSED=1
-     * falls back to 33e's separate-prequant Q4 path. */
+    /* Single-launch fused prequant + Q4 matmul.  Sits above the plain
+     * Q4 dispatch -- saves an extra kernel launch and the cuda_tmp_alloc
+     * by carrying xq/xscale in shared memory.  Opt-out:
+     * DS4_CUDA_NO_ATTN_OUT_A_FUSED=1 falls back to the separate-prequant
+     * Q4 path. */
     if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4_ATTN_OUT") == NULL &&
@@ -10147,13 +10139,12 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
                                             blocks_a);
     if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
-    /* Q4 cache dispatch -- section 33d's preload covers attn_output_a, but
-     * the batched-path Q4 dispatch (cuda_attn_output_q8_a) was never
-     * mirrored here in the single-decode path.  Section 33b profile after
-     * 33d showed attn_output at ~30 % of decode wall, this stage being the
-     * dominant slice.  Pattern matches grouped_q4_0_a_preq_warp8_kernel
-     * dispatch in ds4_gpu_attention_output_q8_batch_tensor (n_tokens==1
-     * arm). */
+    /* Q4 cache dispatch -- the Q4 preload covers attn_output_a, but the
+     * batched-path Q4 dispatch (cuda_attn_output_q8_a) was not mirrored
+     * here in the single-decode path.  Profiling identified attn_output
+     * as ~30% of decode wall, with this stage being the dominant slice.
+     * Pattern matches grouped_q4_0_a_preq_warp8_kernel dispatch in
+     * ds4_gpu_attention_output_q8_batch_tensor (n_tokens==1 arm). */
     if (use_dp4a && getenv("DS4_CUDA_Q4_DECODE") != NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4_ATTN_OUT") == NULL) {
@@ -10204,9 +10195,10 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         float                   clamp) {
-    /* Section 30 (D8-3) fix: the interleaved-acc Q4/Q8 pair path silently
-     * corrupts logits at long context.  Default-skip the pair wrapper;
-     * DS4_CUDA_ENABLE_SHARED_GATE_UP_PAIR=1 restores it for diagnostics. */
+    /* The interleaved-acc Q4/Q8 pair path silently corrupts logits at
+     * long context under --use_fast_math FMA reorder.  Default-skip the
+     * pair wrapper; DS4_CUDA_ENABLE_SHARED_GATE_UP_PAIR=1 restores it
+     * for diagnostics. */
     if (getenv("DS4_CUDA_ENABLE_SHARED_GATE_UP_PAIR") != NULL) {
         return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
                                                  model_map, model_size,
@@ -10215,11 +10207,11 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                                                  x, 1) &&
                ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
     }
-    /* Section 33f: when both gate/up are in the Q4 cache (section 33d
-     * preload covers ffn_gate_shexp + ffn_up_shexp), launch the fused
-     * gate+up+swiglu kernel directly into mid.  Saves 2 kernel launches
-     * per layer vs dual_tensor + swiglu.  Opt-out keeps the dual path
-     * accessible if needed. */
+    /* When both gate/up are in the Q4 cache (Q4 preload covers
+     * ffn_gate_shexp + ffn_up_shexp), launch the fused gate+up+swiglu
+     * kernel directly into mid.  Saves 2 kernel launches per layer vs
+     * dual_tensor + swiglu.  Opt-out keeps the dual path accessible if
+     * needed. */
     if (cuda_q8_use_dp4a() && getenv("DS4_CUDA_Q4_DECODE") != NULL &&
         getenv("DS4_CUDA_Q8_NO_Q4") == NULL &&
         getenv("DS4_CUDA_NO_SHARED_GATE_UP_FUSED") == NULL &&

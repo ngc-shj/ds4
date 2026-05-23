@@ -211,7 +211,7 @@ int ds4_gpu_matmul_q4_0_batch_warp_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-/* Day-6 D6-1: Q4_0 pair + batch matmul.  Computes out0 and out1 from one
+/* Q4_0 pair + batch matmul.  Computes out0 and out1 from one
  * shared activation x using two Q4 weight matrices (w0 @ x, w1 @ x), all
  * in one kernel launch so the activation is read once per (tok, block)
  * rather than twice as with two back-to-back batch-warp calls.  Used by
@@ -590,7 +590,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
-/* Day-10 B.4: multi-session decode attention.  Each session i contributes
+/* Multi-session decode attention.  Each session i contributes
  * one (raw_kv, comp_kv, n_raw, raw_start, n_comp, pos0) tuple; the kernel
  * runs N attentions in parallel along blockIdx.z, reading q from batched_q
  * staged at [i * n_head * head_dim] and writing heads into batched_heads
