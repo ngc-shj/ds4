@@ -118,6 +118,13 @@ static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
+/* Set while a multi-session (N>1) batched prefill is running.  The cuBLAS
+ * tensor-core f16 attention-output path is fast but its reduction order is not
+ * bitwise-stable, so the batched and serial paths can disagree on the
+ * next-token argmax for the same session.  Force the deterministic q8/q4
+ * attention-output kernels for the batched path so its result matches the
+ * serial reference; single-session prefill keeps the fast f16 path. */
+static int g_batched_prefill_active;
 
 /* CUDA Graph capture infrastructure.  All ds4_cuda.cu kernel launches use
  * g_kernel_stream as their stream argument.  In non-capture mode this is
@@ -706,6 +713,10 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
 
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
+    /* Multi-session batched prefill must use the deterministic q8/q4 matmuls so
+     * its per-session argmax matches the serial reference; the cuBLAS f16
+     * tensor-op reduction order is not bitwise-stable across the two paths. */
+    if (g_batched_prefill_active) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
@@ -2603,6 +2614,10 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
+}
+
+extern "C" void ds4_gpu_set_batched_prefill_active(int active) {
+    g_batched_prefill_active = active ? 1 : 0;
 }
 
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {
@@ -10168,6 +10183,9 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&
         getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_A") == NULL) {
+        /* cuda_q8_f16_ptr returns NULL during batched prefill via
+         * cuda_q8_f16_cache_allowed, so this falls back to the deterministic
+         * q8/q4 path automatically. */
         out_a_f16 = cuda_q8_f16_ptr(model_map, out_a_offset, out_a_bytes, group_dim, low_dim, "attn_output_a");
     }
     if (out_a_f16) {

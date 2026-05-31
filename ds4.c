@@ -23324,8 +23324,15 @@ int ds4_sessions_sync_batched(ds4_session **sessions,
      * ineligible (CPU backend, oversized prompt, live checkpoint,
      * etc.); writes err only on real GPU failure. */
     if (err && errlen > 0) err[0] = '\0';
-    if (metal_graph_prefill_layer_major_batched_n_sessions(sessions, prompts, n,
-                                                           err, errlen)) {
+    /* Force deterministic attention-output matmuls for the batched path so its
+     * per-session argmax matches the serial reference; the cuBLAS f16 tensor-op
+     * reduction order is not bitwise-stable across the two paths. */
+    ds4_gpu_set_batched_prefill_active(1);
+    bool batched_ok =
+        metal_graph_prefill_layer_major_batched_n_sessions(sessions, prompts, n,
+                                                           err, errlen);
+    ds4_gpu_set_batched_prefill_active(0);
+    if (batched_ok) {
         return 0;
     }
     if (err && err[0]) return 1;

@@ -1450,6 +1450,10 @@ void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
 }
 
+void ds4_gpu_set_batched_prefill_active(int active) {
+    (void)active;
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,
