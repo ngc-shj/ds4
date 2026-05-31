@@ -645,8 +645,19 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
     /* On 96/128 GB UMA Spark-class systems the expanded Q8->F16 cache can
      * pass a simple free-memory reserve check but still leave too little room
      * for long-prefill cuBLAS execution.  Keep the startup cache useful but
-     * bounded unless the caller explicitly sets DS4_CUDA_Q8_F16_CACHE_MB. */
+     * bounded unless the caller explicitly sets DS4_CUDA_Q8_F16_CACHE_MB.
+     *
+     * Exception: when the whole model image is host-registered as device
+     * visible (g_model_registered), the weights already live in unified memory
+     * and the f16 cache is a pure prefill accelerator.  Clamping it to 8 GiB
+     * there halves prefill on GB10 (185 -> 99 t/s) for no OOM benefit -- the
+     * free/reserve check below is the real guard.  Skip the static clamp in
+     * that regime (set DS4_CUDA_Q8_F16_UMA_CLAMP to force the old behavior). */
+    const int uma_register_fast_path =
+        g_model_registered &&
+        getenv("DS4_CUDA_Q8_F16_UMA_CLAMP") == NULL;
     if (limit == UINT64_MAX &&
+        !uma_register_fast_path &&
         total_bytes <= 128ull * 1073741824ull &&
         (g_model_range_bytes >= 64ull * 1073741824ull ||
          g_model_registered_size >= 64ull * 1073741824ull)) {
