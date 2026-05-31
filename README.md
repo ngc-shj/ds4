@@ -1,6 +1,8 @@
-# DwarfStar 4
+# DwarfStar
 
-DwarfStar 4 is a small native inference engine specific for **DeepSeek V4 Flash**. It is
+**DwarfStar** is a small native inference engine optimized first for
+**DeepSeek V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
+machines. It is
 intentionally narrow: not a generic GGUF runner, not a wrapper around another
 runtime: it is completely self-contained. Other than running the model in a
 correct and fast way, the project goal is to provide DS4 specific loading,
@@ -20,18 +22,36 @@ other contributors.
 
 ## Motivations
 
-Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
-model deserving a standalone engine? Because after comparing it with powerful smaller
-dense models, we can report that:
+Now, back at this project. Why do we believe DeepSeek V4 Flash deserves a
+standalone engine? Because after comparing it with powerful smaller dense
+models, we can report that:
 
-1. DeepSeek v4 Flash is faster because of less active parameters.
-2. In thinking mode, if you avoid *max thinking*, it produces a thinking section that is a lot shorter than other models, even 1/5 of other models in many cases, and crucially, the thinking section length is **proportional to the problem complexity**. This makes DeepSeek v4 Flash usable with thinking enabled when other models are practically impossible to use in the same conditions.
-3. The model features a context window of **1 million tokens**.
-4. Being so large, it knows more things if you go sampling at the edge of knowledge. For instance asking about Italian show or political questions soon uncovers that 284B parameters are a lot more than 27B or 35B parameters.
-5. It writes much better English and Italian. It *feels* a quasi-frontier model.
-6. The KV cache is incredibly compressed, allowing long context inference on local computers and **on disk KV cache persistence**.
-7. It works well with 2-bit quantization, if quantized in a special way (read later). This allows to run it in MacBooks with 128GB of RAM (and many people reported it working with 96GB as well, even at 250k context window!).
-8. We expect DeepSeek to release **updated versions of v4 Flash** in the future, even better than the current one.
+1. DeepSeek V4 Flash is the practical target of the project: it can run on
+   96/128GB machines while still feeling much larger than local dense models.
+2. DeepSeek V4 PRO is supported too, as a side path for 512GB Mac Studio class
+   machines. It is heavier, but it shares the same engine ideas and can be
+   useful when the hardware is available.
+3. In thinking mode, if you avoid *max thinking*, Flash produces a thinking
+   section that is a lot shorter than other models, even 1/5 of other models in
+   many cases, and crucially, the thinking section length is **proportional to
+   the problem complexity**. This makes DeepSeek V4 Flash usable with thinking
+   enabled when other models are practically impossible to use in the same
+   conditions.
+4. The models feature a context window of **1 million tokens**.
+5. Being so large, Flash knows more things if you go sampling at the edge of
+   knowledge. For instance asking about Italian show or political questions soon
+   uncovers that 284B parameters are a lot more than 27B or 35B parameters. PRO
+   pushes further when you can run it.
+6. Flash writes much better English and Italian. It *feels* a quasi-frontier
+   model. PRO is stronger still, especially for tasks such as translation.
+7. The KV cache is incredibly compressed, allowing long context inference on
+   local computers and **on disk KV cache persistence**.
+8. Both DeepSeek V4 variants work well with 2-bit quantization, if quantized in
+   a special way (read later). This allows Flash to run on MacBooks with 128GB
+   of RAM (and many people reported it working with 96GB as well, even at 250k
+   context window!), and PRO on 512GB machines.
+9. We expect DeepSeek to release **updated versions of V4 Flash and PRO** in the
+   future, even better than the current ones.
 
 That said, a few important things about this project:
 
@@ -40,6 +60,10 @@ That said, a few important things about this project:
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache is actually a first-class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is beta quality code, so probably we are not still there.
 * The optimized graph path targets **Metal on macOS** and **CUDA on Linux**. The CPU path is only for correctness checks and model/tokenizer diagnostics. For CPU-only Linux builds, use `make cpu`; it builds the normal `./ds4` and `./ds4-server` binaries without CUDA or Metal. On macOS, **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. It was not possible to fix the CPU inference to avoid crashing, since each time you have to restart the computer, which is not funny. Help us, if you have the guts.
+* The project supports both Flash and PRO variants, but Flash remains the main
+  focus because it is the model that makes sense on 96/128GB personal machines.
+  **PRO support is experimental**: it is useful and welcome, but today it is
+  naturally limited to people with 512GB Mac Studio class hardware.
 
 ## Acknowledgements to llama.cpp and GGML
 
@@ -48,7 +72,7 @@ llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and har
 engineering knowledge developed there**.
 We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
 and its contributors. Their implementation, kernels, tests, and design choices were
-an essential reference while building this DeepSeek V4 Flash-specific inference path.
+an essential reference while building this DeepSeek V4 specific inference path.
 Some source-level pieces are retained or adapted here under the MIT license: GGUF
 quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
 reason, and because we are genuinely grateful, we keep the GGML authors copyright
@@ -80,17 +104,17 @@ next sections.
 - [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
   how the calibration prompt corpus is generated.
 - [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
-  how local GGUFs are scored against official DeepSeek V4 Flash continuations.
+  how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark CSV files and graph
-  generation.
+- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
+  and CSV generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 Flash GGUFs published for
+This implementation only works with the DeepSeek V4 Flash and PRO GGUFs published for
 this project. It is not a general GGUF loader, and arbitrary DeepSeek/GGUF files
 will not have the tensor layout, quantization mix, metadata, or optional MTP
 state expected by the engine. The 2 bit quantizations provided here are not
@@ -104,7 +128,9 @@ Download one main model. **Prefer the imatrix versions.**
 
 ```sh
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
+./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
+./download_model.sh pro-imatrix  # 512 GB RAM machines, PRO imatrix quant
 ```
 
 Legacy GGUF files are still available if you specifically need the older
@@ -113,23 +139,26 @@ non-imatrix quants:
 ```sh
 ./download_model.sh q2           # 96/128 GB RAM machines, legacy non-imatrix
 ./download_model.sh q4           # >= 256 GB RAM machines, legacy non-imatrix
+./download_model.sh pro          # 512 GB RAM machines, legacy non-imatrix PRO
 ```
 
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected q2-imatrix/q4-imatrix/q2/q4
-model. The plain q2 XXS weights are produced with the weights importance vector
-only, without an imatrix. The imatrix variants are preferred.
+updates `./ds4flash.gguf` to point at the selected main model. The plain q2 XXS
+weights are produced with the weights importance vector only, without an
+imatrix. The imatrix variants are preferred.
 Authentication is optional for public downloads, but `--token TOKEN`,
 `HF_TOKEN`, or the local Hugging Face token cache are used when present.
 
 If you want to regenerate GGUF files or collect a new imatrix, see
 [gguf-tools/README.md](gguf-tools/README.md). Those tools are meant for offline
 model-building work and can take a long time on the full DeepSeek V4 Flash
-weights.
+weights. Flash GGUF generation is supported by the local tools. PRO GGUF
+production currently still depends on the external `llama.cpp`-based workflow;
+native tooling can be added later.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
+GGUF for Flash. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
 enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
 still experimental: it is correctness-gated and currently provides at most a
 slight speedup, not a meaningful generation-speed win.
@@ -160,21 +189,228 @@ Q4 requires the larger-memory machine class, so M3 Max Q4 numbers are `N/A`.
 | MacBook Pro M3 Max, 128 GB | q2 | 11709 tokens | 250.11 t/s | 21.47 t/s |
 | MacBook Pro M3 Max, 128 GB | q4 | short | N/A | N/A |
 | MacBook Pro M3 Max, 128 GB | q4 | long | N/A | N/A |
+| MacBook Pro M5 Max, 128 GB | q2 | short | 87.25 t/s | 34.27 t/s |
+| MacBook Pro M5 Max, 128 GB | q2 | 11707 tokens | 463.44 t/s | 25.90 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | short | 84.43 t/s | 36.86 t/s |
 | Mac Studio M3 Ultra, 512 GB | q2 | 11709 tokens | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | short | 78.95 t/s | 35.50 t/s |
 | Mac Studio M3 Ultra, 512 GB | q4 | 12018 tokens | 448.82 t/s | 26.62 t/s |
+| Mac Studio M3 Ultra, 512 GB | PRO q2 | 32768 tokens | 138.82 t/s | 9.56 t/s |
 | DGX Spark GB10, 128 GB | q2 | 7047 tokens | 343.81 t/s | 13.75 t/s |
 
 ![M3 Max t/s](speed-bench/m3_max_ts.svg)
+![PRO model M3 Ultra t/s](speed-bench/pro_model_m3_ultra_ts.svg)
+
+## Distributed Inference
+
+Distributed inference lets DS4 **run a model that is too large for one machine** by
+splitting transformer layers across multiple machines. The main example is the
+full 4-bit Flash quant across two 128 GB MacBooks: each process maps only its
+own layer slice, activations are sent over TCP, and the coordinator keeps normal
+CLI/API behavior.
+
+Distributed inference also allows to **speed up prefill** by
+using multiple GPUs at the same time to process different micro-batches at
+different layers, like in an assembly line. Only prefill can be accelerated this
+way. Generation is purely autoregressive: each token must finish across the
+route before the next token can start. The model work is the same as a single
+process, plus coordination latency, so distributed generation is slower.
+
+To build an initial mental model, here are the high level concepts:
+
+1. You put the GGUF on every machine, but each one loads just a subset. `--layers` controls which tensors are mapped, so a worker with `--layers 20:output` does not load the earlier layers.
+2. Layer ranges are inclusive: `10:20` means layers 10, 11, ..., 20. `N:output` means layer `N` through the final layer plus the output head.
+3. You assign one of the machines the role of `coordinator`, the others the roles of `workers`. Workers will connect to the coordinator and will tell they are there and which layers they are able to process.
+4. Each worker keeps its slice of the KV cache.
+5. Communication is worker-to-worker, there is no need to use the coordinator as relay, so if your coordinator is `A`, and you make a request, activations will flow in `A -> B -> C -> back to A`.
+
+### How it works and how to configure it
+
+The prefill path is pipelined (this is why it can go faster than in a single machine).
+For large prompts the coordinator can run its
+slice on chunk N+1 while the worker is running its slice on chunk N. The
+distributed rows below were measured with two M5 Max 128 GB MacBooks connected
+by Thunderbolt 5, using the Q4 Flash GGUF and the default 4096-token
+distributed prefill chunk. The single-process column is a reference run with
+the Q2 GGUF on a single machine, so it actually is a bit faster since
+the routed MoEs are smaller.
+
+| Prompt | Single-process reference | Two MacBooks | Speedup |
+| ---: | ---: | ---: | ---: |
+| 9421 tokens | 421.70 t/s | 582.22 t/s | 1.38x |
+| 28684 tokens | 405.30 t/s | 674.16 t/s | 1.66x |
+| 63819 tokens | 353.62 t/s | 654.79 t/s | 1.85x |
+
+Generation is different. **It is strictly autoregressive**: token N+1 cannot start
+until token N has produced logits and sampling has selected the next token. That
+means distributed generation cannot use the long prefill pipeline. It pays at
+least one cross-machine activation hop per generated token, so generation is
+slower than a single local process. On the same two-Mac Thunderbolt setup, a
+12k-context control run with the 91 GB Flash quant went from 30.59 t/s
+single-process to 24.67 t/s distributed, a 19.4% loss. Distributed inference is
+therefore mainly for fitting larger models and speeding up long prefills, not
+for making decode faster.
+
+The measurements above use a Thunderbolt 5 cable. The implementation is plain
+TCP and also works over slower links, including WiFi, but fast Ethernet or
+Thunderbolt networking is strongly recommended. Slow links mostly hurt
+generation latency and short prefills; large prefills can still benefit when
+the layer split is balanced. In the normal performance path, the last worker
+owns the output head and returns logits directly.
+
+Minimal two-host configuration:
+
+```sh
+# Machine A: coordinator, owns tokenization, sampling, the prompt, and layers 0..19.
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --role coordinator \
+  --layers 0:19 \
+  --listen 169.254.43.68 1234
+
+# Machine B: worker, connects to A and owns layers 20..output.
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --role worker \
+  --layers 20:output \
+  --coordinator 169.254.43.68 1234
+```
+
+Normally the final worker should own the output head too, for example
+`--layers 20:output`. This avoids returning a full final hidden-state batch
+after prefill and lets the final worker produce the logits directly. On very
+slow or metered links, `--layers 20:42` is also supported: the coordinator will
+load the output head and compute logits locally, trading extra coordinator work
+for smaller per-token replies.
+
+### Network Link Comparison
+
+The table below shows the same two M5 Max hosts, the same 91 GB Flash quant,
+coordinator `--layers 0:19`, worker `--layers 20:output`, an 8192-token prompt
+from `speed-bench/promessi_sposi.txt`, and 128 generated tokens. WiFi and
+Internet numbers vary with local conditions, but the shape is the important
+part: high latency hurts generation directly, while lower bandwidth also pulls
+down long-prefill speed.
+
+| Link | Addresses | Ping avg | Prefill | Generation |
+| --- | --- | ---: | ---: | ---: |
+| Thunderbolt 5 | `169.254.43.68` -> `169.254.12.245` | 0.45 ms | 582.99 t/s | 25.09 t/s |
+| WiFi | `192.168.1.57` -> `192.168.1.95` | 77.20 ms | 250.70 t/s | 10.70 t/s |
+| Internet / VPN | `10.77.0.4` -> `10.77.0.3` | 152.10 ms | 114.88 t/s | 3.63 t/s |
+
+The Internet/VPN case is not meant to be a good interactive experience. It is
+still useful for collective testing: multiple people can temporarily combine
+machines to run a larger model that would not fit on any single host, accepting
+slow decode in exchange for being able to inspect the model at all.
+
+Use the coordinator exactly like normal `./ds4`: interactive chat, `/read`,
+and ordinary generation go through the same high-level session API. The same
+distributed options are also wired into `ds4-agent`, `ds4-eval`, and
+`ds4-bench`. For benchmarks, workers should already be running; `ds4-bench`
+waits until a complete route is available.
+
+Useful tuning and diagnostics:
+
+```sh
+./ds4-bench \
+  -m gguf/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf \
+  --prompt-file speed-bench/promessi_sposi.txt \
+  --ctx-start 32768 \
+  --ctx-max 65536 \
+  --step-incr 32768 \
+  --gen-tokens 0 \
+  --role coordinator \
+  --layers 0:19 \
+  --listen 169.254.43.68 1234 \
+  --debug
+```
+
+`--debug` on the coordinator prints route formation and per-hop telemetry:
+layer range, token span, local evaluation time, downstream wait time, socket
+send time, and input/output byte counts. This is the current profiling tool for
+deciding whether a split is balanced. `--dist-prefill-window N` controls how
+many prefill chunks may be in flight end-to-end; the default is conservative
+and bounded. `--dist-prefill-chunk N` exists for experiments, but the default
+4096-token chunk is the canonical setting and should be used unless you are
+explicitly validating a different chunk size.
+
+By default DS4 sends hidden-state activations as 32-bit floats. To reduce
+traffic, pass `--dist-activation-bits 16` or `--dist-activation-bits 8` on the
+coordinator. This changes only the transport format between machines, not the
+model weights or KV cache. 16-bit transport halves activation traffic and is the
+first option to try on Ethernet or WiFi. 8-bit transport is more aggressive and
+should be treated as an approximate/experimental mode unless you have validated
+the output for your use case. However experimentally reduction activation
+size didn't provide a significant improvement, so this option may be removed
+in the future.
+
+**If a worker disconnects, the coordinator removes that worker from the active
+route**. The request already in flight can fail, and later calls report an
+incomplete route until a compatible worker reconnects and sends a new
+registration. For live sessions, the coordinator keeps the token history and can
+rebuild worker KV state by replaying the prefix when the route is available
+again. Workers also validate a rolling 64-bit token-prefix hash on every work
+item, so a restarted worker at position 0 cannot silently accept work for
+position N; it reports the mismatch and the coordinator replays the current
+transcript. Ctrl+C in the CLI and agent is cooperative: DS4 waits for the
+current distributed token or prefill chunk to drain before returning control,
+which avoids coordinator-caused KV splits. Saved agent/server sessions use the
+same KV file format as single-machine sessions: during save the coordinator
+fetches worker-owned layer tensors and serializes one normal payload; during
+load it splits that payload over the currently registered route.
+
+### Distributed protocol overview
+
+At the protocol level there are two kinds of connections. Workers keep a
+control TCP connection open to the coordinator and send a `HELLO` with their
+model ID, model family, quant profile, layer slice, context capacity, and data
+port. The coordinator uses these registrations to build a route that covers all
+layers. Work then moves over low-latency TCP data connections: the coordinator
+computes the first slice, sends a `WORK` frame with session ID, token positions,
+rolling token-prefix hashes before and after the span, route information, and
+hidden-state payload, and each worker computes its slice. Middle workers can
+forward directly to the next worker. The final worker returns logits to the
+coordinator, or ACKs for non-final prefill chunks so the prefill pipeline can
+stay full. `RESULT` frames echo the request ID and the post-span hash. A worker
+status error is handled differently from a socket failure: KV/hash mismatch can
+be recovered by replaying the token history on the same route, while transport
+failure drops the route and waits for a replacement worker. For persistent KV,
+the coordinator opens worker data connections and sends snapshot save/load
+messages for each worker-owned layer range; the disk payload remains a single
+agent/server cache file. The protocol has no
+encryption or authentication, and is not release-stable yet; coordinator and
+workers should be built from the same commit and used on trusted machines and
+trusted networks.
+
+## Reducing heat, power usage and fan noise
+
+Long local inference runs can keep the GPU busy for extended periods. If you
+care more about heat, fan noise, battery life on MacBooks, or reducing thermal
+stress on the hardware than about maximum throughput, use `--power N`.
+
+`--power 100` is the default and means full speed. Lower values ask DS4 to target
+that percentage of GPU usage: `--power 70` targets about 70%, `--power 50`
+targets about half usage, and so forth. DS4 does this by measuring GPU work time
+and inserting small sleeps between work units: during prefill it sleeps between
+layers, and during generation it sleeps between decoded tokens. This reduces
+sustained load without changing model output.
+
+The option is available on the CLI, server, agent, eval, and benchmark tools,
+for example:
+
+```sh
+./ds4 --power 50
+./ds4-agent --power 70
+./ds4-server --power 40 --ctx 100000
+```
 
 ## Native agent
 
-DwarfStar 4 features a native coding agent that works in a different way
+DwarfStar features a native coding agent that works in a different way
 than most other systems: the inference is controlled from within the agent
 itself, without socket/API boundaries, so the session is represented
 by the on-disk KV cache itself. Moreover the tools and the system prompt
-are all designed vertically for DeepSeek v4 Flash. This provides a
+are all designed vertically for DeepSeek v4 Flash and PRO. This provides a
 few advantages:
 
 * Low latency experience, bounded mainly by the prefill speed limits. Displaying of generated text, tool calling, start of a new session are always instantaneous.
@@ -182,7 +418,18 @@ few advantages:
 * No DSML tool calling conversion, the tools are handled natively in the LLM format.
 * KV cache mismatch are impossible by construction, the current state is always the truth.
 * Everything is tuned for this model.
-* Ability to switch session with `/list` and `/switch` without any prefill stage.
+* Ability to switch saved sessions with `/list` and `/switch`; full KV sessions resume without a prefill stage.
+
+Agent sessions are stored in `~/.ds4/kvcache`. Use `/save` to persist the
+current session, `/list` to show saved sessions sorted by recent update time,
+and `/switch <sha>` to resume one of them. The session ID is stable across
+future saves and is derived from the first user prompt and creation time.
+`/del <sha>` removes a saved session. `/strip <sha>` keeps the rendered
+conversation text and title but removes the heavy KV payload; switching to a
+stripped session rebuilds the KV cache by prefilling the saved text.
+
+Use `--chdir /path/to/ds4` when launching `ds4-agent` from another directory,
+so relative runtime files such as `metal/*.metal` resolve from the project tree.
 
 However while the system already works, there is a lot of work to do
 in order to make it ready for prime time. When finally the agent will reach
@@ -217,6 +464,16 @@ exponential sweeps. Output is CSV with one row per frontier: latest prefill
 interval tokens/sec, generation tokens/sec at that frontier, and
 `kvcache_bytes`.
 
+Sessions prefill long prompts in 4096-token chunks by default. Set
+`DS4_METAL_PREFILL_CHUNK=N` to compare another chunk size, for example `2048`
+to match the strict official-vector checkpoint path, or
+`DS4_METAL_PREFILL_CHUNK=0` to prefill a prompt as one whole batch when memory
+allows. Changing the chunk changes the KV checkpoint/logit path, so compare it
+as an explicit run configuration.
+Chunked Metal prefill reuses the same range-capable layer-major graph for each
+chunk, preserving absolute compressor/indexer boundaries while avoiding the old
+per-layer chunk dispatch path.
+
 ## Capability Evaluation
 
 `ds4-eval` is a small real-model integration benchmark. It is not a leaderboard
@@ -240,6 +497,34 @@ tokens. Press `p` to pause, `q` to exit and print the report, Up/Down to
 inspect or select another question, and Enter to run the selected question next.
 `--plain` disables the TUI.
 
+Use `--regrade-trace /path/to/trace.txt` to replay the current answer
+extractor and scorer against a prior `--trace` file without loading the model
+or regenerating tokens. This is useful when auditing evaluator changes: it
+shows which cases changed, the old picked answer, the new picked answer, and a
+pass/fail summary.
+
+For inference changes that can affect generation drift, keep this deterministic
+q1..q4 token-count gate in the test plan:
+
+```sh
+./ds4-eval \
+  -m ds4flash.gguf \
+  --plain \
+  --questions 4 \
+  --tokens 2048 \
+  --temp 0 \
+  --seed 1
+```
+
+The generated-token counts must stay aligned with the baseline:
+
+| Question | Expected state | Expected generated tokens | Expected given/correct |
+|---:|---|---:|---|
+| 1 | `PASSED` | 2048 | `B` / `B` |
+| 2 | `PASSED` | 438 | `C` / `C` |
+| 3 | `PASSED` | 666 | `70` / `70` |
+| 4 | `FAILED` | 2048 | `A` / `C` |
+
 The first 75 embedded questions are interleaved as 25 GPQA Diamond, 25 audited
 SuperGPQA, and 25 AIME 2025 problems. The final 17 are an audited COMPSEC
 subset of reduced single-function C/C++ vulnerability-localization questions.
@@ -253,11 +538,11 @@ of them. The SuperGPQA slice is curated rather than blind: upstream rows with
 wrong keys, missing figures, or underspecified prompts are replaced with cleaner
 rows.
 
-For a model like DeepSeek V4 Flash, the set should be treated as a hard
-capability regression suite rather than a pass/fail unit test:
+The set should be treated as a hard capability regression suite rather than
+a pass/fail unit test.
 
 - **GPQA Diamond** contributes graduate-level science questions with
-  multiple-choice answers. DeepSeek's model card reports strong Flash results
+  multiple-choice answers. DeepSeek's model card reports strong results
   on full GPQA Diamond in thinking mode, but individual items still require
   careful physics, chemistry, or biology reasoning and are easy to lose with a
   small prompt/rendering or sampling regression.
@@ -332,10 +617,15 @@ Supported endpoints:
 
 - `GET /v1/models`
 - `GET /v1/models/deepseek-v4-flash`
+- `GET /v1/models/deepseek-v4-pro`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 - `POST /v1/completions`
 - `POST /v1/messages`
+
+The Flash and PRO model endpoints are compatibility aliases. They both report
+the model currently loaded from the GGUF passed with `-m`; the endpoint name does
+not select a different model.
 
 `/v1/chat/completions` accepts the usual OpenAI-style `messages`,
 `max_tokens`/`max_completion_tokens`, `temperature`, `top_p`, `top_k`, `min_p`,
@@ -379,7 +669,7 @@ explicitly when remote machines should be able to connect.
 
 ### Tool call handling and canonicalization
 
-DeepSeek V4 Flash emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
+DeepSeek V4 emits tool calls as [DSML text](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/encoding/README.md). Agent clients do not send that
 same text back on the next request: they send normalized OpenAI/Anthropic JSON
 tool-call objects. **If the server re-rendered those objects slightly
 differently, the rendered byte prefix would no longer match the live KV
@@ -701,7 +991,7 @@ The DS4 session payload starts with thirteen little-endian `u32` fields:
 
 ```text
 0   magic = "DSV4"
-1   payload version = 1
+1   payload version = 2
 2   saved context size
 3   prefill chunk size
 4   raw KV ring capacity
@@ -734,6 +1024,12 @@ snapshot can sample or continue from the exact next-token distribution without
 running one extra decode step. MTP draft logits/state are not persisted; after
 loading a disk checkpoint the draft state is invalidated and rebuilt by normal
 generation.
+
+Distributed coordinator sessions use the same `DSV4` payload. Worker-owned
+layer tensors are pulled during save and merged into the normal layer-ordered
+tensor stream; during load the coordinator splits that stream into the current
+route and pushes the relevant layer tensors back to the workers. The saved file
+does not retain the distributed topology.
 
 The tensor payload is DS4-specific KV/session state, not a generic inference
 graph dump. It is expected to be portable only across compatible `ds4.c`
@@ -826,12 +1122,15 @@ captured from the official DeepSeek V4 Flash API. The requests use
 `deepseek-v4-flash`, greedy decoding, thinking disabled, and the maximum
 `top_logprobs` slice exposed by the API. Local vectors are generated with
 `./ds4 --dump-logprobs` and compared by token bytes, so tokenizer/template or
-attention regressions show up before they become long generation failures.
+attention regressions show up before they become long generation failures. The
+C runner pins `DS4_METAL_PREFILL_CHUNK=2048` for this strict API-vector
+comparison.
 
-All project tests are driven by the C runner:
+All project tests are driven by the C runner, with a small `ds4-eval`
+extractor self-test run first:
 
 ```sh
-make test                  # ./ds4_test --all
+make test                  # ./ds4-eval --self-test-extractors && ./ds4_test --all
 ./ds4_test --logprob-vectors
 ./ds4_test --server
 ```
@@ -844,6 +1143,7 @@ first answer:
 ```sh
 ./ds4 --dump-tokens -p "..."
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
+./ds4 --dump-logits /tmp/logits.json --metal --nothink --prompt-file prompt.txt
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 

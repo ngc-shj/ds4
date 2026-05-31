@@ -1,4 +1,6 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
+#include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
 
@@ -584,6 +586,7 @@ typedef struct {
     api_style api;
     ds4_tokens prompt;
     char *model;
+    bool model_from_request;
     stop_list stops;
     char *raw_body;
     char *prompt_text;
@@ -888,6 +891,17 @@ static bool model_alias_disables_thinking(const char *model) {
 
 static bool model_alias_enables_thinking(const char *model) {
     return model && !strcmp(model, "deepseek-reasoner");
+}
+
+static const char *server_model_id_from_engine(ds4_engine *engine) {
+    return ds4_engine_model_id(engine) == 1 ?
+           "deepseek-v4-pro" : "deepseek-v4-flash";
+}
+
+static bool server_model_alias_known(const char *id) {
+    return id &&
+           (!strcmp(id, "deepseek-v4-flash") ||
+            !strcmp(id, "deepseek-v4-pro"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2664,6 +2678,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens") || !strcmp(key, "max_completion_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -2874,6 +2889,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -3775,6 +3791,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -3992,6 +4009,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 free(key);
                 goto bad;
             }
+            r->model_from_request = true;
         } else if (!strcmp(key, "max_tokens")) {
             if (!json_int(&p, &r->max_tokens)) {
                 free(key);
@@ -4429,6 +4447,8 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     if (require_thinking_closed) {
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
+            /* Model did not close thinking, ignore any DSML in reasoning */
+            fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
             split_reasoning_content(text, strlen(text), content_out, reasoning_out);
             return true;
         }
@@ -4591,6 +4611,70 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     }
 }
 
+/* Try to repair a truncated DSML block.
+ *
+ * DSML nesting order is: tool_calls > invoke > parameter.
+ * Single-pass scan: count opens vs closes, then append missing closing tags.
+ *
+ * Returns true if repair was applied, false if the text had no recognizable DSML
+ * or was already balanced.  This deliberately does not rewrite malformed but
+ * balanced DSML into assistant text; semantic recovery belongs to the model. */
+static bool try_repair_dsml(const char *s, size_t len, buf *out) {
+    if (!s || !len) return false;
+
+    /* Only scan DSML tags after the last </think>.  DSML mentioned inside
+     * reasoning is not executable — it inflates tag counts and causes false
+     * positive repairs.  If no </think> is found, scan from the start
+     * (thinking mode is not active or thinking was never opened). */
+    const char *think_end = find_last_substr(s, "</think>");
+    const char *scan_start = think_end ? (think_end + 8) : s;
+    size_t scan_len = (size_t)((s + len) - scan_start);
+
+    /* Detect style from first <tool_calls> tag */
+    const char *ts, *te, *is, *ie, *ps, *pe;
+    if (strstr(scan_start, DS4_TOOL_CALLS_START)) {
+        ts = DS4_TOOL_CALLS_START;  te = DS4_TOOL_CALLS_END;
+        is = DS4_INVOKE_START;      ie = DS4_INVOKE_END;
+        ps = DS4_PARAM_START;       pe = DS4_PARAM_END;
+    } else if (strstr(scan_start, DS4_TOOL_CALLS_START_SHORT)) {
+        ts = DS4_TOOL_CALLS_START_SHORT;  te = DS4_TOOL_CALLS_END_SHORT;
+        is = DS4_INVOKE_START_SHORT;      ie = DS4_INVOKE_END_SHORT;
+        ps = DS4_PARAM_START_SHORT;       pe = DS4_PARAM_END_SHORT;
+    } else if (strstr(scan_start, "<tool_calls>")) {
+        ts = "<tool_calls>";   te = "</tool_calls>";
+        is = "<invoke";        ie = "</invoke>";
+        ps = "<parameter";     pe = "</parameter>";
+    } else {
+        return false; /* No recognizable DSML start tag */
+    }
+
+    /* Single-pass: count all 6 tag types in one scan */
+    size_t tos = 0, toe = 0, ios = 0, ioe = 0, pos = 0, poe = 0;
+    const char *e = scan_start + scan_len;
+    for (const char *p = scan_start; p < e; ) {
+        size_t d;
+        if ((d = strlen(ts)) && !strncmp(p, ts, d)) { tos++; p += d; }
+        else if ((d = strlen(te)) && !strncmp(p, te, d)) { toe++; p += d; }
+        else if ((d = strlen(is)) && !strncmp(p, is, d)) { ios++; p += d; }
+        else if ((d = strlen(ie)) && !strncmp(p, ie, d)) { ioe++; p += d; }
+        else if ((d = strlen(ps)) && !strncmp(p, ps, d)) { pos++; p += d; }
+        else if ((d = strlen(pe)) && !strncmp(p, pe, d)) { poe++; p += d; }
+        else p++;
+    }
+    if (tos == toe && ios == ioe && pos == poe) return false;
+    if (toe > tos || ioe > ios || poe > pos) {
+        /* Extra closing tags are not a truncation pattern.  Refuse repair so the
+         * unsigned differences below cannot wrap and append a huge suffix. */
+        return false;
+    }
+    /* Repair: copy original text and append missing closing tags in reverse order */
+    buf_puts(out, s);
+    for (size_t i = 0; i < pos - poe; i++) buf_puts(out, pe);
+    for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
+    for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);
+    return true;
+}
+
 static const char *tool_parse_failure_recovery_finish(const char *finish) {
     /* Once DSML failed to parse there is no executable tool call to report.
      * Preserve a true length stop, because callers can distinguish truncation
@@ -4625,11 +4709,11 @@ static bool parse_generated_message_for_response(const char *text,
     *reasoning_out = NULL;
     tool_calls_free(calls);
 
-    /* A malformed tool block is model output, not a server failure.  Returning
-     * the sampled text as a regular assistant message keeps the API response
-     * valid and gives the caller enough transcript context to retry or recover
-     * on a later turn, instead of terminating the whole session on
-     * finish_reason="error". */
+    /* A malformed tool block is model output, not a server failure.  The
+     * generation worker may hide this turn from the client, append a tool error
+     * plus protocol reminder to the live session, and let the model try again.
+     * If that continuation is unavailable, parsed_content keeps the raw text as
+     * a last-resort assistant fallback instead of crashing the request. */
     const char *finish = finish_io && *finish_io ? *finish_io : "stop";
     if (has_tools && saw_tool_start && strcmp(finish, "error") != 0) {
         if (finish_io) *finish_io = tool_parse_failure_recovery_finish(finish);
@@ -8454,7 +8538,7 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
-    ds4_kvstore_fill_header(h, quant_bits, reason, ext_flags, tokens, hits,
+    ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
                             ctx_size, created_at, last_used, payload_bytes);
 }
 #endif
@@ -8471,6 +8555,10 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
+    /* Tool replay payloads are stored next to KV checkpoints; keep them model
+     * scoped too, since token positions and graph state are not portable across
+     * Flash/Pro shapes even when the rendered chat text is identical. */
+    uint8_t model_id = s->engine ? (uint8_t)ds4_engine_model_id(s->engine) : 0;
 
     DIR *d = opendir(s->kv.dir);
     if (!d) {
@@ -8491,7 +8579,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         uint32_t text_bytes = 0;
         bool ok = kv_read_header(fp, &hdr, &text_bytes);
         uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
-        if (ok && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
+        if (ok && hdr.model_id == model_id && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
             skip <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
         {
@@ -8505,16 +8593,17 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
 
 #ifdef DS4_SERVER_TEST
 static double kv_entry_eviction_score(const kv_entry *e, const ds4_tokens *live,
-                                      const char *protected_sha,
-                                      uint64_t now) {
-    return ds4_kvstore_entry_eviction_score(e, live, protected_sha, now);
+                                      uint64_t now,
+                                      const ds4_kvstore_eviction_context *incoming) {
+    return ds4_kvstore_entry_eviction_score(e, live, now, incoming);
 }
 #endif
 
 #ifdef DS4_SERVER_TEST
 static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live,
-                           const char *protected_sha) {
-    ds4_kvstore_evict(kc, live, protected_sha);
+                           uint64_t extra_bytes,
+                           const ds4_kvstore_eviction_context *incoming) {
+    ds4_kvstore_evict(kc, live, extra_bytes, incoming);
 }
 #endif
 
@@ -8704,6 +8793,21 @@ static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
     ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
 }
 
+static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
+    if (!s || !path) return;
+    if (unlink(path) == 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache discarded reason=prefill-failed file=%s",
+                   path);
+    } else if (errno != ENOENT) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: kv cache failed to discard prefill-failed file=%s: %s",
+                   path, strerror(errno));
+    }
+    s->kv.continued_last_store_tokens = 0;
+    ds4_session_invalidate(s->session);
+}
+
 static void kv_cache_maybe_store_continued(server *s, ds4_session *sess) {
     kv_disk_cache *kc = &s->kv;
     const ds4_tokens *tokens = ds4_session_tokens(sess);
@@ -8718,7 +8822,7 @@ static void kv_cache_maybe_store_continued(server *s, ds4_session *sess) {
 #ifdef DS4_SERVER_TEST
 static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
-    return ds4_kvstore_find_text_prefix(kc, prompt_text, quant_bits, ctx_size);
+    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 #endif
 
@@ -9336,6 +9440,97 @@ static thinking_state thinking_state_from_prompt(const request *r) {
     return st;
 }
 
+static char *rendered_chat_system_region(const char *prompt_text) {
+    if (!prompt_text) return xstrdup("");
+    const char *p = prompt_text;
+    const char *bos = "<｜begin▁of▁sentence｜>";
+    const size_t bos_len = strlen(bos);
+    if (!strncmp(p, bos, bos_len)) p += bos_len;
+    const char *max_prefix = ds4_think_max_prefix();
+    const size_t max_prefix_len = strlen(max_prefix);
+    if (max_prefix_len && !strncmp(p, max_prefix, max_prefix_len)) {
+        p += max_prefix_len;
+    }
+    while (*p && isspace((unsigned char)*p)) p++;
+
+    const char *user = strstr(p, "<｜User｜>");
+    const char *assistant = strstr(p, "<｜Assistant｜>");
+    const char *end = NULL;
+    if (user && assistant) end = user < assistant ? user : assistant;
+    else end = user ? user : assistant;
+    if (!end) end = p + strlen(p);
+    while (end > p && isspace((unsigned char)end[-1])) end--;
+    return xstrndup(p, (size_t)(end - p));
+}
+
+static char *build_invalid_dsml_tool_error_suffix(const request *r,
+                                                  const thinking_state *thinking,
+                                                  const char *detail) {
+    char *system = rendered_chat_system_region(r ? r->prompt_text : NULL);
+    buf tool_error = {0};
+    buf_puts(&tool_error, "Tool error: invalid DSML tool call");
+    if (detail && detail[0]) {
+        buf_puts(&tool_error, ": ");
+        buf_puts(&tool_error, detail);
+    }
+    buf_puts(&tool_error,
+             "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
+             "Emit a new valid DSML tool call, or answer normally if no tool is needed.");
+    if (system && system[0]) {
+        buf_puts(&tool_error, "\n\nSystem prompt reminder:\n");
+        buf_puts(&tool_error, system);
+    }
+
+    buf suffix = {0};
+    if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
+        buf_puts(&suffix, "</think>");
+    }
+    buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
+    append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
+    buf_puts(&suffix, "</tool_result><｜Assistant｜>");
+    buf_puts(&suffix, r && ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
+
+    free(system);
+    buf_free(&tool_error);
+    return buf_take(&suffix);
+}
+
+static bool append_rendered_suffix_to_live_session(server *s, const char *suffix,
+                                                   int *tokens_appended,
+                                                   char *err, size_t errlen) {
+    if (tokens_appended) *tokens_appended = 0;
+    if (!s || !suffix || !suffix[0]) return true;
+    const ds4_tokens *live = ds4_session_tokens(s->session);
+    if (!live) {
+        if (err && errlen) snprintf(err, errlen, "live session is unavailable");
+        return false;
+    }
+
+    ds4_tokens target = {0};
+    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
+    const int before = ds4_session_pos(s->session);
+    bool ok = ds4_session_sync(s->session, &target, err, errlen) == 0;
+    if (ok && tokens_appended) {
+        int delta = ds4_session_pos(s->session) - before;
+        *tokens_appended = delta > 0 ? delta : 0;
+    }
+    ds4_tokens_free(&target);
+    return ok;
+}
+
+static bool continue_after_invalid_dsml(server *s, const request *r,
+                                        const thinking_state *thinking,
+                                        const char *detail,
+                                        int *tokens_appended,
+                                        char *err, size_t errlen) {
+    char *suffix = build_invalid_dsml_tool_error_suffix(r, thinking, detail);
+    bool ok = append_rendered_suffix_to_live_session(s, suffix,
+                                                     tokens_appended,
+                                                     err, errlen);
+    free(suffix);
+    return ok;
+}
+
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
@@ -9375,7 +9570,10 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
 
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
-    if (!p || !event || strcmp(event, "prefill_chunk")) return;
+    if (!p || !event) return;
+    const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
+    const bool is_display = strcmp(event, "prefill_display") == 0;
+    if (!is_chunk && !is_display) return;
 
     double now = now_sec();
     /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
@@ -9401,6 +9599,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
             }
         }
     }
+    if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
         if (p->srv && current > p->cached_tokens) {
@@ -9670,8 +9869,10 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         };
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(s->session, server_progress_cb, &rebuild_progress);
+        ds4_session_set_display_progress(s->session, server_progress_cb, &rebuild_progress);
         if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
             ds4_session_set_progress(s->session, NULL, NULL);
+            ds4_session_set_display_progress(s->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
                 server_log(DS4_LOG_KVCACHE,
@@ -9690,6 +9891,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
             }
         } else {
             ds4_session_set_progress(s->session, NULL, NULL);
+            ds4_session_set_display_progress(s->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
                        rebuild_ctx, ctx, source, loaded, replay_tokens,
@@ -9876,7 +10078,6 @@ static void generate_job(server *s, job *j) {
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
-    free(disk_cache_path);
     char ctx_span[48];
     request_ctx_span(ctx_span, sizeof(ctx_span), cached, prompt_tokens);
     server_prefill_progress progress = {
@@ -9938,6 +10139,7 @@ static void generate_job(server *s, job *j) {
                req_flags[0] ? " " : "",
                req_flags);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
+    ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
     if (cached == 0 &&
@@ -9974,8 +10176,11 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
+            ds4_session_set_display_progress(s->session, NULL, NULL);
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
+            kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -9994,18 +10199,23 @@ static void generate_job(server *s, job *j) {
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
+        ds4_session_set_display_progress(s->session, NULL, NULL);
         kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                               cold_store_len);
+        kv_cache_discard_failed_disk_entry(s, disk_cache_path);
+        free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
+    free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
+    ds4_session_set_display_progress(s->session, NULL, NULL);
     kv_cache_maybe_store_continued(s, s->session);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -10090,6 +10300,11 @@ static void generate_job(server *s, job *j) {
         }
     }
 
+    bool dsml_recovery_attempted = false;
+    uint64_t rng = j->req.seed ? j->req.seed :
+        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+decode_again:
+    ;
     buf text = {0};
     size_t plain_stream_pos = 0;
     size_t stop_scan_from = 0;
@@ -10103,8 +10318,6 @@ static void generate_job(server *s, job *j) {
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
-    uint64_t rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
@@ -10341,11 +10554,77 @@ static void generate_job(server *s, job *j) {
     if (j->req.kind == REQ_CHAT && j->req.has_tools &&
         saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
     {
-        /* A partial streamed tool call cannot be retracted.  If the model ends
-         * before closing the DSML block, fail the turn instead of letting clients
-         * execute an incomplete `{}` or partially parsed argument object. */
-        finish = "error";
-        snprintf(err, sizeof(err), "unterminated tool call");
+        /* Deterministically complete a simple truncation.  Anything more than
+         * missing closing tags stays model-owned: for non-streaming requests,
+         * append a tool error plus prompt reminder to the live session and let
+         * the model issue a fresh call. */
+        bool completed_truncation = false;
+        buf repaired = {0};
+        if (try_repair_dsml(text.ptr, text.len, &repaired)) {
+            /* Parse repaired text to verify it produces valid tool calls */
+            tool_calls test_calls = {0};
+            char *test_content = NULL;
+            char *test_reasoning = NULL;
+            bool repair_ok = parse_generated_message_ex(repaired.ptr, false, &test_content, &test_reasoning, &test_calls);
+            free(test_content);
+            free(test_reasoning);
+            if (repair_ok && test_calls.len > 0) {
+                /* Repair succeeded - replace text with repaired version */
+                free(text.ptr);
+                text.ptr = buf_take(&repaired);
+                text.len = strlen(text.ptr);
+                saw_tool_end = true;
+                completed_truncation = true;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s repaired unterminated tool call (%d calls recovered)",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           test_calls.len);
+                trace_event(s, trace_id, "repaired unterminated tool call (%d calls recovered)", test_calls.len);
+            }
+            tool_calls_free(&test_calls);
+        }
+        if (!completed_truncation) {
+            if (!j->req.stream && !dsml_recovery_attempted) {
+                int recovery_tokens = 0;
+                char recovery_err[160] = {0};
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s unterminated tool call; continuing with model-visible tool error",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
+                trace_event(s, trace_id,
+                            "unterminated tool call; continuing with model-visible tool error");
+                if (continue_after_invalid_dsml(s, &j->req, &thinking,
+                                                "unterminated tool call",
+                                                &recovery_tokens,
+                                                recovery_err,
+                                                sizeof(recovery_err)))
+                {
+                    dsml_recovery_attempted = true;
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+                               ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
+                               recovery_tokens);
+                    trace_event(s, trace_id,
+                                "tool-error continuation appended %d tokens",
+                                recovery_tokens);
+                    buf_free(&repaired);
+                    buf_free(&text);
+                    goto decode_again;
+                }
+                finish = "error";
+                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
+                         recovery_err[0] ? recovery_err : "unknown error");
+            } else {
+                finish = "error";
+                snprintf(err, sizeof(err), "unterminated tool call");
+            }
+        }
+        buf_free(&repaired);
     }
 
     if (completion > last_decode_log_completion) {
@@ -10384,16 +10663,89 @@ static void generate_job(server *s, job *j) {
             &parsed_reasoning,
             &parsed_calls,
             &recovered_tool_parse_failure);
-        if (!parsed_ok && recovered_tool_parse_failure) {
-            server_log(DS4_LOG_WARNING,
-                       "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s",
-                       ctx_span,
-                       req_flags[0] ? " " : "",
-                       req_flags,
-                       final_finish);
-            trace_event(s, trace_id,
-                        "invalid tool call returned as assistant text finish=%s",
-                        final_finish);
+        if (!parsed_ok && recovered_tool_parse_failure && j->req.has_tools && saw_tool_start) {
+            /* parse_generated_message failed even though DSML was present.
+             * Semantic repair is intentionally avoided: if the parser cannot
+             * execute the block, feed the model a tool error and the protocol
+             * reminder so it owns the corrected next action. */
+            if (!j->req.stream && !dsml_recovery_attempted) {
+                int recovery_tokens = 0;
+                char recovery_err[160] = {0};
+                const char *detail = err[0] ? err : "invalid tool call";
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s invalid tool call; continuing with model-visible tool error",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags);
+                trace_event(s, trace_id,
+                            "invalid tool call; continuing with model-visible tool error");
+                if (continue_after_invalid_dsml(s, &j->req, &thinking,
+                                                detail,
+                                                &recovery_tokens,
+                                                recovery_err,
+                                                sizeof(recovery_err)))
+                {
+                    dsml_recovery_attempted = true;
+                    server_log(DS4_LOG_GENERATION,
+                               "ds4-server: chat ctx=%s%s%s tool-error continuation appended %d tokens",
+                               ctx_span,
+                               req_flags[0] ? " " : "",
+                               req_flags,
+                               recovery_tokens);
+                    trace_event(s, trace_id,
+                                "tool-error continuation appended %d tokens",
+                                recovery_tokens);
+                    free(parsed_content);
+                    free(parsed_reasoning);
+                    tool_calls_free(&parsed_calls);
+                    buf_free(&text);
+                    goto decode_again;
+                }
+                final_finish = "error";
+                snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
+                         recovery_err[0] ? recovery_err : "unknown error");
+            }
+            if (!parsed_ok) {
+                /* Print raw DSML snippet for debugging */
+                size_t dsml_snippet_len = 0;
+                const char *dsml_start = NULL;
+                const char *p;
+                for (p = text.ptr; p && (size_t)(p - text.ptr) < text.len - 20; p++) {
+                    if ((strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)) == 0) ||
+                        (strncmp(p, DS4_TOOL_CALLS_START_SHORT, strlen(DS4_TOOL_CALLS_START_SHORT)) == 0) ||
+                        (strncmp(p, "<tool_calls>", 12) == 0)) {
+                        dsml_start = p;
+                        break;
+                    }
+                }
+                if (dsml_start) {
+                    dsml_snippet_len = text.len - (dsml_start - text.ptr);
+                    if (dsml_snippet_len > 500) dsml_snippet_len = 500;
+                }
+                /* Also log a snippet of the full text to see what the model output */
+                size_t text_snippet_len = text.len > 300 ? 300 : text.len;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s invalid tool call returned as assistant text finish=%s [text_len=%zu saw_start=%d saw_end=%d text_snippet: %.*s]",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           final_finish,
+                           text.len,
+                           saw_tool_start,
+                           saw_tool_end,
+                           (int)text_snippet_len,
+                           text.ptr ? text.ptr : "(null)");
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: chat ctx=%s%s%s invalid tool call dsml_snippet: %.*s",
+                           ctx_span,
+                           req_flags[0] ? " " : "",
+                           req_flags,
+                           (int)dsml_snippet_len,
+                           dsml_start ? dsml_start : "(none)");
+                trace_event(s, trace_id,
+                            "invalid tool call returned as assistant text finish=%s",
+                            final_finish);
+            }
         }
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
@@ -11164,14 +11516,20 @@ typedef struct {
     int fd;
 } client_arg;
 
-static void append_model_json_values(buf *b, int ctx, int default_tokens) {
+static void append_model_json_values(buf *b, const char *id, const char *name,
+                                     int ctx, int default_tokens) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
-        "{\"id\":\"deepseek-v4-flash\","
-        "\"object\":\"model\","
+        "{\"id\":");
+    json_escape(b, id);
+    buf_puts(b,
+        ",\"object\":\"model\","
         "\"created\":1767225600,"
         "\"owned_by\":\"ds4.c\","
-        "\"name\":\"DeepSeek V4 Flash\","
+        "\"name\":");
+    json_escape(b, name);
+    buf_printf(b,
+        ","
         "\"context_length\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
@@ -11194,13 +11552,17 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
         max_completion);
 }
 
-static void append_model_json(buf *b, const server *s) {
-    append_model_json_values(b, ds4_session_ctx(s->session), s->default_tokens);
+static void append_model_json(buf *b, const server *s, const char *id) {
+    append_model_json_values(b,
+                             id,
+                             ds4_engine_model_name(s->engine),
+                             ds4_session_ctx(s->session),
+                             s->default_tokens);
 }
 
-static bool send_model(server *s, int fd) {
+static bool send_model(server *s, int fd, const char *id) {
     buf b = {0};
-    append_model_json(&b, s);
+    append_model_json(&b, s, id);
     buf_putc(&b, '\n');
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -11210,7 +11572,9 @@ static bool send_model(server *s, int fd) {
 static bool send_models(server *s, int fd) {
     buf b = {0};
     buf_puts(&b, "{\"object\":\"list\",\"data\":[");
-    append_model_json(&b, s);
+    append_model_json(&b, s, "deepseek-v4-flash");
+    buf_putc(&b, ',');
+    append_model_json(&b, s, "deepseek-v4-pro");
     buf_puts(&b, "]}\n");
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
@@ -11249,8 +11613,13 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
-        send_model(s, fd);
+    const char *model_path_prefix = "/v1/models/";
+    const size_t model_path_prefix_len = strlen(model_path_prefix);
+    if (!strcmp(hr.method, "GET") &&
+        !strncmp(hr.path, model_path_prefix, model_path_prefix_len) &&
+        server_model_alias_known(hr.path + model_path_prefix_len))
+    {
+        send_model(s, fd, hr.path + model_path_prefix_len);
         http_request_free(&hr);
         goto done;
     }
@@ -11281,6 +11650,10 @@ static void *client_main(void *arg) {
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
         goto done;
+    }
+    if (!req.model_from_request) {
+        free(req.model);
+        req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
     if (request_exceeds_context(&req, ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
@@ -11453,96 +11826,8 @@ static void server_close_resources(server *s) {
     memset(s, 0, sizeof(*s));
 }
 
-static void usage(FILE *fp) {
-    fprintf(fp,
-        "Usage: ds4-server [options]\n"
-        "\n"
-        "Model and runtime:\n"
-        "  -m, --model FILE\n"
-        "      GGUF model path. Default: ds4flash.gguf\n"
-        "  --mtp FILE\n"
-        "      Optional MTP support GGUF used for draft-token probes.\n"
-        "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
-        "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
-        "  -c, --ctx N\n"
-        "      Context size allocated at startup. Default: 32768\n"
-        "  -n, --tokens N\n"
-        "      Default max output tokens when the client omits a limit. Default: 393216 (384K)\n"
-        "  -t, --threads N\n"
-        "      CPU helper threads for lightweight host-side work.\n"
-        "  --chdir DIR\n"
-        "      Change working directory before loading the model or runtime assets.\n"
-        "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
-        "  --dir-steering-file FILE\n"
-        "      Load one f32 direction vector per layer for directional steering.\n"
-        "  --dir-steering-ffn F\n"
-        "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
-        "  --dir-steering-attn F\n"
-        "      Apply steering after attention outputs. Default: 0\n"
-        "  --warm-weights\n"
-        "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --metal | --cuda | --cpu | --backend NAME\n"
-        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
-        "\n"
-        "HTTP API:\n"
-        "  --host HOST\n"
-        "      Bind address. Default: 127.0.0.1\n"
-        "  --port N\n"
-        "      Bind port. Default: 8000\n"
-        "  --cors\n"
-        "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
-        "  --trace FILE\n"
-        "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
-        "\n"
-        "Thinking and sampling:\n"
-        "  DeepSeek-compatible chat requests default to thinking mode with high effort.\n"
-        "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
-        "  Think Max is applied only when --ctx is at least 393216 tokens; smaller contexts use high.\n"
-        "  thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.\n"
-        "  API defaults are temperature=1, top_p=1, min_p=0.05, and no top-k cap.\n"
-        "  In thinking mode, client sampling knobs are ignored like the official API.\n"
-        "\n"
-        "Disk KV cache:\n"
-        "  --kv-disk-dir DIR\n"
-        "      Enable disk KV checkpoints in DIR. The directory is created if needed.\n"
-        "  --kv-disk-space-mb N\n"
-        "      Disk budget for checkpoint files. Default when enabled: 4096\n"
-        "  --kv-cache-min-tokens N\n"
-        "      Do not save or load checkpoints shorter than N tokens. Default: 512\n"
-        "  --kv-cache-cold-max-tokens N\n"
-        "      Cold first prompts in [min,N] are saved automatically. 0 disables cold saves. Default: 30000\n"
-        "  --kv-cache-continued-interval-tokens N\n"
-        "      Save at absolute aligned frontiers spaced about N tokens apart. 0 disables. Default: 10000\n"
-        "  --kv-cache-boundary-trim-tokens N\n"
-        "      Trim this many tail tokens before cold boundary saves to avoid tokenizer boundary merges. Default: 32\n"
-        "  --kv-cache-boundary-align-tokens N\n"
-        "      Align cold boundary saves down to this token multiple. 0 disables alignment. Default: 2048\n"
-        "  --kv-cache-reject-different-quant\n"
-        "      Refuse checkpoints written by the same model with a different routed-expert quantization.\n"
-        "  --disable-exact-dsml-tool-replay\n"
-        "      Disable the tool-id -> exact sampled DSML map. Tool history falls back to canonical JSON rendering.\n"
-        "  --tool-memory-max-ids N\n"
-        "      Maximum exact tool-call IDs kept in RAM for replay. Default: 100000\n"
-        "\n"
-        "  Cache triggers:\n"
-        "      cold       save a stable prefix of a long first prompt before generation starts\n"
-        "      continued  save absolute aligned restart frontiers during long prefill or generation\n"
-        "      evict      save the live conversation before another request replaces it\n"
-        "      shutdown   save the live conversation when the server exits cleanly\n"
-        "\n"
-        "Normal server command:\n"
-        "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
-        "\n"
-        "Notes:\n"
-        "  Use /v1/chat/completions, /v1/responses, /v1/completions, or /v1/messages.\n"
-        "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
-        "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
-        "\n"
-        "  -h, --help\n"
-        "      Show this help.\n");
+static void usage(FILE *fp, const char *topic) {
+    ds4_help_print(fp, DS4_HELP_SERVER, topic);
 }
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
@@ -11584,9 +11869,29 @@ static server_config parse_options(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            usage(stdout);
+            const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
+                argv[i + 1] : NULL;
+            usage(stdout, topic);
             exit(0);
-        } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
+        }
+        char dist_parse_err[256] = {0};
+        ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg,
+                                   &i,
+                                   argc,
+                                   argv,
+                                   &c.engine.distributed,
+                                   dist_parse_err,
+                                   sizeof(dist_parse_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       dist_parse_err[0] ? dist_parse_err : "invalid distributed option");
+            exit(2);
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
@@ -11632,6 +11937,12 @@ static server_config parse_options(int argc, char **argv) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--power")) {
+            c.engine.power_percent = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --power must be between 1 and 100");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--dir-steering-file")) {
             c.engine.directional_steering_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
@@ -11652,7 +11963,7 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
-            usage(stderr);
+            usage(stderr, NULL);
             exit(2);
         }
     }
@@ -11665,6 +11976,14 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    char dist_err[256];
+    if (ds4_dist_prepare_engine_options(&c.engine.distributed,
+                                        &c.engine,
+                                        dist_err,
+                                        sizeof(dist_err)) != 0) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
+        exit(2);
     }
     return c;
 }
@@ -11690,6 +12009,14 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+        ds4_dist_generation_options gen = {
+            .ctx_size = cfg.ctx_size,
+        };
+        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+        ds4_engine_close(engine);
+        return rc;
+    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
@@ -13312,6 +13639,213 @@ static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     tool_calls_free(&calls);
 }
 
+/* Verify that try_repair_dsml + parse_generated_message produces structurally
+   valid tool calls for all three DSML styles and multiple truncation scenarios.
+   Balanced but malformed DSML is not repaired: the model must retry it.
+   This tests repair ACCURACY, not just that it doesn't crash. */
+static void test_dsml_repair_produces_parseable_calls(void) {
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    buf repaired = {0};
+
+    /* === TEST 1: Full DSML - missing </tool_calls> === */
+    {
+        const char *broken =
+            "thinking done\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">ls -la" DS4_PARAM_END "\n"
+            DS4_INVOKE_END "\n";
+        /* Missing: DS4_TOOL_CALLS_END */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"ls -la\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 2: Full DSML - missing </invoke> and </tool_calls> === */
+    {
+        const char *broken =
+            "\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"edit\">\n"
+            DS4_PARAM_START " name=\"path\" string=\"true\">/tmp/test.c" DS4_PARAM_END "\n";
+        /* Missing: DS4_INVOKE_END, DS4_TOOL_CALLS_END */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "edit"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/test.c\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 3: Full DSML - missing </parameter> === */
+    {
+        const char *broken =
+            "\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">echo hello";
+        /* Missing: DS4_PARAM_END, DS4_INVOKE_END, DS4_TOOL_CALLS_END */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hello\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 4: Short DSML - missing closing tags === */
+    {
+        const char *broken =
+            "\n\n"
+            DS4_TOOL_CALLS_START_SHORT "\n"
+            DS4_INVOKE_START_SHORT " name=\"write_file\">\n"
+            DS4_PARAM_START_SHORT " name=\"path\" string=\"true\">/tmp/out.txt" DS4_PARAM_END_SHORT "\n"
+            DS4_PARAM_START_SHORT " name=\"content\" string=\"true\">hello world" DS4_PARAM_END_SHORT "\n"
+            DS4_INVOKE_END_SHORT "\n";
+        /* Missing: DS4_TOOL_CALLS_END_SHORT */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write_file"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"/tmp/out.txt\"") != NULL);
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"content\": \"hello world\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 5: Plain XML - missing closing tags === */
+    {
+        const char *broken =
+            "\n\n"
+            "<tool_calls>\n"
+            "<invoke name=\"execute_command\">\n"
+            "<parameter name=\"command\" string=\"true\">pwd</parameter>\n"
+            "</invoke>\n";
+        /* Missing: </tool_calls> */
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, false, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "execute_command"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pwd\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === TEST 6: Balanced text should NOT be modified === */
+    {
+        const char *balanced =
+            "\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">ls" DS4_PARAM_END "\n"
+            DS4_INVOKE_END "\n"
+            DS4_TOOL_CALLS_END;
+
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced, strlen(balanced), &repaired));
+        /* No repair needed */
+    }
+
+    /* === TEST 7: No DSML tags should return false === */
+    {
+        const char *no_dsml = "just plain text, no tools";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(no_dsml, strlen(no_dsml), &repaired));
+    }
+
+    /* === TEST 8: Balanced DSML with no invoke is not repaired === */
+    {
+        const char *balanced_no_invoke =
+            "Let me analyze this.\n\n"
+            DS4_TOOL_CALLS_START
+            "The write tool truncates this too, at what looks like the same content location."
+            DS4_TOOL_CALLS_END;
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced_no_invoke, strlen(balanced_no_invoke), &repaired));
+    }
+
+    /* === TEST 9: Balanced short DSML with no invoke is not repaired === */
+    {
+        const char *balanced_short_no_invoke =
+            "thinking...\n\n"
+            DS4_TOOL_CALLS_START_SHORT
+            "some content here"
+            DS4_TOOL_CALLS_END_SHORT;
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced_short_no_invoke, strlen(balanced_short_no_invoke), &repaired));
+    }
+
+    /* === TEST 10: Balanced plain XML DSML with no invoke is not repaired === */
+    {
+        const char *balanced_xml_no_invoke =
+            "Let me think.\n\n"
+            "<tool_calls>"
+            "I need to use a tool but I don't know which one."
+            "</tool_calls>";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced_xml_no_invoke, strlen(balanced_xml_no_invoke), &repaired));
+    }
+
+    /* === TEST 11: DSML mentioned inside thinking is not repaired === */
+    {
+        const char *thinking_quote =
+            "<think>The protocol uses "
+            DS4_TOOL_CALLS_START
+            "some explanatory text"
+            DS4_TOOL_CALLS_END
+            ", but this is only a quote.</think>\nFinal answer.";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(thinking_quote, strlen(thinking_quote), &repaired));
+    }
+
+    /* === TEST 12: Extra closing tags are unrecoverable, not truncation === */
+    {
+        const char *orphan_close =
+            "done\n\n"
+            DS4_TOOL_CALLS_START
+            DS4_TOOL_CALLS_END
+            DS4_TOOL_CALLS_END;
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(orphan_close, strlen(orphan_close), &repaired));
+    }
+
+    /* === TEST 13: Real DSML after thinking still repairs normally === */
+    {
+        const char *broken_after_think =
+            "<think>"
+            DS4_TOOL_CALLS_START
+            "quoted DSML, not executable"
+            DS4_TOOL_CALLS_END
+            "</think>\n\n"
+            DS4_TOOL_CALLS_START "\n"
+            DS4_INVOKE_START " name=\"bash\">\n"
+            DS4_PARAM_START " name=\"command\" string=\"true\">date" DS4_PARAM_END "\n"
+            DS4_INVOKE_END "\n";
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken_after_think, strlen(broken_after_think), &repaired));
+        TEST_ASSERT(parse_generated_message_ex(repaired.ptr, true, &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"date\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    buf_free(&repaired);
+}
+
 static void test_tool_parse_failure_returns_recoverable_finish(void) {
     const char *generated =
         "trying a tool\n\n"
@@ -13347,6 +13881,28 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
+}
+
+static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
+    request r = {0};
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(
+        "<｜begin▁of▁sentence｜>"
+        "## Tools\nschema\n\nSystem rule\n\n"
+        "<｜User｜>Hi<｜Assistant｜><think>");
+    thinking_state st = {.inside = true};
+
+    char *suffix = build_invalid_dsml_tool_error_suffix(&r, &st, "missing invoke name");
+    TEST_ASSERT(suffix != NULL);
+    TEST_ASSERT(strstr(suffix, "</think><｜end▁of▁sentence｜><｜User｜><tool_result>") == suffix);
+    TEST_ASSERT(strstr(suffix, "Tool error: invalid DSML tool call: missing invoke name") != NULL);
+    TEST_ASSERT(strstr(suffix, "The previous assistant output was not executed") != NULL);
+    TEST_ASSERT(strstr(suffix, "System prompt reminder:\n## Tools\nschema\n\nSystem rule") != NULL);
+    TEST_ASSERT(strstr(suffix, "<｜User｜>Hi") == NULL);
+    TEST_ASSERT(strstr(suffix, "</tool_result><｜Assistant｜><think>") != NULL);
+
+    free(suffix);
+    free(r.prompt_text);
 }
 
 static void test_thinking_dsml_is_not_executable_before_think_close(void) {
@@ -14277,12 +14833,18 @@ static void test_json_skip_has_nesting_limit(void) {
 
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
-    append_model_json_values(&b, 32768, 393216);
+    append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
+                             32768, 393216);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     buf_free(&b);
 
-    append_model_json_values(&b, 100000, 4096);
+    append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
+                             100000, 4096);
+    TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
@@ -14469,19 +15031,19 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kc.enabled = true;
     kc.opt = kv_cache_default_options();
 
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239, 0) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240, 0) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10239) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240, 4096) == 10240);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 10240) == 10240);
 
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720, 24576) == 30720);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30720) == 30720);
 
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432, 10240) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480, 10240) == 20480);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 18432) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 20480) == 20480);
 
     kc.opt.boundary_align_tokens = 0;
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999, 20480) == 0);
-    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000, 20480) == 30000);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 29999) == 0);
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
@@ -14544,8 +15106,10 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file(const char *dir, const char *text,
-                                   uint32_t tokens, uint64_t payload_bytes) {
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -14559,7 +15123,8 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    kv_fill_header(h, 2, KV_REASON_COLD, 0, tokens, 0, 32768, 100, 100, payload_bytes);
+    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
+                            32768, 100, 100, payload_bytes);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -14572,6 +15137,12 @@ static void test_kv_text_stub_file(const char *dir, const char *text,
     free(path);
 }
 
+static void test_kv_text_stub_file(const char *dir, const char *text,
+                                   uint8_t reason,
+                                   uint32_t tokens, uint64_t payload_bytes) {
+    test_kv_text_stub_file_model(dir, text, 0, reason, tokens, payload_bytes);
+}
+
 static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     char tmpl[] = "/tmp/ds4-kv-text-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -14580,8 +15151,8 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
 
     const char *short_text = "transcript prefix";
     const char *long_text = "transcript prefix with sampled token bytes";
-    test_kv_text_stub_file(dir, short_text, 512, 0);
-    test_kv_text_stub_file(dir, long_text, 768, 0);
+    test_kv_text_stub_file(dir, short_text, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file(dir, long_text, KV_REASON_COLD, 768, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -14609,6 +15180,79 @@ static void test_kv_cache_lookup_uses_longest_text_prefix(void) {
     unlink(long_path);
     free(short_path);
     free(long_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_lookup_rejects_wrong_model(void) {
+    char tmpl[] = "/tmp/ds4-kv-model-id-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "shared rendered prefix";
+    test_kv_text_stub_file_model(dir, text, 1, KV_REASON_COLD, 512, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
+                                             0, 2, 32768) < 0);
+    int idx = ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
+                                           1, 2, 32768);
+    TEST_ASSERT(idx >= 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].model_id == 1);
+
+    kv_cache_close(&kc);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
+    char tmpl[] = "/tmp/ds4-kv-stale-abi-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "stale rendered prefix";
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        uint8_t h[KV_CACHE_FIXED_HEADER];
+        kv_fill_header(h, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
+        h[20] = 0; /* pre-ABI-guard files used this byte as reserved zero. */
+        uint8_t text_len[4];
+        le_put32(text_len, (uint32_t)strlen(text));
+        TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+        TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+        TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
+        TEST_ASSERT(fclose(fp) == 0);
+    }
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "stale rendered prefix and tail",
+                                             0, 2, 32768) < 0);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
     rmdir(dir);
 }
 
@@ -14770,7 +15414,7 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, NULL);
+    kv_cache_evict(&kc, NULL, 0, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -14783,75 +15427,197 @@ static void test_kv_cache_eviction_values_fresh_snapshots(void) {
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_protects_current_store(void) {
-    char tmpl[] = "/tmp/ds4-kv-current-store-evict-test.XXXXXX";
+static void test_kv_cache_eviction_prefers_anchor_reason(void) {
+    char tmpl[] = "/tmp/ds4-kv-anchor-reason-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *anchor_sha = "1111111111111111111111111111111111111111";
+    const char *continued_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    test_kv_stub_file(dir, anchor_sha, KV_REASON_COLD, 2048, 0, now, 2048);
+    test_kv_stub_file(dir, continued_sha, KV_REASON_CONTINUED, 2048, 0, now, 2048);
+
+    char anchor_name[44], continued_name[44];
+    snprintf(anchor_name, sizeof(anchor_name), "%.40s.kv", anchor_sha);
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    char *anchor_path = path_join(dir, anchor_name);
+    char *continued_path = path_join(dir, continued_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(anchor_path, F_OK) == 0);
+    TEST_ASSERT(access(continued_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(anchor_path);
+    unlink(continued_path);
+    free(anchor_path);
+    free(continued_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_makes_room_before_store(void) {
+    char tmpl[] = "/tmp/ds4-kv-pre-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
     const char *old_sha = "1111111111111111111111111111111111111111";
-    const char *new_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
     test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, now, 2048);
-    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 2048, 0, now, 4096);
 
-    char old_name[44], new_name[44];
+    char old_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
-    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
     char *old_path = path_join(dir, old_name);
-    char *new_path = path_join(dir, new_name);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 4096u) + 16u;
-    kv_cache_evict(&kc, NULL, new_sha);
+    kv_cache_evict(&kc, NULL, KV_CACHE_FIXED_HEADER + 4u + 4096u, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
-    TEST_ASSERT(access(new_path, F_OK) == 0);
 
     kv_cache_close(&kc);
     unlink(old_path);
-    unlink(new_path);
     free(old_path);
-    free(new_path);
     rmdir(dir);
 }
 
-static void test_kv_cache_eviction_does_not_protect_oversize_current_store(void) {
+static void test_kv_cache_eviction_ignores_oversize_incoming(void) {
     char tmpl[] = "/tmp/ds4-kv-oversize-store-evict-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
     TEST_ASSERT(dir != NULL);
     if (!dir) return;
 
     const char *old_sha = "1111111111111111111111111111111111111111";
-    const char *new_sha = "2222222222222222222222222222222222222222";
     uint64_t now = (uint64_t)time(NULL);
     test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 4096, 0, now, 1024);
-    test_kv_stub_file(dir, new_sha, KV_REASON_CONTINUED, 4096, 0, now, 4096);
 
-    char old_name[44], new_name[44];
+    char old_name[44];
     snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
-    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
     char *old_path = path_join(dir, old_name);
-    char *new_path = path_join(dir, new_name);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 1024u) + 16u;
-    kv_cache_evict(&kc, NULL, new_sha);
+    kv_cache_evict(&kc, NULL, kc.budget_bytes + 1, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) == 0);
-    TEST_ASSERT(access(new_path, F_OK) != 0);
 
     kv_cache_close(&kc);
     unlink(old_path);
-    unlink(new_path);
     free(old_path);
-    free(new_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_prefers_superseded_continued_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-prefix-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *continued_text = "system: hello world";
+    const char *cold_text = "different stable prefix";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
+
+    char continued_sha[41], cold_sha[41];
+    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
+    sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
+    char continued_name[44], cold_name[44];
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    char *continued_path = path_join(dir, continued_name);
+    char *cold_path = path_join(dir, cold_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(cold_text) + 2048u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+    };
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(continued_path, F_OK) != 0);
+    TEST_ASSERT(access(cold_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(continued_path);
+    unlink(cold_path);
+    free(continued_path);
+    free(cold_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-prefix-ctx-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *continued_text = "system: hello world";
+    const char *cold_text = "different stable prefix";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED, 4096, 2048);
+    test_kv_text_stub_file(dir, cold_text, KV_REASON_COLD, 1024, 2048);
+
+    char continued_sha[41], cold_sha[41];
+    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
+    sha1_bytes_hex(cold_text, strlen(cold_text), cold_sha);
+    char continued_name[44], cold_name[44];
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    snprintf(cold_name, sizeof(cold_name), "%.40s.kv", cold_sha);
+    char *continued_path = path_join(dir, continued_name);
+    char *cold_path = path_join(dir, cold_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    uint64_t incoming_bytes =
+        KV_CACHE_FIXED_HEADER + 4u + strlen(incoming_text) + 2048u;
+    kc.budget_bytes =
+        incoming_bytes + KV_CACHE_FIXED_HEADER + 4u + strlen(continued_text) + 2048u;
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 65536,
+        .reject_different_quant = false,
+    };
+    kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
+
+    TEST_ASSERT(access(continued_path, F_OK) == 0);
+    TEST_ASSERT(access(cold_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(continued_path);
+    unlink(cold_path);
+    free(continued_path);
+    free(cold_path);
     rmdir(dir);
 }
 
@@ -14864,8 +15630,8 @@ static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     kv_entry stale = {.tokens = 1024, .hits = 10, .file_size = 4096, .last_used = 1000};
     kv_entry fresh = {.tokens = 2048, .hits = 0,  .file_size = 4096, .last_used = now};
 
-    double s_on = kv_entry_eviction_score(&stale, NULL, NULL, now);
-    double f_on = kv_entry_eviction_score(&fresh, NULL, NULL, now);
+    double s_on = kv_entry_eviction_score(&stale, NULL, now, NULL);
+    double f_on = kv_entry_eviction_score(&fresh, NULL, now, NULL);
     TEST_ASSERT(s_on < f_on);
 
     /* A fresh entry's score never decays below its (0+1) * tokens/size floor,
@@ -14899,7 +15665,7 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, NULL);
+    kv_cache_evict(&kc, NULL, 0, NULL);
 
     TEST_ASSERT(access(old_path, F_OK) != 0);
     TEST_ASSERT(access(new_path, F_OK) == 0);
@@ -14935,7 +15701,7 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
     kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
-    kv_cache_evict(&kc, NULL, NULL);
+    kv_cache_evict(&kc, NULL, 0, NULL);
 
     TEST_ASSERT(access(cold_path, F_OK) != 0);
     TEST_ASSERT(access(continued_path, F_OK) == 0);
@@ -15251,7 +16017,9 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_dsml_parser_recovers_loose_nested_parameters();
+    test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
+    test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
@@ -15296,9 +16064,14 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
     test_kv_cache_lookup_uses_longest_text_prefix();
+    test_kv_cache_lookup_rejects_wrong_model();
+    test_kv_cache_lookup_rejects_stale_payload_abi();
     test_kv_cache_eviction_values_fresh_snapshots();
-    test_kv_cache_eviction_protects_current_store();
-    test_kv_cache_eviction_does_not_protect_oversize_current_store();
+    test_kv_cache_eviction_prefers_anchor_reason();
+    test_kv_cache_eviction_makes_room_before_store();
+    test_kv_cache_eviction_ignores_oversize_incoming();
+    test_kv_cache_eviction_prefers_superseded_continued_prefix();
+    test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
