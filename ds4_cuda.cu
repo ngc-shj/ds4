@@ -2808,7 +2808,18 @@ __global__ static void repeat_hc_kernel(float *out, const float *row, uint32_t n
 
 __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __float2half(x[i]);
+    if (i < n) {
+        /* Saturate to the f16 range before conversion. A long-context
+         * prefill can drive an activation past 65504, which __float2half
+         * turns into +inf; that inf then propagates through layernorm and
+         * collapses the whole final logit vector to NaN (argmax -> 0). The
+         * f16 GEMM accumulates in f32, so clamping the input magnitude is
+         * the only place this overflow can be stopped. */
+        const float hmax = 65504.0f;
+        float v = x[i];
+        v = fminf(fmaxf(v, -hmax), hmax);
+        out[i] = __float2half(v);
+    }
 }
 
 __device__ static float warp_sum_f32(float v) {
