@@ -143,13 +143,9 @@ Details in [memory `project-dead-ends`](../../../home/noguchi/.claude/projects/-
 - Expected +50% (encode 27 ms → ~1 ms); multi-day with high
   roll-back cost on failure.
 - WIP reference: `5ae22be` on `perf/cuda-graph-wip`.
-- **Correction (2026-09-15): the +50% estimate is wrong.** It treated
-  `5ae22be`'s encode 27 ms and execute 47 ms as sequential, but kernel
-  launches are asynchronous: the GPU computes while the host enqueues
-  (and the encode window also contained the sync after layer 4), so the
-  two overlap and do not add. nsys shows the GPU 91.8% busy at N=1,
-  which caps what removing launch cost can recover at ~8%; the capture
-  branch itself measured generation at 13.0 vs 13.0 t/s. See
+- **Correction (2026-09-15): no gain.** The GPU is already saturated by
+  memory bandwidth on GB10 (91.8% busy), so fewer kernel launches via
+  CUDA Graphs changed nothing (13.0 vs 13.0 t/s). See
   [NOTES.md section 5](https://github.com/ngc-shj/ds4/blob/1865c4c6ddb7266e51d1283aad327f2865526e5d/NOTES.md#L373-L413).
 
 **Candidate C: re-measure B.4 perf (post 33c fix)**
