@@ -1580,6 +1580,8 @@ static double g_batch_cb_created_ms;
 static double ds4_gpu_now_ms(void);
 static void ds4_gpu_queue_keepalive_start(void);
 static void ds4_gpu_queue_keepalive_stop_thread(void);
+static void ds4_gpu_pacer_note_activity(void);
+static void ds4_gpu_pacer_start(void);
 unsigned long long g_ds4_cb_finished;
 
 unsigned long long ds4_gpu_cb_finished(void) { return g_ds4_cb_finished; }
@@ -1611,6 +1613,7 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
 
     const double t_commit = ds4_gpu_now_ms();
     [cb commit];
+    ds4_gpu_pacer_note_activity();
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
         ok = 0;
@@ -2398,6 +2401,7 @@ static int ds4_gpu_finish_model_views(
         }
     }
     ds4_gpu_queue_keepalive_start();
+    ds4_gpu_pacer_start();
     const double t_warm = ds4_gpu_now_ms();
     if (ds4_gpu_model_map_log_enabled()) {
         fprintf(stderr,
@@ -11409,6 +11413,70 @@ static void ds4_gpu_queue_keepalive_stop_thread(void) {
     g_queue_keepalive_stop = 1;
     pthread_join(g_queue_keepalive_thread, NULL);
     g_queue_keepalive_running = 0;
+}
+
+/* Decode pacer.  A single decode stream leaves the GPU idle between the
+ * per-layer readbacks, and the frequency governor reads that as an idle
+ * machine: a Metal System Trace has it at the minimum performance state for
+ * 58.7% of a single-session V4.1 decode, against 9.7% with four sessions in
+ * flight.  Filling the gaps with throwaway ALU work on a second queue is
+ * worth +9% on this box, so the parasite pays for itself.  It runs only
+ * while the main queue is busy, and DS4_METAL_GPU_PACER=1 turns it on. */
+static pthread_t g_pacer_thread;
+static volatile int g_pacer_running;
+static volatile int g_pacer_stop;
+static volatile double g_pacer_last_activity_ms;
+
+static void ds4_gpu_pacer_note_activity(void) {
+    if (g_pacer_running) g_pacer_last_activity_ms = ds4_gpu_now_ms();
+}
+
+static void *ds4_gpu_pacer_thread(void *arg) {
+    (void)arg;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    id<MTLCommandQueue> queue = [g_device newCommandQueue];
+    const uint32_t tgs = (uint32_t)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_TGS", 16u, 1u, 2048u);
+    const uint32_t iters = (uint32_t)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_ITERS", 2000u, 1u, 100000000u);
+    const double idle_ms = (double)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_IDLE_MS", 20u, 1u, 10000u);
+    id<MTLBuffer> scratch = [g_device newBufferWithLength:(NSUInteger)tgs * 256u * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    if (!pipeline || !queue || !scratch) {
+        fprintf(stderr, "ds4: GPU pacer setup failed (continuing without)\n");
+        return NULL;
+    }
+    memset(scratch.contents, 0, (size_t)tgs * 256u * sizeof(float));
+    while (!g_pacer_stop) {
+        if (ds4_gpu_now_ms() - g_pacer_last_activity_ms > idle_ms) {
+            usleep(2000);
+            continue;
+        }
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:scratch offset:0 atIndex:0];
+            [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)tgs, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
+    return NULL;
+}
+
+static void ds4_gpu_pacer_start(void) {
+    if (g_pacer_running) return;
+    if (getenv("DS4_METAL_GPU_PACER") == NULL) return;
+    g_pacer_stop = 0;
+    g_pacer_running = 1;
+    if (pthread_create(&g_pacer_thread, NULL, ds4_gpu_pacer_thread, NULL) != 0) {
+        g_pacer_running = 0;
+        fprintf(stderr, "ds4: failed to start the GPU pacer thread\n");
+        return;
+    }
+    fprintf(stderr, "ds4: GPU pacer on\n");
 }
 
 int ds4_gpu_tp_failed(void) {
