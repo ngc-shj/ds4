@@ -40854,7 +40854,15 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
-    return ds41_moe_partial(g, m, l, il, token) && ds41_moe_finish(g, il);
+    if (!ds41_moe_partial(g, m, l, il, token)) return false;
+    /* The expert dispatches are encoded here but nothing is submitted until
+     * the next layer's selected-id signal, so the GPU has nothing to run for
+     * the 0.147 ms a layer the host then spends encoding the next layer's
+     * attention. The queue already orders whatever is encoded next, so
+     * committing now costs a command buffer boundary and buys that overlap. */
+    if (g->streaming && getenv("DS4_METAL_V41_EARLY_COMMIT") &&
+        !ds4_gpu_flush_commands()) return false;
+    return ds41_moe_finish(g, il);
 }
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
@@ -42519,8 +42527,17 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         if (ab) {
             setenv(ab, "1", 1);
             t0 = now_sec();
-            for (long i = 0; ok && i < steps; i++)
+            for (long i = 0; ok && i < steps; i++) {
+                int arg = 0;
                 ok = ds41_graph_step(g, m, w, tok[i], lg);
+                if (!ok) break;
+                DS41_SELFTEST_ARGMAX(lg, arg);
+                checked++;
+                if (batch_mismatch < 0 && arg != tok[i + 1]) {
+                    batch_mismatch = i;
+                    batch_gap = refgap[i + 1];
+                }
+            }
             single_b[r] = (now_sec() - t0) * 1000.0 / (double)steps;
             unsetenv(ab);
             DS41_SELFTEST_REWIND();
@@ -42549,8 +42566,14 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         fprintf(stderr,
                 "  median unset    : %.2f ms/token\n"
                 "  median set      : %.2f ms/token\n"
-                "  setting %s costs %+.1f%%\n",
-                a, b, ab, 100.0 * (b / a - 1.0));
+                "  setting %s costs %+.1f%%\n"
+                "  set arm output  : %s (%ld tokens checked)\n",
+                a, b, ab, 100.0 * (b / a - 1.0),
+                batch_mismatch < 0 ? "identical argmax" : "DIVERGED", checked);
+        if (batch_mismatch >= 0)
+            fprintf(stderr, "  set arm first diverged at offset %ld, "
+                    "where the reference led second place by %.6g\n",
+                    batch_mismatch, (double)batch_gap);
         goto done;
     }
     qsort(batch, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
