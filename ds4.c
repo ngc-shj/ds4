@@ -41273,7 +41273,7 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
-                           bool shared_owner) {
+                           bool shared_owner, bool force_resident) {
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
@@ -41304,7 +41304,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
-            il, count, &mid_f16, true)) &&
+            il, count, &mid_f16, force_resident)) &&
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
@@ -41982,7 +41982,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false);
+                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
                 DS41_STAGE("shared/routed ffn");
                 if (ok && batch_hc) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
@@ -42101,19 +42101,31 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
-static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
+/* row_logits, when given, collects every row's logits instead of only the
+ * frontier row's. Speculative verification needs all of them: it compares each
+ * drafted token against what the target model would have chosen there. */
+static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
-                                   const ds4_model *model, const ds4_weights *weights) {
+                                   const ds4_model *model, const ds4_weights *weights,
+                                   float *row_logits) {
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
     /* Sparse block masks scale with context, even when prefill caps match.
      * Attention and Engram history remain private to each session. */
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
-    if (!g) return false;
+    if (!g || (row_logits && (g->tp_world != 1 || g->tp_logits_half))) return false;
     const uint32_t rows = (uint32_t)count;
-    const bool prefill_only = prefill_rows == rows;
+    /* Consecutive positions in one session and publishing only the frontier
+     * row are separate things; a verifier wants the first and not the second. */
+    const bool prefill_only = prefill_rows == rows && !row_logits;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+    /* The streaming expert cache can serve a whole batch from one address
+     * table, so every row reads each unique expert once instead of once per
+     * row. The per-row detour below stays the default until that path has
+     * been shown to match it byte for byte on this model's shapes. */
+    const bool batch_stream_experts = g->streaming && g->tp_world == 1 &&
+        getenv("DS4_METAL_V41_BATCH_STREAM_EXPERTS") != NULL;
     ds41_prefill_row active = {0};
     ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
     uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
@@ -42152,6 +42164,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    /* Which part of a k-row step actually grows with k. Splitting it costs a
+     * command buffer boundary per stage, so the totals run high; the shares
+     * between them are the point. */
+    const bool stage_ms = getenv("DS4_V41_BATCH_STAGE_MS") != NULL;
+    double stage_pre = 0, stage_attn = 0, stage_moe = 0, stage_mark = 0;
+    if (stage_ms) {
+        ok = ok && ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
+        stage_mark = now_sec();
+    }
+#define DS41_BSTAGE(acc) do { \
+        if (ok && stage_ms) { \
+            ok = ds4_gpu_end_commands() != 0; \
+            const double now = now_sec(); \
+            (acc) += (now - stage_mark) * 1000.0; \
+            stage_mark = now; \
+            if (ok) ok = ds4_gpu_begin_commands() != 0; \
+        } \
+    } while (0)
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
@@ -42166,6 +42196,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
+        DS41_BSTAGE(stage_pre);
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -42177,6 +42208,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ok = ds41_attention(&row, model, l, il, true) &&
                 ds41_attention_output(&row, model, l);
         }
+        DS41_BSTAGE(stage_attn);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows);
@@ -42185,7 +42217,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
              * streaming expert cache is wired into the single-row path, so the
              * rows run through that, still inside this command buffer: one host
              * round trip per step instead of one per token. */
-            if (g->streaming) {
+            if (batch_stream_experts) {
+                ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, false);
+            } else if (g->streaming) {
                 ds41_gpu_graph moe_rows[DS4_TP_BATCH_MAX_ROWS];
                 for (int i = 0; i < count; i++) {
                     moe_rows[i] = *graphs[i];
@@ -42212,7 +42246,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 (void)ds4_gpu_routed_moe_set_selected_override(NULL, 0);
                 (void)ds4_gpu_routed_moe_set_row_slot(0);
             } else {
-                ok = ds41_moe_batch(g, model, l, il, rows, shared_owner);
+                ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, true);
             }
         }
         if (ok) ok =
@@ -42223,6 +42257,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+        DS41_BSTAGE(stage_moe);
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
@@ -42252,6 +42287,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     }
     if (ok && batch_logits)
         ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
+    if (ok && row_logits) {
+        /* All rows share one session's tensors, so the tail below would leave
+         * only the last row's logits behind. Take them from the batch buffer
+         * while they are all still there. */
+        ok = batch_logits != NULL && ds4_gpu_end_commands() != 0;
+        for (uint32_t i = 0; ok && i < rows; i++)
+            ok = ds4_gpu_tensor_read(batch_logits, (uint64_t)i * logits_bytes,
+                                     row_logits + (size_t)i * DS4_N_VOCAB,
+                                     logits_bytes) != 0;
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+    }
     for (int i = first_output; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         if (batch_logits)
@@ -42260,6 +42306,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
+    if (stage_ms)
+        fprintf(stderr, "ds4: V4.1 batch step rows=%u pre %.1f ms, per-row attention %.1f ms, "
+                "moe %.1f ms\n", rows, stage_pre, stage_attn, stage_moe);
+#undef DS41_BSTAGE
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)
@@ -42270,6 +42320,212 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     }
     free(engram);
     return ok;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens,
+                                   int count, uint32_t prefill_rows,
+                                   const ds4_model *model, const ds4_weights *weights) {
+    return ds41_graph_step_batch_logits(graphs, tokens, count, prefill_rows,
+                                        model, weights, NULL);
+}
+
+/* Speculative decoding rests on three things that are not safe to assume here:
+ * that a session can be rolled back to an earlier position and reproduce its
+ * own output, that a k-row batch over consecutive positions agrees with k
+ * single steps, and that the batch costs less than k of them. This measures all
+ * three on the live model. The two arms alternate inside one run because this
+ * machine drifts by more between runs than the effect being measured. */
+static int ds41_selftest_cmp(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_weights *w, int first_token) {
+    const char *env = getenv("DS4_V41_VERIFY_SELFTEST");
+    const long k = env && env[0] ? strtol(env, NULL, 10) : 0;
+    if (k < 2 || k > DS4_TP_BATCH_MAX_ROWS) return;
+    if (g->prefill_cap < (uint32_t)k) {
+        fprintf(stderr, "ds4: verify selftest needs prefill_cap >= %ld, have %u\n",
+                k, g->prefill_cap);
+        return;
+    }
+    const char *renv = getenv("DS4_V41_VERIFY_SELFTEST_ROUNDS");
+    long rounds = renv && renv[0] ? strtol(renv, NULL, 10) : 3;
+    if (rounds < 1) rounds = 1;
+    if (rounds > 9) rounds = 9;
+    const long blocks = 8;
+    const long steps = k * blocks;
+    const uint32_t pos0 = g->pos;
+    const ds4_engram_history hist0 = g->history;
+    if (g->ctx - pos0 < (uint32_t)steps + 1u) {
+        fprintf(stderr, "ds4: verify selftest needs %ld positions of context\n", steps + 1);
+        return;
+    }
+    float *lg = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *rowbuf = malloc((size_t)k * DS4_N_VOCAB * sizeof(float));
+    int *tok = malloc((size_t)(steps + 1) * sizeof(int));
+    float *carry = NULL;
+    float *refgap = malloc((size_t)(steps + 1) * sizeof(float));
+    /* What the first rolled-back pass decided, to tell "rollback lands
+     * somewhere else but stays there" from "every pass differs". */
+    int *tok2 = malloc((size_t)(steps + 1) * sizeof(int));
+    double *single = malloc((size_t)rounds * sizeof(double));
+    double *batch = malloc((size_t)rounds * sizeof(double));
+    if (!lg || !rowbuf || !tok || !refgap || !tok2 || !single || !batch) goto done;
+    /* Isolating the rollback: with no batch pass in between, a divergence can
+     * only come from the rewind itself. */
+    const bool nobatch = getenv("DS4_V41_VERIFY_SELFTEST_NOBATCH") != NULL;
+    tok[0] = first_token;
+
+#define DS41_SELFTEST_TOP2(src, dst, gap) do { \
+        int best = 0; float bv = (src)[0], second = -FLT_MAX; \
+        for (uint32_t v = 1; v < DS4_N_VOCAB; v++) { \
+            if ((src)[v] > bv) { second = bv; bv = (src)[v]; best = (int)v; } \
+            else if ((src)[v] > second) second = (src)[v]; \
+        } \
+        (dst) = best; (gap) = bv - second; \
+    } while (0)
+#define DS41_SELFTEST_ARGMAX(src, dst) do { \
+        float gap_unused_; DS41_SELFTEST_TOP2((src), (dst), gap_unused_); \
+    } while (0)
+/* Rewinding to an odd position has to put back the half-finished ratio-2
+ * compression pair as well: it is carried from step to step rather than
+ * indexed by position, so pos alone does not describe it. ds41_state_spans
+ * says the same thing about what a saved session must hold. */
+#define DS41_SELFTEST_CARRY_BYTES (512u * 4u)
+#define DS41_SELFTEST_REWIND() do { \
+        g->pos = pos0; g->history = hist0; g->valid = true; \
+        if (carry && ds4_gpu_synchronize()) \
+            for (uint32_t ci = 0; ci < 3; ci++) { \
+                (void)ds4_gpu_tensor_write(g->previous_kv[ci], 0, \
+                    carry + (size_t)ci * 2u * 512u, DS41_SELFTEST_CARRY_BYTES); \
+                (void)ds4_gpu_tensor_write(g->previous_score[ci], 0, \
+                    carry + ((size_t)ci * 2u + 1u) * 512u, DS41_SELFTEST_CARRY_BYTES); \
+            } \
+    } while (0)
+
+    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    for (long i = 0; i < k; i++) graphs[i] = g;
+    bool ok = true;
+    if ((pos0 & 1u) && !getenv("DS4_V41_VERIFY_SELFTEST_NO_CARRY") &&
+        ds4_gpu_synchronize()) {
+        carry = malloc((size_t)3u * 2u * 512u * sizeof(float));
+        for (uint32_t ci = 0; carry && ci < 3; ci++)
+            if (!ds4_gpu_tensor_read(g->previous_kv[ci], 0,
+                    carry + (size_t)ci * 2u * 512u, DS41_SELFTEST_CARRY_BYTES) ||
+                !ds4_gpu_tensor_read(g->previous_score[ci], 0,
+                    carry + ((size_t)ci * 2u + 1u) * 512u, DS41_SELFTEST_CARRY_BYTES)) {
+                free(carry); carry = NULL;
+            }
+    }
+    long rollback_mismatch = -1, batch_mismatch = -1, checked = 0;
+    long repeat_mismatch = -1;
+    float rollback_gap = 0, batch_gap = 0;
+
+    /* The reference token at every position, and the throwaway warm-up: a first
+     * pass after a build or a prefill runs well off the steady state. */
+    for (long i = 0; ok && i < steps; i++) {
+        ok = ds41_graph_step(g, m, w, tok[i], lg);
+        if (ok) DS41_SELFTEST_TOP2(lg, tok[i + 1], refgap[i + 1]);
+    }
+    DS41_SELFTEST_REWIND();
+    for (long b = 0; ok && !nobatch && b < blocks; b++) {
+        ok = ds4_gpu_begin_commands() &&
+             ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k,
+                                          m, w, rowbuf);
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+    }
+    DS41_SELFTEST_REWIND();
+    if (!ok) { fprintf(stderr, "ds4: verify selftest warm-up failed\n"); goto done; }
+
+    for (long r = 0; ok && r < rounds; r++) {
+        double t0 = now_sec();
+        for (long i = 0; ok && i < steps; i++) {
+            int arg = 0;
+            ok = ds41_graph_step(g, m, w, tok[i], lg);
+            if (!ok) break;
+            DS41_SELFTEST_ARGMAX(lg, arg);
+            /* Re-deciding the same positions is the rollback test: a session
+             * that cannot reproduce its own output cannot be speculated on. */
+            if (rollback_mismatch < 0 && arg != tok[i + 1]) {
+                rollback_mismatch = i;
+                rollback_gap = refgap[i + 1];
+            }
+            if (r == 0) tok2[i + 1] = arg;
+            else if (repeat_mismatch < 0 && arg != tok2[i + 1]) repeat_mismatch = i;
+        }
+        single[r] = (now_sec() - t0) * 1000.0 / (double)steps;
+        DS41_SELFTEST_REWIND();
+
+        t0 = now_sec();
+        for (long b = 0; ok && !nobatch && b < blocks; b++) {
+            ok = ds4_gpu_begin_commands() &&
+                 ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k,
+                                              m, w, rowbuf);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else { (void)ds4_gpu_synchronize(); break; }
+            for (long j = 0; j < k; j++) {
+                int arg = 0;
+                DS41_SELFTEST_ARGMAX(rowbuf + (size_t)j * DS4_N_VOCAB, arg);
+                checked++;
+                if (batch_mismatch < 0 && arg != tok[b * k + j + 1]) {
+                    batch_mismatch = b * k + j;
+                    batch_gap = refgap[b * k + j + 1];
+                }
+            }
+        }
+        batch[r] = (now_sec() - t0) * 1000.0 / (double)steps;
+        DS41_SELFTEST_REWIND();
+    }
+    if (!ok) { fprintf(stderr, "ds4: verify selftest timing pass failed\n"); goto done; }
+
+    fprintf(stderr, "ds4: V4.1 verify selftest k=%ld, %ld positions from %u (%s), %ld alternating rounds\n",
+            k, steps, pos0,
+            (pos0 & 1u) ? (carry ? "odd start, pair carry restored"
+                                 : "odd start, pair carry NOT restored")
+                        : "even start, no pair carry",
+            rounds);
+    for (long r = 0; r < rounds; r++)
+        fprintf(stderr, "  round %ld: single %.2f ms/token, batch %.2f ms/step\n",
+                r, single[r], batch[r] * (double)k);
+    qsort(single, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
+    qsort(batch, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
+    const double sm = single[rounds / 2], bm = batch[rounds / 2] * (double)k;
+    fprintf(stderr,
+            "  median single    : %.2f ms/token\n"
+            "  median %ld-row step: %.2f ms = %.2fx one single step\n"
+            "  marginal row cost: %.2f ms = %.0f%% of a standalone token\n"
+            "  rollback         : %s\n"
+            "  batch vs single  : %s (%ld rows checked)\n"
+            "  break-even       : accept %.0f%% of drafted tokens to beat single\n",
+            sm, k, bm, bm / sm,
+            (bm - sm) / (double)(k - 1), 100.0 * (bm - sm) / (double)(k - 1) / sm,
+            rollback_mismatch < 0 ? "reproduces its own output" : "DIVERGED",
+            !checked ? "not run" :
+                batch_mismatch < 0 ? "identical argmax" : "DIVERGED", checked,
+            100.0 * bm / sm / (double)k);
+    /* A divergence where the reference itself was a near tie says the greedy
+     * pick flipped, not that the path is wrong. */
+    if (rollback_mismatch >= 0)
+        fprintf(stderr, "  rollback first diverged at offset %ld, "
+                "where the reference led second place by %.6g\n",
+                rollback_mismatch, (double)rollback_gap);
+    fprintf(stderr, "  rolled-back passes agree with each other: %s\n",
+            repeat_mismatch < 0 ? "yes" : "no");
+    if (batch_mismatch >= 0)
+        fprintf(stderr, "  batch first diverged at offset %ld, "
+                "where the reference led second place by %.6g\n",
+                batch_mismatch, (double)batch_gap);
+#undef DS41_SELFTEST_TOP2
+#undef DS41_SELFTEST_ARGMAX
+#undef DS41_SELFTEST_CARRY_BYTES
+#undef DS41_SELFTEST_REWIND
+done:
+    g->pos = pos0; g->history = hist0; g->valid = true;
+    free(lg); free(rowbuf); free(tok); free(refgap); free(tok2); free(single); free(batch);
+    free(carry);
 }
 
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
@@ -77402,6 +77658,12 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
+        static int selftest_done;
+        if (!selftest_done && s->ds41_graph_ready &&
+            s->ds41_graph.pos == (uint32_t)s->checkpoint.len) {
+            selftest_done = 1;
+            ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
+        }
         if (!s->ds41_graph_ready ||
             (!s->checkpoint_valid && s->checkpoint.len != 0) ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
