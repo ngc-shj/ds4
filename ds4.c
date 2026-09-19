@@ -41174,10 +41174,24 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
+double g_v41_pre_moe_ms, g_v41_moe_ms, g_v41_post_moe_ms;
+
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    const bool prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
+    const double t0 = prof ? now_sec() : 0.0;
+    if (!ds41_graph_before_moe(g, m, l, il)) return false;
+    const double t1 = prof ? now_sec() : 0.0;
+    if (!ds41_moe(g, m, l, il, (uint32_t)token)) return false;
+    const double t2 = prof ? now_sec() : 0.0;
+    const bool ok = ds41_graph_after_moe(g);
+    if (prof) {
+        const double t3 = now_sec();
+        g_v41_pre_moe_ms += (t1 - t0) * 1000.0;
+        g_v41_moe_ms += (t2 - t1) * 1000.0;
+        g_v41_post_moe_ms += (t3 - t2) * 1000.0;
+    }
+    return ok;
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41372,8 +41386,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         gpu_ms += (t3 - v41_t2) * 1000.0;
         if ((++steps % 32ull) == 0ull)
             fprintf(stderr,
-                    "ds4: v41 decode %llu steps: engram %.3f ms + encode %.3f ms + gpu/logits %.3f ms = %.3f ms/token, %.1f cbs/token (layer 20: %llu)\n",
-                    steps, eng_ms / (double)steps, enc_ms / (double)steps,
+                    "ds4: v41 decode %llu steps: engram %.3f + pre-moe %.3f + moe %.3f + post-moe %.3f + other %.3f + logits %.3f = %.3f ms/token, %.1f cbs/token (layer 20: %llu)\n",
+                    steps, eng_ms / (double)steps,
+                    g_v41_pre_moe_ms / (double)steps,
+                    g_v41_moe_ms / (double)steps,
+                    g_v41_post_moe_ms / (double)steps,
+                    (enc_ms - g_v41_pre_moe_ms - g_v41_moe_ms - g_v41_post_moe_ms) / (double)steps,
                     gpu_ms / (double)steps,
                     (eng_ms + enc_ms + gpu_ms) / (double)steps,
                     (double)(ds4_gpu_cb_finished() - v41_cb_first) / (double)steps,
