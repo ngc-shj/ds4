@@ -11505,7 +11505,22 @@ static volatile int g_pacer_running;
 static volatile int g_pacer_stop;
 static volatile double g_pacer_last_activity_ms;
 
+static void ds4_gpu_pacer_start(void);
+static void ds4_gpu_pacer_stop(void);
+
+/* With DS4_METAL_GPU_PACER_DYNAMIC set, the pacer follows DS4_METAL_GPU_PACER
+ * while the process runs instead of only at init. An arm-per-server A/B cannot
+ * resolve what the pacer does here - two runs of each arm gave 54.44/53.98
+ * against 48.76/56.60 - and an in-process A/B could not toggle something read
+ * once at startup. This makes the variable mean what the harness assumes. */
 static void ds4_gpu_pacer_note_activity(void) {
+    static int dynamic = -1;
+    if (dynamic < 0) dynamic = getenv("DS4_METAL_GPU_PACER_DYNAMIC") != NULL;
+    if (dynamic) {
+        const int want = getenv("DS4_METAL_GPU_PACER") != NULL;
+        if (want && !g_pacer_running) ds4_gpu_pacer_start();
+        else if (!want && g_pacer_running) ds4_gpu_pacer_stop();
+    }
     if (g_pacer_running) g_pacer_last_activity_ms = ds4_gpu_now_ms();
 }
 
@@ -11542,6 +11557,14 @@ static void *ds4_gpu_pacer_thread(void *arg) {
         }
     }
     return NULL;
+}
+
+static void ds4_gpu_pacer_stop(void) {
+    if (!g_pacer_running) return;
+    g_pacer_stop = 1;
+    pthread_join(g_pacer_thread, NULL);
+    g_pacer_running = 0;
+    fprintf(stderr, "ds4: GPU pacer off\n");
 }
 
 static void ds4_gpu_pacer_start(void) {
