@@ -44302,6 +44302,31 @@ int ds4_gpu_routed_moe_batch_tensor(
                         layer_index);
                 return 0;
             }
+            /* Proof that a batch really shared its expert reads, and by how
+             * much: unique is what the rows read together, tokens*n_expert is
+             * what they would have read one row at a time. */
+            {
+                static uint64_t calls, tokens_sum, unique_sum, every;
+                static int checked;
+                if (!checked) {
+                    checked = 1;
+                    const char *env = getenv("DS4_METAL_BATCH_STREAM_ADDR_COUNT");
+                    every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+                }
+                if (every) {
+                    tokens_sum += n_tokens;
+                    unique_sum += stream_unique;
+                    if ((++calls % every) == 0)
+                        fprintf(stderr,
+                                "ds4: batch stream addr dispatches: %llu, "
+                                "mean tokens %.2f, mean unique experts %.2f "
+                                "(vs %.2f read per row)\n",
+                                (unsigned long long)calls,
+                                (double)tokens_sum / (double)calls,
+                                (double)unique_sum / (double)calls,
+                                (double)tokens_sum * (double)n_expert / (double)calls);
+                }
+            }
             for (uint32_t i = 0; i < stream_resource_count; i++) {
                 ds4_gpu_stream_expert_cache_entry *entry = stream_resources[i];
                 if (!entry ||
