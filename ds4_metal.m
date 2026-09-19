@@ -16525,6 +16525,46 @@ static int ds4_gpu_stream_expert_pending_load_matches(
     return 1;
 }
 
+/* Unified memory: the GPU can read the mapped GGUF where it lies, so a cache
+ * miss only has to be made resident, not copied into a slab. A per-expert
+ * no-copy buffer wires just that expert's pages, and dropping it releases
+ * them, which keeps the cache's bound while removing both the copy and the
+ * second resident copy of the same bytes. Returns 0 when the range cannot be
+ * wrapped and the caller falls back to the copying path. */
+static int ds4_gpu_stream_expert_zero_copy_enabled(void) {
+    static int checked, enabled;
+    if (!checked) {
+        enabled = getenv("DS4_METAL_ZERO_COPY_EXPERTS") != NULL;
+        checked = 1;
+    }
+    return enabled;
+}
+
+static int ds4_gpu_stream_expert_nocopy_buffer(const void *model_map,
+                                               uint64_t    model_size,
+                                               uint64_t    offset,
+                                               uint64_t    bytes,
+                                               __strong id<MTLBuffer> *out,
+                                               NSUInteger *inner) {
+    if (!model_map || !out || !inner || bytes == 0 ||
+        offset >= model_size || bytes > model_size - offset) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uintptr_t page = (uintptr_t)getpagesize();
+    const uintptr_t base = (uintptr_t)model_map + (uintptr_t)offset;
+    const uintptr_t aligned = base & ~(page - 1u);
+    const uint64_t delta = (uint64_t)(base - aligned);
+    uint64_t len = (delta + bytes + (uint64_t)page - 1u) & ~((uint64_t)page - 1u);
+    if (aligned + (uintptr_t)len > (uintptr_t)model_map + (uintptr_t)model_size) return 0;
+    id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:(void *)aligned
+                                                    length:(NSUInteger)len
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+    if (!buf) return 0;
+    *out = buf;
+    *inner = (NSUInteger)delta;
+    return 1;
+}
+
 int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
@@ -16707,6 +16747,19 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
                                               down_expert_bytes);
 
+        if (ds4_gpu_stream_expert_zero_copy_enabled() &&
+            ds4_gpu_stream_expert_nocopy_buffer(model_map, model_size,
+                p->gate_abs_offsets[slot], gate_expert_bytes,
+                &p->gate_bufs[load_i], &p->gate_inners[load_i]) &&
+            ds4_gpu_stream_expert_nocopy_buffer(model_map, model_size,
+                p->up_abs_offsets[slot], gate_expert_bytes,
+                &p->up_bufs[load_i], &p->up_inners[load_i]) &&
+            ds4_gpu_stream_expert_nocopy_buffer(model_map, model_size,
+                p->down_abs_offsets[slot], down_expert_bytes,
+                &p->down_bufs[load_i], &p->down_inners[load_i])) {
+            if (!force_reuse && reserved_entries < UINT32_MAX) reserved_entries++;
+            continue;   /* nothing to read: the GPU addresses the file in place */
+        }
         if (load_i < batch_reuse_count &&
             batch_reuse[load_i].gate_buffer &&
             batch_reuse[load_i].up_buffer &&
@@ -16999,6 +17052,19 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                                                   down_expert_bytes);
         }
 
+        if (!gpu_copy_source && ds4_gpu_stream_expert_zero_copy_enabled() &&
+            ds4_gpu_stream_expert_nocopy_buffer(model_map, model_size,
+                gate_abs_offsets[slot], gate_expert_bytes,
+                &gate_bufs[load_i], &gate_inners[load_i]) &&
+            ds4_gpu_stream_expert_nocopy_buffer(model_map, model_size,
+                up_abs_offsets[slot], gate_expert_bytes,
+                &up_bufs[load_i], &up_inners[load_i]) &&
+            ds4_gpu_stream_expert_nocopy_buffer(model_map, model_size,
+                down_abs_offsets[slot], down_expert_bytes,
+                &down_bufs[load_i], &down_inners[load_i])) {
+            if (!force_reuse && reserved_entries < UINT32_MAX) reserved_entries++;
+            continue;   /* nothing to read: the GPU addresses the file in place */
+        }
         if (load_i < batch_reuse_count &&
             batch_reuse[load_i].gate_buffer &&
             batch_reuse[load_i].up_buffer &&
