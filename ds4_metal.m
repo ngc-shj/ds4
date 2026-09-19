@@ -16609,6 +16609,51 @@ static int ds4_gpu_stream_expert_zero_copy_enabled(void) {
     return enabled;
 }
 
+/* How much of a missed expert is already in the page cache.  The cache's miss
+ * rate counts lookups this process could not serve from its own table, which is
+ * not the same as the bytes being absent, and the difference decides whether the
+ * per-layer readback is paying for I/O or for bookkeeping.
+ * DS4_METAL_MISS_RESIDENCY=<n> reports every n misses. */
+static void ds4_gpu_note_miss_residency(const void *addr, uint64_t bytes) {
+    static uint64_t every, misses, pages_seen, pages_resident, fully_resident;
+    static char *vec;
+    static size_t vec_pages;
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *env = getenv("DS4_METAL_MISS_RESIDENCY");
+        every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+    }
+    if (every == 0 || !addr || bytes == 0) return;
+
+    const uintptr_t page = (uintptr_t)getpagesize();
+    const uintptr_t base = (uintptr_t)addr & ~(page - 1u);
+    const size_t len = (size_t)((((uintptr_t)addr + bytes + page - 1u) & ~(page - 1u)) - base);
+    const size_t pages = len / (size_t)page;
+    if (pages > vec_pages) {
+        char *grown = realloc(vec, pages);
+        if (!grown) return;
+        vec = grown;
+        vec_pages = pages;
+    }
+    if (mincore((void *)base, len, vec) != 0) return;
+
+    size_t resident = 0;
+    for (size_t i = 0; i < pages; i++) if (vec[i] & MINCORE_INCORE) resident++;
+    misses++;
+    pages_seen += pages;
+    pages_resident += resident;
+    if (resident == pages) fully_resident++;
+    if ((misses % every) == 0) {
+        fprintf(stderr,
+                "ds4: expert misses %llu: %.1f%% of their pages already resident, "
+                "%.1f%% of misses fully resident\n",
+                (unsigned long long)misses,
+                100.0 * (double)pages_resident / (double)pages_seen,
+                100.0 * (double)fully_resident / (double)misses);
+    }
+}
+
 static int ds4_gpu_stream_expert_nocopy_buffer(const void *model_map,
                                                uint64_t    model_size,
                                                uint64_t    offset,
@@ -16618,6 +16663,7 @@ static int ds4_gpu_stream_expert_nocopy_buffer(const void *model_map,
     if (!model_map || !out || !inner || bytes == 0 ||
         offset >= model_size || bytes > model_size - offset) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_note_miss_residency((const char *)model_map + offset, bytes);
     const uintptr_t page = (uintptr_t)getpagesize();
     const uintptr_t base = (uintptr_t)model_map + (uintptr_t)offset;
     const uintptr_t aligned = base & ~(page - 1u);
