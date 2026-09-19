@@ -1014,6 +1014,8 @@ static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EX
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_slabs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+static id g_stream_expert_residency_set;
+static int g_stream_expert_residency_on_queue;
 static uint32_t g_stream_expert_cache_slab_start_slot[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
 static uint32_t g_stream_expert_cache_slab_slot_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
 static uint32_t g_stream_expert_cache_slab_slots_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
@@ -11436,6 +11438,56 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
     return 0;
 }
 
+/* Signal after the router's dispatch and keep the batch open: whatever is
+ * encoded next runs while the host wakes up and reads the ids. */
+static uint64_t ds4_gpu_encode_selected_signal(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    if (!g_batch_cb) return 0;
+    if (@available(macOS 12.0, *)) {
+        if (!g_selected_readback_event) {
+            g_selected_readback_event = [g_device newSharedEvent];
+            if (!g_selected_readback_event) return 0;
+        }
+        ds4_gpu_close_batch_encoder();
+        const uint64_t value = ++g_selected_readback_event_value;
+        [g_batch_cb encodeSignalEvent:g_selected_readback_event value:value];
+        g_batch_has_work = YES;
+        return value;
+    }
+    return 0;
+}
+
+static int ds4_gpu_commit_and_wait_selected(uint64_t value, const char *label) {
+    if (!g_batch_cb || value == 0) return 0;
+    if (@available(macOS 12.0, *)) {
+        ds4_gpu_close_batch_encoder();
+        id<MTLCommandBuffer> cb = g_batch_cb;
+        g_batch_cb = nil;
+        [cb commit];
+        ds4_gpu_stream_expert_cache_note_batch_committed();
+        const BOOL signaled = [g_selected_readback_event waitUntilSignaledValue:value timeoutMS:60000];
+        [g_pending_cbs addObject:cb];
+        if (!signaled || cb.status == MTLCommandBufferStatusError) {
+            fprintf(stderr, "ds4: Metal %s failed\n", label ? label : "selected-id readback");
+            (void)ds4_gpu_wait_pending_command_buffers(label ? label : "selected-id readback");
+            [g_transient_buffers removeAllObjects];
+            return 0;
+        }
+        /* The caller keeps encoding this layer, so it needs a batch again. */
+        g_batch_cb = ds4_gpu_new_command_buffer();
+        g_batch_has_work = NO;
+        if (!g_batch_cb) {
+            (void)ds4_gpu_wait_pending_command_buffers(label ? label : "selected-id readback");
+            [g_transient_buffers removeAllObjects];
+            return 0;
+        }
+        ds4_gpu_stream_expert_cache_note_batch_created();
+        return 1;
+    }
+    return 0;
+}
+
 static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
@@ -14204,6 +14256,34 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
 
         slab = g_stream_expert_cache_slab_count++;
         g_stream_expert_cache_slabs[slab] = slab_buffer;
+#if TARGET_OS_OSX
+        /* Keep the slabs resident as a set: the speculative expert pass runs
+         * before the host knows which experts it will read, so it cannot name
+         * them per dispatch, and naming 70 GiB of slabs on every layer costs
+         * more than the pass saves. */
+        if (@available(macOS 15.0, *)) {
+            if (getenv("DS4_METAL_NO_RESIDENCY") == NULL) {
+                if (!g_stream_expert_residency_set) {
+                    MTLResidencySetDescriptor *rdesc = [[MTLResidencySetDescriptor alloc] init];
+                    rdesc.label = @"ds4_stream_experts";
+                    rdesc.initialCapacity = DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS;
+                    NSError *rerr = nil;
+                    g_stream_expert_residency_set =
+                        [g_device newResidencySetWithDescriptor:rdesc error:&rerr];
+                }
+                if (g_stream_expert_residency_set) {
+                    [g_stream_expert_residency_set addAllocation:slab_buffer];
+                    [g_stream_expert_residency_set commit];
+                    [g_stream_expert_residency_set requestResidency];
+                    if (!g_stream_expert_residency_on_queue && g_queue &&
+                        [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+                        [g_queue addResidencySet:g_stream_expert_residency_set];
+                        g_stream_expert_residency_on_queue = 1;
+                    }
+                }
+            }
+        }
+#endif
         g_stream_expert_cache_slab_start_slot[slab] =
             g_stream_expert_cache_slab_total_slots;
         g_stream_expert_cache_slab_slot_count[slab] = slots;
@@ -32899,20 +32979,27 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
         NSUInteger                  threadgroup_bytes,
         NSUInteger                  nsg,
         bool                        rows_per_group_is_nr0) {
-    if (!cb || !pipeline || !args || !act || !split || !entries ||
+    if (!cb || !pipeline || !args || !act || !split ||
         !gate_addrs || !up_addrs || !src1 || !dst_a || !dst_b || !dst_mid ||
         !ids || !weights ||
         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 || args->nei1 <= 0 ||
         args->ne02 <= 0 || args->ne02 > 384) {
         return 0;
     }
-    for (uint32_t i = 0; i < 6; i++) {
-        if ((split->active_mask & (1u << i)) == 0) continue;
-        if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
-    }
-    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
-                                                           6,
-                                                           split->active_mask)) {
+    /* Without entries the caller does not know yet which experts the router
+     * picked: the kernel reads the ids itself and skips any whose address in
+     * the layer's table is zero, so the cache's slabs are declared as a set. */
+    if (entries) {
+        for (uint32_t i = 0; i < 6; i++) {
+            if ((split->active_mask & (1u << i)) == 0) continue;
+            if (!entries[i] || !entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
+        }
+        if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries,
+                                                               6,
+                                                               split->active_mask)) {
+            return 0;
+        }
+    } else if (g_stream_expert_cache_slab_count == 0) {
         return 0;
     }
 
@@ -32934,10 +33021,23 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     [enc setBuffer:dst_mid    offset:dst_mid_off atIndex:8];
     [enc setBuffer:ids        offset:ids_off     atIndex:9];
     [enc setBuffer:weights    offset:weights_off atIndex:10];
-    for (uint32_t i = 0; i < 6; i++) {
-        if ((split->active_mask & (1u << i)) == 0) continue;
-        [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
-        [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
+    if (entries) {
+        for (uint32_t i = 0; i < 6; i++) {
+            if ((split->active_mask & (1u << i)) == 0) continue;
+            [enc useResource:entries[i]->gate_buffer usage:MTLResourceUsageRead];
+            [enc useResource:entries[i]->up_buffer usage:MTLResourceUsageRead];
+        }
+    } else if (!g_stream_expert_residency_on_queue) {
+        id<MTLResource> slabs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
+        NSUInteger n_slabs = 0;
+        for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+            if (g_stream_expert_cache_slabs[i]) slabs[n_slabs++] = g_stream_expert_cache_slabs[i];
+        }
+        if (n_slabs == 0) {
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return 0;
+        }
+        [enc useResources:slabs count:n_slabs usage:MTLResourceUsageRead];
     }
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
@@ -40600,6 +40700,9 @@ int ds4_gpu_routed_moe_one_tensor(
         bool use_stream_compact_addr_table = false;
         bool use_stream_expert_cache = false;
         bool use_stream_expert_split_candidate = false;
+        /* Set when the cached experts were computed behind the router's signal,
+         * so the split below only adds the ones that were missing. */
+        bool early_resident_pass = false;
         bool use_stream_expert_split_deferred = false;
         bool stream_expert_split_completed = false;
         uint32_t stream_expert_resident_mask = 0;
@@ -41651,7 +41754,63 @@ int ds4_gpu_routed_moe_one_tensor(
                         double selected_boundary_t0 =
                             selected_timing ? ds4_gpu_now_ms() : 0.0;
                         if (q4_selected_shared_event) {
-                            if (ds4_gpu_signal_batch_and_wait_event("selected-id readback") == 0) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32942); return 0; }
+                            /* Signal right after the router, then speculate: the
+                             * experts already in cache are almost always the ones
+                             * it picked, and the kernel reads the real ids and
+                             * skips the rest, so computing them now is free when
+                             * the guess holds and harmless when it does not. The
+                             * host reads the ids and loads the misses while this
+                             * runs; the split afterwards adds only what is left. */
+                            const uint64_t selected_signal = ds4_gpu_encode_selected_signal();
+                            if (selected_signal == 0) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32942); return 0; }
+                            if (use_stream_expert_split_candidate &&
+                                getenv("DS4_METAL_DISABLE_V41_SPECULATIVE_RESIDENT") == NULL &&
+                                g_stream_expert_cache_slab_count != 0 &&
+                                ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
+                                                                         &stream_gate_addr_buf,
+                                                                         &stream_up_addr_buf,
+                                                                         &stream_down_addr_buf)) {
+                                int early_owned = 0;
+                                id<MTLCommandBuffer> early_cb = ds4_gpu_command_buffer(&early_owned);
+                                if (early_cb) {
+                                    const ds4_gpu_dsv4_moe_swiglu_weight_args early_act = {
+                                        .width = expert_mid_dim,
+                                        .rows = pair_rows,
+                                        .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                                        .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                                        .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                                        .weight_stride = sizeof(float),
+                                        .write_clamped = 0,
+                                        .clamp_value = clamp,
+                                    };
+                                    const ds4_gpu_stream_expert_split_args early_split = {
+                                        .active_mask = 0x3fu,
+                                        .accumulate = 0u,
+                                    };
+                                    early_resident_pass =
+                                        ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
+                                                early_cb,
+                                                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                                &gate_args, &early_act, &early_split, NULL,
+                                                stream_gate_addr_buf, stream_up_addr_buf,
+                                                xbuf, ds4_gpu_tensor_offset(x),
+                                                gatebuf, ds4_gpu_tensor_offset(gate),
+                                                upbuf, ds4_gpu_tensor_offset(up),
+                                                midbuf, ds4_gpu_tensor_offset(mid),
+                                                selectedbuf, ds4_gpu_tensor_offset(selected),
+                                                weightsbuf, ds4_gpu_tensor_offset(weights),
+                                                gate_smem, 2, false) != 0;
+                                    static int spec_noted;
+                                    if (!spec_noted) {
+                                        spec_noted = 1;
+                                        fprintf(stderr,
+                                                "ds4: V4.1 speculative resident experts %s (layer %u, %u slabs)\n",
+                                                early_resident_pass ? "active" : "refused",
+                                                layer_index, g_stream_expert_cache_slab_count);
+                                    }
+                                }
+                            }
+                            if (ds4_gpu_commit_and_wait_selected(selected_signal, "selected-id readback") == 0) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32943); return 0; }
                         } else if (ds4_gpu_end_commands() == 0) {
                             if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32931);
                             return 0;
@@ -42436,10 +42595,11 @@ int ds4_gpu_routed_moe_one_tensor(
                         double stream_split_t0 =
                             stream_split_timing ? ds4_gpu_now_ms() : 0.0;
                         ds4_gpu_stream_expert_split_args resident_pair_args = {
-                            .active_mask = stream_expert_resident_mask,
+                            .active_mask = early_resident_pass ? 0u : stream_expert_resident_mask,
                             .accumulate = 0u,
                         };
-                        ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
+                        ok = resident_pair_args.active_mask == 0u ? 1 :
+                             ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
                                                                                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
                                                                                &gate_args,
                                                                                &act_args,
@@ -42649,11 +42809,24 @@ int ds4_gpu_routed_moe_one_tensor(
                                     stream_split_missing_ms);
                         }
                     } else {
+                        /* The speculative pass already computed every lane that
+                         * was cached when it ran, so only the rest is left. */
+                        const uint32_t remaining_mask =
+                            early_resident_pass ? (0x3fu & ~stream_expert_resident_mask)
+                                                : 0x3fu;
                         ds4_gpu_stream_expert_split_args split_args = {
-                            .active_mask = 0x3fu,
+                            .active_mask = remaining_mask,
                             .accumulate = 0u,
                         };
-                        ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
+                        static int spec_full_hit_noted;
+                        if (remaining_mask == 0u && !spec_full_hit_noted) {
+                            spec_full_hit_noted = 1;
+                            fprintf(stderr,
+                                    "ds4: V4.1 speculative pass covered every expert (layer %u)\n",
+                                    layer_index);
+                        }
+                        ok = remaining_mask == 0u ? 1 :
+                             ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(cb,
                                                                                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
                                                                                &gate_args,
                                                                                &act_args,
