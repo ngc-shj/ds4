@@ -40807,6 +40807,42 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+/* Router and shared expert: the part of a row's MoE that does not depend on
+ * the selected ids reaching the host. Encoded for every row before the batch
+ * pays its single readback. */
+static DS4_MAYBE_UNUSED bool ds41_moe_route_row(ds41_gpu_graph *g, const ds4_model *m,
+                                                const ds4_layer_weights *l, uint32_t token) {
+    const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
+    if (!bias) return false;
+    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
+        !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
+            m->map, m->size, bias->abs_offset, 0, 0, token,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
+            g->route_logits)) return false;
+    return ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) &&
+        ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) &&
+        ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds41_bf16(g->shared_mid, DS4_N_FF_EXP) &&
+        ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
+}
+
+/* The routed experts for one row. The ids are already on the host, so the
+ * streaming path binds and loads without a readback of its own. */
+static DS4_MAYBE_UNUSED bool ds41_moe_experts_row(ds41_gpu_graph *g, const ds4_model *m,
+                                                  const ds4_layer_weights *l, uint32_t il) {
+    uint64_t gate_row = 0, down_row = 0;
+    if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+        !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
+    return ds4_gpu_routed_moe_one_tensor(g->routed, g->gate, g->up, g->mid, g->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
+            DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
+            !g->streaming) != 0;
+}
+
 static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
@@ -42125,8 +42161,43 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows) &&
-            ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+            ds41_after_attention_batch(&active, model, l, rows);
+        if (ok) {
+            /* The batched routed kernels bind resident expert tensors. The
+             * streaming expert cache is wired into the single-row path, so the
+             * rows run through that, still inside this command buffer: one host
+             * round trip per step instead of one per token. */
+            if (g->streaming) {
+                ds41_gpu_graph moe_rows[DS4_TP_BATCH_MAX_ROWS];
+                for (int i = 0; i < count; i++) {
+                    moe_rows[i] = *graphs[i];
+                    moe_rows[i].pos = positions[i];
+#define DS41_SESSION_MOE_ROW(name, width) moe_rows[i].name = g->rows_view[i].name;
+                    DS41_PREFILL_ROWS(DS41_SESSION_MOE_ROW)
+#undef DS41_SESSION_MOE_ROW
+                }
+                for (int i = 0; ok && i < count; i++)
+                    ok = ds41_moe_route_row(&moe_rows[i], model, l, (uint32_t)tokens[i]);
+                /* One stall for the whole batch: the rows' ids come back
+                 * together, so the per-token cost of the round trip falls with
+                 * every extra row. */
+                int32_t row_ids[DS4_TP_BATCH_MAX_ROWS][DS4_MAX_EXPERT_USED];
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                for (int i = 0; ok && i < count; i++)
+                    ok = ds4_gpu_tensor_read(moe_rows[i].selected, 0, row_ids[i],
+                                             (uint64_t)DS4_N_EXPERT_USED * sizeof(row_ids[0][0])) != 0;
+                if (ok) ok = ds4_gpu_begin_commands() != 0;
+                for (int i = 0; ok && i < count; i++)
+                    ok = ds4_gpu_routed_moe_set_row_slot((uint32_t)i) != 0 &&
+                        ds4_gpu_routed_moe_set_selected_override(row_ids[i], DS4_N_EXPERT_USED) != 0 &&
+                        ds41_moe_experts_row(&moe_rows[i], model, l, il);
+                (void)ds4_gpu_routed_moe_set_selected_override(NULL, 0);
+                (void)ds4_gpu_routed_moe_set_row_slot(0);
+            } else {
+                ok = ds41_moe_batch(g, model, l, il, rows, shared_owner);
+            }
+        }
+        if (ok) ok =
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
@@ -78168,7 +78239,9 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
         if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid || s->distributed ||
-            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) : s->ds41_graph.streaming) ||
+            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) :
+                (s->ds41_graph.streaming &&
+                 !getenv("DS4_METAL_ENABLE_V41_STREAMING_SESSION_BATCH"))) ||
             s->ds41_graph.imatrix || s->ds41_graph.quality ||
             !s->ds41_graph.valid || s->ds41_graph.image_count ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return false;

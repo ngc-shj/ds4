@@ -2660,6 +2660,10 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         uint32_t                mid_token_stride);
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
+/* Select which row's binding scratch the next routed MoE call uses. Decode
+ * batches encode several rows into one command buffer; slot 0 is the default
+ * and what every single-row caller gets. */
+int ds4_gpu_routed_moe_set_row_slot(uint32_t slot);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_dspark_gfx1151_fast_path(void);

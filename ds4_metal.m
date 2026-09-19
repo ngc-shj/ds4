@@ -1035,11 +1035,26 @@ static uint64_t g_stream_expert_cache_done_seq;
 static uint64_t g_stream_expert_cache_batch_seq;
 static uint64_t g_stream_expert_cache_owned_seq;
 static uint64_t g_stream_expert_cache_pending_max_seq;
-static id<MTLBuffer> g_stream_compact_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static id<MTLBuffer> g_stream_compact_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static id<MTLBuffer> g_stream_compact_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static id<MTLBuffer> g_stream_compact_selected_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static id<MTLBuffer> g_stream_selected_id_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+/* A decode batch encodes several rows into one command buffer, so the layer's
+ * binding scratch cannot be shared between them: the last row's ids would be
+ * what every row's kernel reads at execution time. One set per row slot. */
+enum { DS4_METAL_ROW_SLOTS = 8 };
+static uint32_t g_routed_moe_row_slot;
+static id<MTLBuffer> g_stream_compact_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * DS4_METAL_ROW_SLOTS];
+static id<MTLBuffer> g_stream_compact_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * DS4_METAL_ROW_SLOTS];
+static id<MTLBuffer> g_stream_compact_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * DS4_METAL_ROW_SLOTS];
+static id<MTLBuffer> g_stream_compact_selected_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * DS4_METAL_ROW_SLOTS];
+static id<MTLBuffer> g_stream_selected_id_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * DS4_METAL_ROW_SLOTS];
+
+static inline uint32_t ds4_row_scratch(uint32_t layer) {
+    return layer * DS4_METAL_ROW_SLOTS + g_routed_moe_row_slot;
+}
+
+int ds4_gpu_routed_moe_set_row_slot(uint32_t slot) {
+    if (slot >= DS4_METAL_ROW_SLOTS) return 0;
+    g_routed_moe_row_slot = slot;
+    return 1;
+}
 static id<MTLBuffer> g_stream_expert_validate_status_buffer;
 
 @interface DS4MetalTensor : NSObject
@@ -11592,11 +11607,14 @@ void ds4_gpu_cleanup(void) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
             g_stream_expert_cache_up_addr_buffers[layer] = nil;
             g_stream_expert_cache_down_addr_buffers[layer] = nil;
-            g_stream_compact_gate_addr_buffers[layer] = nil;
-            g_stream_compact_up_addr_buffers[layer] = nil;
-            g_stream_compact_down_addr_buffers[layer] = nil;
-            g_stream_compact_selected_buffers[layer] = nil;
-            g_stream_selected_id_buffers[layer] = nil;
+            for (uint32_t slot = 0; slot < DS4_METAL_ROW_SLOTS; slot++) {
+                const uint32_t idx = layer * DS4_METAL_ROW_SLOTS + slot;
+                g_stream_compact_gate_addr_buffers[idx] = nil;
+                g_stream_compact_up_addr_buffers[idx] = nil;
+                g_stream_compact_down_addr_buffers[idx] = nil;
+                g_stream_compact_selected_buffers[idx] = nil;
+                g_stream_selected_id_buffers[idx] = nil;
+            }
         }
         g_set_rows_f32_i32_pipeline = nil;
         g_get_rows_f32_pipeline = nil;
@@ -14552,19 +14570,19 @@ static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer) {
         NSString *label = @"ds4_stream_compact_gate_addresses";
         switch (i) {
         case 0:
-            current = g_stream_compact_gate_addr_buffers[layer];
+            current = g_stream_compact_gate_addr_buffers[ds4_row_scratch(layer)];
             label = @"ds4_stream_compact_gate_addresses";
             break;
         case 1:
-            current = g_stream_compact_up_addr_buffers[layer];
+            current = g_stream_compact_up_addr_buffers[ds4_row_scratch(layer)];
             label = @"ds4_stream_compact_up_addresses";
             break;
         case 2:
-            current = g_stream_compact_down_addr_buffers[layer];
+            current = g_stream_compact_down_addr_buffers[ds4_row_scratch(layer)];
             label = @"ds4_stream_compact_down_addresses";
             break;
         default:
-            current = g_stream_compact_selected_buffers[layer];
+            current = g_stream_compact_selected_buffers[ds4_row_scratch(layer)];
             bytes = ids_bytes;
             label = @"ds4_stream_compact_selected_ids";
             break;
@@ -14580,16 +14598,16 @@ static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer) {
         memset([b contents], 0, bytes);
         switch (i) {
         case 0:
-            g_stream_compact_gate_addr_buffers[layer] = b;
+            g_stream_compact_gate_addr_buffers[ds4_row_scratch(layer)] = b;
             break;
         case 1:
-            g_stream_compact_up_addr_buffers[layer] = b;
+            g_stream_compact_up_addr_buffers[ds4_row_scratch(layer)] = b;
             break;
         case 2:
-            g_stream_compact_down_addr_buffers[layer] = b;
+            g_stream_compact_down_addr_buffers[ds4_row_scratch(layer)] = b;
             break;
         default:
-            g_stream_compact_selected_buffers[layer] = b;
+            g_stream_compact_selected_buffers[ds4_row_scratch(layer)] = b;
             break;
         }
     }
@@ -14632,10 +14650,10 @@ static int ds4_gpu_stream_compact_addr_prepare(
 
     const NSUInteger addr_bytes = 6u * sizeof(uint64_t);
     const NSUInteger ids_bytes = 6u * sizeof(int32_t);
-    id<MTLBuffer> gb = g_stream_compact_gate_addr_buffers[layer];
-    id<MTLBuffer> ub = g_stream_compact_up_addr_buffers[layer];
-    id<MTLBuffer> db = g_stream_compact_down_addr_buffers[layer];
-    id<MTLBuffer> ib = g_stream_compact_selected_buffers[layer];
+    id<MTLBuffer> gb = g_stream_compact_gate_addr_buffers[ds4_row_scratch(layer)];
+    id<MTLBuffer> ub = g_stream_compact_up_addr_buffers[ds4_row_scratch(layer)];
+    id<MTLBuffer> db = g_stream_compact_down_addr_buffers[ds4_row_scratch(layer)];
+    id<MTLBuffer> ib = g_stream_compact_selected_buffers[ds4_row_scratch(layer)];
     memcpy([gb contents], gate_values, addr_bytes);
     memcpy([ub contents], up_values, addr_bytes);
     memcpy([db contents], down_values, addr_bytes);
@@ -14666,7 +14684,7 @@ static int ds4_gpu_stream_selected_ids_prepare(
 
     const NSUInteger bytes =
         (NSUInteger)DS4_METAL_MAX_ROUTED_EXPERT_USED * sizeof(int32_t);
-    id<MTLBuffer> b = g_stream_selected_id_buffers[layer];
+    id<MTLBuffer> b = g_stream_selected_id_buffers[ds4_row_scratch(layer)];
     if (!b) {
         b = [g_device newBufferWithLength:bytes
                                   options:MTLResourceStorageModeShared];
@@ -14675,7 +14693,7 @@ static int ds4_gpu_stream_selected_ids_prepare(
             return 0;
         }
         b.label = @"ds4_stream_selected_ids";
-        g_stream_selected_id_buffers[layer] = b;
+        g_stream_selected_id_buffers[ds4_row_scratch(layer)] = b;
     }
 
     int32_t ids[DS4_METAL_MAX_ROUTED_EXPERT_USED] = {0};
