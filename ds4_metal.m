@@ -44302,9 +44302,12 @@ int ds4_gpu_routed_moe_batch_tensor(
                         layer_index);
                 return 0;
             }
-            /* Proof that a batch really shared its expert reads, and by how
-             * much: unique is what the rows read together, tokens*n_expert is
-             * what they would have read one row at a time. */
+            /* How much duplication there is to collect, not how much was
+             * collected: this dedupes the buffers and addresses the dispatch
+             * prepares, while the kernel still streams one expert per
+             * (row, slot) pair. unique against tokens*n_expert is therefore the
+             * ceiling a row-tiled matvec could reach, and the 4-6% the address
+             * table actually wins is what preparation alone was worth. */
             {
                 static uint64_t calls, tokens_sum, unique_sum, every;
                 static int checked;
