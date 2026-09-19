@@ -10181,6 +10181,28 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_take_spare(uint3
 static int ds4_gpu_stream_expert_cache_wait_inflight_seq(uint64_t seq,
                                                           const char *label) {
     const char *what = label ? label : "streaming expert cache in-flight";
+    {   /* which caller is still stopping, now that installs have spares */
+        static uint64_t every, calls;
+        static const char *names[6];
+        static uint64_t counts[6];
+        static int checked;
+        if (!checked) {
+            checked = 1;
+            const char *env = getenv("DS4_METAL_INFLIGHT_WAIT_CENSUS");
+            every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+        }
+        if (every) {
+            size_t i = 0;
+            for (; i < 6 && names[i]; i++) if (names[i] == what) break;
+            if (i < 6) { if (!names[i]) names[i] = what; counts[i]++; }
+            if ((++calls % every) == 0) {
+                fprintf(stderr, "ds4: in-flight waits after %llu:", (unsigned long long)calls);
+                for (size_t j = 0; j < 6 && names[j]; j++)
+                    fprintf(stderr, " %s=%llu", names[j], (unsigned long long)counts[j]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     static int checked, targeted;
     if (!checked) {
         checked = 1;
@@ -15809,7 +15831,7 @@ retry:
         if (skipped_inflight && !waited_inflight &&
             !ds4_gpu_stream_expert_cache_on_service_thread()) {
             waited_inflight = 1;
-            if (!ds4_gpu_stream_expert_cache_wait_inflight(
+            if (!ds4_gpu_stream_expert_cache_wait_inflight_seq(0,
                     "streaming expert cache reuse")) {
                 return 0;
             }
@@ -15952,7 +15974,7 @@ retry:
     if (victim_count == 0) {
         if (skipped_inflight && !waited_inflight) {
             waited_inflight = 1;
-            if (!ds4_gpu_stream_expert_cache_wait_inflight(
+            if (!ds4_gpu_stream_expert_cache_wait_inflight_seq(0,
                     "streaming expert cache batch reuse")) {
                 return 0;
             }
@@ -42961,7 +42983,17 @@ int ds4_gpu_routed_moe_one_tensor(
                              * accumulation order stable regardless of the
                              * resident/missing split.
                              */
-                            ok = ds4_gpu_wait_pending_command_buffers(
+                            /* The queue already runs command buffers in the
+                             * order they were committed, so the missing pass
+                             * cannot overtake the resident one.  What the host
+                             * gains by waiting here is not obvious, and it is
+                             * 0.29 ms a layer. */
+                            static int checked, skip;
+                            if (!checked) {
+                                checked = 1;
+                                skip = getenv("DS4_METAL_SPLIT_WAIT_RESIDENT") == NULL;
+                            }
+                            ok = skip ? 1 : ds4_gpu_wait_pending_command_buffers(
                                     "streaming expert split resident");
                             if (stream_split_timing) {
                                 const double now_ms = ds4_gpu_now_ms();
