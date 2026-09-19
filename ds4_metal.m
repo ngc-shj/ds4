@@ -995,6 +995,20 @@ typedef struct {
 
 static ds4_gpu_stream_expert_cache_entry
     g_stream_expert_cache[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+
+/* The cache is indexed by expert, so reusing a slot the GPU is still reading
+ * means waiting for it -- 0.31 ms a layer, which is most of what the host
+ * spends between one layer's command buffer and the next.  Under zero-copy
+ * there is nothing to wait for: the bytes are already mapped, and only the
+ * bookkeeping wants that slot.  Park the entry here instead and carry on; the
+ * expert simply is not cached under its own index this time. */
+enum { DS4_METAL_STREAM_EXPERT_SPARE_PER_LAYER = 8 };
+static ds4_gpu_stream_expert_cache_entry
+    g_stream_expert_spare[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER]
+                         [DS4_METAL_STREAM_EXPERT_SPARE_PER_LAYER];
+static uint32_t g_stream_expert_spare_next[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+
+static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_take_spare(uint32_t layer);
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -10144,6 +10158,44 @@ int ds4_gpu_parallel_ffn_finish(void) {
 }
 
 
+/* Reusing an entry means waiting for whatever command buffer still reads it.
+ * Only a reference held by the batch still being built needs that batch
+ * committed first; one held by a buffer that is already on the queue just needs
+ * waiting for, and committing early there costs a command buffer boundary for
+ * nothing. */
+static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_take_spare(uint32_t layer) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return NULL;
+    for (uint32_t n = 0; n < DS4_METAL_STREAM_EXPERT_SPARE_PER_LAYER; n++) {
+        const uint32_t i = (g_stream_expert_spare_next[layer] + n) %
+                           DS4_METAL_STREAM_EXPERT_SPARE_PER_LAYER;
+        ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_spare[layer][i];
+        if (ds4_gpu_stream_expert_cache_entry_inflight(e)) continue;
+        g_stream_expert_spare_next[layer] =
+            (i + 1) % DS4_METAL_STREAM_EXPERT_SPARE_PER_LAYER;
+        memset(e, 0, sizeof(*e));
+        return e;
+    }
+    return NULL;
+}
+
+static int ds4_gpu_stream_expert_cache_wait_inflight_seq(uint64_t seq,
+                                                          const char *label) {
+    const char *what = label ? label : "streaming expert cache in-flight";
+    static int checked, targeted;
+    if (!checked) {
+        checked = 1;
+        targeted = getenv("DS4_METAL_UNTARGETED_INFLIGHT_WAIT") == NULL;
+    }
+    const int needs_flush =
+        !targeted || seq == 0 || seq == g_stream_expert_cache_batch_seq;
+    if (needs_flush && g_batch_cb && ds4_gpu_flush_commands() == 0) return 0;
+    if ([g_pending_cbs count] != 0 &&
+        ds4_gpu_wait_pending_command_buffers(what) == 0) {
+        return 0;
+    }
+    return 1;
+}
+
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label) {
     const char *what = label ? label : "streaming expert cache in-flight";
     if (g_batch_cb && ds4_gpu_flush_commands() == 0) return 0;
@@ -11508,7 +11560,43 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
     return 0;
 }
 
+/* What the host does with a layer once the ids arrive.  The trace puts 0.558 ms
+ * between one layer's command buffer and the next, and a bare round trip
+ * measures 0.15 ms, so most of that gap is this. */
+static double g_host_layer_t0;
+static void ds4_gpu_note_host_layer_done(void) {
+    static uint64_t every, layers;
+    static double total;
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *env = getenv("DS4_METAL_HOST_LAYER_MS");
+        every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+    }
+    if (every == 0 || g_host_layer_t0 == 0.0) return;
+    total += ds4_gpu_now_ms() - g_host_layer_t0;
+    g_host_layer_t0 = 0.0;
+    if ((++layers % every) == 0)
+        fprintf(stderr, "ds4: host work after the readback: %.3f ms/layer over %llu layers\n",
+                total / (double)layers, (unsigned long long)layers);
+}
+
 static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
+    ds4_gpu_note_host_layer_done();
+    /* Count the host round trips a token actually costs: the point of a full
+     * address table is to remove them, and that has to be checked, not assumed. */
+    {
+        static uint64_t calls, every;
+        static int checked;
+        if (!checked) {
+            checked = 1;
+            const char *env = getenv("DS4_METAL_ROUND_TRIP_COUNT");
+            every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+        }
+        if (every && (++calls % every) == 0)
+            fprintf(stderr, "ds4: selected-id round trips: %llu\n",
+                    (unsigned long long)calls);
+    }
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
@@ -11533,6 +11621,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
         const BOOL signaled = [g_selected_readback_event waitUntilSignaledValue:value timeoutMS:60000];
+        g_host_layer_t0 = ds4_gpu_now_ms();
         [g_pending_cbs addObject:cb];
         if (!signaled) {
             fprintf(stderr, "ds4: timeout waiting for Metal shared event in %s\n",
@@ -14965,7 +15054,17 @@ static void ds4_gpu_stream_full_expert_addr_prewire(NSArray<id<MTLBuffer>> *buff
 static void ds4_gpu_stream_full_expert_addr_note_residency(NSArray<id<MTLBuffer>> *buffers) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
-        if (getenv("DS4_METAL_NO_RESIDENCY") != NULL || !g_device || buffers.count == 0) return;
+        if (!g_device || buffers.count == 0) return;
+        /* Nothing else declares these buffers -- the kernel reaches them through
+         * raw addresses in the table -- so without the set the GPU reads pages
+         * it was never given, which comes back as plausible numbers and a
+         * different answer rather than as a fault.  Refuse instead. */
+        if (getenv("DS4_METAL_NO_RESIDENCY") != NULL) {
+            fprintf(stderr,
+                    "ds4: the full expert address table needs a residency set; "
+                    "DS4_METAL_NO_RESIDENCY would silently corrupt its reads\n");
+            abort();
+        }
         if (!g_stream_full_expert_residency_set) {
             MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
             desc.label = @"ds4_full_expert_addr";
@@ -14975,6 +15074,7 @@ static void ds4_gpu_stream_full_expert_addr_note_residency(NSArray<id<MTLBuffer>
             if (!g_stream_full_expert_residency_set) return;
         }
         for (id<MTLBuffer> b in buffers) [g_stream_full_expert_residency_set addAllocation:b];
+        /* fall through: commit and request below */
         [g_stream_full_expert_residency_set commit];
         [g_stream_full_expert_residency_set requestResidency];
         if (!g_stream_full_expert_residency_on_queue && g_queue) {
@@ -16082,8 +16182,8 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         &g_stream_expert_cache[layer][expert];
     if (e->valid && ds4_gpu_stream_expert_cache_entry_inflight(e)) {
         if (ds4_gpu_stream_expert_cache_on_service_thread()) return 0;
-        if (!ds4_gpu_stream_expert_cache_wait_inflight(
-                "streaming expert cache replacement")) {
+        if (!ds4_gpu_stream_expert_cache_wait_inflight_seq(
+                e->inflight_seq, "streaming expert cache replacement")) {
             return 0;
         }
         e = &g_stream_expert_cache[layer][expert];
@@ -16354,10 +16454,39 @@ ds4_gpu_stream_expert_cache_install_loaded(
             ds4_gpu_stream_expert_cache_on_service_thread()) {
             return NULL;
         }
-        if (ds4_gpu_stream_expert_cache_entry_inflight(e) &&
-            !ds4_gpu_stream_expert_cache_wait_inflight(
-                    "streaming expert cache install")) {
-            return NULL;
+        if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
+            /* Somebody is still reading this slot.  Nothing has to be copied
+             * to use the expert -- the buffers are already mapped -- so take a
+             * spare entry rather than stopping to wait for the GPU. */
+            static int checked, spare_on;
+            if (!checked) {
+                checked = 1;
+                spare_on = getenv("DS4_METAL_NO_SPARE_EXPERT_ENTRIES") == NULL;
+            }
+            ds4_gpu_stream_expert_cache_entry *spare =
+                spare_on ? ds4_gpu_stream_expert_take_spare(layer) : NULL;
+            if (spare) {
+                spare->valid = 1;
+                spare->model_map = model_map;
+                spare->model_size = model_size;
+                spare->gate_abs_offset = gate_abs_offset;
+                spare->up_abs_offset = up_abs_offset;
+                spare->down_abs_offset = down_abs_offset;
+                spare->gate_expert_bytes = gate_expert_bytes;
+                spare->down_expert_bytes = down_expert_bytes;
+                spare->logical_bytes = logical_bytes;
+                spare->gate_buffer = gate_buf;
+                spare->up_buffer = up_buf;
+                spare->down_buffer = down_buf;
+                spare->gate_inner = gate_inner;
+                spare->up_inner = up_inner;
+                spare->down_inner = down_inner;
+                return spare;
+            }
+            if (!ds4_gpu_stream_expert_cache_wait_inflight_seq(
+                        e->inflight_seq, "streaming expert cache install")) {
+                return NULL;
+            }
         }
         if (ds4_gpu_stream_expert_cache_entry_inflight(e)) return NULL;
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
