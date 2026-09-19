@@ -19,6 +19,7 @@ struct ds4_metal_args_dsv4_hc_weighted_sum {
     uint64_t nb_w1;
     uint64_t nb0;
     uint64_t nb1;
+    uint64_t bf16;
 };
 
 
@@ -1067,6 +1068,14 @@ kernel void kernel_dsv4_hc_weighted_sum(
         acc += xv * wv;
     }
 
+    /* The V4.1 graph rounds this sum to BF16 in its own pass; doing it here
+     * saves a dispatch per sublayer, and a decode token has eighty of them. */
+    if (args.bf16) {
+        uint bits = as_type<uint>(acc);
+        if ((bits & 0x7f800000u) != 0x7f800000u)
+            bits += 0x7fffu + ((bits >> 16u) & 1u);
+        acc = as_type<float>(bits & 0xffff0000u);
+    }
     *((device float *) (dst + d*args.nb0 + t*args.nb1)) = acc;
 }
 

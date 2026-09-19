@@ -5713,6 +5713,7 @@ typedef struct {
     uint64_t nb_w1;
     uint64_t nb0;
     uint64_t nb1;
+    uint64_t bf16;
 } ds4_gpu_hc_weighted_sum_args;
 
 typedef struct {
@@ -44707,6 +44708,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
         uint64_t                weight_row_stride,
         uint32_t                n_embd,
         uint32_t                n_hc,
+        int                     round_bf16,
         const char             *label) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !residual_hc || !weights || n_embd == 0 || n_hc == 0 ||
@@ -44762,6 +44764,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
             .nb_w1 = weight_row_stride,
             .nb0 = sizeof(float),
             .nb1 = (uint64_t)n_embd * sizeof(float),
+            .bf16 = round_bf16 ? 1u : 0u,
         };
         const uint64_t n_elem = (uint64_t)n_embd * n_tokens64;
         const NSUInteger nth = MIN((NSUInteger)256, MAX((NSUInteger)1, (NSUInteger)n_elem));
@@ -44799,7 +44802,25 @@ int ds4_gpu_hc_weighted_sum_tensor(
                                              (uint64_t)n_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
                                              "HC weighted sum");
+}
+
+int ds4_gpu_hc_weighted_sum_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return ds4_gpu_hc_weighted_sum_strided(out,
+                                             residual_hc,
+                                             weights,
+                                             0,
+                                             (uint64_t)n_hc * sizeof(float),
+                                             n_embd,
+                                             n_hc,
+                                             1,
+                                             "HC weighted sum bf16");
 }
 
 int ds4_gpu_hc_weighted_sum_split_tensor(
@@ -44816,7 +44837,26 @@ int ds4_gpu_hc_weighted_sum_split_tensor(
                                              mix_hc * sizeof(float),
                                              n_embd,
                                              n_hc,
+                                             0,
                                              "HC weighted sum split");
+}
+
+int ds4_gpu_hc_weighted_sum_split_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    return ds4_gpu_hc_weighted_sum_strided(out,
+                                             residual_hc,
+                                             split,
+                                             0,
+                                             mix_hc * sizeof(float),
+                                             n_embd,
+                                             n_hc,
+                                             1,
+                                             "HC weighted sum split bf16");
 }
 
 /* Release decode fused HC pre-sublayer operation.  The graph driver owns the

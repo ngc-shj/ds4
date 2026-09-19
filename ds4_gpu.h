@@ -2858,6 +2858,18 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         uint32_t                sinkhorn_iters,
         float                   eps);
 
+int ds4_gpu_hc_weighted_sum_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+int ds4_gpu_hc_weighted_sum_split_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
 int ds4_gpu_hc_weighted_sum_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *residual_hc,

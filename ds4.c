@@ -40860,8 +40860,8 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
-    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+    bool ok = ds4_gpu_hc_weighted_sum_bf16_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+              ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
     if (!ds4_gpu_end_commands()) ok = false;
@@ -40879,8 +40879,8 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_hc_mix(g, m, l, false) &&
-        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        ds4_gpu_hc_weighted_sum_bf16_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+        ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
@@ -40888,8 +40888,8 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
     return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
         ds41_hc_mix(g, m, l, true) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        ds4_gpu_hc_weighted_sum_split_bf16_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+        ds41_norm(g->norm, g->x, m, l->ffn_norm);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
