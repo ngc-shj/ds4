@@ -41271,6 +41271,17 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+static bool ds41_moe_split_note(bool enabled, double *t0, uint32_t il,
+                                uint32_t count, const char *label) {
+    if (!enabled) return true;
+    if (!ds4_gpu_end_commands()) return false;
+    const double now = now_sec();
+    fprintf(stderr, "ds4: V4.1 moe split layer=%u rows=%u %s=%.3f ms\n",
+            il, count, label, (now - *t0) * 1000.0);
+    *t0 = now;
+    return ds4_gpu_begin_commands() != 0;
+}
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner, bool force_resident) {
@@ -41278,8 +41289,19 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
+    /* The shared expert is the same 37 MiB for every row, and the Q8_0 matvec
+     * dispatches one threadgroup slice per row, so it is re-read k times with
+     * nothing routing-dependent to excuse it. Timing it apart from the routed
+     * experts says how much that is worth. */
+    const bool split_ms = getenv("DS4_V41_MOE_SPLIT_MS") != NULL;
+    double split_t0 = 0;
+    if (split_ms) {
+        if (!ds4_gpu_end_commands() || !ds4_gpu_begin_commands()) return false;
+        split_t0 = now_sec();
+    }
     return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count) &&
+        ds41_moe_split_note(split_ms, &split_t0, il, count, "router") &&
         ((shared_owner && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
@@ -41287,6 +41309,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
+        ds41_moe_split_note(split_ms, &split_t0, il, count, "shared") &&
         (
 #ifndef __APPLE__
         g->tp_world == 2 ?
@@ -41305,6 +41328,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
             il, count, &mid_f16, force_resident)) &&
+        ds41_moe_split_note(split_ms, &split_t0, il, count, "routed") &&
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
