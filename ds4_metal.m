@@ -11609,6 +11609,35 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
  * between one layer's command buffer and the next, and a bare round trip
  * measures 0.15 ms, so most of that gap is this. */
 static double g_host_layer_t0;
+/* The window between one selected-id wait returning and the next one starting
+ * is 0.218 ms a layer, and adding up a profile to say where it goes is how a
+ * wrong number got into the notes once already. These three marks measure it
+ * directly: binding and encoding the experts the readback just named, then
+ * everything the graph does between one routed call and the next, then
+ * encoding the next layer's router and shared expert up to its wait. */
+static double g_host_split_mark;
+static double g_host_split_bind_ms;    /* wait returns -> routed call returns */
+static double g_host_split_graph_ms;   /* routed call returns -> next entry */
+static double g_host_split_encode_ms;  /* next entry -> next wait starts */
+static uint64_t g_host_split_layers;
+
+static int ds4_gpu_host_layer_split_every(void) {
+    static uint64_t every;
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *env = getenv("DS4_METAL_HOST_LAYER_SPLIT");
+        every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+    }
+    return (int)every;
+}
+
+static void ds4_gpu_host_split_note(double *acc) {
+    if (!ds4_gpu_host_layer_split_every() || g_host_split_mark == 0.0) return;
+    const double now = ds4_gpu_now_ms();
+    *acc += now - g_host_split_mark;
+    g_host_split_mark = now;
+}
 static void ds4_gpu_note_host_layer_done(void) {
     static uint64_t every, layers;
     static double total;
@@ -11624,6 +11653,20 @@ static void ds4_gpu_note_host_layer_done(void) {
     if ((++layers % every) == 0)
         fprintf(stderr, "ds4: host work after the readback: %.3f ms/layer over %llu layers\n",
                 total / (double)layers, (unsigned long long)layers);
+    const int split_every = ds4_gpu_host_layer_split_every();
+    if (split_every) {
+        ds4_gpu_host_split_note(&g_host_split_encode_ms);
+        g_host_split_mark = 0.0;
+        if ((++g_host_split_layers % (uint64_t)split_every) == 0) {
+            const double n = (double)g_host_split_layers;
+            fprintf(stderr,
+                    "ds4: host layer split over %llu layers: bind+encode experts %.3f ms, "
+                    "graph between routed calls %.3f ms, next router+shared encode %.3f ms\n",
+                    (unsigned long long)g_host_split_layers,
+                    g_host_split_bind_ms / n, g_host_split_graph_ms / n,
+                    g_host_split_encode_ms / n);
+        }
+    }
 }
 
 static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
@@ -11667,6 +11710,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 
         const BOOL signaled = [g_selected_readback_event waitUntilSignaledValue:value timeoutMS:60000];
         g_host_layer_t0 = ds4_gpu_now_ms();
+        if (ds4_gpu_host_layer_split_every()) g_host_split_mark = g_host_layer_t0;
         [g_pending_cbs addObject:cb];
         if (!signaled) {
             fprintf(stderr, "ds4: timeout waiting for Metal shared event in %s\n",
@@ -40969,7 +41013,61 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
+static int ds4_gpu_routed_moe_one_tensor_impl(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in,
+        uint32_t                layer_index,
+        bool                    force_resident);
+
 int ds4_gpu_routed_moe_one_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
+        uint32_t layer_index, bool force_resident) {
+    ds4_gpu_host_split_note(&g_host_split_graph_ms);
+    const int rc = ds4_gpu_routed_moe_one_tensor_impl(out, gate, up, mid, experts,
+        model_map, model_size, gate_offset, up_offset, down_offset,
+        gate_type, down_type, gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim,
+        out_dim, selected, weights, n_total_expert, n_expert, clamp, x, add_in,
+        layer_index, force_resident);
+    ds4_gpu_host_split_note(&g_host_split_bind_ms);
+    return rc;
+}
+
+static int ds4_gpu_routed_moe_one_tensor_impl(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
