@@ -14928,6 +14928,40 @@ static NSMutableArray<id<MTLBuffer>> *g_stream_full_expert_addr_buffers;
 static id<MTLResidencySet> g_stream_full_expert_residency_set API_AVAILABLE(macos(15.0));
 static int g_stream_full_expert_residency_on_queue;
 
+/* Wiring a buffer's pages happens when the GPU first touches it, and costs
+ * about 1.7 ms for an expert whether the read is one byte or all of it.  Paying
+ * that lazily during decode is what made a full address table slower than the
+ * readback it removes, so pay it once, here, before the first token. */
+static void ds4_gpu_stream_full_expert_addr_prewire(NSArray<id<MTLBuffer>> *buffers) {
+    if (!g_device || !g_queue || buffers.count == 0) return;
+    if (getenv("DS4_METAL_FULL_ADDR_NO_PREWIRE") != NULL) return;
+    /* Copy the whole expert, not a token amount of it: the pages are wired as
+     * they are touched, so a 16-byte read leaves the rest for decode to pay. */
+    NSUInteger widest = 0;
+    for (id<MTLBuffer> b in buffers) if ([b length] > widest) widest = [b length];
+    static id<MTLBuffer> scratch;
+    if (!scratch || [scratch length] < widest) {
+        scratch = [g_device newBufferWithLength:widest options:MTLResourceStorageModePrivate];
+        if (!scratch) return;
+    }
+    const double t0 = ds4_gpu_now_ms();
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return;
+        for (id<MTLBuffer> b in buffers) {
+            if ([b length] == 0) continue;
+            [blit copyFromBuffer:b sourceOffset:0 toBuffer:scratch destinationOffset:0
+                            size:[b length]];
+        }
+        [blit endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    fprintf(stderr, "ds4: V4.1 wired %lu expert buffers in %.0f ms\n",
+            (unsigned long)buffers.count, ds4_gpu_now_ms() - t0);
+}
+
 static void ds4_gpu_stream_full_expert_addr_note_residency(NSArray<id<MTLBuffer>> *buffers) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
@@ -15153,6 +15187,7 @@ static int ds4_gpu_stream_full_expert_addr_table_prepare(
             }
             [g_stream_full_expert_addr_buffers addObjectsFromArray:kept];
             ds4_gpu_stream_full_expert_addr_note_residency(kept);
+            ds4_gpu_stream_full_expert_addr_prewire(kept);
             fprintf(stderr,
                     "ds4: V4.1 layer %u addresses every expert (%u buffers, no readback)\n",
                     layer, (unsigned)kept.count);
