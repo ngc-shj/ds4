@@ -41265,6 +41265,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     const bool v41_prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
     const double v41_t0 = v41_prof ? now_sec() : 0.0;
+    extern unsigned long long ds4_gpu_cb_finished(void);
+    const unsigned long long v41_cb0 = v41_prof ? ds4_gpu_cb_finished() : 0ull;
+    unsigned long long v41_cb_layer = 0ull;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
@@ -41292,6 +41295,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             const uint32_t i = il == 1 ? 0 : 1;
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
+        const unsigned long long v41_cb_before = v41_prof ? ds4_gpu_cb_finished() : 0ull;
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             ok = ds41_graph_decode_layer(g, m, l, il, token);
@@ -41299,6 +41303,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
+        if (v41_prof && il == 20u) v41_cb_layer = ds4_gpu_cb_finished() - v41_cb_before;
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
@@ -41323,17 +41328,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     }
     if (v41_prof) {
         static double eng_ms, enc_ms, gpu_ms;
-        static unsigned long long steps;
+        static unsigned long long steps, v41_cb_first;
+        if (!steps) v41_cb_first = v41_cb0;
         const double t3 = now_sec();
         eng_ms += (v41_t1 - v41_t0) * 1000.0;
         enc_ms += (v41_t2 - v41_t1) * 1000.0;
         gpu_ms += (t3 - v41_t2) * 1000.0;
         if ((++steps % 32ull) == 0ull)
             fprintf(stderr,
-                    "ds4: v41 decode %llu steps: engram %.3f ms + encode %.3f ms + gpu/logits %.3f ms = %.3f ms/token\n",
+                    "ds4: v41 decode %llu steps: engram %.3f ms + encode %.3f ms + gpu/logits %.3f ms = %.3f ms/token, %.1f cbs/token (layer 20: %llu)\n",
                     steps, eng_ms / (double)steps, enc_ms / (double)steps,
                     gpu_ms / (double)steps,
-                    (eng_ms + enc_ms + gpu_ms) / (double)steps);
+                    (eng_ms + enc_ms + gpu_ms) / (double)steps,
+                    (double)(ds4_gpu_cb_finished() - v41_cb_first) / (double)steps,
+                    v41_cb_layer);
     }
     g->history = next_history;
     g->pos++;

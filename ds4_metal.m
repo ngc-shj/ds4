@@ -1565,8 +1565,34 @@ static double g_batch_cb_created_ms;
 static double ds4_gpu_now_ms(void);
 static void ds4_gpu_queue_keepalive_start(void);
 static void ds4_gpu_queue_keepalive_stop_thread(void);
+unsigned long long g_ds4_cb_finished;
+
+unsigned long long ds4_gpu_cb_finished(void) { return g_ds4_cb_finished; }
+
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
+    g_ds4_cb_finished++;
+
+    if (getenv("DS4_METAL_CB_LABEL_PROFILE")) {
+        enum { CB_LABELS = 32 };
+        static const char *names[CB_LABELS];
+        static unsigned long long counts[CB_LABELS];
+        static unsigned long long total;
+        const char *name = label ? label : "(unlabelled)";
+        size_t i = 0;
+        for (; i < CB_LABELS && names[i]; i++)
+            if (names[i] == name || strcmp(names[i], name) == 0) break;
+        if (i < CB_LABELS) {
+            if (!names[i]) names[i] = name;
+            counts[i]++;
+        }
+        if ((++total % 4096ull) == 0ull) {
+            fprintf(stderr, "ds4: cb labels after %llu buffers:", total);
+            for (size_t j = 0; j < CB_LABELS && names[j]; j++)
+                fprintf(stderr, " %s=%llu", names[j], counts[j]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     const double t_commit = ds4_gpu_now_ms();
     [cb commit];
@@ -13102,7 +13128,14 @@ static int ds4_gpu_stream_expert_split_worthwhile(
      * reads can be hidden by resident expert work.  With one or two misses,
      * especially in large caches, a single unsplit routed pass is faster.
      */
-    return ds4_gpu_stream_expert_popcount(missing_mask) >= 3u;
+    unsigned min_missing = 3u;
+    const char *env = getenv("DS4_METAL_STREAM_SPLIT_MIN_MISSING");
+    if (env && env[0]) {
+        char *end = NULL;
+        const long v = strtol(env, &end, 10);
+        if (end && *end == '\0' && v > 0 && v <= 32) min_missing = (unsigned)v;
+    }
+    return ds4_gpu_stream_expert_popcount(missing_mask) >= min_missing;
 }
 
 static void ds4_gpu_stream_expert_timing_note_selected(
@@ -41091,8 +41124,10 @@ int ds4_gpu_routed_moe_one_tensor(
             selected_profile_env != NULL &&
             selected_profile_layer_match;
         const bool q4_selected_shared_event =
-            use_q4_selected_slots &&
-            getenv("DS4_METAL_Q4_SELECTED_SHARED_EVENT") != NULL;
+            ((use_q4_selected_slots &&
+              getenv("DS4_METAL_Q4_SELECTED_SHARED_EVENT") != NULL) ||
+             (use_iq2_selected_slots &&
+              getenv("DS4_METAL_IQ2_SELECTED_SHARED_EVENT") != NULL));
         const bool q4_selected_base_views =
             use_q4_selected_slots &&
             getenv("DS4_METAL_Q4_SELECTED_USE_BASE_VIEWS") != NULL &&
