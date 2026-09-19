@@ -17972,6 +17972,53 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                            frequency,
                                                            n_total_expert);
     }
+    /* What a width-2 tile could actually collect here. The duplication is real
+     * but uneven, so the mean unique count overstates it: only an expert chosen
+     * by two rows saves anything, and an odd third row pays full price. The
+     * cost units are measured - a 2-row tile is 1.64 single-row dispatches at
+     * these shapes - so this is the ceiling before any of it is built. */
+    if (ok) {
+        static uint64_t calls, sel_sum, every, hist[9];
+        static double tiled_sum, tiled4_sum;
+        static int checked;
+        if (!checked) {
+            checked = 1;
+            const char *env = getenv("DS4_METAL_BATCH_TILE2_MODEL");
+            every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+        }
+        if (every) {
+            /* Measured dispatch cost of a tile of each width, in single-row
+             * dispatches: 1, 1.64, 2.14, 2.71. Greedy widest-first. */
+            static const double unit[5] = {0.0, 1.00, 1.64, 2.14, 2.71};
+            double tiled2 = 0, tiled4 = 0;
+            for (uint32_t u = 0; u < unique_count; u++) {
+                uint32_t c = frequency[(uint32_t)unique_ids[u]];
+                if (c <= 8u) hist[c]++;
+                tiled2 += (double)(c / 2u) * unit[2] + (double)(c % 2u) * unit[1];
+                for (uint32_t rest = c; rest; ) {
+                    const uint32_t w = rest >= 4u ? 4u : rest;
+                    tiled4 += unit[w];
+                    rest -= w;
+                }
+            }
+            sel_sum += n_ids;
+            tiled_sum += tiled2;
+            tiled4_sum += tiled4;
+            if ((++calls % every) == 0) {
+                fprintf(stderr,
+                        "ds4: tiling model over %llu layers: %.2f selections -> "
+                        "width-2 %.2f units (%.1f%%), width-4 %.2f units (%.1f%%)\n",
+                        (unsigned long long)calls,
+                        (double)sel_sum / (double)calls,
+                        tiled_sum / (double)calls, 100.0 * tiled_sum / (double)sel_sum,
+                        tiled4_sum / (double)calls, 100.0 * tiled4_sum / (double)sel_sum);
+                fprintf(stderr, "ds4:   rows per expert:");
+                for (uint32_t c = 1; c <= 8u; c++)
+                    fprintf(stderr, " %u:%.2f", c, (double)hist[c] / (double)calls);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     /*
      * When the layer's unique selected set does not fit the cache budget, the
      * extra experts are addressed straight into whole-tensor mapped model views
