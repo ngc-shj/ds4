@@ -42395,11 +42395,24 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
      * somewhere else but stays there" from "every pass differs". */
     int *tok2 = malloc((size_t)(steps + 1) * sizeof(int));
     double *single = malloc((size_t)rounds * sizeof(double));
+    double *single_b = malloc((size_t)rounds * sizeof(double));
     double *batch = malloc((size_t)rounds * sizeof(double));
-    if (!lg || !rowbuf || !tok || !refgap || !tok2 || !single || !batch) goto done;
+    if (!lg || !rowbuf || !tok || !refgap || !tok2 || !single || !single_b || !batch) goto done;
     /* Isolating the rollback: with no batch pass in between, a divergence can
      * only come from the rewind itself. */
-    const bool nobatch = getenv("DS4_V41_VERIFY_SELFTEST_NOBATCH") != NULL;
+    const bool nobatch = getenv("DS4_V41_VERIFY_SELFTEST_NOBATCH") != NULL ||
+                         getenv("DS4_V41_VERIFY_SELFTEST_AB") != NULL;
+    /* Name an environment variable and the single-step arms alternate with it
+     * set and unset, inside one process against one set of weights. Between
+     * runs this machine drifts by more than most of what is worth measuring,
+     * so an A/B that starts a server per arm cannot see a few percent.
+     *
+     * This only works for a variable the code reads on every use. One read at
+     * startup - DS4_METAL_GPU_PACER, whose thread starts during GPU init and
+     * never stops - leaves both arms identical and the result is noise wearing
+     * a result's clothes. Check the variable's getenv before trusting a number
+     * from here, and make the change print something when it takes effect. */
+    const char *ab = getenv("DS4_V41_VERIFY_SELFTEST_AB");
     tok[0] = first_token;
 
 #define DS41_SELFTEST_TOP2(src, dst, gap) do { \
@@ -42502,6 +42515,16 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         }
         batch[r] = (now_sec() - t0) * 1000.0 / (double)steps;
         DS41_SELFTEST_REWIND();
+
+        if (ab) {
+            setenv(ab, "1", 1);
+            t0 = now_sec();
+            for (long i = 0; ok && i < steps; i++)
+                ok = ds41_graph_step(g, m, w, tok[i], lg);
+            single_b[r] = (now_sec() - t0) * 1000.0 / (double)steps;
+            unsetenv(ab);
+            DS41_SELFTEST_REWIND();
+        }
     }
     if (!ok) { fprintf(stderr, "ds4: verify selftest timing pass failed\n"); goto done; }
 
@@ -42511,10 +42534,25 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                                  : "odd start, pair carry NOT restored")
                         : "even start, no pair carry",
             rounds);
-    for (long r = 0; r < rounds; r++)
+    for (long r = 0; !ab && r < rounds; r++)
         fprintf(stderr, "  round %ld: single %.2f ms/token, batch %.2f ms/step\n",
                 r, single[r], batch[r] * (double)k);
+    if (ab) {
+        for (long r = 0; r < rounds; r++)
+            fprintf(stderr, "  round %ld: %s unset %.2f ms/token, set %.2f ms/token\n",
+                    r, ab, single[r], single_b[r]);
+        qsort(single_b, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
+    }
     qsort(single, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
+    if (ab) {
+        const double a = single[rounds / 2], b = single_b[rounds / 2];
+        fprintf(stderr,
+                "  median unset    : %.2f ms/token\n"
+                "  median set      : %.2f ms/token\n"
+                "  setting %s costs %+.1f%%\n",
+                a, b, ab, 100.0 * (b / a - 1.0));
+        goto done;
+    }
     qsort(batch, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
     const double sm = single[rounds / 2], bm = batch[rounds / 2] * (double)k;
     fprintf(stderr,
@@ -42548,8 +42586,8 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_SELFTEST_REWIND
 done:
     g->pos = pos0; g->history = hist0; g->valid = true;
-    free(lg); free(rowbuf); free(tok); free(refgap); free(tok2); free(single); free(batch);
-    free(carry);
+    free(lg); free(rowbuf); free(tok); free(refgap); free(tok2); free(single);
+    free(single_b); free(batch); free(carry);
 }
 
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
