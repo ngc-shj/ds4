@@ -50,6 +50,7 @@ void ds4_gpu_gate_clear_route(void);
 unsigned long long ds4_gpu_gate_ungatable(void);
 unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);  /* NOT launches */
 unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failures */
+void ds4_gpu_gate_print_ungatable(void);
 
 static int        g_gate_layers;
 static id<MTLBuffer> g_gate_grid;
@@ -99,6 +100,50 @@ static void ds4_gate_hook_encoder(id enc) {
                           @selector(ds4_gate_dispatchThreads:threadsPerThreadgroup:));
 }
 
+/* Which call sites issue a dispatch the gate cannot switch off, and with what
+ * shape. Unslid addresses, to be symbolised with atos. */
+#define DS4_GATE_UNGATABLE_SITES 16u
+static struct { uintptr_t caller; uint64_t count; uint32_t w, h, d, tw, th_, td; }
+    g_gate_ungatable_sites[DS4_GATE_UNGATABLE_SITES];
+static uint32_t g_gate_n_ungatable_sites;
+static os_unfair_lock g_gate_site_lock = OS_UNFAIR_LOCK_INIT;
+
+static void ds4_gate_note_ungatable(uintptr_t caller, MTLSize th, MTLSize tpt) {
+    const uintptr_t unslid = caller - (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    os_unfair_lock_lock(&g_gate_site_lock);
+    for (uint32_t i = 0; i < g_gate_n_ungatable_sites; i++)
+        if (g_gate_ungatable_sites[i].caller == unslid) {
+            g_gate_ungatable_sites[i].count++;
+            os_unfair_lock_unlock(&g_gate_site_lock);
+            return;
+        }
+    if (g_gate_n_ungatable_sites < DS4_GATE_UNGATABLE_SITES) {
+        const uint32_t i = g_gate_n_ungatable_sites++;
+        g_gate_ungatable_sites[i].caller = unslid;
+        g_gate_ungatable_sites[i].count = 1;
+        g_gate_ungatable_sites[i].w = (uint32_t)th.width;
+        g_gate_ungatable_sites[i].h = (uint32_t)th.height;
+        g_gate_ungatable_sites[i].d = (uint32_t)th.depth;
+        g_gate_ungatable_sites[i].tw = (uint32_t)tpt.width;
+        g_gate_ungatable_sites[i].th_ = (uint32_t)tpt.height;
+        g_gate_ungatable_sites[i].td = (uint32_t)tpt.depth;
+    }
+    os_unfair_lock_unlock(&g_gate_site_lock);
+}
+
+void ds4_gpu_gate_print_ungatable(void) {
+    os_unfair_lock_lock(&g_gate_site_lock);
+    for (uint32_t i = 0; i < g_gate_n_ungatable_sites; i++)
+        fprintf(stderr, "ds4: ungatable dispatch at 0x%llx: %llu times, "
+                        "threads %ux%ux%u per group %ux%ux%u\n",
+                (unsigned long long)g_gate_ungatable_sites[i].caller,
+                (unsigned long long)g_gate_ungatable_sites[i].count,
+                g_gate_ungatable_sites[i].w, g_gate_ungatable_sites[i].h,
+                g_gate_ungatable_sites[i].d, g_gate_ungatable_sites[i].tw,
+                g_gate_ungatable_sites[i].th_, g_gate_ungatable_sites[i].td);
+    os_unfair_lock_unlock(&g_gate_site_lock);
+}
+
 /* Takes the next slot, writes the real grid into it, and returns the byte
  * offset the dispatch should read its arguments from. */
 static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
@@ -136,9 +181,14 @@ static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
     static int no_threads = -1;
     if (no_threads < 0) no_threads = getenv("DS4_METAL_V41_ABORT_GATE_NO_THREADS") != NULL;
     /* Counted whether or not it is converted, so the hole is visible: a
-     * non-uniform dispatch that is left direct still runs after an abort. */
-    if (no_threads && atomic_load_explicit(&g_gate_active, memory_order_relaxed))
+     * non-uniform dispatch that is left direct still runs after an abort.
+     * The caller is recorded too - there are fourteen such call sites in the
+     * file and only some are on the decode path, and the ones that are have to
+     * be named before they can be changed. */
+    if (no_threads && atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&g_gate_ungatable, 1u, memory_order_relaxed);
+        ds4_gate_note_ungatable((uintptr_t)__builtin_return_address(0), th, tpt);
+    }
     if (!no_threads && atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
         const NSUInteger w = tpt.width ? tpt.width : 1, h = tpt.height ? tpt.height : 1,
                          d = tpt.depth ? tpt.depth : 1;

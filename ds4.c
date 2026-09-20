@@ -41450,6 +41450,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern unsigned long long ds4_gpu_gate_ungatable(void);
     extern unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);
     extern unsigned long long ds4_gpu_gate_slots_left_live(void);
+    extern void ds4_gpu_gate_print_ungatable(void);
     extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
                                    const int32_t *ids, uint32_t n_sel, uint32_t n_total,
                                    uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -41605,7 +41606,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                     (double)g_gate_after / (double)g_gate_tokens,
                     g_gate_live, ds4_gpu_gate_ungatable(),
                     (double)g_gate_touched / (double)g_gate_tokens,
-                    (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0);
+                    (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0),
+            ds4_gpu_gate_print_ungatable();
     }
 #else
     const uint32_t gate_n = 0, gate_done = 0;

@@ -50145,8 +50145,14 @@ int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
             for (NSUInteger i = 0; i < 5; i++)
                 [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
                         offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 1];
-            [enc dispatchThreads:MTLSizeMake(width, pairs, 1)
-                 threadsPerThreadgroup:MTLSizeMake(MIN(width, 256u), 1, 1)];
+            /* Uniform, so the abort gate can switch it off: a non-uniform
+             * dispatch has no indirect form. kernel_dsv41_pool2 bounds-checks
+             * index.x and index.y, so the rounded-up threads return. */
+            {
+                const NSUInteger tw = MIN(width, 256u);
+                [enc dispatchThreadgroups:MTLSizeMake((width + tw - 1u) / tw, pairs, 1)
+                     threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
             if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 KV pair pooling")) return 0;
         }
@@ -50190,8 +50196,13 @@ static int dsv41_candidates(ds4_gpu_tensor *out, const ds4_gpu_tensor *scores,
         for (NSUInteger i = 0; i < 3; i++)
             [enc setBuffer:ds4_gpu_tensor_buffer(inputs[i])
                     offset:ds4_gpu_tensor_offset(inputs[i]) atIndex:i + 1];
-        [enc dispatchThreads:MTLSizeMake(output_width, rows, 1)
-             threadsPerThreadgroup:MTLSizeMake(MIN(output_width, 256u), 1, 1)];
+        /* Uniform for the same reason; both candidate kernels bounds-check
+         * index.x against the real width and index.y against the rows. */
+        {
+            const NSUInteger tw = MIN(output_width, 256u);
+            [enc dispatchThreadgroups:MTLSizeMake((output_width + tw - 1u) / tw, rows, 1)
+                 threadsPerThreadgroup:MTLSizeMake(tw, 1, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 candidate selection");
     }
