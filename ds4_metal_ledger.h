@@ -196,10 +196,9 @@ static uint16_t ds4_ledger_pso_name(const void *pso) {
 }
 
 /* ---- side tables for live command buffers and encoders --------------- */
-#define DS4_LEDGER_CB_SLOTS  4096u
+#define DS4_LEDGER_CB_SLOTS  16384u
 #define DS4_LEDGER_ENC_SLOTS 4096u
 static ds4_ledger_cb  g_ledger_cbs[DS4_LEDGER_CB_SLOTS];
-static ds4_ledger_enc g_ledger_encs[DS4_LEDGER_ENC_SLOTS];
 static os_unfair_lock g_ledger_tab_lock = OS_UNFAIR_LOCK_INIT;
 /* Consecutive dispatches land on the same encoder, so remember the last one
  * and keep the table lock off the per-dispatch path. */
@@ -207,40 +206,93 @@ static _Thread_local ds4_ledger_enc *g_ledger_enc_cache;
 
 #define DS4_LEDGER_DEAD ((const void *)-1)
 
+static _Atomic uint64_t g_ledger_cb_probes, g_ledger_cb_lookups, g_ledger_cb_probe_max;
+static _Atomic uint64_t g_ledger_cb_rehashes;
+static uint32_t g_ledger_cb_used;    /* slots holding anything, live or done */
+
+/* A completed buffer stays findable until the table needs its slot, so a host
+ * wait on an already finished buffer can still name it. Done slots are
+ * tombstones: they keep probe chains intact but never become NULL again, so
+ * the table is rebuilt once they crowd it. Without the rebuild every lookup
+ * eventually scans the whole table under a global lock - at 43 command buffers
+ * a token that arrives within a hundred tokens. */
+static void ds4_ledger_cb_rehash(void) {
+    static ds4_ledger_cb scratch[DS4_LEDGER_CB_SLOTS];
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < DS4_LEDGER_CB_SLOTS; i++)
+        if (g_ledger_cbs[i].cb && !g_ledger_cbs[i].done) scratch[n++] = g_ledger_cbs[i];
+    memset(g_ledger_cbs, 0, sizeof(g_ledger_cbs));
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t i = ds4_ledger_ptr_hash(scratch[k].cb) & (DS4_LEDGER_CB_SLOTS - 1u);
+        while (g_ledger_cbs[i].cb) i = (i + 1u) & (DS4_LEDGER_CB_SLOTS - 1u);
+        g_ledger_cbs[i] = scratch[k];
+    }
+    g_ledger_cb_used = n;
+    atomic_fetch_add_explicit(&g_ledger_cb_rehashes, 1u, memory_order_relaxed);
+}
+
 static ds4_ledger_cb *ds4_ledger_cb_find(const void *cb, int create) {
+    if (create && g_ledger_cb_used > (DS4_LEDGER_CB_SLOTS / 4u) * 3u) ds4_ledger_cb_rehash();
     uint32_t i = ds4_ledger_ptr_hash(cb) & (DS4_LEDGER_CB_SLOTS - 1u);
     ds4_ledger_cb *reuse = NULL;
+    uint32_t probes = 0;
+    ds4_ledger_cb *out = NULL;
     for (uint32_t n = 0; n < DS4_LEDGER_CB_SLOTS; n++, i = (i + 1u) & (DS4_LEDGER_CB_SLOTS - 1u)) {
-        if (g_ledger_cbs[i].cb == cb) return &g_ledger_cbs[i];
+        probes++;
+        if (g_ledger_cbs[i].cb == cb) { out = &g_ledger_cbs[i]; break; }
         if (g_ledger_cbs[i].done && !reuse) reuse = &g_ledger_cbs[i];
         if (g_ledger_cbs[i].cb == NULL) {
-            if (!create) return NULL;
-            ds4_ledger_cb *slot = reuse ? reuse : &g_ledger_cbs[i];
-            memset(slot, 0, sizeof(*slot));
-            slot->cb = cb;
-            return slot;
+            if (create) {
+                out = reuse ? reuse : &g_ledger_cbs[i];
+                if (!reuse) g_ledger_cb_used++;
+                memset(out, 0, sizeof(*out));
+                out->cb = cb;
+            }
+            break;
         }
     }
-    if (create && reuse) { memset(reuse, 0, sizeof(*reuse)); reuse->cb = cb; return reuse; }
+    if (!out && create && reuse) { memset(reuse, 0, sizeof(*reuse)); reuse->cb = cb; out = reuse; }
+    atomic_fetch_add_explicit(&g_ledger_cb_probes, probes, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_ledger_cb_lookups, 1u, memory_order_relaxed);
+    uint64_t mx = atomic_load_explicit(&g_ledger_cb_probe_max, memory_order_relaxed);
+    while (probes > mx &&
+           !atomic_compare_exchange_weak_explicit(&g_ledger_cb_probe_max, &mx, probes,
+                                                  memory_order_relaxed, memory_order_relaxed)) {}
+    return out;
+}
+
+/* Metal requires an encoder to be encoded into from one thread, and ds4 never
+ * holds more than a handful open at once. A thread-local list of the open ones
+ * is therefore exact, needs no lock, and cannot degrade: the shared table this
+ * replaces filled with tombstones after about nineteen tokens, after which
+ * every encoder creation scanned it under a global lock. */
+#define DS4_LEDGER_OPEN_ENCS 16u
+static _Thread_local ds4_ledger_enc g_open_encs[DS4_LEDGER_OPEN_ENCS];
+static _Thread_local uint32_t g_n_open_encs;
+static _Atomic uint64_t g_ledger_enc_overflow;
+
+static ds4_ledger_enc *ds4_ledger_enc_open(const void *enc) {
+    if (g_n_open_encs >= DS4_LEDGER_OPEN_ENCS) {
+        atomic_fetch_add_explicit(&g_ledger_enc_overflow, 1u, memory_order_relaxed);
+        return NULL;
+    }
+    ds4_ledger_enc *e = &g_open_encs[g_n_open_encs++];
+    memset(e, 0, sizeof(*e));
+    e->enc = enc;
+    return e;
+}
+
+static ds4_ledger_enc *ds4_ledger_enc_lookup(const void *enc) {
+    for (uint32_t i = g_n_open_encs; i-- > 0; )
+        if (g_open_encs[i].enc == enc) return &g_open_encs[i];
     return NULL;
 }
 
-static ds4_ledger_enc *ds4_ledger_enc_find(const void *enc, int create) {
-    uint32_t i = ds4_ledger_ptr_hash(enc) & (DS4_LEDGER_ENC_SLOTS - 1u);
-    ds4_ledger_enc *reuse = NULL;
-    for (uint32_t n = 0; n < DS4_LEDGER_ENC_SLOTS; n++, i = (i + 1u) & (DS4_LEDGER_ENC_SLOTS - 1u)) {
-        if (g_ledger_encs[i].enc == enc) return &g_ledger_encs[i];
-        if (g_ledger_encs[i].enc == DS4_LEDGER_DEAD && !reuse) reuse = &g_ledger_encs[i];
-        if (g_ledger_encs[i].enc == NULL) {
-            if (!create) return NULL;
-            ds4_ledger_enc *slot = reuse ? reuse : &g_ledger_encs[i];
-            memset(slot, 0, sizeof(*slot));
-            slot->enc = enc;
-            return slot;
-        }
-    }
-    if (create && reuse) { memset(reuse, 0, sizeof(*reuse)); reuse->enc = enc; return reuse; }
-    return NULL;
+static void ds4_ledger_enc_close(ds4_ledger_enc *e) {
+    const uint32_t i = (uint32_t)(e - g_open_encs);
+    if (i >= g_n_open_encs) return;
+    if (i + 1u != g_n_open_encs) g_open_encs[i] = g_open_encs[g_n_open_encs - 1u];
+    g_n_open_encs--;
 }
 
 
@@ -415,6 +467,9 @@ static id ds4_ledger_adopt_cb(id cbid, id queue) {
     if (rec) {
         rec->seq = seq; rec->token = ctx.token; rec->layer = ctx.layer;
         rec->role = role; rec->queue = qname; rec->n_enc = 0;
+        /* Metal reuses command buffer addresses. Without this the slot keeps
+         * the previous buffer's done flag and is reused while live. */
+        rec->done = 0;
         rec->t_create = ds4_ledger_now();
     }
     os_unfair_lock_unlock(&g_ledger_tab_lock);
@@ -452,17 +507,21 @@ static id ds4_ledger_adopt_enc(id encid, id cbid, uint8_t kind) {
     const uint64_t seq = atomic_fetch_add(&g_ledger_enc_seq, 1u) + 1u;
     os_unfair_lock_lock(&g_ledger_tab_lock);
     ds4_ledger_cb *cbrec = ds4_ledger_cb_find((__bridge const void *)cbid, 0);
-    ds4_ledger_enc *e = ds4_ledger_enc_find((__bridge const void *)encid, 1);
+    const uint64_t cbseq = cbrec ? cbrec->seq : 0;
+    const uint64_t cbtok = cbrec ? cbrec->token : g_ledger_ctx.token;
+    const int32_t cblay = cbrec ? cbrec->layer : g_ledger_ctx.layer;
+    const uint32_t idx = cbrec ? cbrec->n_enc++ : 0;
+    os_unfair_lock_unlock(&g_ledger_tab_lock);
+    ds4_ledger_enc *e = ds4_ledger_enc_open((__bridge const void *)encid);
     if (e) {
         e->seq = seq;
-        e->cb_seq = cbrec ? cbrec->seq : 0;
-        e->token = cbrec ? cbrec->token : g_ledger_ctx.token;
-        e->layer = cbrec ? cbrec->layer : g_ledger_ctx.layer;
-        e->idx_in_cb = cbrec ? cbrec->n_enc++ : 0;
+        e->cb_seq = cbseq;
+        e->token = cbtok;
+        e->layer = cblay;
+        e->idx_in_cb = idx;
         e->kind = kind;
         e->t_create = ds4_ledger_now();
     }
-    os_unfair_lock_unlock(&g_ledger_tab_lock);
     g_ledger_enc_cache = e;
     if (kind == 0) ds4_ledger_hook_compute_encoder_class(encid);
     else           ds4_ledger_hook_blit_encoder_class(encid);
@@ -472,9 +531,7 @@ static id ds4_ledger_adopt_enc(id encid, id cbid, uint8_t kind) {
 static ds4_ledger_enc *ds4_ledger_enc_for(const void *enc) {
     ds4_ledger_enc *e = g_ledger_enc_cache;
     if (e && e->enc == enc) return e;
-    os_unfair_lock_lock(&g_ledger_tab_lock);
-    e = ds4_ledger_enc_find(enc, 0);
-    os_unfair_lock_unlock(&g_ledger_tab_lock);
+    e = ds4_ledger_enc_lookup(enc);
     if (e) g_ledger_enc_cache = e;
     return e;
 }
@@ -652,10 +709,8 @@ static _Thread_local uint16_t g_ledger_cur_kernel;
             r->name_id = ds4_ledger_intern(comp);
             r->t_ns = e->t_create; r->a = e->n_dispatch; r->b = e->bytes;
         }
-        os_unfair_lock_lock(&g_ledger_tab_lock);
-        e->enc = DS4_LEDGER_DEAD;
-        os_unfair_lock_unlock(&g_ledger_tab_lock);
         if (g_ledger_enc_cache == e) g_ledger_enc_cache = NULL;
+        ds4_ledger_enc_close(e);
     }
     [self ds4_lg_endEncoding];
 }
@@ -774,6 +829,15 @@ void ds4_gpu_ledger_dump(void) {
     if (n > DS4_LEDGER_MAX_RECS) n = DS4_LEDGER_MAX_RECS;
     fprintf(g_ledger_out, "# ds4 decode ledger v1 pid=%d timebase=%u/%u\n",
             (int)getpid(), g_ledger_tb.numer, g_ledger_tb.denom);
+    fprintf(g_ledger_out, "# cb_lookups=%llu probes=%llu mean=%.2f max=%llu rehashes=%llu "
+            "enc_overflow=%llu\n",
+            (unsigned long long)atomic_load(&g_ledger_cb_lookups),
+            (unsigned long long)atomic_load(&g_ledger_cb_probes),
+            atomic_load(&g_ledger_cb_lookups)
+                ? (double)atomic_load(&g_ledger_cb_probes) / (double)atomic_load(&g_ledger_cb_lookups) : 0.0,
+            (unsigned long long)atomic_load(&g_ledger_cb_probe_max),
+            (unsigned long long)atomic_load(&g_ledger_cb_rehashes),
+            (unsigned long long)atomic_load(&g_ledger_enc_overflow));
     fprintf(g_ledger_out, "# records=%u dropped=%llu cbs=%llu encoders=%llu\n",
             n, (unsigned long long)dropped,
             (unsigned long long)atomic_load(&g_ledger_cb_seq),
