@@ -984,6 +984,26 @@ static int ds4_gpu_capture_hits_only(void) {
 
 static uint64_t g_capture_fast_layers, g_capture_slow_layers, g_capture_boundary_flushes;
 
+/* How often the hits-only arm could skip the readback, over a run long enough
+ * to have a real miss profile: the selftest's repeated short sequence leaves
+ * everything cached and reports 100%, which says nothing. */
+static void ds4_gpu_capture_fastpath_note(void) {
+    static uint64_t every;
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *env = getenv("DS4_METAL_CAPTURE_FASTPATH_COUNT");
+        every = env && env[0] ? strtoull(env, NULL, 10) : 0;
+    }
+    if (!every) return;
+    const uint64_t total = g_capture_fast_layers + g_capture_slow_layers;
+    if ((total % every) == 0)
+        fprintf(stderr, "ds4: replay fast path %llu of %llu layers (%.1f%%)\n",
+                (unsigned long long)g_capture_fast_layers,
+                (unsigned long long)total,
+                100.0 * (double)g_capture_fast_layers / (double)total);
+}
+
 void ds4_gpu_capture_fastpath_counts(uint64_t *fast, uint64_t *slow, uint64_t *flushes) {
     if (fast) *fast = g_capture_fast_layers;
     if (slow) *slow = g_capture_slow_layers;
@@ -42532,6 +42552,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                      * goes the normal way and the readback returns the same
                      * ids the replay already consumed. */
                     g_capture_fast_layers++;
+                    ds4_gpu_capture_fastpath_note();
                     selected_id_source = "replay";
                     selected_exec_ids_from_host = true;
                     g_routed_moe_selected_override_n = 0;
@@ -42541,6 +42562,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                     }
                 } else if (replayed_selected_ids > 0) {
                     g_capture_slow_layers++;
+                    ds4_gpu_capture_fastpath_note();
                 } else if (g_routed_moe_selected_override_n == n_expert) {
                     memcpy(selected_ids,
                            g_routed_moe_selected_override,
