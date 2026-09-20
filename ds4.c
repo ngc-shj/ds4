@@ -42367,6 +42367,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
  * single steps, and that the batch costs less than k of them. This measures all
  * three on the live model. The two arms alternate inside one run because this
  * machine drifts by more between runs than the effect being measured. */
+/* The ceiling on removing the per-layer control loop: decode a fixed token
+ * sequence once to learn every layer's selected experts, then decode it again
+ * with those ids supplied from the host, which skips the signal, the wait and
+ * the readback while leaving the router and the expert work exactly as they
+ * were. The difference is what GPU-resident routing could be worth here, and
+ * it is an upper bound because no real scheme gets the ids for free. */
+void ds4_gpu_moe_selected_capture_start(uint32_t width);
+void ds4_gpu_moe_selected_capture_stop(void);
+uint64_t ds4_gpu_moe_selected_capture_count(void);
+void ds4_gpu_moe_selected_capture_replay(int on);
+void ds4_gpu_moe_selected_capture_rewind(void);
+
 static int ds41_selftest_cmp(const void *a, const void *b) {
     const double x = *(const double *)a, y = *(const double *)b;
     return x < y ? -1 : x > y ? 1 : 0;
@@ -42409,7 +42421,8 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     /* Isolating the rollback: with no batch pass in between, a divergence can
      * only come from the rewind itself. */
     const bool nobatch = getenv("DS4_V41_VERIFY_SELFTEST_NOBATCH") != NULL ||
-                         getenv("DS4_V41_VERIFY_SELFTEST_AB") != NULL;
+                         getenv("DS4_V41_VERIFY_SELFTEST_AB") != NULL ||
+                         getenv("DS4_V41_VERIFY_SELFTEST_NOREADBACK") != NULL;
     /* Name an environment variable and the single-step arms alternate with it
      * set and unset, inside one process against one set of weights. Between
      * runs this machine drifts by more than most of what is worth measuring,
@@ -42421,6 +42434,11 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
      * a result's clothes. Check the variable's getenv before trusting a number
      * from here, and make the change print something when it takes effect. */
     const char *ab = getenv("DS4_V41_VERIFY_SELFTEST_AB");
+    /* The same alternation, but the B arm supplies every layer's selected ids
+     * from a capture instead of reading them back, so the forty synchronisation
+     * points a token disappear and nothing else does. */
+    const bool noreadback = getenv("DS4_V41_VERIFY_SELFTEST_NOREADBACK") != NULL;
+    if (noreadback) ab = "selected-id capture";
     tok[0] = first_token;
 
 #define DS41_SELFTEST_TOP2(src, dst, gap) do { \
@@ -42470,9 +42488,15 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
 
     /* The reference token at every position, and the throwaway warm-up: a first
      * pass after a build or a prefill runs well off the steady state. */
+    if (noreadback) ds4_gpu_moe_selected_capture_start((uint32_t)DS4_N_EXPERT_USED);
     for (long i = 0; ok && i < steps; i++) {
         ok = ds41_graph_step(g, m, w, tok[i], lg);
         if (ok) DS41_SELFTEST_TOP2(lg, tok[i + 1], refgap[i + 1]);
+    }
+    if (noreadback) {
+        ds4_gpu_moe_selected_capture_stop();
+        fprintf(stderr, "ds4: captured %llu selected-id sets over %ld tokens\n",
+                (unsigned long long)ds4_gpu_moe_selected_capture_count(), steps);
     }
     DS41_SELFTEST_REWIND();
     for (long b = 0; ok && !nobatch && b < blocks; b++) {
@@ -42527,11 +42551,16 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         if (ab) {
             /* NAME sets NAME=1 in the B arm; NAME=VALUE sets that value, which
              * is what a sweep of a knob rather than a switch needs. */
-            char ab_name[128];
-            const char *eq = strchr(ab, '=');
-            const size_t nlen = eq ? (size_t)(eq - ab) : strlen(ab);
-            snprintf(ab_name, sizeof(ab_name), "%.*s", (int)nlen, ab);
-            setenv(ab_name, eq ? eq + 1 : "1", 1);
+            char ab_name[128] = {0};
+            if (noreadback) {
+                ds4_gpu_moe_selected_capture_rewind();
+                ds4_gpu_moe_selected_capture_replay(1);
+            } else {
+                const char *eq = strchr(ab, '=');
+                const size_t nlen = eq ? (size_t)(eq - ab) : strlen(ab);
+                snprintf(ab_name, sizeof(ab_name), "%.*s", (int)nlen, ab);
+                setenv(ab_name, eq ? eq + 1 : "1", 1);
+            }
             t0 = now_sec();
             for (long i = 0; ok && i < steps; i++) {
                 int arg = 0;
@@ -42545,7 +42574,8 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             single_b[r] = (now_sec() - t0) * 1000.0 / (double)steps;
-            unsetenv(ab_name);
+            if (noreadback) ds4_gpu_moe_selected_capture_replay(0);
+            else unsetenv(ab_name);
             DS41_SELFTEST_REWIND();
         }
     }

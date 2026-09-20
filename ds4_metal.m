@@ -896,6 +896,69 @@ static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
 static FILE *g_moe_selected_trace_record_fp;
 static uint64_t g_moe_selected_trace_record_count;
+/* An in-process capture of the selected ids, so the same run can decode a token
+ * sequence normally and then decode it again with the forty readbacks removed.
+ * The file-backed trace cannot do that: it is loaded once, and a record run and
+ * a replay run are two processes whose prefixes have to be trusted to match. */
+static int32_t *g_moe_selected_capture;
+static uint64_t g_moe_selected_capture_count, g_moe_selected_capture_cap;
+static uint32_t g_moe_selected_capture_width;
+static int g_moe_selected_capture_active, g_moe_selected_capture_replay;
+static uint64_t g_moe_selected_capture_pos;
+
+void ds4_gpu_moe_selected_capture_start(uint32_t width) {
+    free(g_moe_selected_capture);
+    g_moe_selected_capture = NULL;
+    g_moe_selected_capture_count = g_moe_selected_capture_cap = 0;
+    g_moe_selected_capture_width = width;
+    g_moe_selected_capture_active = 1;
+    g_moe_selected_capture_replay = 0;
+}
+
+void ds4_gpu_moe_selected_capture_stop(void) { g_moe_selected_capture_active = 0; }
+
+/* Returns the number of captured entries, so a caller can check the replay
+ * covers what it is about to decode rather than run off the end silently. */
+uint64_t ds4_gpu_moe_selected_capture_count(void) { return g_moe_selected_capture_count; }
+
+void ds4_gpu_moe_selected_capture_replay(int on) {
+    g_moe_selected_capture_replay = on ? 1 : 0;
+    g_moe_selected_capture_pos = 0;
+}
+
+void ds4_gpu_moe_selected_capture_rewind(void) { g_moe_selected_capture_pos = 0; }
+
+static void ds4_gpu_moe_selected_capture_note(const int32_t *ids, uint32_t n) {
+    if (!g_moe_selected_capture_active || n != g_moe_selected_capture_width) return;
+    if (g_moe_selected_capture_count == g_moe_selected_capture_cap) {
+        const uint64_t cap = g_moe_selected_capture_cap ? g_moe_selected_capture_cap * 2u : 4096u;
+        int32_t *grown = realloc(g_moe_selected_capture,
+                                 (size_t)cap * n * sizeof(int32_t));
+        if (!grown) { g_moe_selected_capture_active = 0; return; }
+        g_moe_selected_capture = grown;
+        g_moe_selected_capture_cap = cap;
+    }
+    memcpy(g_moe_selected_capture + g_moe_selected_capture_count * n,
+           ids, (size_t)n * sizeof(int32_t));
+    g_moe_selected_capture_count++;
+}
+
+/* 1 if this call's ids came from the capture, 0 to fall through to the
+ * readback, -1 if the capture ran out - which is a broken experiment, not a
+ * slow one, so it has to be loud. */
+static int ds4_gpu_moe_selected_capture_take(int32_t *ids, uint32_t n) {
+    if (!g_moe_selected_capture_replay || n != g_moe_selected_capture_width) return 0;
+    if (g_moe_selected_capture_pos >= g_moe_selected_capture_count) {
+        fprintf(stderr, "ds4: selected-id capture exhausted after %llu entries\n",
+                (unsigned long long)g_moe_selected_capture_pos);
+        return -1;
+    }
+    memcpy(ids, g_moe_selected_capture + g_moe_selected_capture_pos * n,
+           (size_t)n * sizeof(int32_t));
+    g_moe_selected_capture_pos++;
+    return 1;
+}
+
 static int g_moe_selected_trace_replay_initialized;
 static int32_t *g_moe_selected_trace_replay_ids;
 static uint64_t g_moe_selected_trace_replay_count;
@@ -42270,6 +42333,12 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                                                  ? full_entry : NULL;
                 }
                 use_stream_expert_addr_table = true;
+            } else if (g_moe_selected_capture_replay) {
+                const int took = ds4_gpu_moe_selected_capture_take(selected_ids, n_expert);
+                if (took <= 0) return 0;   /* exhausted, or a width mismatch */
+                selected_id_source = "capture";
+                selected_exec_ids_from_host = true;
+                g_routed_moe_selected_override_n = 0;
             } else {
                 const int replayed_selected_ids =
                     ds4_gpu_moe_selected_trace_replay(selected_ids, n_expert);
@@ -42395,6 +42464,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                 ds4_gpu_stream_expert_cache_note_selected_hotness(layer_index,
                                                                   selected_ids,
                                                                   n_expert);
+                ds4_gpu_moe_selected_capture_note(selected_ids, n_expert);
                 if (!ds4_gpu_moe_selected_trace_record(selected_ids, n_expert) ||
                     !ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          selected_ids,
