@@ -41459,6 +41459,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after,
                               g_gate_live, g_gate_tokens, g_gate_touched;
     static double g_gate_encode_ms, g_gate_wait_ms;
+    /* One token's wall, cut into parts that do not overlap, inside one run.
+     * Subtracting figures from different runs is how the last residual was
+     * built, and it was not a residual. */
+    static double g_gt_entry_ms, g_gt_repair_ms, g_gt_account_ms,
+                  g_gt_tail_ms, g_gt_wall_ms, g_gt_gpu_ms;
+    extern double ds4_gpu_take_span_ms(void);
+    const double gt_token0 = now_sec();
     const uint32_t gate_n = (uint32_t)ds4_gpu_gate_layers();
     /* The gated region is a window, so a single layer can be isolated: at
      * gate_n=24 the token is correct and at 25 it is not, and a prefix cannot
@@ -41469,6 +41476,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         gate_lo_env = e && e[0] ? atoi(e) : 0;
     }
     const uint32_t gate_lo = (uint32_t)gate_lo_env < gate_n ? (uint32_t)gate_lo_env : 0u;
+    const double gt_entry1 = now_sec();
     uint32_t gate_done = 0;
     if (gate_n > gate_lo) {
         uint32_t start = gate_lo;
@@ -41549,6 +41557,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             const double seg_t2 = now_sec();
             g_gate_encode_ms += (seg_t1 - seg_t0) * 1000.0;
             g_gate_wait_ms += (seg_t2 - seg_t1) * 1000.0;
+            g_gt_gpu_ms += ds4_gpu_take_span_ms();
             g_gate_cbs++;
             uint32_t bad = 0, mask = 0, n_sel = 0;
             int32_t ids[16];
@@ -41563,6 +41572,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
              * behind the aborting layer that is still live is a dispatch it
              * failed to switch off. */
             g_gate_live += ds4_gpu_gate_slots_left_live();
+            const double gt_rep0 = now_sec();
             const ds4_layer_weights *bl = &w->layer[bad];
             uint64_t gate_row = 0, down_row = 0;
             if (!tensor_nbytes(bl->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
@@ -41572,6 +41582,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                      bl->ffn_down_exps->abs_offset,
                                      gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
                                      mask, &g_gate_bytes)) { ok = false; break; }
+            g_gt_repair_ms += (now_sec() - gt_rep0) * 1000.0;
             start = bad;
             resume_from_moe = 1;
         }
@@ -41586,6 +41597,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * the last command buffer of the region has completed, so it needs no
          * synchronisation of its own, and once per layer however many
          * continuations that layer took. */
+        const double gt_acct0 = now_sec();
         if (ok) {
             unsigned long long touched = 0;
             for (uint32_t il = gate_lo; il < gate_n; il++) {
@@ -41606,6 +41618,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             g_gate_touched += touched;
             ds4_gpu_gate_clear_route();
         }
+        g_gt_account_ms += (now_sec() - gt_acct0) * 1000.0;
+        g_gt_entry_ms += (gt_entry1 - gt_token0) * 1000.0;
 
         /* The ordinary loop below is entered with a batch already open. */
         if (ok && gate_n < DS4_N_LAYER && !ds4_gpu_commands_active() &&
@@ -41615,7 +41629,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                             "%.1f slots encoded behind an abort (not launches), "
                             "%llu the gate failed to switch off, %llu it could not gate, "
                             "%.1f expert ids accounted a token, %.2f MiB loaded a token, "
-                            "encode %.2f ms and commit-to-done %.2f ms a token\n",
+                            "encode %.2f ms and commit-to-done %.2f ms a token\n"
+                            "ds4:   one token, exclusive, same run: entry %.2f + encode %.2f "
+                            "+ commit-to-done %.2f + repair %.2f + accounting %.2f + tail %.2f "
+                            "= %.2f of a %.2f ms wall, residual %.2f\n"
+                            "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n",
                     g_gate_tokens, (double)g_gate_cbs / (double)g_gate_tokens,
                     (double)g_gate_aborts / (double)g_gate_tokens,
                     (double)g_gate_after / (double)g_gate_tokens,
@@ -41623,7 +41641,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                     (double)g_gate_touched / (double)g_gate_tokens,
                     (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0,
                     g_gate_encode_ms / (double)g_gate_tokens,
-                    g_gate_wait_ms / (double)g_gate_tokens),
+                    g_gate_wait_ms / (double)g_gate_tokens,
+                    g_gt_entry_ms / (double)g_gate_tokens,
+                    g_gate_encode_ms / (double)g_gate_tokens,
+                    g_gate_wait_ms / (double)g_gate_tokens,
+                    g_gt_repair_ms / (double)g_gate_tokens,
+                    g_gt_account_ms / (double)g_gate_tokens,
+                    g_gt_tail_ms / (double)g_gate_tokens,
+                    (g_gt_entry_ms + g_gate_encode_ms + g_gate_wait_ms + g_gt_repair_ms +
+                     g_gt_account_ms + g_gt_tail_ms) / (double)g_gate_tokens,
+                    g_gt_wall_ms / (double)g_gate_tokens,
+                    (g_gt_wall_ms - g_gt_entry_ms - g_gate_encode_ms - g_gate_wait_ms -
+                     g_gt_repair_ms - g_gt_account_ms - g_gt_tail_ms) / (double)g_gate_tokens,
+                    g_gt_gpu_ms / (double)g_gate_tokens,
+                    (g_gate_wait_ms - g_gt_gpu_ms) / (double)g_gate_tokens),
             ds4_gpu_gate_print_ungatable();
     }
 #else
@@ -41677,8 +41708,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const double v41_t2 = v41_prof ? now_sec() : 0.0;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
+#ifdef __APPLE__
+    const double gt_tail0 = now_sec();
+#endif
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
 #ifdef __APPLE__
+    if (gate_n > gate_lo) {
+        g_gt_tail_ms += (now_sec() - gt_tail0) * 1000.0;
+        g_gt_wall_ms += (now_sec() - gt_token0) * 1000.0;
+    }
     ds4_gpu_ledger_token_end();
 #endif
     if (!ok) {

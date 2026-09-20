@@ -1495,8 +1495,24 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
+/* The GPU's own span for whatever a drain waits on, so commit-to-done can be
+ * split into the GPU running and the GPU not running without mixing a host
+ * clock with Metal's: only differences within one clock are taken. */
+static double g_gpu_span_accum_ms;
+static uint64_t g_gpu_span_cbs;
+double ds4_gpu_take_span_ms(void);
+double ds4_gpu_take_span_ms(void) {
+    const double v = g_gpu_span_accum_ms;
+    g_gpu_span_accum_ms = 0.0;
+    return v;
+}
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
+    if (cb.GPUEndTime > cb.GPUStartTime) {
+        g_gpu_span_accum_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+        g_gpu_span_cbs++;
+    }
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
