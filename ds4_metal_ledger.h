@@ -47,6 +47,7 @@ void ds4_gpu_ledger_mark(const char *name, const char *detail);
 void ds4_gpu_ledger_wait_begin(const char *what);
 void ds4_gpu_ledger_wait_end(const char *what);
 void ds4_gpu_ledger_dump(void);
+void ds4_gpu_ledger_origin(const char *what);
 
 /* ---- record stream ---- */
 enum {
@@ -119,6 +120,11 @@ static _Thread_local ds4_ledger_ctx g_ledger_ctx = { 0, 0, -1, "pre-decode" };
 static _Atomic uint64_t g_ledger_token_seq;
 static _Thread_local ds4_ledger_ctx g_ledger_saved;
 static _Thread_local os_signpost_id_t g_ledger_tok_sid;
+/* Which call site made the next command buffer. Set immediately before the
+ * creation and consumed by it, so the ledger can say why a token needs fifty
+ * command buffers rather than the two the layer loop drains at. */
+static _Thread_local const char *g_ledger_origin = "other";
+void ds4_gpu_ledger_origin(const char *what);
 
 static uint64_t ds4_ledger_now(void) {
     return mach_absolute_time() * g_ledger_tb.numer / g_ledger_tb.denom;
@@ -461,6 +467,8 @@ static id ds4_ledger_adopt_cb(id cbid, id queue) {
     const ds4_ledger_ctx ctx = g_ledger_ctx;
     const uint16_t qname = ds4_ledger_queue_name((__bridge const void *)queue);
     const uint16_t role = ds4_ledger_intern(ctx.role ? ctx.role : "unset");
+    const uint16_t origin = ds4_ledger_intern(g_ledger_origin);
+    g_ledger_origin = "other";
 
     os_unfair_lock_lock(&g_ledger_tab_lock);
     ds4_ledger_cb *rec = ds4_ledger_cb_find((__bridge const void *)cb, 1);
@@ -483,7 +491,7 @@ static id ds4_ledger_adopt_cb(id cbid, id queue) {
         memset(r, 0, sizeof(*r));
         r->kind = DS4_LR_CB_CREATE; r->id = seq; r->token = ctx.token;
         r->layer = ctx.layer; r->name_id = role; r->t_ns = ds4_ledger_now();
-        r->a = qname;
+        r->a = qname; r->b = origin;
     }
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         ds4_ledger_rec *f = ds4_ledger_claim();
@@ -783,6 +791,7 @@ void ds4_gpu_ledger_token_end(void) {
 }
 
 void ds4_gpu_ledger_layer(int il) { if (g_ledger_on) g_ledger_ctx.layer = il; }
+void ds4_gpu_ledger_origin(const char *what) { if (g_ledger_on) g_ledger_origin = what; }
 void ds4_gpu_ledger_role(const char *role) { if (g_ledger_on) g_ledger_ctx.role = role; }
 
 void ds4_gpu_ledger_push(unsigned long long token, int layer, const char *role) {
@@ -844,7 +853,7 @@ void ds4_gpu_ledger_dump(void) {
             (unsigned long long)atomic_load(&g_ledger_enc_seq));
     fprintf(g_ledger_out, "# TB  tok t_ns pos                      token begin\n");
     fprintf(g_ledger_out, "# TE  tok t_ns pos                      token end\n");
-    fprintf(g_ledger_out, "# CC  cb tok lay t_ns role queue        command buffer created\n");
+    fprintf(g_ledger_out, "# CC  cb tok lay t_ns role queue origin command buffer created\n");
     fprintf(g_ledger_out, "# CM  cb tok lay t_ns n_encoders        committed\n");
     fprintf(g_ledger_out, "# CD  cb tok lay t_ns gpu_start gpu_end completed (Metal API times)\n");
     fprintf(g_ledger_out, "# EN  enc cb tok lay t_create n_dispatch kernels   compute encoder\n");
@@ -862,10 +871,11 @@ void ds4_gpu_ledger_dump(void) {
             fprintf(g_ledger_out, "TE %llu %llu %llu\n", (unsigned long long)r->token,
                     (unsigned long long)r->t_ns, (unsigned long long)r->a); break;
         case DS4_LR_CB_CREATE:
-            fprintf(g_ledger_out, "CC %llu %llu %d %llu %s %s\n",
+            fprintf(g_ledger_out, "CC %llu %llu %d %llu %s %s %s\n",
                     (unsigned long long)r->id, (unsigned long long)r->token, r->layer,
                     (unsigned long long)r->t_ns, nm,
-                    (r->a < g_ledger_n_names) ? g_ledger_names[r->a] : "?"); break;
+                    (r->a < g_ledger_n_names) ? g_ledger_names[r->a] : "?",
+                    (r->b < g_ledger_n_names) ? g_ledger_names[r->b] : "?"); break;
         case DS4_LR_CB_COMMIT:
             fprintf(g_ledger_out, "CM %llu %llu %d %llu %llu\n",
                     (unsigned long long)r->id, (unsigned long long)r->token, r->layer,

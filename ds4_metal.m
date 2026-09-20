@@ -1434,6 +1434,7 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
         return g_batch_cb;
     }
     *owned = 1;
+    ds4_gpu_ledger_origin("owned");
     id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
     if (cb) ds4_gpu_stream_expert_cache_note_owned_created();
     return cb;
@@ -9677,6 +9678,7 @@ int ds4_gpu_begin_commands(void) {
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_HEAD_RMS_ROPE_PIPELINE_STATIC") == NULL;
     g_batch_cb_created_ms = ds4_gpu_now_ms();
+    ds4_gpu_ledger_origin("begin");
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
@@ -9705,6 +9707,7 @@ int ds4_gpu_flush_commands(void) {
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
 
+    ds4_gpu_ledger_origin("flush");
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
@@ -10409,6 +10412,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
             return 0;
         }
 
+        ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
         g_batch_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
@@ -11905,6 +11909,7 @@ static int ds4_gpu_commit_and_wait_selected(uint64_t value, const char *label) {
             return 0;
         }
         /* The caller keeps encoding this layer, so it needs a batch again. */
+        ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
         g_batch_has_work = NO;
         if (!g_batch_cb) {
@@ -11988,6 +11993,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
             return 0;
         }
 
+        ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
         g_batch_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
