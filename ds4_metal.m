@@ -15370,6 +15370,16 @@ static int ds4_gpu_stream_expert_cache_set_addr_slot(
  * is zero, so a pass over this table runs the repairs and nothing else, which
  * is how the repair avoids recomputing what the first pass already did without
  * needing a mask the host cannot know at encode time. */
+/* Three tables a layer, because the host cannot write one the GPU is reading.
+ *   snapshot - what the cache held when the layer was encoded; the first pass
+ *              reads it and nothing touches it until the layer is over
+ *   repair   - only what the host had to fetch; the second pass runs those
+ *   complete - snapshot plus repairs, for the down pass
+ * The host writes repair and complete before releasing the stall, and the GPU
+ * reads them after it, so the event orders them. Writing into the live cache
+ * table instead is a race: the first pass may or may not have passed the lane. */
+static id<MTLBuffer> g_stream_expert_snapshot_addr[3][DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static id<MTLBuffer> g_stream_expert_complete_addr[3][DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_repair_gate_addr[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_repair_up_addr[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_repair_down_addr[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -15377,6 +15387,26 @@ static id<MTLBuffer> g_stream_expert_repair_down_addr[DS4_METAL_STREAM_EXPERT_CA
  * stale entry would run an expert the first pass had already covered. */
 static int32_t g_stream_expert_repair_written[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][6];
 static uint32_t g_stream_expert_repair_written_n[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+
+static int ds4_gpu_stream_expert_extra_table(
+        __strong id<MTLBuffer> table[3][DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER],
+        uint32_t layer, id<MTLBuffer> *gate, id<MTLBuffer> *up, id<MTLBuffer> *down) {
+    if (!g_device || layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return 0;
+    const NSUInteger bytes =
+        (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
+    for (uint32_t i = 0; i < 3; i++) {
+        if (table[i][layer]) continue;
+        id<MTLBuffer> b = [g_device newBufferWithLength:bytes
+                                                options:MTLResourceStorageModeShared];
+        if (!b) return 0;
+        memset([b contents], 0, bytes);
+        table[i][layer] = b;
+    }
+    if (gate) *gate = table[0][layer];
+    if (up) *up = table[1][layer];
+    if (down) *down = table[2][layer];
+    return 1;
+}
 
 static int ds4_gpu_stream_expert_repair_buffers(
         uint32_t layer, id<MTLBuffer> *gate, id<MTLBuffer> *up, id<MTLBuffer> *down) {
@@ -41493,6 +41523,170 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
+/* The service thread.
+ *
+ * The decode thread's job is to encode layers and commit them. Waiting for a
+ * router to come back and fetching an expert is not its job, and while it does
+ * those the GPU has only what it was already handed. Moving them here is what
+ * takes the host off the critical path: the decode thread pushes a job and
+ * goes straight on to the next layer.
+ *
+ * The ids have to be copied per job. `selected` is one tensor the graph reuses
+ * every layer, so by the time this thread reads it the decode thread is several
+ * layers on and the GPU has overwritten it. Each job gets its own slot, blitted
+ * from `selected` before the signal.
+ */
+#define DS4_RESIDENT_JOBS 64u
+
+typedef struct {
+    uint64_t signal, release;
+    uint32_t layer, n_expert, n_total_expert;
+    const void *model_map;
+    uint64_t model_size, gate_offset, up_offset, down_offset;
+    uint64_t gate_expert_bytes, down_expert_bytes;
+    __unsafe_unretained id<MTLBuffer> ids_slot;
+    __unsafe_unretained id<MTLBuffer> snap_gate, snap_up, snap_down;
+    __unsafe_unretained id<MTLBuffer> repair_gate, repair_up, repair_down;
+    __unsafe_unretained id<MTLBuffer> full_gate, full_up, full_down;
+} ds4_resident_job;
+
+static ds4_resident_job g_resident_jobs[DS4_RESIDENT_JOBS];
+static id<MTLBuffer> g_resident_ids_slots[DS4_RESIDENT_JOBS];
+static uint64_t g_resident_head, g_resident_tail;   /* tail pushes, head pops */
+static pthread_mutex_t g_resident_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_resident_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t g_resident_thread;
+static int g_resident_thread_running;
+static double g_resident_service_total_ms;
+static uint64_t g_resident_service_jobs, g_resident_service_repairs;
+
+static void ds4_gpu_resident_run_job(const ds4_resident_job *j) {
+    if (@available(macOS 12.0, *)) {
+        if (![g_selected_readback_event waitUntilSignaledValue:j->signal timeoutMS:60000]) {
+            fprintf(stderr, "ds4: resident service timed out on layer %u\n", j->layer);
+            ds4_gpu_resident_service_release(j->release);
+            return;
+        }
+    }
+    const double t0 = ds4_gpu_now_ms();
+    const int32_t *ids = (const int32_t *)[j->ids_slot contents];
+    const size_t table_bytes =
+        (size_t)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
+    const uint64_t *sg = (const uint64_t *)[j->snap_gate contents];
+    uint64_t *fg = (uint64_t *)[j->full_gate contents];
+    uint64_t *fu = (uint64_t *)[j->full_up contents];
+    uint64_t *fd = (uint64_t *)[j->full_down contents];
+    memcpy(fg, sg, table_bytes);
+    memcpy(fu, [j->snap_up contents], table_bytes);
+    memcpy(fd, [j->snap_down contents], table_bytes);
+    uint64_t *rg = (uint64_t *)[j->repair_gate contents];
+    uint64_t *ru = (uint64_t *)[j->repair_up contents];
+    uint64_t *rd = (uint64_t *)[j->repair_down contents];
+
+    ds4_gpu_stream_expert_cache_entry *loaded[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED] = {0};
+    int need = 0;
+    for (uint32_t i = 0; i < j->n_expert; i++) {
+        const int32_t id = ids[i];
+        if (id >= 0 && (uint32_t)id < j->n_total_expert && sg[id] == 0) need = 1;
+    }
+    if (need) {
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = j->model_map, .model_size = j->model_size, .layer = j->layer,
+            .n_total_expert = j->n_total_expert, .gate_offset = j->gate_offset,
+            .up_offset = j->up_offset, .down_offset = j->down_offset,
+            .gate_expert_bytes = j->gate_expert_bytes,
+            .down_expert_bytes = j->down_expert_bytes,
+        };
+        if (!ds4_gpu_stream_expert_cache_begin_selected_load(&table, ids, j->n_expert) ||
+            !ds4_gpu_stream_expert_pending_load_finish(loaded)) {
+            for (uint32_t i = 0; i < j->n_expert; i++) loaded[i] = NULL;
+        }
+        g_resident_service_repairs++;
+    }
+    for (uint32_t i = 0; i < j->n_expert; i++) {
+        const int32_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= j->n_total_expert) continue;
+        if (sg[id] != 0) continue;                    /* the first pass had it */
+        const uint64_t e = (uint64_t)(uint32_t)id;
+        ds4_gpu_stream_expert_cache_entry *entry = loaded[i];
+        if (!entry)
+            entry = ds4_gpu_stream_expert_cache_get(
+                    j->model_map, j->model_size, j->layer, (uint32_t)id,
+                    j->n_total_expert, j->n_expert,
+                    j->gate_offset + e * j->gate_expert_bytes,
+                    j->up_offset + e * j->gate_expert_bytes,
+                    j->down_offset + e * j->down_expert_bytes,
+                    j->gate_expert_bytes, j->down_expert_bytes);
+        if (!entry) {
+            fprintf(stderr, "ds4: resident service could not reach expert %d\n", id);
+            continue;
+        }
+        rg[id] = ds4_gpu_buffer_address(entry->gate_buffer, entry->gate_inner);
+        ru[id] = ds4_gpu_buffer_address(entry->up_buffer, entry->up_inner);
+        rd[id] = ds4_gpu_buffer_address(entry->down_buffer, entry->down_inner);
+        fg[id] = rg[id]; fu[id] = ru[id]; fd[id] = rd[id];
+        const uint32_t n = g_stream_expert_repair_written_n[j->layer];
+        if (n < 6) {
+            g_stream_expert_repair_written[j->layer][n] = id;
+            g_stream_expert_repair_written_n[j->layer] = n + 1;
+        }
+    }
+    g_resident_service_total_ms += ds4_gpu_now_ms() - t0;
+    g_resident_service_jobs++;
+    ds4_gpu_resident_service_release(j->release);
+}
+
+static void *ds4_gpu_resident_service_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_resident_mu);
+        while (g_resident_head == g_resident_tail)
+            pthread_cond_wait(&g_resident_cv, &g_resident_mu);
+        const ds4_resident_job job = g_resident_jobs[g_resident_head % DS4_RESIDENT_JOBS];
+        pthread_mutex_unlock(&g_resident_mu);
+        ds4_gpu_resident_run_job(&job);
+        pthread_mutex_lock(&g_resident_mu);
+        g_resident_head++;
+        pthread_cond_broadcast(&g_resident_cv);
+        pthread_mutex_unlock(&g_resident_mu);
+    }
+    return NULL;
+}
+
+static int ds4_gpu_resident_service_start(void) {
+    if (g_resident_thread_running) return 1;
+    if (pthread_create(&g_resident_thread, NULL,
+                       ds4_gpu_resident_service_thread, NULL) != 0) {
+        fprintf(stderr, "ds4: failed to start the resident service thread\n");
+        return 0;
+    }
+    g_resident_thread_running = 1;
+    fprintf(stderr, "ds4: resident service thread on\n");
+    return 1;
+}
+
+/* The decode thread blocks here only if the ring is full, which means the
+ * service is a whole ring behind - forty layers at the time of writing. */
+static void ds4_gpu_resident_push(const ds4_resident_job *job) {
+    pthread_mutex_lock(&g_resident_mu);
+    while (g_resident_tail - g_resident_head >= DS4_RESIDENT_JOBS)
+        pthread_cond_wait(&g_resident_cv, &g_resident_mu);
+    g_resident_jobs[g_resident_tail % DS4_RESIDENT_JOBS] = *job;
+    g_resident_tail++;
+    pthread_cond_broadcast(&g_resident_cv);
+    pthread_mutex_unlock(&g_resident_mu);
+}
+
+static id<MTLBuffer> ds4_gpu_resident_ids_slot(uint64_t seq) {
+    const uint32_t i = (uint32_t)(seq % DS4_RESIDENT_JOBS);
+    if (!g_resident_ids_slots[i]) {
+        g_resident_ids_slots[i] = [g_device newBufferWithLength:6 * sizeof(int32_t)
+                                                        options:MTLResourceStorageModeShared];
+        if (g_resident_ids_slots[i]) g_resident_ids_slots[i].label = @"ds4_resident_ids";
+    }
+    return g_resident_ids_slots[i];
+}
+
 /* One layer of streaming MoE with the selected ids never leaving the GPU.
  *
  *   validator -> signal -> hit experts (table A) -> wait -> repairs (table B)
@@ -41545,10 +41739,16 @@ static int ds4_gpu_routed_moe_one_resident(
 
     id<MTLBuffer> table_gate = nil, table_up = nil, table_down = nil;
     id<MTLBuffer> repair_gate = nil, repair_up = nil, repair_down = nil;
+    id<MTLBuffer> snap_gate = nil, snap_up = nil, snap_down = nil;
+    id<MTLBuffer> full_gate = nil, full_up = nil, full_down = nil;
     if (!ds4_gpu_stream_expert_cache_addr_buffers(layer_index, &table_gate,
                                                   &table_up, &table_down) ||
         !ds4_gpu_stream_expert_repair_buffers(layer_index, &repair_gate,
-                                              &repair_up, &repair_down))
+                                              &repair_up, &repair_down) ||
+        !ds4_gpu_stream_expert_extra_table(g_stream_expert_snapshot_addr, layer_index,
+                                           &snap_gate, &snap_up, &snap_down) ||
+        !ds4_gpu_stream_expert_extra_table(g_stream_expert_complete_addr, layer_index,
+                                           &full_gate, &full_up, &full_down))
         DS4_RESIDENT_DECLINE("no address or repair table");
     id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x), gatebuf = ds4_gpu_tensor_buffer(gate);
     id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up), midbuf = ds4_gpu_tensor_buffer(mid);
@@ -41585,19 +41785,53 @@ static int ds4_gpu_routed_moe_one_resident(
     /* Whatever the repair table still holds from the last token would run an
      * expert this token's first pass has already covered. */
     ds4_gpu_stream_expert_repair_clear(layer_index);
+    /* Freeze what the cache can reach right now. The first pass reads this and
+     * the host does not touch it again, so installing a missing expert cannot
+     * change what that pass sees half way through. */
+    const size_t table_bytes =
+        (size_t)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
+    memcpy([snap_gate contents], [table_gate contents], table_bytes);
+    memcpy([snap_up contents], [table_up contents], table_bytes);
+    memcpy([snap_down contents], [table_down contents], table_bytes);
 
+    static int timing = -1;
+    if (timing < 0) timing = getenv("DS4_METAL_V41_RESIDENT_TIMING") != NULL;
+    if (!ds4_gpu_resident_service_start()) DS4_RESIDENT_DECLINE("no service thread");
+    /* The ids get their own slot: `selected` is one tensor the graph reuses
+     * every layer, and by the time the service thread looks the decode thread
+     * is several layers on. */
+    id<MTLBuffer> ids_slot = ds4_gpu_resident_ids_slot(g_resident_tail);
+    if (!ids_slot) DS4_RESIDENT_DECLINE("no ids slot");
+    ds4_gpu_close_batch_encoder();
+    {
+        id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
+        if (!blit) DS4_RESIDENT_DECLINE("no blit encoder");
+        [blit copyFromBuffer:selbuf
+                sourceOffset:ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected)
+                    toBuffer:ids_slot destinationOffset:0
+                        size:(NSUInteger)n_expert * sizeof(int32_t)];
+        [blit endEncoding];
+    }
     const uint64_t signal = ds4_gpu_encode_selected_signal();
     if (!signal) return 0;
     if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
             g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
-            &gate_args, &act_args, &all_lanes, NULL, table_gate, table_up,
+            &gate_args, &act_args, &all_lanes, NULL, snap_gate, snap_up,
             xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
             upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
             selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
             ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights), gate_smem, 2, false)) return 0;
-    const uint64_t release = ds4_gpu_encode_resident_service_wait();
-    if (!release) return 0;
-    if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
+    /* Diagnostic only: without the stall and the repair pass the answer is
+     * wrong on any layer that missed, but the difference says what the barrier
+     * itself costs, which is the thing left to explain. */
+    static int no_repair = -1, no_pass_b = -1;
+    if (no_repair < 0) no_repair = getenv("DS4_METAL_V41_RESIDENT_NO_REPAIR") != NULL;
+    /* Keeps the stall and drops only the repair dispatch, to tell which of the
+     * two the difference is. Also wrong on a missing layer. */
+    if (no_pass_b < 0) no_pass_b = getenv("DS4_METAL_V41_RESIDENT_NO_PASS_B") != NULL;
+    const uint64_t release = no_repair ? 0 : ds4_gpu_encode_resident_service_wait();
+    if (!release && !no_repair) return 0;
+    if (!no_repair && !no_pass_b && !ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
             g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
             &gate_args, &act_args, &all_lanes, NULL, repair_gate, repair_up,
             xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
@@ -41609,76 +41843,53 @@ static int ds4_gpu_routed_moe_one_resident(
     }
     if (!ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
             g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
-            &down_args, &all_lanes, NULL, table_down,
+            &down_args, &all_lanes, NULL, no_repair ? snap_down : full_down,
             midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out),
             selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), down_smem, 2)) {
         ds4_gpu_resident_service_release(release);
         return 0;
     }
 
-    /* Everything this layer will do is now submitted. The host's work happens
-     * underneath the first pass instead of in front of it - if it is quick
-     * enough, which is the question, so time it rather than assume it. */
-    static int timing = -1;
-    if (timing < 0) timing = getenv("DS4_METAL_V41_RESIDENT_TIMING") != NULL;
-    const double t_flush = timing ? ds4_gpu_now_ms() : 0.0;
-    if (!ds4_gpu_flush_commands()) { ds4_gpu_resident_service_release(release); return 0; }
-    int ok = 1;
-    if (@available(macOS 12.0, *)) {
-        if (![g_selected_readback_event waitUntilSignaledValue:signal timeoutMS:60000]) {
-            fprintf(stderr, "ds4: resident layer timed out waiting for the router\n");
-            ok = 0;
-        }
-    } else {
-        ok = 0;
-    }
-    const double t_signal = timing ? ds4_gpu_now_ms() : 0.0;
-
-    int32_t ids[6];
-    if (ok && !ds4_gpu_tensor_read((ds4_gpu_tensor *)selected, 0, ids, sizeof(ids))) ok = 0;
-    if (ok) {
-        uint64_t *rg = (uint64_t *)[repair_gate contents];
-        uint64_t *ru = (uint64_t *)[repair_up contents];
-        uint64_t *rd = (uint64_t *)[repair_down contents];
-        const uint64_t *tg = (const uint64_t *)[table_gate contents];
-        for (uint32_t i = 0; ok && i < n_expert; i++) {
-            const int32_t id = ids[i];
-            if (id < 0 || (uint32_t)id >= n_total_expert) { ok = 0; break; }
-            if (tg[id] != 0) continue;                    /* the first pass had it */
-            const uint64_t e = (uint64_t)(uint32_t)id;
-            ds4_gpu_stream_expert_cache_entry *entry = ds4_gpu_stream_expert_cache_get(
-                    model_map, model_size, layer_index, (uint32_t)id, n_total_expert, n_expert,
-                    gate_offset + e * gate_expert_bytes, up_offset + e * gate_expert_bytes,
-                    down_offset + e * down_expert_bytes, gate_expert_bytes, down_expert_bytes);
-            if (!entry) { ok = 0; break; }
-            rg[id] = ds4_gpu_buffer_address(entry->gate_buffer, entry->gate_inner);
-            ru[id] = ds4_gpu_buffer_address(entry->up_buffer, entry->up_inner);
-            rd[id] = ds4_gpu_buffer_address(entry->down_buffer, entry->down_inner);
-            if (!rg[id] || !ru[id] || !rd[id]) { ok = 0; break; }
-            const uint32_t n = g_stream_expert_repair_written_n[layer_index];
-            if (n < 6) {
-                g_stream_expert_repair_written[layer_index][n] = id;
-                g_stream_expert_repair_written_n[layer_index] = n + 1;
-            }
-        }
-    }
-    /* Released either way. Leaving the GPU stalled is a hang; a wrong answer
-     * is at least recoverable by falling back, and the caller can. */
+    /* Submitted. The decode thread's part ends here: the wait, the ids and
+     * whatever has to be fetched are the service thread's, and it has a whole
+     * ring of layers of slack before this one blocks. */
+    if (!ds4_gpu_flush_commands()) { ds4_gpu_resident_service_release(release); return 1; }
+    const ds4_resident_job job = {
+        .signal = signal, .release = release, .layer = layer_index,
+        .n_expert = n_expert, .n_total_expert = n_total_expert,
+        .model_map = model_map, .model_size = model_size,
+        .gate_offset = gate_offset, .up_offset = up_offset, .down_offset = down_offset,
+        .gate_expert_bytes = gate_expert_bytes, .down_expert_bytes = down_expert_bytes,
+        .ids_slot = ids_slot,
+        .snap_gate = snap_gate, .snap_up = snap_up, .snap_down = snap_down,
+        .repair_gate = repair_gate, .repair_up = repair_up, .repair_down = repair_down,
+        .full_gate = full_gate, .full_up = full_up, .full_down = full_down,
+    };
+    if (!no_repair) ds4_gpu_resident_push(&job);
+    /* Isolating the stall itself. Everything else stays: the service thread
+     * runs, the cache grows, the repair pass is encoded and dispatched. Only
+     * the GPU's waiting is removed, by satisfying the event before it can get
+     * there. The answer is wrong on a layer that missed, but the work done is
+     * the same - which the no-repair switch above cannot claim, since without
+     * a service thread the cache stops growing and the first pass simply skips
+     * more lanes every token. */
+    static int no_wait = -1;
+    if (no_wait < 0) no_wait = getenv("DS4_METAL_V41_RESIDENT_NO_WAIT") != NULL;
+    if (no_wait) ds4_gpu_resident_service_release(release);
     if (timing) {
-        static double wake_ms, service_ms; static uint64_t layers, repaired;
-        wake_ms += t_signal - t_flush;
-        service_ms += ds4_gpu_now_ms() - t_signal;
-        if (g_stream_expert_repair_written_n[layer_index]) repaired++;
+        static uint64_t layers;
         if ((++layers % 2000) == 0)
             fprintf(stderr,
-                    "ds4: resident layer over %llu layers: waiting for the router "
-                    "%.3f ms, servicing %.3f ms, %.1f%% needed a repair\n",
-                    (unsigned long long)layers, wake_ms / (double)layers,
-                    service_ms / (double)layers,
-                    100.0 * (double)repaired / (double)layers);
+                    "ds4: resident over %llu layers: service thread %.3f ms a job, "
+                    "%.1f%% needed a repair, decode thread does none of it\n",
+                    (unsigned long long)layers,
+                    g_resident_service_jobs ?
+                        g_resident_service_total_ms / (double)g_resident_service_jobs : 0.0,
+                    g_resident_service_jobs ?
+                        100.0 * (double)g_resident_service_repairs /
+                        (double)g_resident_service_jobs : 0.0);
     }
-    ds4_gpu_resident_service_release(release);
-    return ok;
+    return 1;
 }
 
 static int ds4_gpu_routed_moe_one_tensor_impl(
