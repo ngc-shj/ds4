@@ -41458,6 +41458,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                    uint32_t missing_mask, unsigned long long *bytes_loaded);
     static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after,
                               g_gate_live, g_gate_tokens, g_gate_touched;
+    static double g_gate_encode_ms, g_gate_wait_ms;
     const uint32_t gate_n = (uint32_t)ds4_gpu_gate_layers();
     /* The gated region is a window, so a single layer can be isolated: at
      * gate_n=24 the token is correct and at 25 it is not, and a prefix cannot
@@ -41494,9 +41495,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 ok = false;
                 break;
             }
-            const uint32_t chunk_end = (start < 14u && gate_n > 14u) ? 14u : gate_n;
-            (void)0;
+            static int seg_max = -1;
+            if (seg_max < 0) {
+                const char *e = getenv("DS4_METAL_V41_ABORT_GATE_SEG");
+                seg_max = e && e[0] ? atoi(e) : 0;
+            }
+            uint32_t chunk_end = (start < 14u && gate_n > 14u) ? 14u : gate_n;
+            if (seg_max > 0 && chunk_end - start > (uint32_t)seg_max)
+                chunk_end = start + (uint32_t)seg_max;
             ds4_gpu_gate_segment_begin();
+            const double seg_t0 = now_sec();
             if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) { ok = false; break; }
             for (uint32_t il = start; ok && il < chunk_end; il++) {
                 ds4_gpu_gate_layer_begin(il);
@@ -41534,7 +41542,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 if (ok) ds41_gate_trace(g, il, "out");
             }
             ds4_gpu_gate_segment_end();
+            /* Everything up to here is the host encoding; end_commands commits
+             * and waits, so the two have to be timed apart. */
+            const double seg_t1 = now_sec();
             if (!ok || !ds4_gpu_end_commands()) { ok = false; break; }
+            const double seg_t2 = now_sec();
+            g_gate_encode_ms += (seg_t1 - seg_t0) * 1000.0;
+            g_gate_wait_ms += (seg_t2 - seg_t1) * 1000.0;
             g_gate_cbs++;
             uint32_t bad = 0, mask = 0, n_sel = 0;
             int32_t ids[16];
@@ -41600,13 +41614,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             fprintf(stderr, "ds4: gate over %llu tokens: %.2f command buffers, %.2f aborts, "
                             "%.1f slots encoded behind an abort (not launches), "
                             "%llu the gate failed to switch off, %llu it could not gate, "
-                            "%.1f expert ids accounted a token, %.2f MiB loaded a token\n",
+                            "%.1f expert ids accounted a token, %.2f MiB loaded a token, "
+                            "encode %.2f ms and commit-to-done %.2f ms a token\n",
                     g_gate_tokens, (double)g_gate_cbs / (double)g_gate_tokens,
                     (double)g_gate_aborts / (double)g_gate_tokens,
                     (double)g_gate_after / (double)g_gate_tokens,
                     g_gate_live, ds4_gpu_gate_ungatable(),
                     (double)g_gate_touched / (double)g_gate_tokens,
-                    (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0),
+                    (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0,
+                    g_gate_encode_ms / (double)g_gate_tokens,
+                    g_gate_wait_ms / (double)g_gate_tokens),
             ds4_gpu_gate_print_ungatable();
     }
 #else
