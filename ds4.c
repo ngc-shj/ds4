@@ -40754,6 +40754,20 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+#ifdef __APPLE__
+    /* The earliest point at which the route is known. Everything after it -
+     * the shared expert, the routed dispatch, the rest of the layer, the
+     * layers behind it - is switched off if an expert here is unreachable. */
+    {
+        extern int ds4_gpu_gate_layers(void);
+        extern int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
+                                                uint32_t n_sel, uint32_t n_total);
+        const int gate_n = ds4_gpu_gate_layers();
+        if (gate_n > 0 && il < (uint32_t)gate_n &&
+            !ds4_gpu_gate_encode_validate(g->selected, il,
+                                          DS4_N_EXPERT_USED, DS4_N_EXPERT)) return false;
+    }
+#endif
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41378,7 +41392,93 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const bool queue_layers = (g->tp_world == 2 ||
                                getenv("DS4_METAL_V41_DECODE_QUEUE")) && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+#ifdef __APPLE__
+    /* ---- gated segment ---------------------------------------------------
+     * The first `gate_n` layers go in as one command buffer with no readback
+     * in them at all. A layer whose route cannot be reached records itself and
+     * switches the rest of the segment off, the buffer completes, the host
+     * brings the expert in with the loader it already has, and the segment is
+     * re-submitted from that layer's routed stage - not from its top, because
+     * its attention has already run correctly and its carry must not advance
+     * twice. The host is involved once per layer that actually missed. */
+    extern int ds4_gpu_gate_layers(void);
+    extern void ds4_gpu_gate_segment_begin(void);
+    extern void ds4_gpu_gate_segment_end(void);
+    extern void ds4_gpu_gate_layer_begin(uint32_t il);
+    extern int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
+    extern unsigned long long ds4_gpu_gate_ungatable(void);
+    extern unsigned long long ds4_gpu_gate_dispatches_after_abort(void);
+    extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
+                                   const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                                   uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                   uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                   uint32_t missing_mask, unsigned long long *bytes_loaded);
+    static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after, g_gate_tokens;
+    const uint32_t gate_n = (uint32_t)ds4_gpu_gate_layers();
+    uint32_t gate_done = 0;
+    if (gate_n > 0) {
+        uint32_t start = 0;
+        int resume_from_moe = 0;
+        for (uint32_t pass = 0; ok && pass <= gate_n; pass++) {
+            ds4_gpu_gate_segment_begin();
+            if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) { ok = false; break; }
+            for (uint32_t il = start; ok && il < gate_n; il++) {
+                ds4_gpu_gate_layer_begin(il);
+                const ds4_layer_weights *gl = &w->layer[il];
+                ok = (il == start && resume_from_moe)
+                     ? (ds41_moe(g, m, gl, il, (uint32_t)token) && ds41_graph_after_moe(g))
+                     : ds41_graph_layer(g, m, gl, il, token);
+            }
+            ds4_gpu_gate_segment_end();
+            if (!ok || !ds4_gpu_end_commands()) { ok = false; break; }
+            g_gate_cbs++;
+            uint32_t bad = 0, mask = 0, n_sel = 0;
+            int32_t ids[16];
+            if (!ds4_gpu_gate_read_miss(&bad, &mask, ids, &n_sel)) { gate_done = gate_n; break; }
+            g_gate_aborts++;
+            g_gate_after += ds4_gpu_gate_dispatches_after_abort();
+            if (getenv("DS4_METAL_V41_ABORT_GATE_DEBUG") && g_gate_aborts < 30ull) {
+                fprintf(stderr, "ds4: gate pass %u aborted at layer %u mask %#x ids", pass, bad, mask);
+                for (uint32_t k = 0; k < n_sel; k++) fprintf(stderr, " %d", ids[k]);
+                fprintf(stderr, "\n");
+            }
+            const ds4_layer_weights *bl = &w->layer[bad];
+            uint64_t gate_row = 0, down_row = 0;
+            if (!tensor_nbytes(bl->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+                !tensor_nbytes(bl->ffn_down_exps->type, DS4_N_FF_EXP, &down_row) ||
+                !ds4_gpu_gate_repair(m->map, m->size, bad, ids, n_sel, DS4_N_EXPERT,
+                                     bl->ffn_gate_exps->abs_offset, bl->ffn_up_exps->abs_offset,
+                                     bl->ffn_down_exps->abs_offset,
+                                     gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                     mask, &g_gate_bytes)) { ok = false; break; }
+            start = bad;
+            resume_from_moe = 1;
+        }
+        if (ok && gate_done != gate_n) {
+            fprintf(stderr, "ds4: abort gate did not settle within %u passes\n", gate_n);
+            ok = false;
+        }
+        if (ok && ds4_gpu_gate_ungatable() != 0) {
+            fprintf(stderr, "ds4: abort gate saw %llu dispatches it could not gate\n",
+                    ds4_gpu_gate_ungatable());
+            ok = false;
+        }
+        /* The ordinary loop below is entered with a batch already open. */
+        if (ok && gate_n < DS4_N_LAYER && !ds4_gpu_commands_active() &&
+            !ds4_gpu_begin_commands()) ok = false;
+        if (ok && ((++g_gate_tokens % 64ull) == 0ull))
+            fprintf(stderr, "ds4: gate over %llu tokens: %.2f command buffers, %.2f aborts, "
+                            "%.1f dispatches issued after an abort, %.2f MiB loaded a token\n",
+                    g_gate_tokens, (double)g_gate_cbs / (double)g_gate_tokens,
+                    (double)g_gate_aborts / (double)g_gate_tokens,
+                    (double)g_gate_after / (double)g_gate_tokens,
+                    (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0);
+    }
+#else
+    const uint32_t gate_n = 0, gate_done = 0;
+    (void)gate_done;
+#endif
+    for (uint32_t il = gate_n; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
 #ifdef __APPLE__
         ds4_gpu_ledger_layer((int)il);

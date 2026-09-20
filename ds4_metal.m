@@ -26,6 +26,7 @@
 #include "ds4_gpu.h"
 #include "ds4_image.h"
 #include "ds4_metal_ledger.h"
+#include "ds4_metal_gate.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -1441,6 +1442,14 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
 }
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
+    static int gate_hooked;
+    if (g_gate_layers && !gate_hooked) {
+        /* One empty encoder, once, to learn the concrete class and swizzle it.
+         * The replacement is inert until a segment turns gating on. */
+        gate_hooked = 1;
+        id<MTLComputeCommandEncoder> probe = [cb computeCommandEncoder];
+        if (probe) { ds4_gate_hook_encoder(probe); [probe endEncoding]; }
+    }
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (g_timeline_enabled && g_timeline_batch) {
@@ -7035,6 +7044,7 @@ int ds4_gpu_init(void) {
         }
         ds4_gpu_timeline_probe(g_device);
         ds4_gpu_ledger_probe(g_device);
+        ds4_gpu_gate_probe(g_device);
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
 
@@ -15490,6 +15500,121 @@ static void ds4_gpu_resident_service_release(uint64_t value) {
     if (@available(macOS 12.0, *)) {
         if (g_resident_service_event && value) g_resident_service_event.signaledValue = value;
     }
+}
+
+static int ds4_gpu_stream_expert_cache_set_addr_slot_raw(
+        uint32_t layer, uint32_t expert,
+        id<MTLBuffer> gate_buffer, NSUInteger gate_inner,
+        id<MTLBuffer> up_buffer, NSUInteger up_inner,
+        id<MTLBuffer> down_buffer, NSUInteger down_inner);
+
+static int ds4_gpu_stream_expert_cache_load_selected_missing(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const int32_t *selected_ids, uint32_t n_total_expert, uint32_t n_selected,
+        const uint64_t *gate_abs_offsets, const uint64_t *up_abs_offsets,
+        const uint64_t *down_abs_offsets, uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes, uint32_t missing_mask,
+        ds4_gpu_stream_expert_cache_entry **entries);
+
+/* Bring in the experts a gated layer could not reach.
+ *
+ * Runs after the segment's command buffer has completed, so the record it acts
+ * on is visible by the only ordering rule that does not need an event. Uses
+ * the loader the readback path already uses, which is what installs the
+ * address the next pass will find. */
+int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
+                        const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                        uint32_t missing_mask, unsigned long long *bytes_loaded) {
+    if (!g_gate_layers || n_sel > DS4_METAL_MAX_ROUTED_EXPERT_USED) return 0;
+    uint64_t gate_abs[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { 0 };
+    uint64_t up_abs[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { 0 };
+    uint64_t down_abs[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { 0 };
+    ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { NULL };
+    unsigned long long bytes = 0;
+    for (uint32_t i = 0; i < n_sel; i++) {
+        const int32_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= n_total) return 0;
+        gate_abs[i] = gate_offset + (uint64_t)id * gate_expert_bytes;
+        up_abs[i] = up_offset + (uint64_t)id * gate_expert_bytes;
+        down_abs[i] = down_offset + (uint64_t)id * down_expert_bytes;
+        if (missing_mask & (1u << i)) bytes += 2ull * gate_expert_bytes + down_expert_bytes;
+    }
+    if (!ds4_gpu_stream_expert_cache_load_selected_missing(
+            model_map, model_size, layer, ids, n_total, n_sel,
+            gate_abs, up_abs, down_abs, gate_expert_bytes, down_expert_bytes,
+            missing_mask, entries)) return 0;
+    /* Loading puts the bytes in a slot; the table is what the GPU reads, and
+     * the readback path writes it here too. Without this the next pass sees
+     * the same hole and aborts on the same layer forever. */
+    for (uint32_t i = 0; i < n_sel; i++) {
+        ds4_gpu_stream_expert_cache_entry *entry = entries[i];
+        if (!entry) continue;
+        if (!ds4_gpu_stream_expert_cache_set_addr_slot_raw(
+                    layer, (uint32_t)ids[i],
+                    entry->gate_buffer, entry->gate_inner,
+                    entry->up_buffer, entry->up_inner,
+                    entry->down_buffer, entry->down_inner)) return 0;
+    }
+    if (bytes_loaded) *bytes_loaded += bytes;
+    return 1;
+}
+
+static int ds4_gpu_stream_expert_cache_addr_buffers(uint32_t layer, id<MTLBuffer> *gate,
+                                                    id<MTLBuffer> *up, id<MTLBuffer> *down);
+
+/* Encode the abort gate for one layer.
+ *
+ * Must sit between the router's select and the layer's routed dispatch: it
+ * reads the ids the router just wrote and the layer's address table, and if
+ * any selected expert has no address it records the layer and switches every
+ * dispatch encoded after it off. The validate itself is not gated - it has to
+ * run whatever happened earlier in the segment is irrelevant, and it is the
+ * thing that does the switching off.
+ */
+int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
+                                 uint32_t n_sel, uint32_t n_total) {
+    if (!g_gate_layers || !g_batch_cb || !g_gate_grid || !g_gate_miss) return 0;
+    if (!g_gate_validate_pso) {
+        g_gate_validate_pso = ds4_gpu_get_pipeline("kernel_dsv41_gate_validate");
+        if (!g_gate_validate_pso) {
+            fprintf(stderr, "ds4: abort gate has no validate pipeline\n");
+            g_gate_layers = 0;
+            return 0;
+        }
+    }
+    id<MTLBuffer> table_gate = nil, table_up = nil, table_down = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer, &table_gate, &table_up, &table_down))
+        return 0;
+    id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)selected_tensor);
+    if (!selbuf) return 0;
+
+    /* The validate runs directly; everything after it reads its grid from the
+     * table, so the first slot it may zero is whatever comes next. */
+    const int was_active = atomic_exchange_explicit(&g_gate_active, 0, memory_order_relaxed);
+    const uint32_t gate_from = ds4_gpu_gate_slots_used();
+    uint32_t n_slots = gate_from + 8192u;
+    if (n_slots > DS4_GATE_MAX_SLOTS) n_slots = DS4_GATE_MAX_SLOTS;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    if (!enc) { atomic_store_explicit(&g_gate_active, was_active, memory_order_relaxed); return 0; }
+    [enc setComputePipelineState:g_gate_validate_pso];
+    [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected_tensor) atIndex:0];
+    [enc setBuffer:table_gate offset:0 atIndex:1];
+    [enc setBuffer:table_up offset:0 atIndex:2];
+    [enc setBuffer:table_down offset:0 atIndex:3];
+    [enc setBuffer:g_gate_grid offset:0 atIndex:4];
+    [enc setBuffer:g_gate_miss offset:0 atIndex:5];
+    [enc setBytes:&layer length:sizeof(layer) atIndex:6];
+    [enc setBytes:&n_sel length:sizeof(n_sel) atIndex:7];
+    [enc setBytes:&gate_from length:sizeof(gate_from) atIndex:8];
+    [enc setBytes:&n_slots length:sizeof(n_slots) atIndex:9];
+    [enc setBytes:&n_total length:sizeof(n_total) atIndex:10];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    atomic_store_explicit(&g_gate_active, was_active, memory_order_relaxed);
+    return 1;
 }
 
 static int ds4_gpu_stream_expert_cache_addr_buffers(

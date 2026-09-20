@@ -291,3 +291,65 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+/* ---- Abort gate -----------------------------------------------------------
+ * A layer's routed experts can only run if every selected expert has an
+ * address in this layer's table. Deciding that on the host costs a command
+ * buffer boundary and a readback a layer, and an event cannot be skipped
+ * because it is encoded before anyone has looked.
+ *
+ * So the GPU decides. If a lane is unreachable this records which layer, which
+ * lanes and which ids, and then zeroes the indirect dispatch arguments of
+ * every dispatch encoded after it, so the rest of the segment issues commands
+ * that launch no threadgroups and touch nothing. The command buffer completes
+ * normally, and the host repairs from a record it can trust because completion
+ * is an ordering point.
+ *
+ * miss[0] = aborted layer + 1 (0 when the segment ran clean), [1] = lane mask,
+ * [2] = expert count, [3..] = the selected ids as they were.
+ */
+kernel void kernel_dsv41_gate_validate(
+        device const int   *selected  [[buffer(0)]],
+        device const ulong *gate_addr [[buffer(1)]],
+        device const ulong *up_addr   [[buffer(2)]],
+        device const ulong *down_addr [[buffer(3)]],
+        device uint        *grid      [[buffer(4)]],
+        device atomic_uint *miss      [[buffer(5)]],
+        constant uint      &layer     [[buffer(6)]],
+        constant uint      &n_sel     [[buffer(7)]],
+        constant uint      &gate_from [[buffer(8)]],
+        constant uint      &n_slots   [[buffer(9)]],
+        constant uint      &n_total   [[buffer(10)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tsz [[threads_per_threadgroup]]) {
+    threadgroup atomic_uint tg_mask;
+    if (tid == 0) atomic_store_explicit(&tg_mask, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < n_sel) {
+        const int id = selected[tid];
+        const bool ok = id >= 0 && (uint)id < n_total &&
+                        gate_addr[id] != 0 && up_addr[id] != 0 && down_addr[id] != 0;
+        if (!ok) atomic_fetch_or_explicit(&tg_mask, 1u << tid, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint mask = atomic_load_explicit(&tg_mask, memory_order_relaxed);
+    if (mask == 0u) return;
+    if (tid == 0) {
+        /* The first layer to abort owns the record; later layers in the same
+         * segment are already gated off and must not overwrite it. */
+        uint expected = 0u;
+        if (atomic_compare_exchange_weak_explicit(&miss[0], &expected, layer + 1u,
+                                                  memory_order_relaxed, memory_order_relaxed)) {
+            atomic_store_explicit(&miss[1], mask, memory_order_relaxed);
+            atomic_store_explicit(&miss[2], n_sel, memory_order_relaxed);
+            for (uint k = 0; k < n_sel; ++k)
+                atomic_store_explicit(&miss[3 + k], (uint)selected[k], memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint i = gate_from + tid; i < n_slots; i += tsz) {
+        grid[3u * i + 0u] = 0u;
+        grid[3u * i + 1u] = 0u;
+        grid[3u * i + 2u] = 0u;
+    }
+}
