@@ -25,6 +25,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_image.h"
+#include "ds4_metal_ledger.h"
 
 /*
  * Objective-C Metal glue for the C engine.
@@ -7032,10 +7033,12 @@ int ds4_gpu_init(void) {
             return 0;
         }
         ds4_gpu_timeline_probe(g_device);
+        ds4_gpu_ledger_probe(g_device);
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
 
         g_queue = [g_device newCommandQueueWithMaxCommandBufferCount:256];
+        ds4_gpu_ledger_note_queue(g_queue, "main");
         if (!g_queue) {
             fprintf(stderr, "ds4: failed to create Metal command queue\n");
             g_device = nil;
@@ -10750,6 +10753,7 @@ static uint32_t ds4_gpu_tp_keepalive_tgs_from_env(void) {
 }
 
 static void *ds4_gpu_tp_keepalive_thread(void *arg) {
+    ds4_gpu_ledger_role("keepalive");
     (void)arg;
     /* Swept on the M5 Max pair: too few iterations lets clocks sag.  Current
      * TP split-resident Flash runs show 1.2M is a small Q4/Q2 decode win over
@@ -10790,6 +10794,7 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
 }
 
 static void *ds4_gpu_tp_service_thread(void *arg) {
+    ds4_gpu_ledger_role("tp-service");
     (void)arg;
     const bool profile = getenv("DS4_TP_GATE_PROFILE") != NULL;
     while (1) {
@@ -11110,6 +11115,7 @@ int ds4_gpu_tp_init(uint32_t rank,
     if (getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
         uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
         g_tp_keepalive_queue = [g_device newCommandQueue];
+        ds4_gpu_ledger_note_queue(g_tp_keepalive_queue, "keepalive");
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
                                                       options:MTLResourceStorageModeShared];
         if (g_tp_keepalive_queue && g_tp_keepalive_buffer &&
@@ -11657,6 +11663,7 @@ static void ds4_gpu_pacer_note_activity(void) {
 
 static void *ds4_gpu_pacer_thread(void *arg) {
     (void)arg;
+    ds4_gpu_ledger_role("pacer");
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
     id<MTLCommandQueue> queue = [g_device newCommandQueue];
     /* Labelled so a trace can be split by it. Without this the pacer's own
@@ -11664,6 +11671,7 @@ static void *ds4_gpu_pacer_thread(void *arg) {
      * median that gets quoted about them; separating by duration does not
      * work, it finds a thousand "pacer" buffers in a run with no pacer. */
     queue.label = @"ds4-pacer";
+    ds4_gpu_ledger_note_queue(queue, "pacer");
     const uint32_t tgs = (uint32_t)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_TGS", 16u, 1u, 2048u);
     const uint32_t iters = (uint32_t)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_ITERS", 2000u, 1u, 100000000u);
     const double idle_ms = (double)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_IDLE_MS", 20u, 1u, 10000u);

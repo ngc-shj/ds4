@@ -41347,6 +41347,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     const bool v41_prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
     const double v41_t0 = v41_prof ? now_sec() : 0.0;
+#ifdef __APPLE__
+    /* The decode ledger needs the token window from the one place that knows
+     * it; everything below attributes itself to whatever is open here. */
+    extern void ds4_gpu_ledger_token_begin(unsigned long long pos);
+    extern void ds4_gpu_ledger_token_end(void);
+    extern void ds4_gpu_ledger_layer(int il);
+    extern void ds4_gpu_ledger_role(const char *role);
+    ds4_gpu_ledger_token_begin((unsigned long long)g->pos);
+#endif
     extern unsigned long long ds4_gpu_cb_finished(void);
     const unsigned long long v41_cb0 = v41_prof ? ds4_gpu_cb_finished() : 0ull;
     unsigned long long v41_cb_layer = 0ull;
@@ -41371,6 +41380,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+#ifdef __APPLE__
+        ds4_gpu_ledger_layer((int)il);
+#endif
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
@@ -41399,11 +41411,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+#ifdef __APPLE__
+    ds4_gpu_ledger_layer(-1);
+    ds4_gpu_ledger_role("token-tail");
+#endif
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
     const double v41_t2 = v41_prof ? now_sec() : 0.0;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+#ifdef __APPLE__
+    ds4_gpu_ledger_token_end();
+#endif
     if (!ok) {
         g->valid = false;
         return false;
