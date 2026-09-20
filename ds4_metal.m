@@ -943,10 +943,11 @@ static void ds4_gpu_moe_selected_capture_note(const int32_t *ids, uint32_t n) {
     g_moe_selected_capture_count++;
 }
 
-/* 1 if this call's ids came from the capture, 0 to fall through to the
- * readback, -1 if the capture ran out - which is a broken experiment, not a
- * slow one, so it has to be loud. */
-static int ds4_gpu_moe_selected_capture_take(int32_t *ids, uint32_t n) {
+/* 1 if this call's ids are available from the capture, 0 to fall through to
+ * the readback, -1 if the capture ran out - a broken experiment rather than a
+ * slow one, so it has to be loud. Peeking does not consume: the hits-only arm
+ * has to be able to look at the ids and still choose the normal path. */
+static int ds4_gpu_moe_selected_capture_peek(int32_t *ids, uint32_t n) {
     if (!g_moe_selected_capture_replay || n != g_moe_selected_capture_width) return 0;
     if (g_moe_selected_capture_pos >= g_moe_selected_capture_count) {
         fprintf(stderr, "ds4: selected-id capture exhausted after %llu entries\n",
@@ -955,8 +956,38 @@ static int ds4_gpu_moe_selected_capture_take(int32_t *ids, uint32_t n) {
     }
     memcpy(ids, g_moe_selected_capture + g_moe_selected_capture_pos * n,
            (size_t)n * sizeof(int32_t));
-    g_moe_selected_capture_pos++;
     return 1;
+}
+
+static void ds4_gpu_moe_selected_capture_advance(void) {
+    if (g_moe_selected_capture_pos < g_moe_selected_capture_count)
+        g_moe_selected_capture_pos++;
+}
+
+/* Keep the command buffer boundary the readback would have forced, without the
+ * wait: that separates what the synchronisation costs from what consolidating
+ * the buffers and encoding whole layers ahead is worth. */
+static int ds4_gpu_capture_keep_boundary(void) {
+    static int checked, on;
+    if (!checked) { checked = 1; on = getenv("DS4_METAL_CAPTURE_KEEP_BOUNDARY") != NULL; }
+    return on;
+}
+
+/* Take the fast path only when every selected expert is already in the cache.
+ * If the host is in this loop to bring a missing expert in, no amount of
+ * GPU-side addressing removes it, and this says how often that is. */
+static int ds4_gpu_capture_hits_only(void) {
+    static int checked, on;
+    if (!checked) { checked = 1; on = getenv("DS4_METAL_CAPTURE_HITS_ONLY") != NULL; }
+    return on;
+}
+
+static uint64_t g_capture_fast_layers, g_capture_slow_layers, g_capture_boundary_flushes;
+
+void ds4_gpu_capture_fastpath_counts(uint64_t *fast, uint64_t *slow, uint64_t *flushes) {
+    if (fast) *fast = g_capture_fast_layers;
+    if (slow) *slow = g_capture_slow_layers;
+    if (flushes) *flushes = g_capture_boundary_flushes;
 }
 
 static int g_moe_selected_trace_replay_initialized;
@@ -18088,6 +18119,28 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
     }
     g_stream_expert_cache_layer_count[layer] = 0;
+}
+
+/* Every selected expert already in the cache? If the host is in this loop to
+ * bring a missing one in, no GPU-side addressing removes it, and the fast path
+ * below can only fire on the layers where that is not the case. */
+static int ds4_gpu_capture_all_cached(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const int32_t *ids, uint32_t n_total_expert, uint32_t n_expert,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    for (uint32_t i = 0; i < n_expert; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= n_total_expert) return 0;
+        const uint64_t e = (uint64_t)(uint32_t)ids[i];
+        if (!ds4_gpu_stream_expert_cache_peek(model_map, model_size, layer,
+                (uint32_t)ids[i], n_total_expert, n_expert,
+                gate_offset + e * gate_expert_bytes,
+                up_offset + e * gate_expert_bytes,
+                down_offset + e * down_expert_bytes,
+                gate_expert_bytes, down_expert_bytes))
+            return 0;
+    }
+    return 1;
 }
 
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
@@ -42333,22 +42386,58 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                                                  ? full_entry : NULL;
                 }
                 use_stream_expert_addr_table = true;
-            } else if (g_moe_selected_capture_replay) {
-                const int took = ds4_gpu_moe_selected_capture_take(selected_ids, n_expert);
-                if (took <= 0) return 0;   /* exhausted, or a width mismatch */
+            } else if (g_moe_selected_capture_replay &&
+                       ds4_gpu_moe_selected_capture_peek(selected_ids, n_expert) > 0 &&
+                       (!ds4_gpu_capture_hits_only() ||
+                        ds4_gpu_capture_all_cached(model_map, model_size, layer_index,
+                                                   selected_ids, n_total_expert, n_expert,
+                                                   gate_offset, up_offset, down_offset,
+                                                   gate_expert_bytes, down_expert_bytes))) {
+                ds4_gpu_moe_selected_capture_advance();
+                g_capture_fast_layers++;
                 selected_id_source = "capture";
                 selected_exec_ids_from_host = true;
                 g_routed_moe_selected_override_n = 0;
+                /* The boundary arm commits here, as the readback would have,
+                 * and simply does not wait for it. */
+                if (ds4_gpu_capture_keep_boundary() && g_batch_cb != nil) {
+                    if (ds4_gpu_flush_commands() == 0) return 0;
+                    g_capture_boundary_flushes++;
+                }
             } else {
+                if (g_moe_selected_capture_replay) {
+                    /* A miss on the hits-only arm: the ids stay in the capture,
+                     * this layer goes the normal way, and the readback that
+                     * follows will hand back the same ids anyway. */
+                    ds4_gpu_moe_selected_capture_advance();
+                    g_capture_slow_layers++;
+                }
                 const int replayed_selected_ids =
                     ds4_gpu_moe_selected_trace_replay(selected_ids, n_expert);
                 if (replayed_selected_ids < 0) {
                     if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32890);
                     return 0;
-                } else if (replayed_selected_ids > 0) {
+                } else if (replayed_selected_ids > 0 &&
+                           (!ds4_gpu_capture_hits_only() ||
+                            ds4_gpu_capture_all_cached(model_map, model_size, layer_index,
+                                                       selected_ids, n_total_expert, n_expert,
+                                                       gate_offset, up_offset, down_offset,
+                                                       gate_expert_bytes, down_expert_bytes))) {
+                    /* The hits-only arm answers a narrower question: how much
+                     * of this is reachable without solving residency. A layer
+                     * with a missing expert needs the host either way, so it
+                     * goes the normal way and the readback returns the same
+                     * ids the replay already consumed. */
+                    g_capture_fast_layers++;
                     selected_id_source = "replay";
                     selected_exec_ids_from_host = true;
                     g_routed_moe_selected_override_n = 0;
+                    if (ds4_gpu_capture_keep_boundary() && g_batch_cb != nil) {
+                        if (ds4_gpu_flush_commands() == 0) return 0;
+                        g_capture_boundary_flushes++;
+                    }
+                } else if (replayed_selected_ids > 0) {
+                    g_capture_slow_layers++;
                 } else if (g_routed_moe_selected_override_n == n_expert) {
                     memcpy(selected_ids,
                            g_routed_moe_selected_override,

@@ -42378,6 +42378,7 @@ void ds4_gpu_moe_selected_capture_stop(void);
 uint64_t ds4_gpu_moe_selected_capture_count(void);
 void ds4_gpu_moe_selected_capture_replay(int on);
 void ds4_gpu_moe_selected_capture_rewind(void);
+void ds4_gpu_capture_fastpath_counts(uint64_t *fast, uint64_t *slow, uint64_t *flushes);
 
 static int ds41_selftest_cmp(const void *a, const void *b) {
     const double x = *(const double *)a, y = *(const double *)b;
@@ -42606,6 +42607,15 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                 "  set arm output  : %s (%ld tokens checked)\n",
                 a, b, ab, 100.0 * (b / a - 1.0),
                 batch_mismatch < 0 ? "identical argmax" : "DIVERGED", checked);
+        if (noreadback) {
+            uint64_t fast = 0, slow = 0, flushes = 0;
+            ds4_gpu_capture_fastpath_counts(&fast, &slow, &flushes);
+            fprintf(stderr, "  layers served from the capture: %llu fast, %llu fell back "
+                    "(%.1f%% fast), %llu boundary flushes\n",
+                    (unsigned long long)fast, (unsigned long long)slow,
+                    (fast + slow) ? 100.0 * (double)fast / (double)(fast + slow) : 0.0,
+                    (unsigned long long)flushes);
+        }
         if (batch_mismatch >= 0)
             fprintf(stderr, "  set arm first diverged at offset %ld, "
                     "where the reference led second place by %.6g\n",
