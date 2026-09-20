@@ -41437,6 +41437,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern void ds4_gpu_gate_segment_end(void);
     extern void ds4_gpu_gate_layer_begin(uint32_t il);
     extern int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
+    extern int ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n);
+    extern void ds4_gpu_gate_clear_route(void);
+    extern int ds4_gpu_gate_account_layer(const void *model_map, uint64_t model_size,
+                                          uint32_t layer, const int32_t *ids, uint32_t n_sel,
+                                          uint32_t n_total, uint64_t gate_offset,
+                                          uint64_t up_offset, uint64_t down_offset,
+                                          uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                          unsigned long long *touched);
     extern int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
                                             uint32_t n_sel, uint32_t n_total);
     extern unsigned long long ds4_gpu_gate_ungatable(void);
@@ -41448,7 +41456,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                    uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                                    uint32_t missing_mask, unsigned long long *bytes_loaded);
     static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after,
-                              g_gate_live, g_gate_tokens;
+                              g_gate_live, g_gate_tokens, g_gate_touched;
     const uint32_t gate_n = (uint32_t)ds4_gpu_gate_layers();
     /* The gated region is a window, so a single layer can be isolated: at
      * gate_n=24 the token is correct and at 25 it is not, and a prefix cannot
@@ -41558,6 +41566,32 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                     ds4_gpu_gate_ungatable());
             ok = false;
         }
+        /* The cache accounting the gated layers never reached, replayed once
+         * per layer per token from the route the validator logged. Done after
+         * the last command buffer of the region has completed, so it needs no
+         * synchronisation of its own, and once per layer however many
+         * continuations that layer took. */
+        if (ok) {
+            unsigned long long touched = 0;
+            for (uint32_t il = gate_lo; il < gate_n; il++) {
+                int32_t rids[8];
+                uint32_t rn = 0;
+                if (!ds4_gpu_gate_read_route(il, rids, &rn)) continue;
+                const ds4_layer_weights *al = &w->layer[il];
+                uint64_t grow = 0, drow = 0;
+                if (!tensor_nbytes(al->ffn_gate_exps->type, DS4_N_EMBD, &grow) ||
+                    !tensor_nbytes(al->ffn_down_exps->type, DS4_N_FF_EXP, &drow)) continue;
+                (void)ds4_gpu_gate_account_layer(m->map, m->size, il, rids, rn, DS4_N_EXPERT,
+                                                 al->ffn_gate_exps->abs_offset,
+                                                 al->ffn_up_exps->abs_offset,
+                                                 al->ffn_down_exps->abs_offset,
+                                                 grow * DS4_N_FF_EXP, drow * DS4_N_EMBD,
+                                                 &touched);
+            }
+            g_gate_touched += touched;
+            ds4_gpu_gate_clear_route();
+        }
+
         /* The ordinary loop below is entered with a batch already open. */
         if (ok && gate_n < DS4_N_LAYER && !ds4_gpu_commands_active() &&
             !ds4_gpu_begin_commands()) ok = false;
@@ -41565,11 +41599,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             fprintf(stderr, "ds4: gate over %llu tokens: %.2f command buffers, %.2f aborts, "
                             "%.1f slots encoded behind an abort (not launches), "
                             "%llu the gate failed to switch off, %llu it could not gate, "
-                            "%.2f MiB loaded a token\n",
+                            "%.1f expert ids accounted a token, %.2f MiB loaded a token\n",
                     g_gate_tokens, (double)g_gate_cbs / (double)g_gate_tokens,
                     (double)g_gate_aborts / (double)g_gate_tokens,
                     (double)g_gate_after / (double)g_gate_tokens,
                     g_gate_live, ds4_gpu_gate_ungatable(),
+                    (double)g_gate_touched / (double)g_gate_tokens,
                     (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0);
     }
 #else

@@ -15514,6 +15514,58 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         uint64_t down_expert_bytes, uint32_t missing_mask,
         ds4_gpu_stream_expert_cache_entry **entries);
 
+static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
+        const void *model_map, uint64_t model_size, uint32_t layer, uint32_t expert,
+        uint32_t n_total_expert, uint32_t n_selected, uint64_t gate_abs_offset,
+        uint64_t up_abs_offset, uint64_t down_abs_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+static void ds4_gpu_stream_expert_cache_note_selected_hotness(
+        uint32_t layer, const int32_t *selected_ids, uint32_t n_selected);
+static void ds4_gpu_stream_expert_cache_note_token(uint32_t layer_index);
+static void ds4_gpu_stream_expert_cache_prune_layer(
+        uint32_t layer, uint32_t n_total_expert, uint32_t n_selected,
+        const int32_t *protect_ids, uint32_t n_protect);
+static void ds4_gpu_stream_expert_cache_prune_global(
+        uint32_t protect_layer, const int32_t *protect_ids, uint32_t n_protect);
+
+/* The cache accounting a gated layer never reaches.
+ *
+ * The readback path touches every selected entry as it binds it: the entry's
+ * last_used and use_count, the layer's route hotness, the token clock, and
+ * then the layer and global prunes. A gated layer binds through the address
+ * table instead, so none of that happens, and on the 71% of layers that hit
+ * the ids never reach the host at all. The cache's own policy is then blind to
+ * three quarters of what the model actually asked for, and pruning on top of
+ * that would evict by a hotness that was never raised.
+ *
+ * This replays exactly those updates from the route the validator logged,
+ * once per layer per token, at a point the command buffer has already
+ * completed. It adds no synchronisation of its own.
+ */
+int ds4_gpu_gate_account_layer(const void *model_map, uint64_t model_size, uint32_t layer,
+                               const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                               uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                               uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                               unsigned long long *touched) {
+    if (!g_gate_layers || !ids || n_sel == 0) return 0;
+    for (uint32_t i = 0; i < n_sel; i++) {
+        const int32_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= n_total) continue;
+        (void)ds4_gpu_stream_expert_cache_peek(
+                model_map, model_size, layer, (uint32_t)id, n_total, n_sel,
+                gate_offset + (uint64_t)id * gate_expert_bytes,
+                up_offset + (uint64_t)id * gate_expert_bytes,
+                down_offset + (uint64_t)id * down_expert_bytes,
+                gate_expert_bytes, down_expert_bytes);
+        if (touched) (*touched)++;
+    }
+    ds4_gpu_stream_expert_cache_note_selected_hotness(layer, ids, n_sel);
+    ds4_gpu_stream_expert_cache_note_token(layer);
+    ds4_gpu_stream_expert_cache_prune_layer(layer, n_total, n_sel, ids, n_sel);
+    ds4_gpu_stream_expert_cache_prune_global(layer, ids, n_sel);
+    return 1;
+}
+
 /* Bring in the experts a gated layer could not reach.
  *
  * Runs after the segment's command buffer has completed, so the record it acts
@@ -15628,6 +15680,7 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     [enc setBytes:&gate_from length:sizeof(gate_from) atIndex:8];
     [enc setBytes:&n_slots length:sizeof(n_slots) atIndex:9];
     [enc setBytes:&n_total length:sizeof(n_total) atIndex:10];
+    [enc setBuffer:g_gate_route offset:0 atIndex:11];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     /* The grid table is written here and read as indirect arguments by the
      * dispatches after it. Ordering that on having watched it work a hundred

@@ -45,6 +45,8 @@ int  ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
                                   uint32_t n_sel, uint32_t n_total);   /* in ds4_metal.m */
 uint32_t ds4_gpu_gate_slots_used(void);
 int  ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
+int  ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n);
+void ds4_gpu_gate_clear_route(void);
 unsigned long long ds4_gpu_gate_ungatable(void);
 unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);  /* NOT launches */
 unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failures */
@@ -52,6 +54,7 @@ unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failur
 static int        g_gate_layers;
 static id<MTLBuffer> g_gate_grid;
 static id<MTLBuffer> g_gate_miss;
+static id<MTLBuffer> g_gate_route;     /* {valid, layer, ids[6]} a layer */
 static _Atomic uint32_t g_gate_next_slot;
 static uint32_t   g_gate_layer_base[DS4_GATE_MAX_LAYER];
 static _Atomic unsigned long long g_gate_ungatable;
@@ -173,7 +176,12 @@ void ds4_gpu_gate_probe(id<MTLDevice> device) {
                                       options:MTLResourceStorageModeShared];
     g_gate_miss = [device newBufferWithLength:DS4_GATE_MISS_WORDS * sizeof(uint32_t)
                                       options:MTLResourceStorageModeShared];
-    if (!g_gate_grid || !g_gate_miss) { g_gate_grid = nil; g_gate_miss = nil; return; }
+    g_gate_route = [device newBufferWithLength:DS4_GATE_MAX_LAYER * 8u * sizeof(uint32_t)
+                                       options:MTLResourceStorageModeShared];
+    if (!g_gate_grid || !g_gate_miss || !g_gate_route) {
+        g_gate_grid = nil; g_gate_miss = nil; g_gate_route = nil; return;
+    }
+    g_gate_route.label = @"ds4_gate_route_log";
     g_gate_grid.label = @"ds4_gate_grid";
     g_gate_miss.label = @"ds4_gate_miss";
     g_gate_layers = (int)n;
@@ -232,6 +240,22 @@ unsigned long long ds4_gpu_gate_slots_left_live(void) {
     for (uint32_t i = base; i < used; i++)
         if (grid[3u * i] | grid[3u * i + 1u] | grid[3u * i + 2u]) live++;
     return live;
+}
+
+/* The route log is per token, not per segment: a continuation re-runs a layer
+ * and would otherwise account for it twice. */
+int ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n) {
+    if (!g_gate_layers || !g_gate_route || layer >= DS4_GATE_MAX_LAYER) return 0;
+    const uint32_t *slot = (const uint32_t *)[g_gate_route contents] + 8u * layer;
+    if (slot[0] == 0u) return 0;
+    if (n) *n = 6u;
+    if (ids) for (uint32_t k = 0; k < 6u; k++) ids[k] = (int32_t)slot[2u + k];
+    return 1;
+}
+
+void ds4_gpu_gate_clear_route(void) {
+    if (g_gate_route) memset([g_gate_route contents], 0,
+                             DS4_GATE_MAX_LAYER * 8u * sizeof(uint32_t));
 }
 
 int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n) {

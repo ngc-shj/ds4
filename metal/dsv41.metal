@@ -320,8 +320,20 @@ kernel void kernel_dsv41_gate_validate(
         constant uint      &gate_from [[buffer(8)]],
         constant uint      &n_slots   [[buffer(9)]],
         constant uint      &n_total   [[buffer(10)]],
+        device uint        *route     [[buffer(11)]],
         uint tid [[thread_position_in_threadgroup]],
         uint tsz [[threads_per_threadgroup]]) {
+    /* The route this layer took, written whether it hits or misses. The host
+     * reads it when the command buffer completes - no new synchronisation -
+     * and uses it to do the cache accounting the readback path does inline.
+     * Without it the 71% of layers whose ids never reach the host are
+     * invisible to the cache's own policy. */
+    if (tid == 0) {
+        device uint *slot = route + 8u * layer;
+        slot[1] = layer;
+        for (uint k = 0; k < n_sel && k < 6u; ++k) slot[2u + k] = (uint)selected[k];
+        slot[0] = 1u;
+    }
     threadgroup atomic_uint tg_mask;
     if (tid == 0) atomic_store_explicit(&tg_mask, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
