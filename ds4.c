@@ -42525,7 +42525,13 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         DS41_SELFTEST_REWIND();
 
         if (ab) {
-            setenv(ab, "1", 1);
+            /* NAME sets NAME=1 in the B arm; NAME=VALUE sets that value, which
+             * is what a sweep of a knob rather than a switch needs. */
+            char ab_name[128];
+            const char *eq = strchr(ab, '=');
+            const size_t nlen = eq ? (size_t)(eq - ab) : strlen(ab);
+            snprintf(ab_name, sizeof(ab_name), "%.*s", (int)nlen, ab);
+            setenv(ab_name, eq ? eq + 1 : "1", 1);
             t0 = now_sec();
             for (long i = 0; ok && i < steps; i++) {
                 int arg = 0;
@@ -42539,7 +42545,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             single_b[r] = (now_sec() - t0) * 1000.0 / (double)steps;
-            unsetenv(ab);
+            unsetenv(ab_name);
             DS41_SELFTEST_REWIND();
         }
     }

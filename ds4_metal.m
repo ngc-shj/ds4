@@ -11518,8 +11518,23 @@ static void ds4_gpu_pacer_note_activity(void) {
     if (dynamic < 0) dynamic = getenv("DS4_METAL_GPU_PACER_DYNAMIC") != NULL;
     if (dynamic) {
         const int want = getenv("DS4_METAL_GPU_PACER") != NULL;
-        if (want && !g_pacer_running) ds4_gpu_pacer_start();
-        else if (!want && g_pacer_running) ds4_gpu_pacer_stop();
+        /* Restart on a shape change too: the thread reads TGS and ITERS when
+         * it starts, so a sweep that only toggles the on switch would measure
+         * the first value every time. */
+        static char shape[64];
+        char now_shape[64];
+        const char *tgs = getenv("DS4_METAL_GPU_PACER_TGS");
+        const char *iters = getenv("DS4_METAL_GPU_PACER_ITERS");
+        snprintf(now_shape, sizeof(now_shape), "%s/%s",
+                 tgs && tgs[0] ? tgs : "-", iters && iters[0] ? iters : "-");
+        if (want && g_pacer_running && strcmp(shape, now_shape) != 0) ds4_gpu_pacer_stop();
+        if (want && !g_pacer_running) {
+            ds4_gpu_pacer_start();
+            snprintf(shape, sizeof(shape), "%s", now_shape);
+        } else if (!want && g_pacer_running) {
+            ds4_gpu_pacer_stop();
+            shape[0] = '\0';
+        }
     }
     if (g_pacer_running) g_pacer_last_activity_ms = ds4_gpu_now_ms();
 }
