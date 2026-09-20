@@ -1442,14 +1442,6 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
 }
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
-    static int gate_hooked;
-    if (g_gate_layers && !gate_hooked) {
-        /* One empty encoder, once, to learn the concrete class and swizzle it.
-         * The replacement is inert until a segment turns gating on. */
-        gate_hooked = 1;
-        id<MTLComputeCommandEncoder> probe = [cb computeCommandEncoder];
-        if (probe) { ds4_gate_hook_encoder(probe); [probe endEncoding]; }
-    }
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (g_timeline_enabled && g_timeline_batch) {
@@ -1470,10 +1462,13 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
             g_batch_enc = g_batch_encoder_concurrent
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder];
+            if (g_gate_layers) ds4_gate_hook_encoder(g_batch_enc);
         }
         return g_batch_enc;
     }
-    return [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    if (g_gate_layers) ds4_gate_hook_encoder(enc);
+    return enc;
 }
 
 static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
@@ -15612,6 +15607,10 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     [enc setBytes:&n_slots length:sizeof(n_slots) atIndex:9];
     [enc setBytes:&n_total length:sizeof(n_total) atIndex:10];
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    /* The grid table is written here and read as indirect arguments by the
+     * dispatches after it. Ordering that on having watched it work a hundred
+     * times is not a guarantee; this is the one Metal documents. */
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     ds4_gpu_end_compute_encoder(g_batch_cb, enc);
     atomic_store_explicit(&g_gate_active, was_active, memory_order_relaxed);
     return 1;

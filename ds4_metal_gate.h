@@ -46,7 +46,8 @@ int  ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
 uint32_t ds4_gpu_gate_slots_used(void);
 int  ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
 unsigned long long ds4_gpu_gate_ungatable(void);
-unsigned long long ds4_gpu_gate_dispatches_after_abort(void);
+unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);  /* NOT launches */
+unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failures */
 
 static int        g_gate_layers;
 static id<MTLBuffer> g_gate_grid;
@@ -78,7 +79,10 @@ uint32_t ds4_gpu_gate_slots_used(void) {
 static Class g_gate_hooked_cls[8];
 static uint32_t g_gate_n_hooked;
 
+/* Called for every encoder the decode path makes. The class set dedups, so a
+ * second class - Metal has more than one - is hooked rather than missed. */
 static void ds4_gate_hook_encoder(id enc) {
+    if (!enc) return;
     Class c = object_getClass(enc);
     for (uint32_t i = 0; i < g_gate_n_hooked; i++) if (g_gate_hooked_cls[i] == c) return;
     if (g_gate_n_hooked < 8) g_gate_hooked_cls[g_gate_n_hooked++] = c;
@@ -188,7 +192,11 @@ void ds4_gpu_gate_layer_begin(uint32_t il) {
     g_gate_layer_base[il] = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
 }
 
-unsigned long long ds4_gpu_gate_dispatches_after_abort(void) {
+/* How many dispatches were encoded behind the layer that aborted. This is a
+ * count of slots taken, NOT of kernels that ran: nothing here observes a
+ * launch, and with one gated layer it is zero only because there is nothing
+ * behind it. It cannot be used to explain a wrong answer. */
+unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void) {
     if (!g_gate_layers || !g_gate_miss) return 0;
     const uint32_t *m = (const uint32_t *)[g_gate_miss contents];
     if (m[0] == 0u) return 0;
@@ -197,6 +205,27 @@ unsigned long long ds4_gpu_gate_dispatches_after_abort(void) {
     const uint32_t base = (aborted + 1u < DS4_GATE_MAX_LAYER && g_gate_layer_base[aborted + 1u])
                           ? g_gate_layer_base[aborted + 1u] : used;
     return used > base ? used - base : 0;
+}
+
+/* What the gate is supposed to guarantee, read back after the buffer has
+ * completed: every slot behind the aborting layer should be zero. A slot that
+ * is not is a dispatch the gate did not switch off - either the validator's
+ * write did not reach it, or the host rewrote the slot after the GPU zeroed
+ * it. This is observable, and it is the number that may be used to explain a
+ * wrong answer. */
+unsigned long long ds4_gpu_gate_slots_left_live(void) {
+    if (!g_gate_layers || !g_gate_miss || !g_gate_grid) return 0;
+    const uint32_t *m = (const uint32_t *)[g_gate_miss contents];
+    if (m[0] == 0u) return 0;
+    const uint32_t aborted = m[0] - 1u;
+    const uint32_t used = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
+    const uint32_t base = (aborted + 1u < DS4_GATE_MAX_LAYER && g_gate_layer_base[aborted + 1u])
+                          ? g_gate_layer_base[aborted + 1u] : used;
+    const uint32_t *grid = (const uint32_t *)[g_gate_grid contents];
+    unsigned long long live = 0;
+    for (uint32_t i = base; i < used; i++)
+        if (grid[3u * i] | grid[3u * i + 1u] | grid[3u * i + 2u]) live++;
+    return live;
 }
 
 int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n) {

@@ -41407,13 +41407,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern void ds4_gpu_gate_layer_begin(uint32_t il);
     extern int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
     extern unsigned long long ds4_gpu_gate_ungatable(void);
-    extern unsigned long long ds4_gpu_gate_dispatches_after_abort(void);
+    extern unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);
+    extern unsigned long long ds4_gpu_gate_slots_left_live(void);
     extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
                                    const int32_t *ids, uint32_t n_sel, uint32_t n_total,
                                    uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
                                    uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                                    uint32_t missing_mask, unsigned long long *bytes_loaded);
-    static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after, g_gate_tokens;
+    static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after,
+                              g_gate_live, g_gate_tokens;
     const uint32_t gate_n = (uint32_t)ds4_gpu_gate_layers();
     uint32_t gate_done = 0;
     if (gate_n > 0) {
@@ -41436,7 +41438,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             int32_t ids[16];
             if (!ds4_gpu_gate_read_miss(&bad, &mask, ids, &n_sel)) { gate_done = gate_n; break; }
             g_gate_aborts++;
-            g_gate_after += ds4_gpu_gate_dispatches_after_abort();
+            g_gate_after += ds4_gpu_gate_slots_encoded_after_abort();
+            /* The gate's own guarantee, read back after completion: a slot
+             * behind the aborting layer that is still live is a dispatch it
+             * failed to switch off. */
+            g_gate_live += ds4_gpu_gate_slots_left_live();
             if (getenv("DS4_METAL_V41_ABORT_GATE_DEBUG") && g_gate_aborts < 30ull) {
                 fprintf(stderr, "ds4: gate pass %u aborted at layer %u mask %#x ids", pass, bad, mask);
                 for (uint32_t k = 0; k < n_sel; k++) fprintf(stderr, " %d", ids[k]);
@@ -41468,10 +41474,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             !ds4_gpu_begin_commands()) ok = false;
         if (ok && ((++g_gate_tokens % 64ull) == 0ull))
             fprintf(stderr, "ds4: gate over %llu tokens: %.2f command buffers, %.2f aborts, "
-                            "%.1f dispatches issued after an abort, %.2f MiB loaded a token\n",
+                            "%.1f slots encoded behind an abort (not launches), "
+                            "%llu the gate failed to switch off, %.2f MiB loaded a token\n",
                     g_gate_tokens, (double)g_gate_cbs / (double)g_gate_tokens,
                     (double)g_gate_aborts / (double)g_gate_tokens,
                     (double)g_gate_after / (double)g_gate_tokens,
+                    g_gate_live,
                     (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0);
     }
 #else
