@@ -41617,7 +41617,11 @@ static int ds4_gpu_routed_moe_one_resident(
     }
 
     /* Everything this layer will do is now submitted. The host's work happens
-     * underneath the first pass instead of in front of it. */
+     * underneath the first pass instead of in front of it - if it is quick
+     * enough, which is the question, so time it rather than assume it. */
+    static int timing = -1;
+    if (timing < 0) timing = getenv("DS4_METAL_V41_RESIDENT_TIMING") != NULL;
+    const double t_flush = timing ? ds4_gpu_now_ms() : 0.0;
     if (!ds4_gpu_flush_commands()) { ds4_gpu_resident_service_release(release); return 0; }
     int ok = 1;
     if (@available(macOS 12.0, *)) {
@@ -41628,6 +41632,7 @@ static int ds4_gpu_routed_moe_one_resident(
     } else {
         ok = 0;
     }
+    const double t_signal = timing ? ds4_gpu_now_ms() : 0.0;
 
     int32_t ids[6];
     if (ok && !ds4_gpu_tensor_read((ds4_gpu_tensor *)selected, 0, ids, sizeof(ids))) ok = 0;
@@ -41659,6 +41664,19 @@ static int ds4_gpu_routed_moe_one_resident(
     }
     /* Released either way. Leaving the GPU stalled is a hang; a wrong answer
      * is at least recoverable by falling back, and the caller can. */
+    if (timing) {
+        static double wake_ms, service_ms; static uint64_t layers, repaired;
+        wake_ms += t_signal - t_flush;
+        service_ms += ds4_gpu_now_ms() - t_signal;
+        if (g_stream_expert_repair_written_n[layer_index]) repaired++;
+        if ((++layers % 2000) == 0)
+            fprintf(stderr,
+                    "ds4: resident layer over %llu layers: waiting for the router "
+                    "%.3f ms, servicing %.3f ms, %.1f%% needed a repair\n",
+                    (unsigned long long)layers, wake_ms / (double)layers,
+                    service_ms / (double)layers,
+                    100.0 * (double)repaired / (double)layers);
+    }
     ds4_gpu_resident_service_release(release);
     return ok;
 }
