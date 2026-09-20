@@ -41561,8 +41561,25 @@ static double g_resident_service_total_ms;
 static uint64_t g_resident_service_jobs, g_resident_service_repairs;
 
 static void ds4_gpu_resident_run_job(const ds4_resident_job *j) {
+    /* Spin rather than block. This thread exists to be ready the moment the
+     * router lands, and the machine has cores to spare; blocking costs a
+     * wake-up that lands in the same range as the pass the GPU is running
+     * underneath it, which is the difference between the GPU stopping at the
+     * stall and sailing through it. Falls back to blocking if the spin runs
+     * long, so a real problem is still a timeout rather than a hang. */
     if (@available(macOS 12.0, *)) {
-        if (![g_selected_readback_event waitUntilSignaledValue:j->signal timeoutMS:60000]) {
+        static int spin = -1;
+        if (spin < 0) spin = getenv("DS4_METAL_V41_RESIDENT_BLOCK") == NULL;
+        int spun = 0;
+        if (spin) {
+            const double give_up = ds4_gpu_now_ms() + 20.0;
+            while (g_selected_readback_event.signaledValue < j->signal) {
+                if (ds4_gpu_now_ms() > give_up) break;
+            }
+            spun = g_selected_readback_event.signaledValue >= j->signal;
+        }
+        if (!spun &&
+            ![g_selected_readback_event waitUntilSignaledValue:j->signal timeoutMS:60000]) {
             fprintf(stderr, "ds4: resident service timed out on layer %u\n", j->layer);
             ds4_gpu_resident_service_release(j->release);
             return;
@@ -41829,6 +41846,27 @@ static int ds4_gpu_routed_moe_one_resident(
     /* Keeps the stall and drops only the repair dispatch, to tell which of the
      * two the difference is. Also wrong on a missing layer. */
     if (no_pass_b < 0) no_pass_b = getenv("DS4_METAL_V41_RESIDENT_NO_PASS_B") != NULL;
+    /* Does the stall cost what it costs because the release lands just after
+     * the GPU asks? The first pass is about 36 MiB, a shade over a tenth of a
+     * millisecond, and the service takes about the same. Running that pass
+     * again writes the same values from the same inputs, so it is a correct
+     * way to lengthen the shadow the host works in and see whether the answer
+     * is a longer shadow rather than a faster host. */
+    static int shadow = -1;
+    if (shadow < 0) {
+        const char *env = getenv("DS4_METAL_V41_RESIDENT_SHADOW");
+        shadow = env && env[0] ? atoi(env) : 0;
+    }
+    for (int sh = 0; sh < shadow; sh++) {
+        if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
+                g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                &gate_args, &act_args, &all_lanes, NULL, snap_gate, snap_up,
+                xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+                selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
+                ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights), gate_smem, 2, false))
+            break;
+    }
     const uint64_t release = no_repair ? 0 : ds4_gpu_encode_resident_service_wait();
     if (!release && !no_repair) return 0;
     if (!no_repair && !no_pass_b && !ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
