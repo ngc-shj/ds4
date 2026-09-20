@@ -73,33 +73,13 @@ uint32_t ds4_gpu_gate_slots_used(void) {
 }
 
 
-/* ---- turning a dispatch into a gated one ------------------------------- */
-
-@interface NSObject (DS4GateSwizzle)
-- (void)ds4_gate_dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt;
-- (void)ds4_gate_dispatchThreads:(MTLSize)th threadsPerThreadgroup:(MTLSize)tpt;
-@end
-
-static Class g_gate_hooked_cls[8];
-static uint32_t g_gate_n_hooked;
-
-/* Called for every encoder the decode path makes. The class set dedups, so a
- * second class - Metal has more than one - is hooked rather than missed. */
-static void ds4_gate_hook_encoder(id enc) {
-    if (!enc) return;
-    Class c = object_getClass(enc);
-    for (uint32_t i = 0; i < g_gate_n_hooked; i++) if (g_gate_hooked_cls[i] == c) return;
-    if (g_gate_n_hooked < 8) g_gate_hooked_cls[g_gate_n_hooked++] = c;
-    /* Shares the ledger's swizzle, which installs on the class that actually
-     * implements the selector and gives that class its own copy of the
-     * replacement first. Exchanging against the category's method on NSObject
-     * rewrites it for every class in the process. */
-    ds4_ledger_swizzle(c, @selector(dispatchThreadgroups:threadsPerThreadgroup:),
-                          @selector(ds4_gate_dispatchThreadgroups:threadsPerThreadgroup:));
-    ds4_ledger_swizzle(c, @selector(dispatchThreads:threadsPerThreadgroup:),
-                          @selector(ds4_gate_dispatchThreads:threadsPerThreadgroup:));
-}
-
+/* ---- the gated dispatch -------------------------------------------------
+ * Every dispatch on the decode path is sent as ds4_dispatch: rather than
+ * dispatchThreadgroups:, so the gate is a call the code makes rather than a
+ * method the runtime was rewritten behind. With the gate off these forward one
+ * message; with it on, each takes a slot in the grid table and goes out
+ * indirect, so the layer that aborts can zero the rest.
+ */
 /* Which call sites issue a dispatch the gate cannot switch off, and with what
  * shape. Unslid addresses, to be symbolised with atos. */
 #define DS4_GATE_UNGATABLE_SITES 16u
@@ -160,51 +140,34 @@ static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
     return 1;
 }
 
-@implementation NSObject (DS4GateSwizzle)
-- (void)ds4_gate_dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt {
+/* The gate itself: every dispatch on the decode path comes through here, so
+ * it is a call the code makes rather than a method the runtime was rewritten
+ * behind. With the gate off this is one message; with it on, the dispatch
+ * takes a slot in the grid table and goes out indirect, so the layer that
+ * aborts can zero the rest. */
+static void ds4_gpu_dispatch(id<MTLComputeCommandEncoder> enc, MTLSize tg, MTLSize tpt) {
     NSUInteger off = 0;
-    if (atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
+    if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
         ds4_gate_take_slot(tg, &off)) {
-        [(id<MTLComputeCommandEncoder>)self dispatchThreadgroupsWithIndirectBuffer:g_gate_grid
-                                                             indirectBufferOffset:off
-                                                            threadsPerThreadgroup:tpt];
+        [enc dispatchThreadgroupsWithIndirectBuffer:g_gate_grid
+                               indirectBufferOffset:off
+                              threadsPerThreadgroup:tpt];
         return;
     }
-    [self ds4_gate_dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+    [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
 }
-- (void)ds4_gate_dispatchThreads:(MTLSize)th threadsPerThreadgroup:(MTLSize)tpt {
-    /* Non-uniform dispatch has no indirect form. Where the grid divides evenly
-     * the two forms are the same work, so it can still be gated; where it does
-     * not, the partial threadgroup would be lost and the call is counted
-     * instead. A segment that reports any of these is not gated and its result
-     * does not count. */
-    static int no_threads = -1;
-    if (no_threads < 0) no_threads = getenv("DS4_METAL_V41_ABORT_GATE_NO_THREADS") != NULL;
-    /* Counted whether or not it is converted, so the hole is visible: a
-     * non-uniform dispatch that is left direct still runs after an abort.
-     * The caller is recorded too - there are fourteen such call sites in the
-     * file and only some are on the decode path, and the ones that are have to
-     * be named before they can be changed. */
-    if (no_threads && atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
+
+/* Non-uniform dispatch has no indirect form. The decode path has none left -
+ * both of its call sites were rounded up to whole threadgroups, their kernels
+ * already bounds-checking - so one arriving here while a segment is gated is
+ * counted and named rather than left running after an abort. */
+static void ds4_gpu_dispatch_threads(id<MTLComputeCommandEncoder> enc, MTLSize th, MTLSize tpt) {
+    if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&g_gate_ungatable, 1u, memory_order_relaxed);
         ds4_gate_note_ungatable((uintptr_t)__builtin_return_address(0), th, tpt);
     }
-    if (!no_threads && atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
-        const NSUInteger w = tpt.width ? tpt.width : 1, h = tpt.height ? tpt.height : 1,
-                         d = tpt.depth ? tpt.depth : 1;
-        NSUInteger off = 0;
-        if (th.width % w == 0 && th.height % h == 0 && th.depth % d == 0 &&
-            ds4_gate_take_slot(MTLSizeMake(th.width / w, th.height / h, th.depth / d), &off)) {
-            [(id<MTLComputeCommandEncoder>)self dispatchThreadgroupsWithIndirectBuffer:g_gate_grid
-                                                                 indirectBufferOffset:off
-                                                                threadsPerThreadgroup:tpt];
-            return;
-        }
-        atomic_fetch_add_explicit(&g_gate_ungatable, 1u, memory_order_relaxed);
-    }
-    [self ds4_gate_dispatchThreads:th threadsPerThreadgroup:tpt];
+    [enc dispatchThreads:th threadsPerThreadgroup:tpt];
 }
-@end
 
 /* ---- lifecycle --------------------------------------------------------- */
 
