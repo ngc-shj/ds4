@@ -41712,8 +41712,9 @@ int ds4_gpu_routed_moe_one_tensor(
      * against this one before any of the other thirty-nine follow it. */
     {
         const char *pick = getenv("DS4_METAL_V41_RESIDENT_LAYER");
+        const int pick_all = pick && (pick[0] == 'a' || pick[0] == 'A');
         if (pick && pick[0] && !force_resident &&
-            (uint32_t)strtoul(pick, NULL, 10) == layer_index) {
+            (pick_all || (uint32_t)strtoul(pick, NULL, 10) == layer_index)) {
             static uint64_t ran;
             if (ds4_gpu_routed_moe_one_resident(out, gate, up, mid,
                     model_map, model_size, gate_offset, up_offset, down_offset,
