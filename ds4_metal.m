@@ -11543,6 +11543,11 @@ static void *ds4_gpu_pacer_thread(void *arg) {
     (void)arg;
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
     id<MTLCommandQueue> queue = [g_device newCommandQueue];
+    /* Labelled so a trace can be split by it. Without this the pacer's own
+     * short buffers sit in the same process as the decode ones and drag every
+     * median that gets quoted about them; separating by duration does not
+     * work, it finds a thousand "pacer" buffers in a run with no pacer. */
+    queue.label = @"ds4-pacer";
     const uint32_t tgs = (uint32_t)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_TGS", 16u, 1u, 2048u);
     const uint32_t iters = (uint32_t)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_ITERS", 2000u, 1u, 100000000u);
     const double idle_ms = (double)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_IDLE_MS", 20u, 1u, 10000u);
@@ -11560,7 +11565,9 @@ static void *ds4_gpu_pacer_thread(void *arg) {
         }
         @autoreleasepool {
             id<MTLCommandBuffer> cb = [queue commandBuffer];
+            cb.label = @"ds4-pacer";
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            enc.label = @"ds4-pacer";
             [enc setComputePipelineState:pipeline];
             [enc setBuffer:scratch offset:0 atIndex:0];
             [enc setBytes:&iters length:sizeof(iters) atIndex:1];
