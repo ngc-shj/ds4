@@ -15365,6 +15365,89 @@ static int ds4_gpu_stream_expert_cache_set_addr_slot(
                                                          down_inner);
 }
 
+/* A second address table a layer, holding only the experts the host repaired
+ * after the GPU had already started. The kernel skips any lane whose address
+ * is zero, so a pass over this table runs the repairs and nothing else, which
+ * is how the repair avoids recomputing what the first pass already did without
+ * needing a mask the host cannot know at encode time. */
+static id<MTLBuffer> g_stream_expert_repair_gate_addr[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static id<MTLBuffer> g_stream_expert_repair_up_addr[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static id<MTLBuffer> g_stream_expert_repair_down_addr[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+/* What was written last time, so it can be cleared before the next layer: a
+ * stale entry would run an expert the first pass had already covered. */
+static int32_t g_stream_expert_repair_written[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][6];
+static uint32_t g_stream_expert_repair_written_n[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+
+static int ds4_gpu_stream_expert_repair_buffers(
+        uint32_t layer, id<MTLBuffer> *gate, id<MTLBuffer> *up, id<MTLBuffer> *down) {
+    if (!g_device || layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return 0;
+    const NSUInteger bytes =
+        (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
+    __strong id<MTLBuffer> *slots[3] = {
+        &g_stream_expert_repair_gate_addr[layer],
+        &g_stream_expert_repair_up_addr[layer],
+        &g_stream_expert_repair_down_addr[layer],
+    };
+    for (uint32_t i = 0; i < 3; i++) {
+        if (*slots[i]) continue;
+        id<MTLBuffer> b = [g_device newBufferWithLength:bytes
+                                                options:MTLResourceStorageModeShared];
+        if (!b) {
+            fprintf(stderr, "ds4: Metal streaming expert repair table allocation failed\n");
+            return 0;
+        }
+        b.label = @"ds4_stream_expert_repair_addresses";
+        memset([b contents], 0, bytes);
+        *slots[i] = b;
+    }
+    if (gate) *gate = g_stream_expert_repair_gate_addr[layer];
+    if (up) *up = g_stream_expert_repair_up_addr[layer];
+    if (down) *down = g_stream_expert_repair_down_addr[layer];
+    return 1;
+}
+
+static void ds4_gpu_stream_expert_repair_clear(uint32_t layer) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    uint64_t *g = (uint64_t *)[g_stream_expert_repair_gate_addr[layer] contents];
+    uint64_t *u = (uint64_t *)[g_stream_expert_repair_up_addr[layer] contents];
+    uint64_t *d = (uint64_t *)[g_stream_expert_repair_down_addr[layer] contents];
+    for (uint32_t i = 0; i < g_stream_expert_repair_written_n[layer]; i++) {
+        const int32_t e = g_stream_expert_repair_written[layer][i];
+        if (e < 0 || (uint32_t)e >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        if (g) g[e] = 0;
+        if (u) u[e] = 0;
+        if (d) d[e] = 0;
+    }
+    g_stream_expert_repair_written_n[layer] = 0;
+}
+
+/* The GPU stalls here until the host has repaired what it could not reach. The
+ * buffer stays committed across the stall, which is the whole difference from
+ * the commit/readback/re-encode this replaces. */
+static id<MTLSharedEvent> g_resident_service_event API_AVAILABLE(macos(12.0));
+static uint64_t g_resident_service_value;
+
+static uint64_t ds4_gpu_encode_resident_service_wait(void) {
+    if (!g_batch_cb) return 0;
+    if (@available(macOS 12.0, *)) {
+        if (!g_resident_service_event) {
+            g_resident_service_event = [g_device newSharedEvent];
+            if (!g_resident_service_event) return 0;
+        }
+        ds4_gpu_close_batch_encoder();
+        const uint64_t value = ++g_resident_service_value;
+        [g_batch_cb encodeWaitForEvent:g_resident_service_event value:value];
+        return value;
+    }
+    return 0;
+}
+
+static void ds4_gpu_resident_service_release(uint64_t value) {
+    if (@available(macOS 12.0, *)) {
+        if (g_resident_service_event && value) g_resident_service_event.signaledValue = value;
+    }
+}
+
 static int ds4_gpu_stream_expert_cache_addr_buffers(
         uint32_t       layer,
         id<MTLBuffer> *gate,
@@ -15784,6 +15867,72 @@ static int ds4_gpu_stream_expert_cache_validate_selected(
     return 1;
 }
 
+/* A residency set over every cached expert, so a kernel can dereference an
+ * address the host did not name for that dispatch. Naming them per dispatch is
+ * what the current path does and it is why the ids have to come back first;
+ * this is the prerequisite for them not to. Kept in step with the cache rather
+ * than declared once, because declaring the whole model was measured losing.
+ * Off unless DS4_METAL_V41_EXPERT_RESIDENCY_SET is set. */
+static int ds4_gpu_expert_residency_wanted(void) {
+    static int checked, on;
+    if (!checked) { checked = 1; on = getenv("DS4_METAL_V41_EXPERT_RESIDENCY_SET") != NULL; }
+    return on;
+}
+
+static uint64_t g_expert_residency_adds, g_expert_residency_removes;
+
+static id ds4_gpu_expert_residency_set(void) {
+    if (!ds4_gpu_expert_residency_wanted()) return nil;
+    if (@available(macOS 15.0, *)) {
+        if (!g_stream_expert_residency_set) {
+            MTLResidencySetDescriptor *rdesc = [MTLResidencySetDescriptor new];
+            rdesc.label = @"ds4 streaming expert cache";
+            rdesc.initialCapacity = 1024;
+            NSError *rerr = nil;
+            g_stream_expert_residency_set =
+                [g_device newResidencySetWithDescriptor:rdesc error:&rerr];
+            if (!g_stream_expert_residency_set) {
+                fprintf(stderr, "ds4: expert residency set: %s\n",
+                        rerr.localizedDescription.UTF8String);
+                return nil;
+            }
+            [g_stream_expert_residency_set commit];
+            [g_stream_expert_residency_set requestResidency];
+            if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)])
+                [g_queue addResidencySet:g_stream_expert_residency_set];
+            fprintf(stderr, "ds4: expert residency set on the queue\n");
+        }
+        return g_stream_expert_residency_set;
+    }
+    return nil;
+}
+
+static void ds4_gpu_expert_residency_update(ds4_gpu_stream_expert_cache_entry *e, int add) {
+    if (!e || e->slab_backed) return;          /* slabs are declared already */
+    id set = ds4_gpu_expert_residency_set();
+    if (!set) return;
+    if (@available(macOS 15.0, *)) {
+        id<MTLBuffer> bufs[3] = { e->gate_buffer, e->up_buffer, e->down_buffer };
+        int touched = 0;
+        for (int i = 0; i < 3; i++) {
+            if (!bufs[i]) continue;
+            if (i && (bufs[i] == bufs[0] || (i == 2 && bufs[i] == bufs[1]))) continue;
+            if (add) [(id<MTLResidencySet>)set addAllocation:bufs[i]];
+            else [(id<MTLResidencySet>)set removeAllocation:bufs[i]];
+            touched = 1;
+        }
+        if (touched) {
+            [(id<MTLResidencySet>)set commit];
+            if (add) g_expert_residency_adds++; else g_expert_residency_removes++;
+        }
+    }
+}
+
+void ds4_gpu_expert_residency_counts(uint64_t *adds, uint64_t *removes) {
+    if (adds) *adds = g_expert_residency_adds;
+    if (removes) *removes = g_expert_residency_removes;
+}
+
 static void ds4_gpu_stream_expert_cache_clear_entry_internal(
         uint32_t                                  layer,
         uint32_t                                  expert,
@@ -15808,6 +15957,9 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
         return;
     }
+    /* Out of the set before the buffers go: an allocation is only safe to drop
+     * once nothing in flight can reach it, which the inflight check above is. */
+    ds4_gpu_expert_residency_update(e, 0);
 
     const uint64_t bytes = e->logical_bytes;
     ds4_gpu_stream_expert_evict_dontneed_range(e->model_map,
@@ -16903,6 +17055,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
         e->slab_slot = 0;
     }
     e->valid = 1;
+    ds4_gpu_expert_residency_update(e, 1);
     g_stream_expert_cache_layer_count[layer]++;
     if (g_stream_expert_cache_entry_count < UINT32_MAX) {
         g_stream_expert_cache_entry_count++;
