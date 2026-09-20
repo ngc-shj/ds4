@@ -41901,7 +41901,19 @@ static int ds4_gpu_routed_moe_one_resident(
     /* Submitted. The decode thread's part ends here: the wait, the ids and
      * whatever has to be fetched are the service thread's, and it has a whole
      * ring of layers of slack before this one blocks. */
-    if (!ds4_gpu_flush_commands()) { ds4_gpu_resident_service_release(release); return 1; }
+    /* Not committing here is the point of the whole design. The graph already
+     * drains only twice a token, so leaving the batch open puts a token's
+     * forty layers in one or two command buffers instead of one a layer. The
+     * event still fires while that buffer runs, and the service thread still
+     * works underneath it - what goes away is sixty buffer starts a token,
+     * each of which the trace prices at more than the work inside it. */
+    static int flush_per_layer = -1;
+    if (flush_per_layer < 0)
+        flush_per_layer = getenv("DS4_METAL_V41_RESIDENT_FLUSH") != NULL;
+    if (flush_per_layer && !ds4_gpu_flush_commands()) {
+        ds4_gpu_resident_service_release(release);
+        return 1;
+    }
     const ds4_resident_job job = {
         .signal = signal, .release = release, .layer = layer_index,
         .n_expert = n_expert, .n_total_expert = n_total_expert,
