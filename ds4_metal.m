@@ -11609,17 +11609,38 @@ int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label
  * between one layer's command buffer and the next, and a bare round trip
  * measures 0.15 ms, so most of that gap is this. */
 static double g_host_layer_t0;
-/* The window between one selected-id wait returning and the next one starting
- * is 0.218 ms a layer, and adding up a profile to say where it goes is how a
- * wrong number got into the notes once already. These three marks measure it
- * directly: binding and encoding the experts the readback just named, then
- * everything the graph does between one routed call and the next, then
- * encoding the next layer's router and shared expert up to its wait. */
+/* The window between one selected-id wait returning and the next wait actually
+ * starting, in four exclusive parts, binned by the layer whose readback opened
+ * it. Adding up a sample profile to say where this goes is how a wrong number
+ * reached the notes once already, so each boundary is marked where it happens.
+ *
+ * Two things the first version of this got wrong. The window does not end at
+ * the signal helper's entry: encoder close, signal encode and commit happen
+ * after that and before waitUntilSignaledValue, and those delay the GPU
+ * directly. And one window in forty is not a layer boundary at all - after the
+ * last layer ds41_graph_step drains, computes logits, reads them back and
+ * returns, so that window carries sampling and the caller as well. An average
+ * over all forty hides both. */
+#define DS4_HOST_SPLIT_MAX_LAYER 64u
+enum {
+    DS4_HOST_SPLIT_BIND = 0,   /* wait returns -> routed call returns */
+    DS4_HOST_SPLIT_GRAPH,      /* routed returns -> next routed entry:
+                                * this layer's moe tail and after_moe, the next
+                                * layer's attention, router and shared expert */
+    DS4_HOST_SPLIT_PRE,        /* next routed entry -> signal helper entry */
+    DS4_HOST_SPLIT_SUBMIT,     /* signal helper entry -> waitUntilSignaledValue */
+    DS4_HOST_SPLIT_PARTS
+};
+static const char *const g_host_split_names[DS4_HOST_SPLIT_PARTS] = {
+    "bind+encode experts", "graph to next routed call",
+    "routed pre-readback", "close+signal+commit"
+};
 static double g_host_split_mark;
-static double g_host_split_bind_ms;    /* wait returns -> routed call returns */
-static double g_host_split_graph_ms;   /* routed call returns -> next entry */
-static double g_host_split_encode_ms;  /* next entry -> next wait starts */
-static uint64_t g_host_split_layers;
+static uint32_t g_host_split_window_layer;
+static uint32_t g_routed_current_layer;
+static double g_host_split_ms[DS4_HOST_SPLIT_PARTS][DS4_HOST_SPLIT_MAX_LAYER];
+static uint64_t g_host_split_windows[DS4_HOST_SPLIT_MAX_LAYER];
+static uint64_t g_host_split_total_windows;
 
 static int ds4_gpu_host_layer_split_every(void) {
     static uint64_t every;
@@ -11632,12 +11653,58 @@ static int ds4_gpu_host_layer_split_every(void) {
     return (int)every;
 }
 
-static void ds4_gpu_host_split_note(double *acc) {
+/* Close one part of the open window. Independent of DS4_METAL_HOST_LAYER_MS,
+ * which the first version was accidentally gated behind. */
+static void ds4_gpu_host_split_note(int part) {
     if (!ds4_gpu_host_layer_split_every() || g_host_split_mark == 0.0) return;
     const double now = ds4_gpu_now_ms();
-    *acc += now - g_host_split_mark;
+    if (g_host_split_window_layer < DS4_HOST_SPLIT_MAX_LAYER)
+        g_host_split_ms[part][g_host_split_window_layer] += now - g_host_split_mark;
     g_host_split_mark = now;
 }
+
+static void ds4_gpu_host_split_report(void) {
+    const int every = ds4_gpu_host_layer_split_every();
+    if (!every || (++g_host_split_total_windows % (uint64_t)every) != 0) return;
+    uint32_t last = 0;
+    for (uint32_t l = 0; l < DS4_HOST_SPLIT_MAX_LAYER; l++)
+        if (g_host_split_windows[l]) last = l;
+    for (uint32_t l = 0; l < DS4_HOST_SPLIT_MAX_LAYER; l++) {
+        if (!g_host_split_windows[l]) continue;
+        /* The last layer's window is a token boundary, not a layer boundary;
+         * layer 13 carries the second Engram upload's extra drain. Both are
+         * printed on their own rather than averaged into the rest. */
+        const int special = (l == last) || (l == 13u);
+        if (!special && l != 0 && l != 1) continue;
+        double sum = 0;
+        for (int i = 0; i < DS4_HOST_SPLIT_PARTS; i++)
+            sum += g_host_split_ms[i][l];
+        fprintf(stderr, "ds4: host window layer %u (%llu): total %.3f ms",
+                l, (unsigned long long)g_host_split_windows[l],
+                sum / (double)g_host_split_windows[l]);
+        for (int i = 0; i < DS4_HOST_SPLIT_PARTS; i++)
+            fprintf(stderr, ", %s %.3f", g_host_split_names[i],
+                    g_host_split_ms[i][l] / (double)g_host_split_windows[l]);
+        fprintf(stderr, "\n");
+    }
+    /* Everything that is an ordinary layer boundary, pooled. */
+    double parts[DS4_HOST_SPLIT_PARTS] = {0};
+    uint64_t n = 0;
+    for (uint32_t l = 0; l < DS4_HOST_SPLIT_MAX_LAYER; l++) {
+        if (!g_host_split_windows[l] || l == last || l == 13u) continue;
+        n += g_host_split_windows[l];
+        for (int i = 0; i < DS4_HOST_SPLIT_PARTS; i++) parts[i] += g_host_split_ms[i][l];
+    }
+    if (!n) return;
+    double sum = 0;
+    for (int i = 0; i < DS4_HOST_SPLIT_PARTS; i++) sum += parts[i];
+    fprintf(stderr, "ds4: host window ordinary layers (%llu): total %.3f ms",
+            (unsigned long long)n, sum / (double)n);
+    for (int i = 0; i < DS4_HOST_SPLIT_PARTS; i++)
+        fprintf(stderr, ", %s %.3f", g_host_split_names[i], parts[i] / (double)n);
+    fprintf(stderr, "\n");
+}
+
 static void ds4_gpu_note_host_layer_done(void) {
     static uint64_t every, layers;
     static double total;
@@ -11653,23 +11720,10 @@ static void ds4_gpu_note_host_layer_done(void) {
     if ((++layers % every) == 0)
         fprintf(stderr, "ds4: host work after the readback: %.3f ms/layer over %llu layers\n",
                 total / (double)layers, (unsigned long long)layers);
-    const int split_every = ds4_gpu_host_layer_split_every();
-    if (split_every) {
-        ds4_gpu_host_split_note(&g_host_split_encode_ms);
-        g_host_split_mark = 0.0;
-        if ((++g_host_split_layers % (uint64_t)split_every) == 0) {
-            const double n = (double)g_host_split_layers;
-            fprintf(stderr,
-                    "ds4: host layer split over %llu layers: bind+encode experts %.3f ms, "
-                    "graph between routed calls %.3f ms, next router+shared encode %.3f ms\n",
-                    (unsigned long long)g_host_split_layers,
-                    g_host_split_bind_ms / n, g_host_split_graph_ms / n,
-                    g_host_split_encode_ms / n);
-        }
-    }
 }
 
 static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
+    ds4_gpu_host_split_note(DS4_HOST_SPLIT_PRE);
     ds4_gpu_note_host_layer_done();
     /* Count the host round trips a token actually costs: the point of a full
      * address table is to remove them, and that has to be checked, not assumed. */
@@ -11708,9 +11762,19 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         [cb commit];
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
+        ds4_gpu_host_split_note(DS4_HOST_SPLIT_SUBMIT);
+        ds4_gpu_host_split_report();
         const BOOL signaled = [g_selected_readback_event waitUntilSignaledValue:value timeoutMS:60000];
         g_host_layer_t0 = ds4_gpu_now_ms();
-        if (ds4_gpu_host_layer_split_every()) g_host_split_mark = g_host_layer_t0;
+        /* Open the next window, owned by the layer whose readback just came
+         * back. After the last layer that is a token boundary, not a layer
+         * one, and it is binned apart for exactly that reason. */
+        if (ds4_gpu_host_layer_split_every()) {
+            g_host_split_window_layer = g_routed_current_layer;
+            if (g_host_split_window_layer < DS4_HOST_SPLIT_MAX_LAYER)
+                g_host_split_windows[g_host_split_window_layer]++;
+            g_host_split_mark = g_host_layer_t0;
+        }
         [g_pending_cbs addObject:cb];
         if (!signaled) {
             fprintf(stderr, "ds4: timeout waiting for Metal shared event in %s\n",
@@ -41056,14 +41120,15 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
         uint32_t layer_index, bool force_resident) {
-    ds4_gpu_host_split_note(&g_host_split_graph_ms);
+    ds4_gpu_host_split_note(DS4_HOST_SPLIT_GRAPH);
+    g_routed_current_layer = layer_index;
     const int rc = ds4_gpu_routed_moe_one_tensor_impl(out, gate, up, mid, experts,
         model_map, model_size, gate_offset, up_offset, down_offset,
         gate_type, down_type, gate_expert_bytes, gate_row_bytes,
         down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim,
         out_dim, selected, weights, n_total_expert, n_expert, clamp, x, add_in,
         layer_index, force_resident);
-    ds4_gpu_host_split_note(&g_host_split_bind_ms);
+    ds4_gpu_host_split_note(DS4_HOST_SPLIT_BIND);
     return rc;
 }
 
