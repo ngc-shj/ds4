@@ -41343,6 +41343,50 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial_batch(g, b->routed, il, count);
 }
 
+
+#ifdef __APPLE__
+/* Checksums of the tensors that carry state across a layer boundary, printed
+ * at the same two points in the ordinary loop and in the gated one, so the
+ * first place the two runs disagree can be named rather than guessed at.
+ * DS4_METAL_V41_GATE_TRACE=<layer>, first eight tokens only. */
+static void ds41_gate_trace(ds41_gpu_graph *g, uint32_t il, const char *where) {
+    static int want = -2;
+    if (want == -2) {
+        const char *env = getenv("DS4_METAL_V41_GATE_TRACE");
+        want = env && env[0] ? atoi(env) : -1;
+    }
+    if (want < 0 || (uint32_t)want != il) return;
+    static uint32_t seen;
+    if (where[0] == 'i' && ++seen > 8u) return;
+    if (seen > 8u) return;
+    static float buf[8192];
+    struct { const char *name; ds4_gpu_tensor *t; uint32_t n; } fields[] = {
+        { "residual", g->residual, DS4_N_HC * DS4_N_EMBD > 8192u ? 8192u : DS4_N_HC * DS4_N_EMBD },
+        { "x", g->x, DS4_N_EMBD > 8192u ? 8192u : DS4_N_EMBD },
+        { "pre", g->pre, 4u },
+        { "norm", g->norm, DS4_N_EMBD > 8192u ? 8192u : DS4_N_EMBD },
+        { "selected", g->selected, DS4_N_EXPERT_USED },
+        { "route_weights", g->route_weights, DS4_N_EXPERT_USED },
+        { "block", g->block, DS4_N_EMBD > 8192u ? 8192u : DS4_N_EMBD },
+    };
+    fprintf(stderr, "ds4: trace layer %u %s tok %u:", il, where, seen);
+    for (size_t f = 0; f < sizeof(fields) / sizeof(fields[0]); f++) {
+        if (!fields[f].t) { fprintf(stderr, " %s=-", fields[f].name); continue; }
+        if (!ds4_gpu_tensor_read(fields[f].t, 0, buf, (uint64_t)fields[f].n * sizeof(float))) {
+            fprintf(stderr, " %s=?", fields[f].name);
+            continue;
+        }
+        uint64_t h = 1469598103934665603ull;
+        const unsigned char *p8 = (const unsigned char *)buf;
+        for (size_t b = 0; b < (size_t)fields[f].n * sizeof(float); b++) {
+            h ^= p8[b]; h *= 1099511628211ull;
+        }
+        fprintf(stderr, " %s=%08llx", fields[f].name, (unsigned long long)(h & 0xffffffffu));
+    }
+    fprintf(stderr, "\n");
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -41406,14 +41450,35 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after,
                               g_gate_live, g_gate_tokens;
     const uint32_t gate_n = (uint32_t)ds4_gpu_gate_layers();
+    /* The gated region is a window, so a single layer can be isolated: at
+     * gate_n=24 the token is correct and at 25 it is not, and a prefix cannot
+     * say whether layer 24 alone is the trouble. */
+    static int gate_lo_env = -1;
+    if (gate_lo_env < 0) {
+        const char *e = getenv("DS4_METAL_V41_ABORT_GATE_FROM");
+        gate_lo_env = e && e[0] ? atoi(e) : 0;
+    }
+    const uint32_t gate_lo = (uint32_t)gate_lo_env < gate_n ? (uint32_t)gate_lo_env : 0u;
     uint32_t gate_done = 0;
-    if (gate_n > 0) {
-        uint32_t start = 0;
+    if (gate_n > gate_lo) {
+        uint32_t start = gate_lo;
         int resume_from_moe = 0;
         /* The ordinary loop drains at layer 13, before layer 14 overwrites the
          * first Engram table's shared input. A gated segment has to respect
          * the same boundary: it is not a gate decision, it is the graph's. */
         uint32_t passes = 0;
+        /* Layers before the window run the ordinary way. */
+        for (uint32_t il = 0; ok && il < gate_lo; il++) {
+            const ds4_layer_weights *pl = &w->layer[il];
+            if (ds41_engram_layer(il)) {
+                const uint32_t ei = il == 1 ? 0 : 1;
+                if (!ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[ei],
+                                          sizeof(g->rows[ei]))) { ok = false; break; }
+            }
+            if (ok) ok = ds41_graph_layer(g, m, pl, il, token);
+            if (ok && il == 13u && !ds4_gpu_end_commands()) ok = false;
+            if (ok && il == 13u && !ds4_gpu_begin_commands()) ok = false;
+        }
         while (ok && start < gate_n) {
             if (++passes > 4u * gate_n + 8u) {
                 fprintf(stderr, "ds4: abort gate did not settle\n");
@@ -41421,6 +41486,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 break;
             }
             const uint32_t chunk_end = (start < 14u && gate_n > 14u) ? 14u : gate_n;
+            (void)0;
             ds4_gpu_gate_segment_begin();
             if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) { ok = false; break; }
             for (uint32_t il = start; ok && il < chunk_end; il++) {
@@ -41441,7 +41507,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                  * nothing else - the attention has already run correctly and
                  * its carry must not advance twice, and the route and the
                  * shared expert are already in the tensors they wrote. */
-                if (!(il == start && resume_from_moe)) {
+                /* Diagnostic: re-run the whole layer on a continuation instead
+                 * of its routed stage. If that makes a depth correct, what is
+                 * wrong is the partial continuation and not the gated path. */
+                static int full_resume = -1;
+                if (full_resume < 0)
+                    full_resume = getenv("DS4_METAL_V41_ABORT_GATE_FULL_RESUME") != NULL;
+                ds41_gate_trace(g, il, "in ");
+                if (!(il == start && resume_from_moe && !full_resume)) {
                     ok = ds41_graph_before_moe(g, m, gl, il) &&
                          ds41_moe_route_row(g, m, gl, (uint32_t)token) &&
                          ds4_gpu_gate_encode_validate(g->selected, il,
@@ -41449,6 +41522,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 }
                 if (ok) ok = ds41_moe_experts_row(g, m, gl, il) &&
                              ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
+                if (ok) ds41_gate_trace(g, il, "out");
             }
             ds4_gpu_gate_segment_end();
             if (!ok || !ds4_gpu_end_commands()) { ok = false; break; }
@@ -41478,7 +41552,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             start = bad;
             resume_from_moe = 1;
         }
-        if (ok && ds4_gpu_gate_ungatable() != 0) {
+        if (ok && ds4_gpu_gate_ungatable() != 0 &&
+            getenv("DS4_METAL_V41_ABORT_GATE_NO_THREADS") == NULL) {
             fprintf(stderr, "ds4: abort gate saw %llu dispatches it could not gate\n",
                     ds4_gpu_gate_ungatable());
             ok = false;
@@ -41489,11 +41564,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && ((++g_gate_tokens % 64ull) == 0ull))
             fprintf(stderr, "ds4: gate over %llu tokens: %.2f command buffers, %.2f aborts, "
                             "%.1f slots encoded behind an abort (not launches), "
-                            "%llu the gate failed to switch off, %.2f MiB loaded a token\n",
+                            "%llu the gate failed to switch off, %llu it could not gate, "
+                            "%.2f MiB loaded a token\n",
                     g_gate_tokens, (double)g_gate_cbs / (double)g_gate_tokens,
                     (double)g_gate_aborts / (double)g_gate_tokens,
                     (double)g_gate_after / (double)g_gate_tokens,
-                    g_gate_live,
+                    g_gate_live, ds4_gpu_gate_ungatable(),
                     (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0);
     }
 #else
@@ -41512,6 +41588,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         const unsigned long long v41_cb_before = v41_prof ? ds4_gpu_cb_finished() : 0ull;
+#ifdef __APPLE__
+        ds41_gate_trace(g, il, "in ");
+#endif
         if (ok) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
             ok = ds41_graph_decode_layer(g, m, l, il, token);
@@ -41519,6 +41598,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds41_graph_layer(g, m, l, il, token);
 #endif
         }
+#ifdef __APPLE__
+        if (ok) ds41_gate_trace(g, il, "out");
+#endif
         if (v41_prof && il == 20u) v41_cb_layer = ds4_gpu_cb_finished() - v41_cb_before;
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer

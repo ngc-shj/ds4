@@ -130,7 +130,13 @@ static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
      * not, the partial threadgroup would be lost and the call is counted
      * instead. A segment that reports any of these is not gated and its result
      * does not count. */
-    if (atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
+    static int no_threads = -1;
+    if (no_threads < 0) no_threads = getenv("DS4_METAL_V41_ABORT_GATE_NO_THREADS") != NULL;
+    /* Counted whether or not it is converted, so the hole is visible: a
+     * non-uniform dispatch that is left direct still runs after an abort. */
+    if (no_threads && atomic_load_explicit(&g_gate_active, memory_order_relaxed))
+        atomic_fetch_add_explicit(&g_gate_ungatable, 1u, memory_order_relaxed);
+    if (!no_threads && atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
         const NSUInteger w = tpt.width ? tpt.width : 1, h = tpt.height ? tpt.height : 1,
                          d = tpt.depth ? tpt.depth : 1;
         NSUInteger off = 0;
