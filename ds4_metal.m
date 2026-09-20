@@ -41819,8 +41819,18 @@ static int ds4_gpu_routed_moe_one_resident(
      * is several layers on. */
     id<MTLBuffer> ids_slot = ds4_gpu_resident_ids_slot(g_resident_tail);
     if (!ids_slot) DS4_RESIDENT_DECLINE("no ids slot");
-    ds4_gpu_close_batch_encoder();
-    {
+    static int no_blit_probe = -1;
+    if (no_blit_probe < 0) no_blit_probe = getenv("DS4_METAL_V41_RESIDENT_NO_BLIT") != NULL;
+    if (no_blit_probe) ids_slot = selbuf;
+    /* Diagnostic: the blit needs its own encoder, and closing the compute one
+     * to get it is a pipeline flush. Skipping it leaves the service thread
+     * reading a `selected` the GPU has moved on from, so the answer is wrong -
+     * but it prices the encoder boundary, which is the remaining suspect for
+     * why this path does more GPU work for the same tokens. */
+    static int no_blit = -1;
+    if (no_blit < 0) no_blit = getenv("DS4_METAL_V41_RESIDENT_NO_BLIT") != NULL;
+    if (!no_blit) ds4_gpu_close_batch_encoder();
+    if (!no_blit) {
         id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
         if (!blit) DS4_RESIDENT_DECLINE("no blit encoder");
         [blit copyFromBuffer:selbuf
