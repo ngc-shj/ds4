@@ -40754,20 +40754,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
-#ifdef __APPLE__
-    /* The earliest point at which the route is known. Everything after it -
-     * the shared expert, the routed dispatch, the rest of the layer, the
-     * layers behind it - is switched off if an expert here is unreachable. */
-    {
-        extern int ds4_gpu_gate_layers(void);
-        extern int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
-                                                uint32_t n_sel, uint32_t n_total);
-        const int gate_n = ds4_gpu_gate_layers();
-        if (gate_n > 0 && il < (uint32_t)gate_n &&
-            !ds4_gpu_gate_encode_validate(g->selected, il,
-                                          DS4_N_EXPERT_USED, DS4_N_EXPERT)) return false;
-    }
-#endif
+
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -41406,6 +41393,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern void ds4_gpu_gate_segment_end(void);
     extern void ds4_gpu_gate_layer_begin(uint32_t il);
     extern int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
+    extern int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
+                                            uint32_t n_sel, uint32_t n_total);
     extern unsigned long long ds4_gpu_gate_ungatable(void);
     extern unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);
     extern unsigned long long ds4_gpu_gate_slots_left_live(void);
@@ -41421,33 +41410,62 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (gate_n > 0) {
         uint32_t start = 0;
         int resume_from_moe = 0;
-        for (uint32_t pass = 0; ok && pass <= gate_n; pass++) {
+        /* The ordinary loop drains at layer 13, before layer 14 overwrites the
+         * first Engram table's shared input. A gated segment has to respect
+         * the same boundary: it is not a gate decision, it is the graph's. */
+        uint32_t passes = 0;
+        while (ok && start < gate_n) {
+            if (++passes > 4u * gate_n + 8u) {
+                fprintf(stderr, "ds4: abort gate did not settle\n");
+                ok = false;
+                break;
+            }
+            const uint32_t chunk_end = (start < 14u && gate_n > 14u) ? 14u : gate_n;
             ds4_gpu_gate_segment_begin();
             if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) { ok = false; break; }
-            for (uint32_t il = start; ok && il < gate_n; il++) {
+            for (uint32_t il = start; ok && il < chunk_end; il++) {
                 ds4_gpu_gate_layer_begin(il);
                 const ds4_layer_weights *gl = &w->layer[il];
-                ok = (il == start && resume_from_moe)
-                     ? (ds41_moe(g, m, gl, il, (uint32_t)token) && ds41_graph_after_moe(g))
-                     : ds41_graph_layer(g, m, gl, il, token);
+                /* The ordinary loop writes this before a layer that reads it;
+                 * a gated segment has to do the same, and not doing it is what
+                 * made two gated layers disagree with the baseline while one
+                 * did not - layer 1 is the first layer that reads it. */
+                if (ds41_engram_layer(il)) {
+                    const uint32_t ei = il == 1 ? 0 : 1;
+                    if (!ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[ei],
+                                              sizeof(g->rows[ei]))) { ok = false; break; }
+                }
+                /* First time through a layer: attention, then route and the
+                 * shared expert, then the validate, then the routed experts.
+                 * A continuation runs the routed experts and the finish and
+                 * nothing else - the attention has already run correctly and
+                 * its carry must not advance twice, and the route and the
+                 * shared expert are already in the tensors they wrote. */
+                if (!(il == start && resume_from_moe)) {
+                    ok = ds41_graph_before_moe(g, m, gl, il) &&
+                         ds41_moe_route_row(g, m, gl, (uint32_t)token) &&
+                         ds4_gpu_gate_encode_validate(g->selected, il,
+                                                      DS4_N_EXPERT_USED, DS4_N_EXPERT);
+                }
+                if (ok) ok = ds41_moe_experts_row(g, m, gl, il) &&
+                             ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
             }
             ds4_gpu_gate_segment_end();
             if (!ok || !ds4_gpu_end_commands()) { ok = false; break; }
             g_gate_cbs++;
             uint32_t bad = 0, mask = 0, n_sel = 0;
             int32_t ids[16];
-            if (!ds4_gpu_gate_read_miss(&bad, &mask, ids, &n_sel)) { gate_done = gate_n; break; }
+            if (!ds4_gpu_gate_read_miss(&bad, &mask, ids, &n_sel)) {
+                start = chunk_end;
+                resume_from_moe = 0;
+                continue;
+            }
             g_gate_aborts++;
             g_gate_after += ds4_gpu_gate_slots_encoded_after_abort();
             /* The gate's own guarantee, read back after completion: a slot
              * behind the aborting layer that is still live is a dispatch it
              * failed to switch off. */
             g_gate_live += ds4_gpu_gate_slots_left_live();
-            if (getenv("DS4_METAL_V41_ABORT_GATE_DEBUG") && g_gate_aborts < 30ull) {
-                fprintf(stderr, "ds4: gate pass %u aborted at layer %u mask %#x ids", pass, bad, mask);
-                for (uint32_t k = 0; k < n_sel; k++) fprintf(stderr, " %d", ids[k]);
-                fprintf(stderr, "\n");
-            }
             const ds4_layer_weights *bl = &w->layer[bad];
             uint64_t gate_row = 0, down_row = 0;
             if (!tensor_nbytes(bl->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
@@ -41459,10 +41477,6 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                      mask, &g_gate_bytes)) { ok = false; break; }
             start = bad;
             resume_from_moe = 1;
-        }
-        if (ok && gate_done != gate_n) {
-            fprintf(stderr, "ds4: abort gate did not settle within %u passes\n", gate_n);
-            ok = false;
         }
         if (ok && ds4_gpu_gate_ungatable() != 0) {
             fprintf(stderr, "ds4: abort gate saw %llu dispatches it could not gate\n",

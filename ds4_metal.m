@@ -15497,6 +15497,9 @@ static void ds4_gpu_resident_service_release(uint64_t value) {
     }
 }
 
+static int ds4_gpu_stream_expert_cache_addr_buffers(uint32_t layer, id<MTLBuffer> *gate,
+                                                    id<MTLBuffer> *up, id<MTLBuffer> *down);
+
 static int ds4_gpu_stream_expert_cache_set_addr_slot_raw(
         uint32_t layer, uint32_t expert,
         id<MTLBuffer> gate_buffer, NSUInteger gate_inner,
@@ -15552,6 +15555,21 @@ int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t lay
                     entry->up_buffer, entry->up_inner,
                     entry->down_buffer, entry->down_inner)) return 0;
     }
+    /* A resume may only happen when every selected expert is reachable. The
+     * loader adds one and can evict another, so check the whole set against
+     * the live table rather than assuming the addition stood. */
+    id<MTLBuffer> tg = nil, tu = nil, td = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td)) return 0;
+    const uint64_t *ga = (const uint64_t *)[tg contents];
+    const uint64_t *ua = (const uint64_t *)[tu contents];
+    const uint64_t *da = (const uint64_t *)[td contents];
+    for (uint32_t i = 0; i < n_sel; i++) {
+        const uint32_t id = (uint32_t)ids[i];
+        if (ga[id] == 0 || ua[id] == 0 || da[id] == 0) {
+            fprintf(stderr, "ds4: gate repair left expert %u of layer %u unreachable\n", id, layer);
+            return 0;
+        }
+    }
     if (bytes_loaded) *bytes_loaded += bytes;
     return 1;
 }
@@ -15585,15 +15603,19 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)selected_tensor);
     if (!selbuf) return 0;
 
-    /* The validate runs directly; everything after it reads its grid from the
-     * table, so the first slot it may zero is whatever comes next. */
-    const int was_active = atomic_exchange_explicit(&g_gate_active, 0, memory_order_relaxed);
-    const uint32_t gate_from = ds4_gpu_gate_slots_used();
+    /* The validate is gated like everything else: once a layer has aborted,
+     * the validate of a layer behind it must not run either - its router was
+     * switched off, so the ids it would read are the previous layer's. It
+     * takes the next slot itself, so the first slot it may zero is the one
+     * after that. */
+    const int was_active = atomic_load_explicit(&g_gate_active, memory_order_relaxed);
+    const uint32_t gate_from = ds4_gpu_gate_slots_used() + 1u;
     uint32_t n_slots = gate_from + 8192u;
     if (n_slots > DS4_GATE_MAX_SLOTS) n_slots = DS4_GATE_MAX_SLOTS;
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
-    if (!enc) { atomic_store_explicit(&g_gate_active, was_active, memory_order_relaxed); return 0; }
+    if (!enc) return 0;
+    (void)was_active;
     [enc setComputePipelineState:g_gate_validate_pso];
     [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected_tensor) atIndex:0];
     [enc setBuffer:table_gate offset:0 atIndex:1];
@@ -15612,7 +15634,6 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
      * times is not a guarantee; this is the one Metal documents. */
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     ds4_gpu_end_compute_encoder(g_batch_cb, enc);
-    atomic_store_explicit(&g_gate_active, was_active, memory_order_relaxed);
     return 1;
 }
 
@@ -41863,6 +41884,95 @@ static id<MTLBuffer> ds4_gpu_resident_ids_slot(uint64_t seq) {
  * cache to be in a residency set: nothing here names an expert per dispatch,
  * so nothing else makes them reachable.
  */
+int ds4_gpu_gate_active_for_layer(uint32_t il) {
+    return g_gate_layers && (int)il < g_gate_layers &&
+           atomic_load_explicit(&g_gate_active, memory_order_relaxed);
+}
+
+/* The routed experts for a layer the gate has already validated.
+ *
+ * The resident path reads a frozen copy of the address table, signals an
+ * event, hands the ids to a service thread and encodes a second pass to repair
+ * whatever that thread brought in. None of that is needed here: the validate
+ * immediately before this has checked every selected expert against the live
+ * table, and nothing writes that table while the segment runs, because the
+ * segment contains no readback. If an expert were missing the dispatches below
+ * would already have been switched off.
+ *
+ * So: two masked passes over the live table and nothing else. No service
+ * thread, no shared event, no repair pass, no snapshot.
+ */
+static int ds4_gpu_routed_moe_one_gated(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
+        uint32_t layer_index) {
+#define DS4_GATED_DECLINE(why) do { \
+        static int said; \
+        if (!said) { said = 1; \
+            fprintf(stderr, "ds4: gated routed path declined at layer %u: %s\n", \
+                    layer_index, (why)); } \
+        return 0; \
+    } while (0)
+    if (!g_batch_cb) DS4_GATED_DECLINE("no open batch");
+    if (n_expert != 6) DS4_GATED_DECLINE("n_expert is not 6");
+    if (g_tp_split_world != 1) DS4_GATED_DECLINE("tensor parallel");
+    if (add_in) DS4_GATED_DECLINE("an addend is bound");
+    if (!ds4_gpu_expert_residency_wanted()) DS4_GATED_DECLINE("no residency set");
+    if (gate_type != DS4_METAL_TENSOR_IQ2_XXS) DS4_GATED_DECLINE("gate is not IQ2_XXS");
+    if (down_type != DS4_METAL_TENSOR_Q2_K) DS4_GATED_DECLINE("down is not Q2_K");
+    if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline ||
+        !g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline) DS4_GATED_DECLINE("no masked pipeline");
+    id<MTLBuffer> table_gate = nil, table_up = nil, table_down = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer_index, &table_gate,
+                                                  &table_up, &table_down))
+        DS4_GATED_DECLINE("no address table");
+    id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x), gatebuf = ds4_gpu_tensor_buffer(gate);
+    id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up), midbuf = ds4_gpu_tensor_buffer(mid);
+    id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+    id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)selected);
+    id<MTLBuffer> wbuf = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)weights);
+    if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !selbuf || !wbuf) return 0;
+    const uint32_t gate_nr0 = ds4_gpu_routed_mv_nr0(gate_type);
+    const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
+    if (!gate_nr0 || !down_nr0) return 0;
+    ds4_gpu_mul_mv_id_args gate_args =
+        ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
+                                    gate_row_bytes, gate_expert_bytes, 1, n_expert, 1, gate_nr0);
+    ds4_gpu_mul_mv_id_args down_args =
+        ds4_gpu_make_mul_mv_id_args(expert_mid_dim, out_dim, n_total_expert,
+                                    down_row_bytes, down_expert_bytes,
+                                    n_expert, n_expert, 1, down_nr0);
+    const ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+        .width = expert_mid_dim, .rows = n_expert,
+        .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+        .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+        .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+        .weight_stride = sizeof(float), .write_clamped = 0, .clamp_value = clamp,
+    };
+    const ds4_gpu_stream_expert_split_args all_lanes = { .active_mask = 0x3fu, .accumulate = 0u };
+    if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
+            g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+            &gate_args, &act_args, &all_lanes, NULL, table_gate, table_up,
+            xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+            upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+            selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
+            ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights),
+            ds4_gpu_routed_mv_smem(gate_type), 2, false)) return 0;
+    if (!ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
+            g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
+            &down_args, &all_lanes, NULL, table_down,
+            midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out),
+            selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected),
+            ds4_gpu_routed_mv_smem(down_type), 2)) return 0;
+    return 1;
+}
+
 static int ds4_gpu_routed_moe_one_resident(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, const void *model_map, uint64_t model_size,
@@ -42135,6 +42245,17 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t layer_index, bool force_resident) {
     ds4_gpu_host_split_note(DS4_HOST_SPLIT_GRAPH);
     g_routed_current_layer = layer_index;
+    /* A gated layer has been validated against the live address table by the
+     * kernel immediately before this, so it needs neither the readback below
+     * nor the resident path's service thread, event and repair pass. It is
+     * deliberately outside the DS4_METAL_V41_RESIDENT_LAYER switch: sharing
+     * that path is what the gate is replacing. */
+    if (ds4_gpu_gate_active_for_layer(layer_index) &&
+        ds4_gpu_routed_moe_one_gated(out, gate, up, mid,
+            gate_type, down_type, gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim,
+            out_dim, selected, weights, n_total_expert, n_expert, clamp,
+            x, add_in, layer_index)) return 1;
     /* One layer at a time, and only when asked: the resident path is compared
      * against this one before any of the other thirty-nine follow it. */
     {
