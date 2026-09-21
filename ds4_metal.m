@@ -21521,9 +21521,8 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         /* The lane form puts both matrices in the grid instead of in the
          * loop, so the threadgroups in flight are what two separate dispatches
          * would have rather than half of it. */
-        static int lanes = -1;
-        if (lanes < 0) lanes = getenv("DS4_METAL_V41_Q8_PAIR_LANES") != NULL;
-        const int use_lanes = lanes && !concat;
+        const char *mode_env = getenv("DS4_METAL_V41_SHARED_PAIR_MODE");
+        const int use_lanes = !concat && mode_env && mode_env[0] && atoi(mode_env) == 2;
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(concat ? "kernel_qwen4_q8_concat" :
                 (use_lanes ? "kernel_mul_mv_q8_0_f32_lanes" : "kernel_mul_mv_q8_0_f32_pair"),
@@ -21535,10 +21534,14 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         }
         /* Compiling is not running: say which form actually went out. */
         static uint64_t n_pair, n_lanes;
-        if (use_lanes) n_lanes++; else n_pair++;
-        if (((n_pair + n_lanes) % 20000ull) == 0ull)
-            fprintf(stderr, "ds4: q8 pair dispatches: %llu paired, %llu laned\n",
-                    (unsigned long long)n_pair, (unsigned long long)n_lanes);
+        static int said_pair, said_lanes;
+        if (use_lanes) {
+            n_lanes++;
+            if (!said_lanes) { said_lanes = 1; fprintf(stderr, "ds4: q8 lane pair path ran\n"); }
+        } else {
+            n_pair++;
+            if (!said_pair) { said_pair = 1; fprintf(stderr, "ds4: q8 serial pair path ran\n"); }
+        }
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);

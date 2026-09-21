@@ -40827,9 +40827,13 @@ static DS4_MAYBE_UNUSED bool ds41_moe_route_row(ds41_gpu_graph *g, const ds4_mod
      * 266: one dispatch with both lanes in flight is the difference worth
      * trying. Same arithmetic, same order of accumulation, so the answer does
      * not change. */
-    static int pair = -1;
-    if (pair < 0) pair = getenv("DS4_METAL_V41_SHARED_PAIR") != NULL;
-    const bool can_pair = pair &&
+    /* Read on every use, not cached: the in-process A/B changes it between
+     * rounds, and a value latched at the first layer of the first token makes
+     * both arms the same arm. 0 separate, 1 the old serial pair, 2 the lane
+     * pair. */
+    const char *mode_env = getenv("DS4_METAL_V41_SHARED_PAIR_MODE");
+    const int pair_mode = mode_env && mode_env[0] ? atoi(mode_env) : 0;
+    const bool can_pair = pair_mode != 0 &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_gate_shexp->dim[0] == l->ffn_up_shexp->dim[0];
