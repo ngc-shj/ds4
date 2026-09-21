@@ -50,6 +50,9 @@ void ds4_gpu_gate_clear_route(void);
 unsigned long long ds4_gpu_gate_ungatable(void);
 unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);  /* NOT launches */
 unsigned long long ds4_gpu_gate_slots_total(void);   /* slots taken, all segments */
+unsigned long long ds4_gpu_gate_direct_total(void); /* prefix dispatches left plain */
+int  ds4_gpu_gate_armed(void);       /* a validate has been encoded in this buffer */
+void ds4_gpu_gate_arm(void);
 unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failures */
 void ds4_gpu_gate_print_ungatable(void);
 void ds4_gpu_gate_print_sites(unsigned long long tokens);
@@ -63,6 +66,14 @@ static _Atomic unsigned long long g_gate_slots_total;
 static uint32_t   g_gate_layer_base[DS4_GATE_MAX_LAYER];
 static _Atomic unsigned long long g_gate_ungatable;
 static _Atomic int g_gate_active;             /* dispatches are being gated now */
+/* Nothing in a command buffer can have aborted before the first validate in
+ * it: the miss record is cleared on the host before the buffer is built, the
+ * previous buffer has already completed, and the validate kernel is the only
+ * writer. So the dispatches ahead of that validate are certain to run, and
+ * sending them indirect buys nothing and costs 1.55 us each. They go plain,
+ * and the gate arms behind the first validate it encodes. */
+static _Atomic int g_gate_armed;
+static _Atomic unsigned long long g_gate_direct_total;
 static id<MTLComputePipelineState> g_gate_validate_pso;
 
 /* The decode thread is the only one that encodes gated work, so the slot
@@ -73,6 +84,37 @@ unsigned long long ds4_gpu_gate_ungatable(void) {
 }
 uint32_t ds4_gpu_gate_slots_used(void) {
     return atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
+}
+unsigned long long ds4_gpu_gate_direct_total(void) {
+    return atomic_load_explicit(&g_gate_direct_total, memory_order_relaxed);
+}
+int ds4_gpu_gate_armed(void) {
+    return atomic_load_explicit(&g_gate_armed, memory_order_relaxed);
+}
+/* Called by the validate encoder *after* it has encoded its own dispatch, so
+ * the first validate of a buffer is itself plain. It cannot be switched off by
+ * anything - it is what does the switching off. */
+void ds4_gpu_gate_arm(void) {
+    atomic_store_explicit(&g_gate_armed, 1, memory_order_relaxed);
+}
+
+/* Off with DS4_METAL_V41_GATE_DIRECT_PREFIX=0, which puts every gated
+ * dispatch back through the indirect table. Read once. */
+static int ds4_gate_direct_prefix_on(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_GATE_DIRECT_PREFIX");
+        checked = 1;
+        on = !e || !e[0] || atoi(e) != 0;
+    }
+    return on;
+}
+
+/* Whether the next gated dispatch will take a slot in the grid table. The
+ * validate needs this to know which slot is the first one behind it. */
+static int ds4_gate_will_slot(void) {
+    return !ds4_gate_direct_prefix_on() ||
+           atomic_load_explicit(&g_gate_armed, memory_order_relaxed);
 }
 
 
@@ -224,6 +266,14 @@ static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
 static void ds4_gpu_dispatch(id<MTLComputeCommandEncoder> enc, MTLSize tg, MTLSize tpt) {
     NSUInteger off = 0;
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
+        !atomic_load_explicit(&g_gate_armed, memory_order_relaxed) &&
+        ds4_gate_direct_prefix_on()) {
+        /* Ahead of the buffer's first validate. Certain to run, so plain. */
+        atomic_fetch_add_explicit(&g_gate_direct_total, 1u, memory_order_relaxed);
+        [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+        return;
+    }
+    if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
         ds4_gate_take_slot(tg, &off)) {
         if (ds4_gate_census_on())
             ds4_gate_note_slot((uintptr_t)__builtin_return_address(0),
@@ -241,7 +291,10 @@ static void ds4_gpu_dispatch(id<MTLComputeCommandEncoder> enc, MTLSize tg, MTLSi
  * already bounds-checking - so one arriving here while a segment is gated is
  * counted and named rather than left running after an abort. */
 static void ds4_gpu_dispatch_threads(id<MTLComputeCommandEncoder> enc, MTLSize th, MTLSize tpt) {
-    if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed)) {
+    /* One of these ahead of the buffer's first validate is certain to run, so
+     * it is not something the gate failed to switch off. */
+    if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
+        atomic_load_explicit(&g_gate_armed, memory_order_relaxed)) {
         atomic_fetch_add_explicit(&g_gate_ungatable, 1u, memory_order_relaxed);
         ds4_gate_note_ungatable((uintptr_t)__builtin_return_address(0), th, tpt);
     }
@@ -282,6 +335,7 @@ void ds4_gpu_gate_probe(id<MTLDevice> device) {
 
 void ds4_gpu_gate_segment_begin(void) {
     if (!g_gate_layers) return;
+    atomic_store_explicit(&g_gate_armed, 0, memory_order_relaxed);
     atomic_store_explicit(&g_gate_next_slot, 0u, memory_order_relaxed);
     memset([g_gate_miss contents], 0, DS4_GATE_MISS_WORDS * sizeof(uint32_t));
     memset(g_gate_layer_base, 0, sizeof(g_gate_layer_base));

@@ -15771,11 +15771,16 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
 
     /* The validate is gated like everything else: once a layer has aborted,
      * the validate of a layer behind it must not run either - its router was
-     * switched off, so the ids it would read are the previous layer's. It
-     * takes the next slot itself, so the first slot it may zero is the one
-     * after that. */
+     * switched off, so the ids it would read are the previous layer's.
+     *
+     * Which slot is the first one behind it depends on whether it takes one
+     * itself, and the first validate of a command buffer does not: nothing
+     * ahead of it can have aborted, so it goes out plain along with the rest
+     * of that prefix. Off by one here leaves a live dispatch behind an abort,
+     * which is exactly what ds4_gpu_gate_slots_left_live() counts, so the
+     * existing readback is the check on this line. */
     const int was_active = atomic_load_explicit(&g_gate_active, memory_order_relaxed);
-    const uint32_t gate_from = ds4_gpu_gate_slots_used() + 1u;
+    const uint32_t gate_from = ds4_gpu_gate_slots_used() + (ds4_gate_will_slot() ? 1u : 0u);
     uint32_t n_slots = gate_from + 8192u;
     if (n_slots > DS4_GATE_MAX_SLOTS) n_slots = DS4_GATE_MAX_SLOTS;
 
@@ -15796,6 +15801,9 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     [enc setBytes:&n_total length:sizeof(n_total) atIndex:10];
     [enc setBuffer:g_gate_route offset:0 atIndex:11];
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
+    /* Everything encoded from here on can be switched off by this validate or
+     * by one behind it, so from here on the dispatches go out indirect. */
+    ds4_gpu_gate_arm();
     /* The grid table is written here and read as indirect arguments by the
      * dispatches after it. Ordering that on having watched it work a hundred
      * times is not a guarantee; this is the one Metal documents. */

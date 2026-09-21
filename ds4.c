@@ -42087,6 +42087,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern unsigned long long ds4_gpu_gate_ungatable(void);
     extern unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);
     extern unsigned long long ds4_gpu_gate_slots_total(void);
+    extern unsigned long long ds4_gpu_gate_direct_total(void);
     extern unsigned long long ds4_gpu_gate_slots_left_live(void);
     extern void ds4_gpu_gate_print_ungatable(void);
     extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
@@ -42362,7 +42363,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && (g_gate_tokens % 64ull) == 0ull) {
             const double dt = 64.0;
             static unsigned long long w_cbs, w_aborts, w_bytes, w_touched,
-                                      w_slots, w_after;
+                                      w_slots, w_after, w_direct;
             static double w_encode, w_wait, w_entry, w_repair, w_account,
                           w_tail, w_wall, w_gpu;
             fprintf(stderr,
@@ -42373,7 +42374,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 "+ commit-to-done %.2f + repair-load %.2f + accounting %.2f + tail %.2f "
                 "= %.2f of a %.2f ms wall, residual %.2f\n"
                 "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n"
-                "ds4:   %.1f gated dispatches a token, %.1f of them behind an abort\n",
+                "ds4:   %.1f gated dispatches a token, %.1f of them behind an abort; "
+                "%.1f sent plain ahead of a buffer's first validate\n",
                 g_gate_tokens - 63ull, g_gate_tokens,
                 (double)(g_gate_cbs - w_cbs) / dt,
                 (double)(g_gate_aborts - w_aborts) / dt,
@@ -42397,13 +42399,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 (g_gt_gpu_ms - w_gpu) / dt,
                 ((g_gate_wait_ms - w_wait) - (g_gt_gpu_ms - w_gpu)) / dt,
                 (double)(ds4_gpu_gate_slots_total() - w_slots) / dt,
-                (double)(g_gate_after - w_after) / dt);
+                (double)(g_gate_after - w_after) / dt,
+                (double)(ds4_gpu_gate_direct_total() - w_direct) / dt);
             w_cbs = g_gate_cbs; w_aborts = g_gate_aborts; w_bytes = g_gate_bytes;
             w_touched = g_gate_touched; w_encode = g_gate_encode_ms;
             w_wait = g_gate_wait_ms; w_entry = g_gt_entry_ms;
             w_repair = g_gt_repair_ms; w_account = g_gt_account_ms;
             w_tail = g_gt_tail_ms; w_wall = g_gt_wall_ms; w_gpu = g_gt_gpu_ms;
             w_slots = ds4_gpu_gate_slots_total(); w_after = g_gate_after;
+            w_direct = ds4_gpu_gate_direct_total();
             (void)ds4_gate_report_cache(g_gate_tokens, g_gate_route_fp);
             ds4_gpu_stage_report(g_gate_tokens);
             ds4_gpu_gate_print_ungatable();
