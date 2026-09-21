@@ -21518,8 +21518,16 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         ds4_gpu_q8_0_matvec_args args1 = ds4_gpu_make_q8_0_mv_args(in_dim, out1_dim);
         args0.nr0 = dispatch0.nr0;
         args1.nr0 = dispatch1.nr0;
+        /* The lane form puts both matrices in the grid instead of in the
+         * loop, so the threadgroups in flight are what two separate dispatches
+         * would have rather than half of it. */
+        static int lanes = -1;
+        if (lanes < 0) lanes = getenv("DS4_METAL_V41_Q8_PAIR_LANES") != NULL;
+        const int use_lanes = lanes && !concat;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(concat ? "kernel_qwen4_q8_concat" : "kernel_mul_mv_q8_0_f32_pair", dispatch0.nsg);
+            ds4_gpu_get_mul_mv_pipeline(concat ? "kernel_qwen4_q8_concat" :
+                (use_lanes ? "kernel_mul_mv_q8_0_f32_lanes" : "kernel_mul_mv_q8_0_f32_pair"),
+                dispatch0.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -21537,7 +21545,10 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         [enc setBuffer:out1buf offset:ds4_gpu_tensor_offset(out1) atIndex:6];
         [enc setThreadgroupMemoryLength:2u * dispatch0.smem atIndex:0];
         const uint64_t max_out_dim = concat ? out0_dim + out1_dim : (out0_dim > out1_dim ? out0_dim : out1_dim);
-        ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)max_out_dim + (NSUInteger)dispatch0.nr0 - 1u) / (NSUInteger)dispatch0.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)dispatch0.nsg, 1));
+        ds4_gpu_dispatch(enc,
+            MTLSizeMake(((NSUInteger)max_out_dim + (NSUInteger)dispatch0.nr0 - 1u) /
+                        (NSUInteger)dispatch0.nr0, 1, use_lanes ? 2u : 1u),
+            MTLSizeMake(32, (NSUInteger)dispatch0.nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "paired Q8_0 matvec")) return 0;

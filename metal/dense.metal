@@ -348,6 +348,41 @@ kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
 // lane/block traversal and two-stage reduction verbatim for each bank; only
 // the activation load and threadgroup scheduling are shared.
 [[host_name("kernel_mul_mv_q8_0_f32_pair")]]
+/* Two independent Q8_0 matvecs over the same input, as ONE dispatch whose z
+ * extent carries the lanes.
+ *
+ * kernel_mul_mv_q8_0_f32_pair below does something different and, for this
+ * purpose, backwards: it keeps a single matmul's threadgroup grid and has each
+ * thread walk both weight matrices, so the threadgroups in flight are halved.
+ * ds4-macos/proto/concur.m measures that what this machine responds to is
+ * threadgroups in flight - one dispatch with z = 6 reaches 437.9 GB/s where
+ * one lane reaches 303 - so the lanes belong in the grid, not in the loop.
+ */
+kernel void kernel_mul_mv_q8_0_f32_lanes(
+        constant ds4_metal_args_mul_mv & args0,
+        constant ds4_metal_args_mul_mv & args1,
+        device const char * src0_a,
+        device const char * src0_b,
+        device const char * src1,
+        device       char * dst_a,
+        device       char * dst_b,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const uint lane = tgpig.z;
+    tgpig.z = 0;
+    if (lane == 0) {
+        if ((int)(tgpig.x * N_R0_Q8_0) < args0.ne01)
+            kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(
+                    args0, src0_a, src1, dst_a, shmem, tgpig, tiisg, sgitg);
+    } else {
+        if ((int)(tgpig.x * N_R0_Q8_0) < args1.ne01)
+            kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(
+                    args1, src0_b, src1, dst_b, shmem, tgpig, tiisg, sgitg);
+    }
+}
+
 kernel void kernel_mul_mv_q8_0_f32_pair(
         constant ds4_metal_args_mul_mv & args0,
         constant ds4_metal_args_mul_mv & args1,
