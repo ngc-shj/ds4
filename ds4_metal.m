@@ -15548,6 +15548,11 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
         const int32_t *protect_ids, uint32_t n_protect);
 static void ds4_gpu_stream_expert_cache_prune_global(
         uint32_t protect_layer, const int32_t *protect_ids, uint32_t n_protect);
+static void ds4_gpu_note_miss_residency(const void *addr, uint64_t bytes);
+static int ds4_gpu_miss_residency_sample(void);
+static void ds4_gpu_expert_residency_begin(void);
+static void ds4_gpu_expert_residency_end(void);
+static int ds4_gpu_repair_batch_enabled(void);
 
 /* The cache accounting a gated layer never reaches.
  *
@@ -15583,8 +15588,28 @@ int ds4_gpu_gate_account_layer(const void *model_map, uint64_t model_size, uint3
     ds4_gpu_stream_expert_cache_note_selected_hotness(layer, ids, n_sel);
     ds4_gpu_stream_expert_cache_note_token(layer);
     ds4_gpu_stream_expert_cache_prune_layer(layer, n_total, n_sel, ids, n_sel);
-    ds4_gpu_stream_expert_cache_prune_global(layer, ids, n_sel);
+    if (!ds4_gpu_repair_batch_enabled())
+        ds4_gpu_stream_expert_cache_prune_global(layer, ids, n_sel);
     return 1;
+}
+
+/* The global prune used to run inside the loop above, once per layer. Thirty-
+ * nine of those returned at the first line because the first had already
+ * brought the count back to budget - and that first one ran with only layer
+ * zero's hotness raised for this token, so it evicted by a hotness that the
+ * other thirty-nine layers had not yet contributed to. Running it once, after
+ * every layer has been noted, evicts on what the whole token asked for.
+ *
+ * The residency bracket covers the same pass: whatever this evicts is
+ * published to the driver in one commit rather than one per buffer. */
+void ds4_gpu_gate_account_begin(void) {
+    ds4_gpu_expert_residency_begin();
+}
+
+void ds4_gpu_gate_account_end(void) {
+    if (ds4_gpu_repair_batch_enabled())
+        ds4_gpu_stream_expert_cache_prune_global(UINT32_MAX, NULL, 0);
+    ds4_gpu_expert_residency_end();
 }
 
 /* Bring in the experts a gated layer could not reach.
@@ -15607,12 +15632,11 @@ void ds4_gpu_gate_repair_counters(uint64_t *resident, uint64_t *absent) {
     if (absent) *absent = g_gate_repair_absent;
 }
 
-int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
+static int ds4_gpu_gate_repair_inner(const void *model_map, uint64_t model_size, uint32_t layer,
                         const int32_t *ids, uint32_t n_sel, uint32_t n_total,
                         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
                         uint32_t missing_mask, unsigned long long *bytes_loaded) {
-    if (!g_gate_layers || n_sel > DS4_METAL_MAX_ROUTED_EXPERT_USED) return 0;
     uint64_t gate_abs[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { 0 };
     uint64_t up_abs[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { 0 };
     uint64_t down_abs[DS4_METAL_MAX_ROUTED_EXPERT_USED] = { 0 };
@@ -15673,6 +15697,24 @@ int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t lay
     }
     if (bytes_loaded) *bytes_loaded += bytes;
     return 1;
+}
+
+int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
+                        const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                        uint32_t missing_mask, unsigned long long *bytes_loaded) {
+    if (!g_gate_layers || n_sel > DS4_METAL_MAX_ROUTED_EXPERT_USED) return 0;
+    /* One residency commit for the whole repair rather than one per buffer.
+     * The caller resubmits the segment in a command buffer it has not begun
+     * yet, so the commit still lands before the GPU can reach any of it. */
+    ds4_gpu_expert_residency_begin();
+    const int rc = ds4_gpu_gate_repair_inner(model_map, model_size, layer, ids, n_sel,
+                                             n_total, gate_offset, up_offset, down_offset,
+                                             gate_expert_bytes, down_expert_bytes,
+                                             missing_mask, bytes_loaded);
+    ds4_gpu_expert_residency_end();
+    return rc;
 }
 
 static int ds4_gpu_stream_expert_cache_addr_buffers(uint32_t layer, id<MTLBuffer> *gate,
@@ -16197,6 +16239,51 @@ static id ds4_gpu_expert_residency_set(void) {
     return nil;
 }
 
+/* One commit for a whole repair, not one per allocation.
+ *
+ * Installing an expert adds three buffers and evicting its victim removes
+ * three, and each of those committed the set on its own: at five and a half
+ * installs a token that is about eleven commits a token, each publishing the
+ * whole allocation list to the driver again. The edits are independent, so
+ * batch them and publish once.
+ *
+ * Deferring is the safe direction. An add must be committed before the GPU is
+ * given work that reaches the buffer, and every caller that brackets is
+ * followed by a fresh command buffer; a remove that lands late only leaves an
+ * allocation resident longer than it had to be. */
+static int g_expert_residency_txn_depth;
+static int g_expert_residency_txn_dirty;
+static uint64_t g_expert_residency_commits;
+
+static void ds4_gpu_expert_residency_commit_now(void) {
+    id set = ds4_gpu_expert_residency_set();
+    if (!set) return;
+    if (@available(macOS 15.0, *)) {
+        [(id<MTLResidencySet>)set commit];
+        g_expert_residency_commits++;
+    }
+}
+
+/* DS4_METAL_V41_REPAIR_BATCH=0 restores a commit per allocation and a global
+ * prune per layer, so the pair can be measured against itself in one binary. */
+static int ds4_gpu_repair_batch_enabled(void) {
+    const char *e = getenv("DS4_METAL_V41_REPAIR_BATCH");
+    return !e || e[0] != '0';
+}
+
+static void ds4_gpu_expert_residency_begin(void) {
+    if (!ds4_gpu_repair_batch_enabled()) return;
+    g_expert_residency_txn_depth++;
+}
+
+static void ds4_gpu_expert_residency_end(void) {
+    if (g_expert_residency_txn_depth == 0) return;
+    if (--g_expert_residency_txn_depth != 0) return;
+    if (!g_expert_residency_txn_dirty) return;
+    g_expert_residency_txn_dirty = 0;
+    ds4_gpu_expert_residency_commit_now();
+}
+
 static void ds4_gpu_expert_residency_update(ds4_gpu_stream_expert_cache_entry *e, int add) {
     if (!e || e->slab_backed) return;          /* slabs are declared already */
     id set = ds4_gpu_expert_residency_set();
@@ -16212,15 +16299,18 @@ static void ds4_gpu_expert_residency_update(ds4_gpu_stream_expert_cache_entry *e
             touched = 1;
         }
         if (touched) {
-            [(id<MTLResidencySet>)set commit];
             if (add) g_expert_residency_adds++; else g_expert_residency_removes++;
+            if (g_expert_residency_txn_depth != 0) g_expert_residency_txn_dirty = 1;
+            else ds4_gpu_expert_residency_commit_now();
         }
     }
 }
 
-void ds4_gpu_expert_residency_counts(uint64_t *adds, uint64_t *removes) {
+void ds4_gpu_expert_residency_counts(uint64_t *adds, uint64_t *removes,
+                                     uint64_t *commits) {
     if (adds) *adds = g_expert_residency_adds;
     if (removes) *removes = g_expert_residency_removes;
+    if (commits) *commits = g_expert_residency_commits;
 }
 
 static void ds4_gpu_stream_expert_cache_clear_entry_internal(
@@ -17698,8 +17788,41 @@ static int ds4_gpu_stream_expert_zero_copy_enabled(void) {
  * the pages being absent -- and the difference decides whether the per-layer
  * readback could be dropped in favour of letting the GPU address any expert.
  * DS4_METAL_MISS_RESIDENCY=<n> reports every n misses. */
+/* Is a miss a page-in, or is it already in core?
+ *
+ * This must run BEFORE the F_RDADVISE for the same expert, or it reports what
+ * the readahead did rather than what the miss found. It says only whether the
+ * CPU's VM has the pages; whether the GPU's page table has them wired is a
+ * different question and this cannot answer it.
+ *
+ * It is also not a pristine reading: a prefetch on an earlier token may have
+ * faulted the same expert in, and this cannot tell that from the file having
+ * been in the page cache all along.
+ *
+ * DS4_METAL_MISS_RESIDENCY=N reports every Nth sampled expert; mincore walks
+ * one byte per page of each range, so sample one expert in
+ * DS4_METAL_MISS_RESIDENCY_SAMPLE (default 16) rather than every one. */
+static uint64_t g_miss_residency_seen;
+
+static int ds4_gpu_miss_residency_sample(void) {
+    static uint64_t sample;
+    static int checked;
+    if (!checked) {
+        const char *env = getenv("DS4_METAL_MISS_RESIDENCY");
+        const char *sp = getenv("DS4_METAL_MISS_RESIDENCY_SAMPLE");
+        checked = 1;
+        if (!env || !env[0]) { sample = 0; return 0; }
+        sample = sp && sp[0] ? strtoull(sp, NULL, 10) : 16ull;
+        if (sample == 0) sample = 1;
+    }
+    if (sample == 0) return 0;
+    return (g_miss_residency_seen++ % sample) == 0;
+}
+
 static void ds4_gpu_note_miss_residency(const void *addr, uint64_t bytes) {
-    static uint64_t every, misses, pages_seen, pages_resident, fully_resident;
+    static uint64_t every, misses, ranges, pages_seen,
+                    pages_resident, fully_resident;
+    const uint64_t seen = g_miss_residency_seen;
     static char *vec;
     static size_t vec_pages;
     static int checked;
@@ -17724,17 +17847,20 @@ static void ds4_gpu_note_miss_residency(const void *addr, uint64_t bytes) {
 
     size_t resident = 0;
     for (size_t i = 0; i < pages; i++) if (vec[i] & MINCORE_INCORE) resident++;
-    misses++;
     pages_seen += pages;
     pages_resident += resident;
     if (resident == pages) fully_resident++;
+    ranges++;
+    if (ranges % 3ull) return;              /* gate, up and down are one expert */
+    misses++;
     if ((misses % every) == 0) {
         fprintf(stderr,
-                "ds4: expert misses %llu: %.1f%% of their pages already resident, "
-                "%.1f%% of misses fully resident\n",
+                "ds4: %llu sampled experts (of %llu missed): %.1f%% of their pages "
+                "already resident before the readahead, %.1f%% of ranges fully resident\n",
                 (unsigned long long)misses,
+                (unsigned long long)seen,
                 100.0 * (double)pages_resident / (double)pages_seen,
-                100.0 * (double)fully_resident / (double)misses);
+                100.0 * (double)fully_resident / (double)(misses * 3ull));
     }
 }
 
@@ -17747,7 +17873,6 @@ static int ds4_gpu_stream_expert_nocopy_buffer(const void *model_map,
     if (!model_map || !out || !inner || bytes == 0 ||
         offset >= model_size || bytes > model_size - offset) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    ds4_gpu_note_miss_residency((const char *)model_map + offset, bytes);
     const uintptr_t page = (uintptr_t)getpagesize();
     const uintptr_t base = (uintptr_t)model_map + (uintptr_t)offset;
     const uintptr_t aligned = base & ~(page - 1u);
@@ -18243,6 +18368,17 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             cache_budget != 0 && reserved_entries >= cache_budget;
 
         if (!gpu_copy_source) {
+            /* Before the readahead, not after it, and all three of the
+             * expert's ranges: they are separate tensors at unrelated file
+             * offsets, so one of them does not speak for the other two. */
+            if (ds4_gpu_miss_residency_sample()) {
+                ds4_gpu_note_miss_residency((const char *)model_map +
+                        gate_abs_offsets[slot], gate_expert_bytes);
+                ds4_gpu_note_miss_residency((const char *)model_map +
+                        up_abs_offsets[slot], gate_expert_bytes);
+                ds4_gpu_note_miss_residency((const char *)model_map +
+                        down_abs_offsets[slot], down_expert_bytes);
+            }
             ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
                                                   gate_expert_bytes);
             ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot],

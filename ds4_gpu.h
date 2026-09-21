@@ -355,6 +355,10 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void);
 /* Of the address-table holes the validator aborts on, how many were already
  * resident in the cache (a missing pointer) versus genuinely absent (a load). */
 void ds4_gpu_gate_repair_counters(uint64_t *resident, uint64_t *absent);
+/* Residency-set edits and the commits that published them. One commit per
+ * edit is what the transaction bracket exists to avoid. */
+void ds4_gpu_expert_residency_counts(uint64_t *adds, uint64_t *removes,
+                                     uint64_t *commits);
 void ds4_gpu_stream_expert_cache_counters(uint64_t *hits,
                                           uint64_t *misses,
                                           uint64_t *evictions,

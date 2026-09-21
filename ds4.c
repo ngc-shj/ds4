@@ -41565,18 +41565,17 @@ static void ds41_weight_ledger(const ds4_model *m, const ds4_weights *w) {
 /* Capacity pressure over the last window rather than over the whole process:
  * prefill installs tens of thousands of entries, so the lifetime totals say
  * nothing about whether decode is still evicting. */
-static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp,
-                                 double repair_ms, double wall_ms) {
+static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp) {
     static uint64_t last_hits, last_misses, last_evictions;
-    static double last_wall, last_repair;
     static unsigned long long last_tokens;
     uint64_t hits = 0, misses = 0, evictions = 0;
     uint32_t entries = 0, budget = 0;
     ds4_gpu_stream_expert_cache_counters(&hits, &misses, &evictions,
                                          &entries, &budget);
-    uint64_t rep_res = 0, rep_abs = 0;
+    uint64_t rep_res = 0, rep_abs = 0, res_add = 0, res_rem = 0, res_com = 0;
     ds4_gpu_gate_repair_counters(&rep_res, &rep_abs);
-    static uint64_t last_res, last_abs;
+    ds4_gpu_expert_residency_counts(&res_add, &res_rem, &res_com);
+    static uint64_t last_res, last_abs, last_add, last_rem, last_com;
     const unsigned long long dt = tokens - last_tokens;
     if (dt != 0) {
         fprintf(stderr,
@@ -41594,13 +41593,13 @@ static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp,
                 (double)(rep_res - last_res) / (double)dt,
                 (double)(rep_abs - last_abs) / (double)dt);
         fprintf(stderr,
-                "ds4:   over the same %llu tokens: %.2f ms wall, %.2f ms repair a token\n",
-                dt,
-                (wall_ms - last_wall) / (double)dt,
-                (repair_ms - last_repair) / (double)dt);
+                "ds4:   residency a token: %.2f adds, %.2f removes, %.2f commits\n",
+                (double)(res_add - last_add) / (double)dt,
+                (double)(res_rem - last_rem) / (double)dt,
+                (double)(res_com - last_com) / (double)dt);
     }
-    last_wall = wall_ms; last_repair = repair_ms;
     last_res = rep_res; last_abs = rep_abs;
+    last_add = res_add; last_rem = res_rem; last_com = res_com;
     last_hits = hits; last_misses = misses; last_evictions = evictions;
     last_tokens = tokens;
     if (route_fp) fflush(route_fp);
@@ -41661,6 +41660,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
     extern int ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n);
     extern void ds4_gpu_gate_clear_route(void);
+    extern void ds4_gpu_gate_account_begin(void);
+    extern void ds4_gpu_gate_account_end(void);
     extern int ds4_gpu_gate_account_layer(const void *model_map, uint64_t model_size,
                                           uint32_t layer, const int32_t *ids, uint32_t n_sel,
                                           uint32_t n_total, uint64_t gate_offset,
@@ -41833,6 +41834,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         const double gt_acct0 = now_sec();
         if (ok) {
             unsigned long long touched = 0;
+            ds4_gpu_gate_account_begin();
             for (uint32_t il = gate_lo; il < gate_n; il++) {
                 int32_t rids[8];
                 uint32_t rn = 0;
@@ -41856,6 +41858,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                     (void)fwrite(rec, sizeof(rec[0]), 8, g_gate_route_fp);
                 }
             }
+            ds4_gpu_gate_account_end();
             g_gate_touched += touched;
             ds4_gpu_gate_clear_route();
         }
@@ -41865,41 +41868,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         /* The ordinary loop below is entered with a batch already open. */
         if (ok && gate_n < DS4_N_LAYER && !ds4_gpu_commands_active() &&
             !ds4_gpu_begin_commands()) ok = false;
-        if (ok && ((++g_gate_tokens % 64ull) == 0ull))
-            fprintf(stderr, "ds4: gate over %llu tokens: %.2f command buffers, %.2f aborts, "
-                            "%.1f slots encoded behind an abort (not launches), "
-                            "%llu the gate failed to switch off, %llu it could not gate, "
-                            "%.1f expert ids accounted a token, %.2f MiB loaded a token, "
-                            "encode %.2f ms and commit-to-done %.2f ms a token\n"
-                            "ds4:   one token, exclusive, same run: entry %.2f + encode %.2f "
-                            "+ commit-to-done %.2f + repair %.2f + accounting %.2f + tail %.2f "
-                            "= %.2f of a %.2f ms wall, residual %.2f\n"
-                            "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n",
-                    g_gate_tokens, (double)g_gate_cbs / (double)g_gate_tokens,
-                    (double)g_gate_aborts / (double)g_gate_tokens,
-                    (double)g_gate_after / (double)g_gate_tokens,
-                    g_gate_live, ds4_gpu_gate_ungatable(),
-                    (double)g_gate_touched / (double)g_gate_tokens,
-                    (double)g_gate_bytes / (double)g_gate_tokens / 1048576.0,
-                    g_gate_encode_ms / (double)g_gate_tokens,
-                    g_gate_wait_ms / (double)g_gate_tokens,
-                    g_gt_entry_ms / (double)g_gate_tokens,
-                    g_gate_encode_ms / (double)g_gate_tokens,
-                    g_gate_wait_ms / (double)g_gate_tokens,
-                    g_gt_repair_ms / (double)g_gate_tokens,
-                    g_gt_account_ms / (double)g_gate_tokens,
-                    g_gt_tail_ms / (double)g_gate_tokens,
-                    (g_gt_entry_ms + g_gate_encode_ms + g_gate_wait_ms + g_gt_repair_ms +
-                     g_gt_account_ms + g_gt_tail_ms) / (double)g_gate_tokens,
-                    g_gt_wall_ms / (double)g_gate_tokens,
-                    (g_gt_wall_ms - g_gt_entry_ms - g_gate_encode_ms - g_gate_wait_ms -
-                     g_gt_repair_ms - g_gt_account_ms - g_gt_tail_ms) / (double)g_gate_tokens,
-                    g_gt_gpu_ms / (double)g_gate_tokens,
-                    (g_gate_wait_ms - g_gt_gpu_ms) / (double)g_gate_tokens),
-            ds4_gate_report_cache(g_gate_tokens, g_gate_route_fp,
-                                  g_gt_repair_ms, g_gt_wall_ms),
-            ds4_gpu_stage_report(g_gate_tokens),
-            ds4_gpu_gate_print_ungatable();
+        if (ok) g_gate_tokens++;
     }
 #else
     const uint32_t gate_n = 0, gate_done = 0;
@@ -41960,6 +41929,55 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (gate_n > gate_lo) {
         g_gt_tail_ms += (now_sec() - gt_tail0) * 1000.0;
         g_gt_wall_ms += (now_sec() - gt_token0) * 1000.0;
+        /* Every figure below covers the same 64 tokens. The report used to run
+         * before this line, so the cache window held the token whose wall had
+         * not been added yet, and the aborts and command buffers were running
+         * means since startup while the misses were a window: a miss count and
+         * an abort count from that report could not be divided by each other. */
+        if (ok && (g_gate_tokens % 64ull) == 0ull) {
+            const double dt = 64.0;
+            static unsigned long long w_cbs, w_aborts, w_bytes, w_touched;
+            static double w_encode, w_wait, w_entry, w_repair, w_account,
+                          w_tail, w_wall, w_gpu;
+            fprintf(stderr,
+                "ds4: gate over tokens %llu-%llu: %.2f command buffers, %.2f aborts, "
+                "%.1f expert ids accounted, %.2f MiB loaded a token; "
+                "%llu the gate failed to switch off, %llu it could not gate\n"
+                "ds4:   one token, exclusive, same window: entry %.2f + encode %.2f "
+                "+ commit-to-done %.2f + repair-load %.2f + accounting %.2f + tail %.2f "
+                "= %.2f of a %.2f ms wall, residual %.2f\n"
+                "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n",
+                g_gate_tokens - 63ull, g_gate_tokens,
+                (double)(g_gate_cbs - w_cbs) / dt,
+                (double)(g_gate_aborts - w_aborts) / dt,
+                (double)(g_gate_touched - w_touched) / dt,
+                (double)(g_gate_bytes - w_bytes) / dt / 1048576.0,
+                g_gate_live, ds4_gpu_gate_ungatable(),
+                (g_gt_entry_ms - w_entry) / dt,
+                (g_gate_encode_ms - w_encode) / dt,
+                (g_gate_wait_ms - w_wait) / dt,
+                (g_gt_repair_ms - w_repair) / dt,
+                (g_gt_account_ms - w_account) / dt,
+                (g_gt_tail_ms - w_tail) / dt,
+                ((g_gt_entry_ms - w_entry) + (g_gate_encode_ms - w_encode) +
+                 (g_gate_wait_ms - w_wait) + (g_gt_repair_ms - w_repair) +
+                 (g_gt_account_ms - w_account) + (g_gt_tail_ms - w_tail)) / dt,
+                (g_gt_wall_ms - w_wall) / dt,
+                ((g_gt_wall_ms - w_wall) - (g_gt_entry_ms - w_entry) -
+                 (g_gate_encode_ms - w_encode) - (g_gate_wait_ms - w_wait) -
+                 (g_gt_repair_ms - w_repair) - (g_gt_account_ms - w_account) -
+                 (g_gt_tail_ms - w_tail)) / dt,
+                (g_gt_gpu_ms - w_gpu) / dt,
+                ((g_gate_wait_ms - w_wait) - (g_gt_gpu_ms - w_gpu)) / dt);
+            w_cbs = g_gate_cbs; w_aborts = g_gate_aborts; w_bytes = g_gate_bytes;
+            w_touched = g_gate_touched; w_encode = g_gate_encode_ms;
+            w_wait = g_gate_wait_ms; w_entry = g_gt_entry_ms;
+            w_repair = g_gt_repair_ms; w_account = g_gt_account_ms;
+            w_tail = g_gt_tail_ms; w_wall = g_gt_wall_ms; w_gpu = g_gt_gpu_ms;
+            (void)ds4_gate_report_cache(g_gate_tokens, g_gate_route_fp);
+            ds4_gpu_stage_report(g_gate_tokens);
+            ds4_gpu_gate_print_ungatable();
+        }
     }
     ds4_gpu_ledger_token_end();
 #endif
@@ -69434,7 +69452,11 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
  * decode and take it back before the next prompt, the way
  * ds41_encoder_acquire borrows in the other direction.
  *
- * DS4_METAL_V41_DECODE_LEND_HEADROOM=0 opts out.
+ * Off by default: the mechanism is confirmed - it removes about 1.2 installs
+ * of 5.5 a token - but no sustained run has yet shown the time, and it raises
+ * the locked footprint by the same 7.12 GiB on a 128 GB machine that has been
+ * seen to fall to 0.88 tok/s once its page cache is churned.
+ * DS4_METAL_V41_DECODE_LEND_HEADROOM=1 turns it on.
  */
 static uint32_t g_ds41_admitted_budget;
 static uint32_t g_ds41_decode_budget;
@@ -69443,10 +69465,10 @@ static int g_ds41_headroom_lent;
 static void ds41_note_prefill_headroom(uint32_t budget,
                                        uint64_t headroom_bytes,
                                        uint64_t expert_bytes) {
-    const char *off = getenv("DS4_METAL_V41_DECODE_LEND_HEADROOM");
+    const char *on = getenv("DS4_METAL_V41_DECODE_LEND_HEADROOM");
     g_ds41_admitted_budget = budget;
     g_ds41_decode_budget = budget;
-    if (!budget || !expert_bytes || (off && off[0] == '0')) return;
+    if (!budget || !expert_bytes || !on || on[0] == '0') return;
     const uint64_t extra = headroom_bytes / expert_bytes;
     if (extra == 0 || extra > UINT32_MAX - budget) return;
     g_ds41_decode_budget = budget + (uint32_t)extra;
