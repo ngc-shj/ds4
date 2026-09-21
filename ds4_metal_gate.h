@@ -56,6 +56,7 @@ void ds4_gpu_gate_arm(void);
 unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failures */
 void ds4_gpu_gate_print_ungatable(void);
 void ds4_gpu_gate_print_sites(unsigned long long tokens);
+void ds4_gpu_gate_census_settle(uint32_t aborted_layer);  /* after the buffer completes */
 
 static int        g_gate_layers;
 static id<MTLBuffer> g_gate_grid;
@@ -167,9 +168,28 @@ static void ds4_gate_note_ungatable(uintptr_t caller, MTLSize th, MTLSize tpt) {
  * that 759 of them come from the quantize encoder does not say which of its
  * nineteen call sites in a layer they are, and the fusion is chosen per call
  * site. */
-static struct { uintptr_t caller, parent; uint64_t count; uint32_t w, h, d, tw, th_, td; }
+static struct { uintptr_t caller, parent; uint64_t count, live, zeroed;
+                uint32_t w, h, d, tw, th_, td; }
     g_gate_sites[DS4_GATE_SITES];
 static uint32_t g_gate_n_sites;
+
+/* Which site took each slot, so that once the buffer has completed the two can
+ * be joined and a call site can say how many of its dispatches ran and how many
+ * the abort switched off. That is the left half of what sending a site plain
+ * would be worth:
+ *
+ *     live rate x 1.55 us  -  zero rate x (kernel time + 0.70 - 1.85) us
+ *
+ * The right half is the kernel's own execution time, which Metal does not give
+ * per dispatch. The grid shape is recorded per site already, so the selection
+ * rule is "small enough that the kernel cannot be worth the 1.55 us it saves",
+ * and raw wall decides after that. Census only - this is an array the size of
+ * the slot table and a scan a command buffer. */
+#define DS4_GATE_NO_SITE 0xffffu
+static uint16_t g_gate_slot_site[DS4_GATE_MAX_SLOTS];
+/* The first slot each layer's validate was told to zero, as it was told it -
+ * not re-derived here, so the join cannot drift from what the kernel did. */
+static uint32_t g_gate_validate_from[DS4_GATE_MAX_LAYER];
 
 static int ds4_gate_census_on(void) {
     static int checked, on;
@@ -177,8 +197,8 @@ static int ds4_gate_census_on(void) {
     return on;
 }
 
-static void ds4_gate_note_slot(uintptr_t caller, uintptr_t parent,
-                               MTLSize tg, MTLSize tpt) {
+static uint32_t ds4_gate_note_slot(uintptr_t caller, uintptr_t parent,
+                                   MTLSize tg, MTLSize tpt) {
     const uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
     const uintptr_t unslid = caller - slide;
     const uintptr_t punslid = parent ? parent - slide : 0;
@@ -187,19 +207,42 @@ static void ds4_gate_note_slot(uintptr_t caller, uintptr_t parent,
         if (g_gate_sites[i].caller == unslid && g_gate_sites[i].parent == punslid) {
             g_gate_sites[i].count++;
             os_unfair_lock_unlock(&g_gate_site_lock);
-            return;
+            return i;
         }
+    uint32_t which = DS4_GATE_NO_SITE;
     if (g_gate_n_sites < DS4_GATE_SITES) {
         const uint32_t i = g_gate_n_sites++;
         g_gate_sites[i].caller = unslid;
         g_gate_sites[i].parent = punslid;
         g_gate_sites[i].count = 1;
+        g_gate_sites[i].live = g_gate_sites[i].zeroed = 0;
         g_gate_sites[i].w = (uint32_t)tg.width;
         g_gate_sites[i].h = (uint32_t)tg.height;
         g_gate_sites[i].d = (uint32_t)tg.depth;
         g_gate_sites[i].tw = (uint32_t)tpt.width;
         g_gate_sites[i].th_ = (uint32_t)tpt.height;
         g_gate_sites[i].td = (uint32_t)tpt.depth;
+        which = i;
+    }
+    os_unfair_lock_unlock(&g_gate_site_lock);
+    return which;
+}
+
+/* Joined once the buffer has completed, so `aborted_layer` is known. Slots at
+ * or after the first one that layer's validate was told to zero did not run;
+ * the rest did. A buffer that did not abort ran all of them. */
+void ds4_gpu_gate_census_settle(uint32_t aborted_layer) {
+    if (!ds4_gate_census_on() || !g_gate_layers) return;
+    uint32_t used = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
+    if (used > DS4_GATE_MAX_SLOTS) used = DS4_GATE_MAX_SLOTS;
+    const uint32_t zero_from = aborted_layer < DS4_GATE_MAX_LAYER
+                               ? g_gate_validate_from[aborted_layer] : used;
+    os_unfair_lock_lock(&g_gate_site_lock);
+    for (uint32_t i = 0; i < used; i++) {
+        const uint16_t site = g_gate_slot_site[i];
+        if (site >= g_gate_n_sites) continue;
+        if (i < zero_from) g_gate_sites[site].live++;
+        else g_gate_sites[site].zeroed++;
     }
     os_unfair_lock_unlock(&g_gate_site_lock);
 }
@@ -216,14 +259,18 @@ void ds4_gpu_gate_print_sites(unsigned long long tokens) {
         for (uint32_t i = 0; i < g_gate_n_sites; i++)
             if (g_gate_sites[i].count > best_c) { best = i; best_c = g_gate_sites[i].count; }
         if (best == DS4_GATE_SITES) break;
+        const uint64_t seen = g_gate_sites[best].live + g_gate_sites[best].zeroed;
         fprintf(stderr, "ds4: gated dispatch site 0x%llx from 0x%llx: %.1f a token, "
-                        "groups %ux%ux%u of %ux%ux%u\n",
+                        "%.1f%% live %.1f%% zeroed, groups %ux%ux%u of %ux%ux%u\n",
                 (unsigned long long)g_gate_sites[best].caller,
                 (unsigned long long)g_gate_sites[best].parent,
                 (double)best_c / (double)tokens,
+                seen ? 100.0 * (double)g_gate_sites[best].live / (double)seen : 0.0,
+                seen ? 100.0 * (double)g_gate_sites[best].zeroed / (double)seen : 0.0,
                 g_gate_sites[best].w, g_gate_sites[best].h, g_gate_sites[best].d,
                 g_gate_sites[best].tw, g_gate_sites[best].th_, g_gate_sites[best].td);
         g_gate_sites[best].count = 0;
+        g_gate_sites[best].live = g_gate_sites[best].zeroed = 0;
     }
     g_gate_n_sites = 0;
     os_unfair_lock_unlock(&g_gate_site_lock);
@@ -275,9 +322,14 @@ static void ds4_gpu_dispatch(id<MTLComputeCommandEncoder> enc, MTLSize tg, MTLSi
     }
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
         ds4_gate_take_slot(tg, &off)) {
-        if (ds4_gate_census_on())
-            ds4_gate_note_slot((uintptr_t)__builtin_return_address(0),
-                               (uintptr_t)__builtin_return_address(1), tg, tpt);
+        if (ds4_gate_census_on()) {
+            const uint32_t site = ds4_gate_note_slot((uintptr_t)__builtin_return_address(0),
+                                                     (uintptr_t)__builtin_return_address(1),
+                                                     tg, tpt);
+            const NSUInteger slot = off / (3u * sizeof(uint32_t));
+            if (slot < DS4_GATE_MAX_SLOTS)
+                g_gate_slot_site[slot] = (uint16_t)site;
+        }
         [enc dispatchThreadgroupsWithIndirectBuffer:g_gate_grid
                                indirectBufferOffset:off
                               threadsPerThreadgroup:tpt];
@@ -336,6 +388,10 @@ void ds4_gpu_gate_probe(id<MTLDevice> device) {
 void ds4_gpu_gate_segment_begin(void) {
     if (!g_gate_layers) return;
     atomic_store_explicit(&g_gate_armed, 0, memory_order_relaxed);
+    if (ds4_gate_census_on()) {
+        memset(g_gate_slot_site, 0xff, sizeof(g_gate_slot_site));
+        memset(g_gate_validate_from, 0, sizeof(g_gate_validate_from));
+    }
     atomic_store_explicit(&g_gate_next_slot, 0u, memory_order_relaxed);
     memset([g_gate_miss contents], 0, DS4_GATE_MISS_WORDS * sizeof(uint32_t));
     memset(g_gate_layer_base, 0, sizeof(g_gate_layer_base));

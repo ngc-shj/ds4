@@ -42088,6 +42088,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);
     extern unsigned long long ds4_gpu_gate_slots_total(void);
     extern unsigned long long ds4_gpu_gate_direct_total(void);
+    extern void ds4_gpu_gate_census_settle(uint32_t aborted_layer);
     extern unsigned long long ds4_gpu_gate_slots_left_live(void);
     extern void ds4_gpu_gate_print_ungatable(void);
     extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
@@ -42212,10 +42213,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             uint32_t bad = 0, mask = 0, n_sel = 0;
             int32_t ids[16];
             if (!ds4_gpu_gate_read_miss(&bad, &mask, ids, &n_sel)) {
+                /* Nothing aborted, so every slot this buffer took ran. Any
+                 * layer out of range says that to the census. */
+                ds4_gpu_gate_census_settle(UINT32_MAX);
                 start = chunk_end;
                 resume_from_moe = 0;
                 continue;
             }
+            ds4_gpu_gate_census_settle(bad);
             g_gate_aborts++;
             g_gate_after += ds4_gpu_gate_slots_encoded_after_abort();
             /* The gate's own guarantee, read back after completion: a slot

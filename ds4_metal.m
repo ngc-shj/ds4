@@ -15781,6 +15781,9 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
      * existing readback is the check on this line. */
     const int was_active = atomic_load_explicit(&g_gate_active, memory_order_relaxed);
     const uint32_t gate_from = ds4_gpu_gate_slots_used() + (ds4_gate_will_slot() ? 1u : 0u);
+    /* Kept for the census to join against once the buffer has completed: the
+     * slot this validate was told to start zeroing from, as it was told it. */
+    if (layer < DS4_GATE_MAX_LAYER) g_gate_validate_from[layer] = gate_from;
     uint32_t n_slots = gate_from + 8192u;
     if (n_slots > DS4_GATE_MAX_SLOTS) n_slots = DS4_GATE_MAX_SLOTS;
 
