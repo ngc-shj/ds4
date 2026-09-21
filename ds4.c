@@ -41468,8 +41468,10 @@ static void ds41_cold_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_wei
             const ds4_layer_weights *l = &w->layer[il];
             bool ok = true;
             if (q_b && l->attn_q_b) {
-                ok = ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, 0,
-                                      DS4_N_HEAD * DS4_N_HEAD_DIM);
+                /* Kernel only. ds41_matmul_rows rounds to BF16 afterwards,
+                 * which the output_a and output_b sweeps do not do, and a
+                 * table that mixes the two is not comparing shapes. */
+                ok = ds41_matmul_batch(g->q, m, l->attn_q_b, g->qr, 1, false);
                 swept += l->attn_q_b->bytes;
             } else if (out_a && l->attn_output_a) {
                 uint64_t row = 0;
