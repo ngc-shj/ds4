@@ -41387,6 +41387,66 @@ static void ds41_gate_trace(ds41_gpu_graph *g, uint32_t il, const char *where) {
 }
 #endif
 
+#ifdef __APPLE__
+/* What one decode token could read, from the shapes rather than a clock.
+ * DS4_METAL_V41_WEIGHT_LEDGER=1, printed once. The routed experts are listed
+ * per selected expert, not per tensor, because a token reads six of 384. */
+static void ds41_weight_ledger(const ds4_model *m, const ds4_weights *w) {
+    static int done;
+    if (done || !getenv("DS4_METAL_V41_WEIGHT_LEDGER")) return;
+    done = 1;
+    (void)m;
+    /* Summed over every layer, not read off one: which tensors exist varies by
+     * layer, and a token reads whatever each of its forty layers has. */
+    struct { const char *cat; uint64_t bytes; } cat[6] = {
+        {"attention", 0}, {"shared expert", 0}, {"router + HC", 0},
+        {"norms", 0}, {"dense ffn", 0}, {"other", 0}
+    };
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const struct { int c; const ds4_tensor *t; } f[] = {
+            {0, l->attn_q_a}, {0, l->attn_q_b}, {0, l->attn_kv}, {0, l->attn_kv_a_mqa},
+            {0, l->attn_k_b}, {0, l->attn_v_b}, {0, l->attn_output},
+            {0, l->attn_output_a}, {0, l->attn_output_b},
+            {0, l->attn_compressor_ape}, {0, l->attn_compressor_kv},
+            {0, l->attn_compressor_gate},
+            {0, l->indexer_attn_q_b}, {0, l->indexer_attn_k}, {0, l->indexer_proj},
+            {0, l->indexer_compressor_ape}, {0, l->indexer_compressor_kv},
+            {0, l->indexer_compressor_gate},
+            {1, l->ffn_gate_shexp}, {1, l->ffn_up_shexp}, {1, l->ffn_down_shexp},
+            {2, l->ffn_gate_inp}, {2, l->ffn_exp_probs_b},
+            {2, l->hc_attn_fn}, {2, l->hc_attn_scale}, {2, l->hc_attn_base},
+            {2, l->hc_ffn_fn}, {2, l->hc_ffn_scale}, {2, l->hc_ffn_base},
+            {3, l->attn_norm}, {3, l->attn_q_a_norm}, {3, l->attn_kv_a_norm},
+            {3, l->ffn_norm}, {3, l->attn_compressor_norm}, {3, l->indexer_k_norm},
+            {4, l->ffn_gate}, {4, l->ffn_up}, {4, l->ffn_down},
+        };
+        for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++)
+            if (f[i].t) cat[f[i].c].bytes += f[i].t->bytes;
+    }
+    if (w->output) cat[5].bytes += w->output->bytes;
+    if (w->output_norm) cat[5].bytes += w->output_norm->bytes;
+    uint64_t total = 0;
+    fprintf(stderr, "ds4: weights one token reads, from the shapes, over %u layers:\n",
+            DS4_N_LAYER);
+    for (int i = 0; i < 6; i++) {
+        if (cat[i].bytes == 0) continue;
+        fprintf(stderr, "ds4:   %-16s %8.3f GB\n", cat[i].cat, (double)cat[i].bytes / 1e9);
+        total += cat[i].bytes;
+    }
+    uint64_t grow = 0, drow = 0, routed = 0;
+    const ds4_layer_weights *l1 = &w->layer[1];
+    if (tensor_nbytes(l1->ffn_gate_exps->type, DS4_N_EMBD, &grow) &&
+        tensor_nbytes(l1->ffn_down_exps->type, DS4_N_FF_EXP, &drow))
+        routed = (2ull * grow * DS4_N_FF_EXP + drow * DS4_N_EMBD) *
+                 DS4_N_EXPERT_USED * DS4_N_LAYER;
+    fprintf(stderr, "ds4:   %-16s %8.3f GB  (%u of %u experts a layer)\n",
+            "routed experts", (double)routed / 1e9, DS4_N_EXPERT_USED, DS4_N_EXPERT);
+    fprintf(stderr, "ds4:   %-16s %8.3f GB non-routed, %8.3f GB with the experts\n",
+            "total", (double)total / 1e9, (double)(total + routed) / 1e9);
+}
+#endif
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -41400,6 +41460,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern void ds4_gpu_ledger_layer(int il);
     extern void ds4_gpu_ledger_role(const char *role);
     ds4_gpu_ledger_token_begin((unsigned long long)g->pos);
+    ds41_weight_ledger(m, w);
 #endif
     extern unsigned long long ds4_gpu_cb_finished(void);
     const unsigned long long v41_cb0 = v41_prof ? ds4_gpu_cb_finished() : 0ull;
