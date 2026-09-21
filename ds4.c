@@ -41562,6 +41562,51 @@ static void ds41_weight_ledger(const ds4_model *m, const ds4_weights *w) {
 }
 #endif
 
+/* Capacity pressure over the last window rather than over the whole process:
+ * prefill installs tens of thousands of entries, so the lifetime totals say
+ * nothing about whether decode is still evicting. */
+static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp,
+                                 double repair_ms, double wall_ms) {
+    static uint64_t last_hits, last_misses, last_evictions;
+    static double last_wall, last_repair;
+    static unsigned long long last_tokens;
+    uint64_t hits = 0, misses = 0, evictions = 0;
+    uint32_t entries = 0, budget = 0;
+    ds4_gpu_stream_expert_cache_counters(&hits, &misses, &evictions,
+                                         &entries, &budget);
+    uint64_t rep_res = 0, rep_abs = 0;
+    ds4_gpu_gate_repair_counters(&rep_res, &rep_abs);
+    static uint64_t last_res, last_abs;
+    const unsigned long long dt = tokens - last_tokens;
+    if (dt != 0) {
+        fprintf(stderr,
+                "ds4:   expert cache over the last %llu tokens: %.2f hits, %.2f misses, "
+                "%.2f evictions a token; %u of %u entries live (%.1f%%)\n",
+                dt,
+                (double)(hits - last_hits) / (double)dt,
+                (double)(misses - last_misses) / (double)dt,
+                (double)(evictions - last_evictions) / (double)dt,
+                entries, budget,
+                budget ? 100.0 * (double)entries / (double)budget : 0.0);
+        fprintf(stderr,
+                "ds4:   of the address-table holes repaired a token: %.2f already resident, "
+                "%.2f genuinely absent\n",
+                (double)(rep_res - last_res) / (double)dt,
+                (double)(rep_abs - last_abs) / (double)dt);
+        fprintf(stderr,
+                "ds4:   over the same %llu tokens: %.2f ms wall, %.2f ms repair a token\n",
+                dt,
+                (wall_ms - last_wall) / (double)dt,
+                (repair_ms - last_repair) / (double)dt);
+    }
+    last_wall = wall_ms; last_repair = repair_ms;
+    last_res = rep_res; last_abs = rep_abs;
+    last_hits = hits; last_misses = misses; last_evictions = evictions;
+    last_tokens = tokens;
+    if (route_fp) fflush(route_fp);
+    return 0;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
@@ -41635,6 +41680,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                    uint32_t missing_mask, unsigned long long *bytes_loaded);
     static unsigned long long g_gate_cbs, g_gate_aborts, g_gate_bytes, g_gate_after,
                               g_gate_live, g_gate_tokens, g_gate_touched;
+    static FILE *g_gate_route_fp;
+    static int g_gate_route_tried;
+    if (!g_gate_route_tried) {
+        const char *rp = getenv("DS4_METAL_V41_GATE_ROUTE_LOG");
+        g_gate_route_tried = 1;
+        if (rp && rp[0]) g_gate_route_fp = fopen(rp, "wb");
+    }
     static double g_gate_encode_ms, g_gate_wait_ms;
     /* One token's wall, cut into parts that do not overlap, inside one run.
      * Subtracting figures from different runs is how the last residual was
@@ -41795,6 +41847,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                                  al->ffn_down_exps->abs_offset,
                                                  grow * DS4_N_FF_EXP, drow * DS4_N_EMBD,
                                                  &touched);
+                /* The route the validator already logged, dumped so a cache
+                 * policy can be replayed offline against the real id stream
+                 * instead of a synthetic one. */
+                if (g_gate_route_fp) {
+                    int32_t rec[8] = { (int32_t)il, (int32_t)rn, 0, 0, 0, 0, 0, 0 };
+                    for (uint32_t k = 0; k < rn && k < 6u; k++) rec[2 + k] = rids[k];
+                    (void)fwrite(rec, sizeof(rec[0]), 8, g_gate_route_fp);
+                }
             }
             g_gate_touched += touched;
             ds4_gpu_gate_clear_route();
@@ -41836,6 +41896,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                      g_gt_repair_ms - g_gt_account_ms - g_gt_tail_ms) / (double)g_gate_tokens,
                     g_gt_gpu_ms / (double)g_gate_tokens,
                     (g_gate_wait_ms - g_gt_gpu_ms) / (double)g_gate_tokens),
+            ds4_gate_report_cache(g_gate_tokens, g_gate_route_fp,
+                                  g_gt_repair_ms, g_gt_wall_ms),
             ds4_gpu_stage_report(g_gate_tokens),
             ds4_gpu_gate_print_ungatable();
     }
@@ -69361,6 +69423,50 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
     return true;
 }
 
+/* The prefill headroom is dead space during decode.
+ *
+ * Prefill reserves it because a layer-major sweep holds far more than the six
+ * routed experts a decode token asks for. Once the prompt is in, decode's
+ * working set is bounded, and in steady state every cache miss is an eviction
+ * this machine had room to avoid: at 7,930 entries a 1,162-token generation
+ * misses 5.36 times a token, at 8,698 it misses 4.08, and the floor - ids the
+ * run had never seen - is 3.31. So lend it to the cache for the duration of
+ * decode and take it back before the next prompt, the way
+ * ds41_encoder_acquire borrows in the other direction.
+ *
+ * DS4_METAL_V41_DECODE_LEND_HEADROOM=0 opts out.
+ */
+static uint32_t g_ds41_admitted_budget;
+static uint32_t g_ds41_decode_budget;
+static int g_ds41_headroom_lent;
+
+static void ds41_note_prefill_headroom(uint32_t budget,
+                                       uint64_t headroom_bytes,
+                                       uint64_t expert_bytes) {
+    const char *off = getenv("DS4_METAL_V41_DECODE_LEND_HEADROOM");
+    g_ds41_admitted_budget = budget;
+    g_ds41_decode_budget = budget;
+    if (!budget || !expert_bytes || (off && off[0] == '0')) return;
+    const uint64_t extra = headroom_bytes / expert_bytes;
+    if (extra == 0 || extra > UINT32_MAX - budget) return;
+    g_ds41_decode_budget = budget + (uint32_t)extra;
+}
+
+static void ds41_lend_headroom_to_decode(void) {
+    if (g_ds41_headroom_lent || g_ds41_decode_budget <= g_ds41_admitted_budget) return;
+    ds4_gpu_move_streaming_expert_cache_budget(g_ds41_decode_budget);
+    g_ds41_headroom_lent = 1;
+    fprintf(stderr, "ds4: expert cache lent the prefill headroom for decode: "
+                    "%u -> %u experts\n",
+            g_ds41_admitted_budget, g_ds41_decode_budget);
+}
+
+static void ds41_reclaim_headroom_for_prefill(void) {
+    if (!g_ds41_headroom_lent) return;
+    ds4_gpu_move_streaming_expert_cache_budget(g_ds41_admitted_budget);
+    g_ds41_headroom_lent = 0;
+}
+
 static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     g_glm_streaming_full_resident_start = 0;
     g_glm_streaming_full_resident_layers = 0;
@@ -69622,6 +69728,9 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
                     budget,
                     (double)budget_expert_bytes / 1048576.0);
         }
+        ds41_note_prefill_headroom(budget,
+                                   prefill_headroom_bytes,
+                                   budget_expert_bytes);
     } else if (full_layers != 0) {
         fprintf(stderr,
                 "ds4: GLM SSD streaming full resident layers: %u "
@@ -76376,6 +76485,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
+        ds41_reclaim_headroom_for_prefill();
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
         for (int i = s->checkpoint.len; i < prompt->len;) {
@@ -76450,6 +76560,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
+        ds41_lend_headroom_to_decode();
         return 0;
     }
 #endif

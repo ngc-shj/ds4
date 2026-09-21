@@ -267,6 +267,9 @@ static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
 static inline int ds4_gpu_device_is_m5_apple_silicon(void) { return 0; }
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+/* Same, but keeps the existing entries: raising only relaxes pruning and
+ * lowering lets the next prune walk down. */
+void ds4_gpu_move_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 int ds4_gpu_qwen4_conv_stream_rows_tensor(
         ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,
@@ -347,6 +350,16 @@ int ds4_gpu_qwen4_batch_mm_q8_tensor(
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+/* Live cache counters, so a caller can watch capacity pressure over a window
+ * rather than only in the end-of-run memory report. */
+/* Of the address-table holes the validator aborts on, how many were already
+ * resident in the cache (a missing pointer) versus genuinely absent (a load). */
+void ds4_gpu_gate_repair_counters(uint64_t *resident, uint64_t *absent);
+void ds4_gpu_stream_expert_cache_counters(uint64_t *hits,
+                                          uint64_t *misses,
+                                          uint64_t *evictions,
+                                          uint32_t *entries,
+                                          uint32_t *budget);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

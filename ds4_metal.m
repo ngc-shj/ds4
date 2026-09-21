@@ -4828,6 +4828,20 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     g_glm_streaming_prefill_full_layer_runtime = enabled ? 1 : 0;
 }
 
+/* Move the budget without discarding what the cache already holds.
+ *
+ * The setter above clears, which is right when the size class or the model
+ * changes. Lending the prefill headroom to decode is neither: raising it only
+ * stops prune_global evicting, and lowering it makes the next prune walk down
+ * to the smaller number. Clearing here would cost a whole refill to save a
+ * handful of misses a token. */
+void ds4_gpu_move_streaming_expert_cache_budget(uint32_t experts) {
+    if (experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
+        experts = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
+    }
+    g_stream_expert_cache_budget_override = experts;
+}
+
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     if (experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
         experts = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
@@ -13563,6 +13577,18 @@ uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
 }
 
+void ds4_gpu_stream_expert_cache_counters(uint64_t *hits,
+                                          uint64_t *misses,
+                                          uint64_t *evictions,
+                                          uint32_t *entries,
+                                          uint32_t *budget) {
+    if (hits) *hits = g_stream_expert_cache_hits;
+    if (misses) *misses = g_stream_expert_cache_misses;
+    if (evictions) *evictions = g_stream_expert_cache_evictions;
+    if (entries) *entries = g_stream_expert_cache_entry_count;
+    if (budget) *budget = ds4_gpu_stream_expert_cache_configured_count();
+}
+
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
@@ -15567,6 +15593,20 @@ int ds4_gpu_gate_account_layer(const void *model_map, uint64_t model_size, uint3
  * on is visible by the only ordering rule that does not need an event. Uses
  * the loader the readback path already uses, which is what installs the
  * address the next pass will find. */
+static int ds4_gpu_stream_expert_cache_entry_matches(
+        const ds4_gpu_stream_expert_cache_entry *e,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_abs_offset, uint64_t up_abs_offset, uint64_t down_abs_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+
+static uint64_t g_gate_repair_resident;
+static uint64_t g_gate_repair_absent;
+
+void ds4_gpu_gate_repair_counters(uint64_t *resident, uint64_t *absent) {
+    if (resident) *resident = g_gate_repair_resident;
+    if (absent) *absent = g_gate_repair_absent;
+}
+
 int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
                         const int32_t *ids, uint32_t n_sel, uint32_t n_total,
                         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -15584,7 +15624,21 @@ int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t lay
         gate_abs[i] = gate_offset + (uint64_t)id * gate_expert_bytes;
         up_abs[i] = up_offset + (uint64_t)id * gate_expert_bytes;
         down_abs[i] = down_offset + (uint64_t)id * down_expert_bytes;
-        if (missing_mask & (1u << i)) bytes += 2ull * gate_expert_bytes + down_expert_bytes;
+        if (missing_mask & (1u << i)) {
+            bytes += 2ull * gate_expert_bytes + down_expert_bytes;
+            /* The validator reports a hole in the address table. That is not
+             * the same as a hole in the cache: an entry can be resident with
+             * no slot written, and then the repair is a pointer store rather
+             * than a load. Separate the two before pricing either. */
+            if (ds4_gpu_stream_expert_cache_entry_matches(
+                        &g_stream_expert_cache[layer][(uint32_t)id],
+                        model_map, model_size, gate_abs[i], up_abs[i], down_abs[i],
+                        gate_expert_bytes, down_expert_bytes)) {
+                g_gate_repair_resident++;
+            } else {
+                g_gate_repair_absent++;
+            }
+        }
     }
     if (!ds4_gpu_stream_expert_cache_load_selected_missing(
             model_map, model_size, layer, ids, n_total, n_sel,
