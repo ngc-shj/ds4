@@ -40820,9 +40820,32 @@ static DS4_MAYBE_UNUSED bool ds41_moe_route_row(ds41_gpu_graph *g, const ds4_mod
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
-    return ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) &&
-        ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) &&
-        ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+    /* The shared expert's gate and up read different weights from the same
+     * input, and on this path they were two dispatches. The routed experts do
+     * the equivalent as one, and this file's own measurement says the routed
+     * pair moves its bytes at 340 GB/s where the rest of the segment manages
+     * 266: one dispatch with both lanes in flight is the difference worth
+     * trying. Same arithmetic, same order of accumulation, so the answer does
+     * not change. */
+    static int pair = -1;
+    if (pair < 0) pair = getenv("DS4_METAL_V41_SHARED_PAIR") != NULL;
+    const bool can_pair = pair &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_gate_shexp->dim[0] == l->ffn_up_shexp->dim[0];
+    if (can_pair) {
+        if (!ds4_gpu_matmul_q8_0_pair_tensor(g->shared_gate, g->shared_up,
+                m->map, m->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                l->ffn_gate_shexp->dim[0], l->ffn_gate_shexp->dim[1],
+                l->ffn_up_shexp->dim[1], g->norm, 1) ||
+            !ds41_bf16(g->shared_gate, (uint32_t)l->ffn_gate_shexp->dim[1]) ||
+            !ds41_bf16(g->shared_up, (uint32_t)l->ffn_up_shexp->dim[1])) return false;
+    } else if (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
+               !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true)) {
+        return false;
+    }
+    return ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                               DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds41_bf16(g->shared_mid, DS4_N_FF_EXP) &&
         ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
