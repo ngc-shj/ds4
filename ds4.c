@@ -41490,6 +41490,125 @@ static void ds41_gate_trace(ds41_gpu_graph *g, uint32_t il, const char *where) {
 #endif
 
 #ifdef __APPLE__
+/* Can a layer's router be run before its layer?
+ *
+ * The route log holds the router's outputs and nothing else, so it can price
+ * every predictor that reads past outputs and no others - and replaying it
+ * empties that family. The previous token's selection for the same layer
+ * overlaps 2.02 of 6 and prefetches nothing, because an expert used last token
+ * is already at the MRU end of the cache. An earlier layer of the *same* token
+ * overlaps 0.08 of 6 against a chance of 0.09, which is no signal at all. A
+ * static per-layer hot set needs 3,840 pinned entries of a 7,930-entry cache
+ * to reach 69% recall, far below what LRU already gets.
+ *
+ * What is left is the one thing the log cannot see: layer T's router applied
+ * to the hidden state an earlier layer of the same token has already produced.
+ *
+ * The surrogate is the router itself, so there is nothing to train and nothing
+ * to re-derive offline - ffn_gate_inp[T] against the norm layer S just wrote,
+ * through the same select kernel the decode path uses, so a predicted
+ * selection is produced by the rule that decides the real one. Offset 0 is in
+ * the list on purpose: predicting a layer from its own norm must reproduce
+ * that layer's selection exactly, and that is the instrument's self-check.
+ *
+ * Predictions go to a GPU buffer and are read once a token, so the probe does
+ * not serialise the graph it is measuring.
+ *
+ * DS4_METAL_V41_ROUTE_PREDICT=<path>, with the abort gate off: these
+ * dispatches are not gated, and the gate fails a token it could not switch
+ * off. */
+#define DS41_RP_OFFSETS 11u
+static const uint32_t g_rp_offset[DS41_RP_OFFSETS] =
+    { 0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32 };
+static FILE *g_rp_fp;
+static ds4_gpu_tensor *g_rp_base, *g_rp_logits, *g_rp_probs, *g_rp_weights;
+static ds4_gpu_tensor *g_rp_slot[DS4_MAX_LAYER][DS41_RP_OFFSETS + 1u];
+static unsigned long long g_rp_token;
+
+static bool ds41_route_predict_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *p = getenv("DS4_METAL_V41_ROUTE_PREDICT");
+        on = p && p[0] && (g_rp_fp = fopen(p, "wb")) != NULL;
+        if (on) fprintf(stderr, "ds4: route prediction trace on, %u offsets\n",
+                        DS41_RP_OFFSETS);
+    }
+    return on > 0;
+}
+
+/* One slot a (source layer, offset) pair, plus one holding the source layer's
+ * own selection, so a token's whole table comes back in a single read. */
+static bool ds41_route_predict_init(void) {
+    static int tried;
+    if (g_rp_base) return true;
+    if (tried) return false;
+    tried = 1;
+    const uint32_t slots = DS4_N_LAYER * (DS41_RP_OFFSETS + 1u);
+    g_rp_base = ds4_gpu_tensor_alloc((uint64_t)slots * DS4_N_EXPERT_USED * sizeof(int32_t));
+    g_rp_logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g_rp_probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+    g_rp_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT_USED * sizeof(float));
+    if (!g_rp_base || !g_rp_logits || !g_rp_probs || !g_rp_weights) return false;
+    for (uint32_t s = 0; s < DS4_N_LAYER && s < DS4_MAX_LAYER; s++)
+        for (uint32_t j = 0; j <= DS41_RP_OFFSETS; j++) {
+            const uint64_t off = ((uint64_t)s * (DS41_RP_OFFSETS + 1u) + j) *
+                                 DS4_N_EXPERT_USED * sizeof(int32_t);
+            g_rp_slot[s][j] = ds4_gpu_tensor_view(g_rp_base, off,
+                                    (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+            if (!g_rp_slot[s][j]) return false;
+        }
+    return true;
+}
+
+static void ds41_route_predict_layer(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_weights *w, uint32_t il, uint32_t token) {
+    if (!ds41_route_predict_on() || il >= DS4_MAX_LAYER || !ds41_route_predict_init()) return;
+    if (!ds4_gpu_tensor_copy(g_rp_slot[il][DS41_RP_OFFSETS], 0, g->selected, 0,
+                             (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t))) return;
+    for (uint32_t j = 0; j < DS41_RP_OFFSETS; j++) {
+        const uint32_t t = il + g_rp_offset[j];
+        if (t >= DS4_N_LAYER) break;
+        const ds4_layer_weights *tl = &w->layer[t];
+        const ds4_tensor *bias = ds41_image_at(g, g->pos) ? tl->ffn_exp_probs_vl
+                                                          : tl->ffn_exp_probs_b;
+        if (!tl->ffn_gate_inp || !bias) continue;
+        if (!ds41_matmul(g_rp_logits, m, tl->ffn_gate_inp, g->norm, false) ||
+            !ds4_gpu_router_select_tensor(g_rp_slot[il][j], g_rp_weights, g_rp_probs,
+                    m->map, m->size, bias->abs_offset, 0, 0, token,
+                    DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE,
+                    0, 0, true, false, g_rp_logits)) return;
+    }
+}
+
+/* Ten int32 a record: {tag, token, source layer, target layer, six ids}. Tag 0
+ * is what the target layer's router actually chose, tag 1 what an earlier
+ * layer's hidden state said it would choose. The buffer is reset to -1 after
+ * every token, so a slot that reads -1 is one nothing wrote rather than one
+ * that predicted expert zero. */
+static void ds41_route_predict_flush(void) {
+    if (!ds41_route_predict_on() || !g_rp_base) return;
+    static int32_t ids[DS4_MAX_LAYER * (DS41_RP_OFFSETS + 1u) * 8u];
+    const uint32_t slots = DS4_N_LAYER * (DS41_RP_OFFSETS + 1u);
+    const uint64_t bytes = (uint64_t)slots * DS4_N_EXPERT_USED * sizeof(int32_t);
+    if (bytes > sizeof(ids) || !ds4_gpu_tensor_read(g_rp_base, 0, ids, bytes)) return;
+    const int32_t tok = (int32_t)g_rp_token++;
+    for (uint32_t s = 0; s < DS4_N_LAYER; s++)
+        for (uint32_t j = 0; j <= DS41_RP_OFFSETS; j++) {
+            const uint32_t t = j == DS41_RP_OFFSETS ? s : s + g_rp_offset[j];
+            const int32_t *src = ids + ((size_t)s * (DS41_RP_OFFSETS + 1u) + j) *
+                                       DS4_N_EXPERT_USED;
+            if (t >= DS4_N_LAYER || src[0] < 0) continue;
+            int32_t rec[10] = { j == DS41_RP_OFFSETS ? 0 : 1, tok,
+                                (int32_t)s, (int32_t)t, 0, 0, 0, 0, 0, 0 };
+            for (uint32_t k = 0; k < DS4_N_EXPERT_USED && k < 6u; k++) rec[4 + k] = src[k];
+            (void)fwrite(rec, sizeof(rec[0]), 10, g_rp_fp);
+        }
+    memset(ids, 0xff, (size_t)bytes);
+    (void)ds4_gpu_tensor_write(g_rp_base, 0, ids, bytes);
+}
+#endif
+
+#ifdef __APPLE__
 /* What one projection shape actually reaches, on its own.
  *
  * Duplicating a pass in place would re-read the same 35-45 MB immediately and
@@ -42200,6 +42319,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         }
 #ifdef __APPLE__
         if (ok) ds41_gate_trace(g, il, "out");
+        if (ok) ds41_route_predict_layer(g, m, w, il, (uint32_t)token);
 #endif
         if (v41_prof && il == 20u) v41_cb_layer = ds4_gpu_cb_finished() - v41_cb_before;
         /* TP gates already submit ordered, bounded command buffers. Drain
@@ -42220,6 +42340,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     ds4_gpu_ledger_role("token-tail");
 #endif
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+#ifdef __APPLE__
+    if (ok) ds41_route_predict_flush();
+#endif
     const double v41_t2 = v41_prof ? now_sec() : 0.0;
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
