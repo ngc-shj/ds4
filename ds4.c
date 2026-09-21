@@ -41433,6 +41433,159 @@ static void ds41_gate_trace(ds41_gpu_graph *g, uint32_t il, const char *where) {
  *
  * DS4_METAL_V41_COLD_SWEEP=q_b|output_a|output_b, once, before the first token.
  */
+/* The ids the validator logged for each layer of the last completed token, so
+ * the routed sweep reads what the model actually routed to rather than a
+ * synthetic set. */
+#define DS41_SWEEP_MAX_USED 8u
+static int32_t g_sweep_ids[DS4_MAX_LAYER][DS41_SWEEP_MAX_USED];
+static uint64_t g_sweep_have;
+
+/* Is there 1 ms in the routed kernel?
+ *
+ * The 7.02 ms the routed stage is credited with came from encoding the same
+ * pass twice in production, which re-reads six experts a layer immediately -
+ * a hot replay. This is the same protocol as the dense sweep: forty different
+ * layers' weights in one command buffer, so nothing the lap before left in
+ * cache is still there, timed by the GPU span alone.
+ *
+ * Fixed conditions: the production address-based masked kernels; six experts
+ * over forty layers, 2.389 GB a lap; gate/up and down timed separately; every
+ * expert made resident and touched once before the clock starts, so view
+ * creation, residency and GPU first touch are already paid; no validate, no
+ * repair and no accounting inside the timed region; laps for linearity; the
+ * starting layer rotated each repetition.
+ *
+ * DS4_METAL_V41_ROUTED_SWEEP=gate_up|down|both, with _LAPS. */
+static void ds41_routed_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
+    static int done;
+    const char *which_s = getenv("DS4_METAL_V41_ROUTED_SWEEP");
+    if (done || !which_s || !which_s[0]) return;
+    /* Wait for a full token's routes: the sweep needs all forty layers. */
+    if (DS4_N_LAYER > 63u) return;
+    if (g_sweep_have != (1ull << DS4_N_LAYER) - 1ull) return;
+    done = 1;
+    extern double ds4_gpu_take_span_ms(void);
+    extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
+                                   const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                                   uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                                   uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                                   uint32_t missing_mask, unsigned long long *bytes_loaded);
+    const uint32_t which = strcmp(which_s, "gate_up") == 0 ? 1u :
+                           strcmp(which_s, "down") == 0 ? 2u :
+                           strcmp(which_s, "both") == 0 ? 3u : 0u;
+    if (!which) { fprintf(stderr, "ds4: routed sweep: gate_up, down or both\n"); return; }
+
+    /* One id set per repetition, and every layer made resident for all of
+     * them before the clock starts.
+     *
+     * The ids cannot vary by layer inside one command buffer: the selected
+     * tensor is a shared buffer written by the host, so every dispatch already
+     * encoded reads whatever was written last. Sweeping forty layers with
+     * forty different writes gave every layer the last layer's ids, which its
+     * own address table mostly answers with zero, and the masked kernel then
+     * reads nothing - 2.389 GB apparently swept in 1.24 ms, which is four
+     * times this machine's memory bandwidth and was the tell.
+     *
+     * So each repetition writes one set once and sweeps every layer with it.
+     * The sets are real routes the validator logged, taken from different
+     * layers, so the sweep still rotates which six experts it asks for as well
+     * as where it starts. */
+    const uint32_t reps = 9;
+    unsigned long long loaded = 0;
+    for (uint32_t r = 0; r < reps; r++) {
+        const int32_t *ids = g_sweep_ids[(r * 7u) % DS4_N_LAYER];
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *l = &w->layer[il];
+            uint64_t grow = 0, drow = 0;
+            if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &grow) ||
+                !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &drow) ||
+                !ds4_gpu_gate_repair(m->map, m->size, il, ids, DS4_N_EXPERT_USED,
+                                     DS4_N_EXPERT, l->ffn_gate_exps->abs_offset,
+                                     l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                                     grow * DS4_N_FF_EXP, drow * DS4_N_EMBD,
+                                     (1u << DS4_N_EXPERT_USED) - 1u, &loaded)) {
+                fprintf(stderr, "ds4: routed sweep: layer %u would not hold set %u\n", il, r);
+                return;
+            }
+        }
+    }
+    fprintf(stderr, "ds4: routed sweep: %u id sets resident over %u layers, %.2f GiB loaded\n",
+            reps, DS4_N_LAYER, (double)loaded / 1073741824.0);
+
+    static int laps = -1;
+    if (laps < 0) {
+        const char *e = getenv("DS4_METAL_V41_ROUTED_SWEEP_LAPS");
+        laps = e && e[0] ? atoi(e) : 1;
+        if (laps < 1) laps = 1;
+    }
+    double ms[16], wms[16];
+    uint64_t bytes = 0;
+    /* One untimed pass first, so the first GPU touch of every one of these
+     * buffers - which the code elsewhere measures at about 1.7 ms a buffer and
+     * which does not depend on how much is read - is behind us. */
+    for (uint32_t r = 0; r <= reps; r++) {
+        (void)ds4_gpu_take_span_ms();
+        const double wall0 = now_sec();
+        if (!ds4_gpu_begin_commands()) { fprintf(stderr, "ds4: routed sweep: no batch\n"); return; }
+        uint64_t swept = 0;
+        /* Written once, before anything is encoded, because every dispatch in
+         * this buffer will read it. */
+        if (!ds4_gpu_tensor_write(g->selected, 0,
+                                  g_sweep_ids[(r ? r - 1u : 0u) * 7u % DS4_N_LAYER],
+                                  sizeof(int32_t) * DS4_N_EXPERT_USED)) {
+            fprintf(stderr, "ds4: routed sweep: selected write failed\n");
+            (void)ds4_gpu_end_commands();
+            return;
+        }
+        for (uint32_t lap = 0; lap < (uint32_t)laps; lap++)
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+            const uint32_t il = (i + r) % DS4_N_LAYER;      /* rotate the start */
+            const ds4_layer_weights *l = &w->layer[il];
+            uint64_t grow = 0, drow = 0;
+            if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &grow) ||
+                !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &drow) ||
+                !ds4_gpu_routed_sweep_encode(g->routed, g->gate, g->up, g->mid,
+                        l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                        grow * DS4_N_FF_EXP, grow, drow * DS4_N_EMBD, drow,
+                        DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected,
+                        g->route_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                        DS4_SWIGLU_CLAMP_EXP, g->norm, il, which)) {
+                fprintf(stderr, "ds4: routed sweep failed at layer %u\n", il);
+                (void)ds4_gpu_end_commands();
+                return;
+            }
+            /* Only what this arm's kernels actually read. */
+            if (which & 1u) swept += 2ull * grow * DS4_N_FF_EXP * DS4_N_EXPERT_USED;
+            if (which & 2u) swept += drow * DS4_N_EMBD * DS4_N_EXPERT_USED;
+        }
+        if (!ds4_gpu_end_commands()) { fprintf(stderr, "ds4: routed sweep: drain failed\n"); return; }
+        if (!ds4_gpu_synchronize()) { fprintf(stderr, "ds4: routed sweep: sync failed\n"); return; }
+        const double span = ds4_gpu_take_span_ms();
+        const double wall = (now_sec() - wall0) * 1000.0;
+        if (r == 0) continue;                       /* the warm-up pass */
+        /* The GPU span only accrues where something waited on a command
+         * buffer. If it is far below the host's own measurement of the same
+         * region, it is not this buffer's span and the number is not a
+         * bandwidth. */
+        ms[r - 1] = span;
+        wms[r - 1] = wall;
+        bytes = swept;
+    }
+    for (uint32_t a = 0; a + 1u < reps; a++)
+        for (uint32_t b = a + 1u; b < reps; b++) {
+            if (ms[b] < ms[a]) { const double t = ms[a]; ms[a] = ms[b]; ms[b] = t; }
+            if (wms[b] < wms[a]) { const double t = wms[a]; wms[a] = wms[b]; wms[b] = t; }
+        }
+    const double med = ms[reps / 2], wmed = wms[reps / 2];
+    fprintf(stderr,
+            "ds4: routed sweep %s: %.3f GB over %u layers x %d laps, GPU span %.2f ms "
+            "median of %u (%.2f..%.2f) = %.0f GB/s; host wall for the same region "
+            "%.2f ms = %.0f GB/s\n",
+            which_s, (double)bytes / 1e9, DS4_N_LAYER, laps, med, reps,
+            ms[0], ms[reps - 1], med > 0.0 ? (double)bytes / (med / 1e3) / 1e9 : 0.0,
+            wmed, wmed > 0.0 ? (double)bytes / (wmed / 1e3) / 1e9 : 0.0);
+}
+
 static void ds41_cold_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
     static int done;
     const char *which = getenv("DS4_METAL_V41_COLD_SWEEP");
@@ -41447,10 +41600,11 @@ static void ds41_cold_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_wei
         return;
     }
     const uint32_t reps = 9;
-    double ms[16];
+    double ms[16], wms[16];
     uint64_t bytes = 0;
     for (uint32_t r = 0; r < reps; r++) {
         (void)ds4_gpu_take_span_ms();
+        const double wall0 = now_sec();
         if (!ds4_gpu_begin_commands()) { fprintf(stderr, "ds4: cold sweep: no batch\n"); return; }
         uint64_t swept = 0;
         /* More laps of the same forty weights inside one buffer: if the time
@@ -41487,18 +41641,23 @@ static void ds41_cold_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_wei
             if (!ok) { fprintf(stderr, "ds4: cold sweep failed at layer %u\n", il); return; }
         }
         if (!ds4_gpu_end_commands()) { fprintf(stderr, "ds4: cold sweep: drain failed\n"); return; }
+        if (!ds4_gpu_synchronize()) { fprintf(stderr, "ds4: cold sweep: sync failed\n"); return; }
         ms[r] = ds4_gpu_take_span_ms();
+        wms[r] = (now_sec() - wall0) * 1000.0;
         bytes = swept;
     }
     for (uint32_t a = 0; a + 1u < reps; a++)
-        for (uint32_t b = a + 1u; b < reps; b++)
+        for (uint32_t b = a + 1u; b < reps; b++) {
             if (ms[b] < ms[a]) { const double t = ms[a]; ms[a] = ms[b]; ms[b] = t; }
-    const double med = ms[reps / 2];
+            if (wms[b] < wms[a]) { const double t = wms[a]; wms[a] = wms[b]; wms[b] = t; }
+        }
+    const double med = ms[reps / 2], wmed = wms[reps / 2];
     fprintf(stderr,
-            "ds4: cold sweep %s: %.3f GB over %u layers, %.2f ms median of %u "
-            "(%.2f..%.2f), %.0f GB/s\n",
+            "ds4: cold sweep %s: %.3f GB over %u layers, GPU span %.2f ms median of %u "
+            "(%.2f..%.2f) = %.0f GB/s; host wall for the same region %.2f ms = %.0f GB/s\n",
             which, (double)bytes / 1e9, DS4_N_LAYER, med, reps, ms[0], ms[reps - 1],
-            med > 0.0 ? (double)bytes / (med / 1e3) / 1e9 : 0.0);
+            med > 0.0 ? (double)bytes / (med / 1e3) / 1e9 : 0.0,
+            wmed, wmed > 0.0 ? (double)bytes / (wmed / 1e3) / 1e9 : 0.0);
 }
 #endif
 
@@ -41621,6 +41780,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     ds4_gpu_ledger_token_begin((unsigned long long)g->pos);
     ds41_weight_ledger(m, w);
     ds41_cold_sweep(g, m, w);
+    ds41_routed_sweep(g, m, w);
 #endif
     extern unsigned long long ds4_gpu_cb_finished(void);
     const unsigned long long v41_cb0 = v41_prof ? ds4_gpu_cb_finished() : 0ull;
@@ -41849,6 +42009,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                                  al->ffn_down_exps->abs_offset,
                                                  grow * DS4_N_FF_EXP, drow * DS4_N_EMBD,
                                                  &touched);
+                if (il < DS4_MAX_LAYER && rn >= DS4_N_EXPERT_USED &&
+                    DS4_N_EXPERT_USED <= DS41_SWEEP_MAX_USED) {
+                    for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++)
+                        g_sweep_ids[il][k] = rids[k];
+                    g_sweep_have |= 1ull << il;
+                }
                 /* The route the validator already logged, dumped so a cache
                  * policy can be replayed offline against the real id stream
                  * instead of a synthetic one. */

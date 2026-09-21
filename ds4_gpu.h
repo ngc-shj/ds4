@@ -359,6 +359,19 @@ void ds4_gpu_gate_repair_counters(uint64_t *resident, uint64_t *absent);
  * edit is what the transaction bracket exists to avoid. */
 void ds4_gpu_expert_residency_counts(uint64_t *adds, uint64_t *removes,
                                      uint64_t *commits);
+
+/* One layer's routed stage encoded into the open batch and nothing else: the
+ * production masked kernels over the live address table, no validate, repair,
+ * accounting or readback. which is 1 for gate/up, 2 for down, 3 for both. */
+int ds4_gpu_routed_sweep_encode(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which);
 void ds4_gpu_stream_expert_cache_counters(uint64_t *hits,
                                           uint64_t *misses,
                                           uint64_t *evictions,

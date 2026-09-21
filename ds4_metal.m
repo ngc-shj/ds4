@@ -16264,11 +16264,14 @@ static void ds4_gpu_expert_residency_commit_now(void) {
     }
 }
 
-/* DS4_METAL_V41_REPAIR_BATCH=0 restores a commit per allocation and a global
- * prune per layer, so the pair can be measured against itself in one binary. */
+/* Off by default. ABBA over 700 tokens an arm cut residency commits from 11.29
+ * to 6.18 a token and moved nothing else: miss, abort and command-buffer counts
+ * identical to two decimals in all four arms, wall 51.30 against 52.31 ms
+ * inside an 8 ms spread. No performance benefit was detected, so the execution
+ * path stays as it was and DS4_METAL_V41_REPAIR_BATCH=1 turns the pair on. */
 static int ds4_gpu_repair_batch_enabled(void) {
     const char *e = getenv("DS4_METAL_V41_REPAIR_BATCH");
-    return !e || e[0] != '0';
+    return e && e[0] != '0';
 }
 
 static void ds4_gpu_expert_residency_begin(void) {
@@ -41818,7 +41821,7 @@ static int ds4_gpu_routed_moe_one_gated(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
-        uint32_t layer_index) {
+        uint32_t layer_index, uint32_t which) {
 #define DS4_GATED_DECLINE(why) do { \
         static int said; \
         if (!said) { said = 1; \
@@ -41876,6 +41879,7 @@ static int ds4_gpu_routed_moe_one_gated(
         shadow_down = e && e[0] ? atoi(e) : 0;
     }
     ds4_gpu_stage(DS4_STAGE_ROUTED_GATE_UP);
+    if (which & 1u)
     for (int sh = 0; sh < shadow_gate; sh++)
         if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
                 g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
@@ -41885,7 +41889,7 @@ static int ds4_gpu_routed_moe_one_gated(
                 selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
                 ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights),
                 ds4_gpu_routed_mv_smem(gate_type), 2, false)) return 0;
-    if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
+    if ((which & 1u) && !ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
             g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
             &gate_args, &act_args, &all_lanes, NULL, table_gate, table_up,
             xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
@@ -41894,6 +41898,7 @@ static int ds4_gpu_routed_moe_one_gated(
             ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights),
             ds4_gpu_routed_mv_smem(gate_type), 2, false)) return 0;
     ds4_gpu_stage(DS4_STAGE_ROUTED_DOWN);
+    if (which & 2u)
     for (int sh = 0; sh < shadow_down; sh++)
         if (!ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
                 g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
@@ -41901,13 +41906,32 @@ static int ds4_gpu_routed_moe_one_gated(
                 midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out),
                 selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected),
                 ds4_gpu_routed_mv_smem(down_type), 2)) return 0;
-    if (!ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
+    if ((which & 2u) && !ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
             g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
             &down_args, &all_lanes, NULL, table_down,
             midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out),
             selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected),
             ds4_gpu_routed_mv_smem(down_type), 2)) return 0;
     return 1;
+}
+
+/* The routed stage for one layer, encoded into the open batch and nothing
+ * else: the same masked kernels against the same live address table the
+ * production gated path uses, with no validate, no repair, no accounting and
+ * no readback. which is 1 for gate/up, 2 for down, 3 for both. */
+int ds4_gpu_routed_sweep_encode(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which) {
+    return ds4_gpu_routed_moe_one_gated(out, gate, up, mid, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, clamp, x, NULL, layer_index, which);
 }
 
 static int ds4_gpu_routed_moe_one_resident(
@@ -42192,7 +42216,7 @@ int ds4_gpu_routed_moe_one_tensor(
             gate_type, down_type, gate_expert_bytes, gate_row_bytes,
             down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim,
             out_dim, selected, weights, n_total_expert, n_expert, clamp,
-            x, add_in, layer_index)) return 1;
+            x, add_in, layer_index, 3u)) return 1;
     /* One layer at a time, and only when asked: the resident path is compared
      * against this one before any of the other thirty-nine follow it. */
     {
