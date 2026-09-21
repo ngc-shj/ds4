@@ -35390,6 +35390,33 @@ static int ds4_gpu_encode_sum_rows_f32(
     return 1;
 }
 
+/* Both default on; =0 restores the generic multi-dispatch path for an A/B. */
+static int ds4_router_fuse_transform_on(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_ROUTER_FUSE_TRANSFORM");
+        checked = 1;
+        on = !e || !e[0] || atoi(e) != 0;
+    }
+    return on;
+}
+
+/* Off by default, and it has to be: kernel_dsv4_router_weights_one sums its six
+ * entries in index order where the generic path's sum_rows reduces them in a
+ * tree, and six floats are enough for that to change the last bits. Measured,
+ * not assumed - with it on, the first correctness prompt hashes e7f14292
+ * against the baseline's d68de436. Making it usable means matching the
+ * reduction order, not flipping this flag. */
+static int ds4_router_fuse_weights_on(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_ROUTER_FUSE_WEIGHTS");
+        checked = 1;
+        on = e && e[0] && atoi(e) != 0;
+    }
+    return on;
+}
+
 static int ds4_gpu_encode_router_select(
         id<MTLCommandBuffer>  cb,
         ds4_gpu_tensor     *selected,
@@ -35431,6 +35458,34 @@ static int ds4_gpu_encode_router_select(
         n_expert == 256u &&
         n_expert_used == 6u &&
         fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f;
+    /* Two of the router's fused kernels do not care how many experts there are.
+     *
+     * kernel_dsv4_softplus_sqrt_f32_4 walks args.ne0 float4 groups and bounds
+     * checks, and computes select(log(1+exp(x)), x, x>20) then sqrt - the same
+     * expression, in the same order, as the two generic kernels it replaces.
+     * It needs the row to be a multiple of four.
+     *
+     * kernel_dsv4_router_weights_one reads six entries of probs through the six
+     * selected ids. What it hard-codes is n_expert_used == 6, the 1.5 scale and
+     * the 6.103515625e-5 clamp - never the expert count.
+     *
+     * DeepSeek V4.1 Flash routes 6 of 384, so the count test alone was keeping
+     * both of them off. The bitonic top-k kernels are a different matter: they
+     * are written for exactly 256 lanes and are left where they are.
+     *
+     * The transform is byte-identical over six prompts to 2,048 generated
+     * tokens and is on. The weights kernel is not - it sums its six entries in
+     * order where the generic path reduces them in a tree - so it is off, and
+     * DS4_METAL_V41_ROUTER_FUSE_WEIGHTS=1 only exists to re-measure that.
+     * DS4_METAL_V41_ROUTER_FUSE_TRANSFORM=0 restores the two-kernel form. */
+    const bool router_count_agnostic_ok =
+        n_expert_used == 6u &&
+        fabsf(expert_weight_scale - 1.5f) <= 1.0e-6f;
+    const bool fuse_transform = (flash_router_fast_path ||
+                                 (router_count_agnostic_ok && (n_expert % 4u) == 0u)) &&
+                                ds4_router_fuse_transform_on();
+    const bool fuse_weights = (flash_router_fast_path || router_count_agnostic_ok) &&
+                              ds4_router_fuse_weights_on();
 
     int ok = 0;
     if (flash_router_fast_path && !mixed_visual &&
@@ -35590,7 +35645,7 @@ static int ds4_gpu_encode_router_select(
         return 1;
     }
 
-    if (flash_router_fast_path && !mixed_visual && !g_quality_mode && n_tokens == 1) {
+    if (fuse_transform && !mixed_visual && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> softplus_sqrt_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_softplus_sqrt_pipeline,
                                     "kernel_dsv4_softplus_sqrt_f32_4");
@@ -35729,7 +35784,7 @@ static int ds4_gpu_encode_router_select(
         return 1;
     }
 
-    if (flash_router_fast_path && !g_quality_mode && n_tokens == 1) {
+    if (fuse_weights && !g_quality_mode && n_tokens == 1) {
         id<MTLComputePipelineState> router_weights_pipeline =
             ds4_gpu_hot_pipeline(g_dsv4_router_weights_one_pipeline,
                                     "kernel_dsv4_router_weights_one");
@@ -35739,7 +35794,9 @@ static int ds4_gpu_encode_router_select(
         [enc setBuffer:probsbuf offset:probs_off atIndex:0];
         [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
         [enc setBuffer:weightsbuf offset:weights_off atIndex:2];
-        ds4_gpu_dispatch_threads(enc, MTLSizeMake(6, 1, 1), MTLSizeMake(6, 1, 1));
+        /* One threadgroup of six, not six loose threads: the same launch, but
+         * uniform, so the abort gate can switch it off with the rest. */
+        ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(6, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return 1;
     }
