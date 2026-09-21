@@ -40821,12 +40821,17 @@ static DS4_MAYBE_UNUSED bool ds41_moe_route_row(ds41_gpu_graph *g, const ds4_mod
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
     /* The shared expert's gate and up read different weights from the same
-     * input, and on this path they were two dispatches. The routed experts do
-     * the equivalent as one, and this file's own measurement says the routed
-     * pair moves its bytes at 340 GB/s where the rest of the segment manages
-     * 266: one dispatch with both lanes in flight is the difference worth
-     * trying. Same arithmetic, same order of accumulation, so the answer does
-     * not change. */
+     * input, so they can go out as one dispatch with two lanes instead of two
+     * dispatches. Same arithmetic and same order of accumulation, so the
+     * answer does not change.
+     *
+     * It buys nothing measurable: 27 paired rounds put the lane form at a
+     * median of -0.10 ms a token. The reason it was expected to is withdrawn -
+     * it came from reading 266 GB/s off weight bytes divided by a residual
+     * that also holds the attention core, the KV traffic and the gaps, and
+     * from carrying proto/concur.m's 288-threadgroup curve onto a projection
+     * that already dispatches 1152. Kept behind the mode switch as the
+     * experiment it is. */
     /* Read on every use, not cached: the in-process A/B changes it between
      * rounds, and a value latched at the first layer of the first token makes
      * both arms the same arm. 0 separate, 1 the old serial pair, 2 the lane
@@ -41415,6 +41420,87 @@ static void ds41_gate_trace(ds41_gpu_graph *g, uint32_t il, const char *where) {
 #endif
 
 #ifdef __APPLE__
+/* What one projection shape actually reaches, on its own.
+ *
+ * Duplicating a pass in place would re-read the same 35-45 MB immediately and
+ * measure a replay out of the last level cache, not the pass. This walks all
+ * forty layers' weights once each instead - 1.4 to 1.8 GB a sweep, enough that
+ * a weight is long gone before it comes round again - through the same kernel
+ * the decode path uses, in one command buffer with one encoder, timed by that
+ * buffer's own GPU span. Writes go to scratch, so nothing the model produces
+ * depends on it. The starting layer rotates so the sweeps do not all begin
+ * with the same weight warm.
+ *
+ * DS4_METAL_V41_COLD_SWEEP=q_b|output_a|output_b, once, before the first token.
+ */
+static void ds41_cold_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
+    static int done;
+    const char *which = getenv("DS4_METAL_V41_COLD_SWEEP");
+    if (done || !which || !which[0]) return;
+    done = 1;
+    extern double ds4_gpu_take_span_ms(void);
+    const int q_b = strcmp(which, "q_b") == 0;
+    const int out_a = strcmp(which, "output_a") == 0;
+    const int out_b = strcmp(which, "output_b") == 0;
+    if (!q_b && !out_a && !out_b) {
+        fprintf(stderr, "ds4: cold sweep: q_b, output_a or output_b\n");
+        return;
+    }
+    const uint32_t reps = 9;
+    double ms[16];
+    uint64_t bytes = 0;
+    for (uint32_t r = 0; r < reps; r++) {
+        (void)ds4_gpu_take_span_ms();
+        if (!ds4_gpu_begin_commands()) { fprintf(stderr, "ds4: cold sweep: no batch\n"); return; }
+        uint64_t swept = 0;
+        /* More laps of the same forty weights inside one buffer: if the time
+         * is the bytes, it scales with this. If it does not, the sweep is not
+         * measuring what it claims. */
+        static int laps = -1;
+        if (laps < 0) {
+            const char *e = getenv("DS4_METAL_V41_COLD_SWEEP_LAPS");
+            laps = e && e[0] ? atoi(e) : 1;
+            if (laps < 1) laps = 1;
+        }
+        for (uint32_t lap = 0; lap < (uint32_t)laps; lap++)
+        for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+            const uint32_t il = (i + r) % DS4_N_LAYER;      /* rotate the start */
+            const ds4_layer_weights *l = &w->layer[il];
+            bool ok = true;
+            if (q_b && l->attn_q_b) {
+                ok = ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, 0,
+                                      DS4_N_HEAD * DS4_N_HEAD_DIM);
+                swept += l->attn_q_b->bytes;
+            } else if (out_a && l->attn_output_a) {
+                uint64_t row = 0;
+                ok = tensor_nbytes(l->attn_output_a->type, 4096, &row) &&
+                     ds4_gpu_attention_output_low_q8_tensor(g->low, m->map, m->size,
+                            l->attn_output_a->abs_offset, 4096, 1024,
+                            DS4_N_OUT_GROUP, g->heads);
+                swept += l->attn_output_a->bytes;
+            } else if (out_b && l->attn_output_b) {
+                ok = ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
+                swept += l->attn_output_b->bytes;
+            }
+            if (!ok) { fprintf(stderr, "ds4: cold sweep failed at layer %u\n", il); return; }
+        }
+        if (!ds4_gpu_end_commands()) { fprintf(stderr, "ds4: cold sweep: drain failed\n"); return; }
+        ms[r] = ds4_gpu_take_span_ms();
+        bytes = swept;
+    }
+    for (uint32_t a = 0; a + 1u < reps; a++)
+        for (uint32_t b = a + 1u; b < reps; b++)
+            if (ms[b] < ms[a]) { const double t = ms[a]; ms[a] = ms[b]; ms[b] = t; }
+    const double med = ms[reps / 2];
+    fprintf(stderr,
+            "ds4: cold sweep %s: %.3f GB over %u layers, %.2f ms median of %u "
+            "(%.2f..%.2f), %.0f GB/s\n",
+            which, (double)bytes / 1e9, DS4_N_LAYER, med, reps, ms[0], ms[reps - 1],
+            med > 0.0 ? (double)bytes / (med / 1e3) / 1e9 : 0.0);
+}
+#endif
+
+#ifdef __APPLE__
 /* What one decode token could read, from the shapes rather than a clock.
  * DS4_METAL_V41_WEIGHT_LEDGER=1, printed once. The routed experts are listed
  * per selected expert, not per tensor, because a token reads six of 384. */
@@ -41488,6 +41574,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern void ds4_gpu_ledger_role(const char *role);
     ds4_gpu_ledger_token_begin((unsigned long long)g->pos);
     ds41_weight_ledger(m, w);
+    ds41_cold_sweep(g, m, w);
 #endif
     extern unsigned long long ds4_gpu_cb_finished(void);
     const unsigned long long v41_cb0 = v41_prof ? ds4_gpu_cb_finished() : 0ull;
