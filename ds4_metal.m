@@ -26,6 +26,7 @@
 #include "ds4_gpu.h"
 #include "ds4_image.h"
 #include "ds4_metal_ledger.h"
+#include "ds4_metal_stage.h"
 #include "ds4_metal_gate.h"
 
 /*
@@ -1513,6 +1514,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
         g_gpu_span_accum_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         g_gpu_span_cbs++;
     }
+    ds4_stage_resolve();
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
@@ -7052,6 +7054,7 @@ int ds4_gpu_init(void) {
         ds4_gpu_timeline_probe(g_device);
         ds4_gpu_ledger_probe(g_device);
         ds4_gpu_gate_probe(g_device);
+        ds4_gpu_stage_probe(g_device);
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
 
@@ -41643,6 +41646,28 @@ static int ds4_gpu_routed_moe_one_gated(
         .weight_stride = sizeof(float), .write_clamped = 0, .clamp_value = clamp,
     };
     const ds4_gpu_stream_expert_split_args all_lanes = { .active_mask = 0x3fu, .accumulate = 0u };
+    /* The envelope cannot be split by sampling - this device has no
+     * dispatch-boundary counters - so a pass is timed by how much the envelope
+     * grows when it is encoded again. Running it twice reads the same inputs
+     * and writes the same values, so the answer does not change and the extra
+     * time is that pass. */
+    static int shadow_gate = -1, shadow_down = -1;
+    if (shadow_gate < 0) {
+        const char *e = getenv("DS4_METAL_V41_GATE_SHADOW_GATEUP");
+        shadow_gate = e && e[0] ? atoi(e) : 0;
+        e = getenv("DS4_METAL_V41_GATE_SHADOW_DOWN");
+        shadow_down = e && e[0] ? atoi(e) : 0;
+    }
+    ds4_gpu_stage(DS4_STAGE_ROUTED_GATE_UP);
+    for (int sh = 0; sh < shadow_gate; sh++)
+        if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
+                g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                &gate_args, &act_args, &all_lanes, NULL, table_gate, table_up,
+                xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+                selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
+                ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights),
+                ds4_gpu_routed_mv_smem(gate_type), 2, false)) return 0;
     if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
             g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
             &gate_args, &act_args, &all_lanes, NULL, table_gate, table_up,
@@ -41651,6 +41676,14 @@ static int ds4_gpu_routed_moe_one_gated(
             selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
             ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights),
             ds4_gpu_routed_mv_smem(gate_type), 2, false)) return 0;
+    ds4_gpu_stage(DS4_STAGE_ROUTED_DOWN);
+    for (int sh = 0; sh < shadow_down; sh++)
+        if (!ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
+                g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
+                &down_args, &all_lanes, NULL, table_down,
+                midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out),
+                selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected),
+                ds4_gpu_routed_mv_smem(down_type), 2)) return 0;
     if (!ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
             g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
             &down_args, &all_lanes, NULL, table_down,

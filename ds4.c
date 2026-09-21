@@ -41465,6 +41465,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     static double g_gt_entry_ms, g_gt_repair_ms, g_gt_account_ms,
                   g_gt_tail_ms, g_gt_wall_ms, g_gt_gpu_ms;
     extern double ds4_gpu_take_span_ms(void);
+    extern void ds4_gpu_stage(int stage);
+    extern void ds4_gpu_stage_report(unsigned long long tokens);
+    enum { GT_OTHER = 0, GT_ATTENTION, GT_ROUTE_SHARED, GT_ROUTED_GATE_UP,
+           GT_ROUTED_DOWN, GT_FINISH };
     const double gt_token0 = now_sec();
     const uint32_t gate_n = (uint32_t)ds4_gpu_gate_layers();
     /* The gated region is a window, so a single layer can be isolated: at
@@ -41655,6 +41659,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                      g_gt_repair_ms - g_gt_account_ms - g_gt_tail_ms) / (double)g_gate_tokens,
                     g_gt_gpu_ms / (double)g_gate_tokens,
                     (g_gate_wait_ms - g_gt_gpu_ms) / (double)g_gate_tokens),
+            ds4_gpu_stage_report(g_gate_tokens),
             ds4_gpu_gate_print_ungatable();
     }
 #else
