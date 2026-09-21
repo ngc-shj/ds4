@@ -41492,6 +41492,8 @@ static void ds41_routed_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
      * as where it starts. */
     const uint32_t reps = 9;
     unsigned long long loaded = 0;
+    uint64_t miss0 = 0;
+    ds4_gpu_stream_expert_cache_counters(NULL, &miss0, NULL, NULL, NULL);
     for (uint32_t r = 0; r < reps; r++) {
         const int32_t *ids = g_sweep_ids[(r * 7u) % DS4_N_LAYER];
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -41509,8 +41511,29 @@ static void ds41_routed_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
             }
         }
     }
-    fprintf(stderr, "ds4: routed sweep: %u id sets resident over %u layers, %.2f GiB loaded\n",
-            reps, DS4_N_LAYER, (double)loaded / 1073741824.0);
+    /* What was asked for, not what was loaded: gate_repair counts a masked bit
+     * whether or not the entry was already there. The installs are the cache's
+     * own miss counter over this preload. */
+    uint64_t miss1 = 0;
+    ds4_gpu_stream_expert_cache_counters(NULL, &miss1, NULL, NULL, NULL);
+    /* Every address the timed region will follow, before the timed region.
+     * A zero here is a kernel that reads nothing and reports nothing. */
+    uint32_t live = 0;
+    for (uint32_t r = 0; r < reps; r++)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+            live += ds4_gpu_expert_addresses_live(il,
+                        g_sweep_ids[(r * 7u) % DS4_N_LAYER], DS4_N_EXPERT_USED);
+    const uint32_t want = reps * DS4_N_LAYER * DS4_N_EXPERT_USED;
+    fprintf(stderr,
+            "ds4: routed sweep preload: %u id sets over %u layers, %.2f GiB requested, "
+            "%llu installs, %u of %u addresses live\n",
+            reps, DS4_N_LAYER, (double)loaded / 1073741824.0,
+            (unsigned long long)(miss1 - miss0), live, want);
+    if (live != want) {
+        fprintf(stderr, "ds4: routed sweep: %u addresses are not reachable; not measuring\n",
+                want - live);
+        return;
+    }
 
     static int laps = -1;
     if (laps < 0) {
@@ -41520,10 +41543,45 @@ static void ds41_routed_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     }
     double ms[16], wms[16];
     uint64_t bytes = 0;
-    /* One untimed pass first, so the first GPU touch of every one of these
-     * buffers - which the code elsewhere measures at about 1.7 ms a buffer and
-     * which does not depend on how much is read - is behind us. */
-    for (uint32_t r = 0; r <= reps; r++) {
+    /* Every set touched by the GPU once before anything is timed.
+     *
+     * The first GPU touch of a buffer wires its pages, which the code
+     * elsewhere measures at about 1.7 ms a buffer and which does not depend on
+     * how much is read. Warming only the first set left the other eight paying
+     * it inside their own timed repetition. Both kernels are run here whatever
+     * the arm is measuring, so gate, up and down buffers are all touched, and
+     * 20 GB of sets is far past anything the last-level cache can hold, so the
+     * warm-up leaves nothing behind but the wiring. */
+    for (uint32_t r = 0; r < reps; r++) {
+        if (!ds4_gpu_tensor_write(g->selected, 0, g_sweep_ids[(r * 7u) % DS4_N_LAYER],
+                                  sizeof(int32_t) * DS4_N_EXPERT_USED) ||
+            !ds4_gpu_begin_commands()) {
+            fprintf(stderr, "ds4: routed sweep: warm-up could not start\n");
+            return;
+        }
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const ds4_layer_weights *l = &w->layer[il];
+            uint64_t grow = 0, drow = 0;
+            if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &grow) ||
+                !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &drow) ||
+                !ds4_gpu_routed_sweep_encode(g->routed, g->gate, g->up, g->mid,
+                        l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                        grow * DS4_N_FF_EXP, grow, drow * DS4_N_EMBD, drow,
+                        DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected,
+                        g->route_weights, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                        DS4_SWIGLU_CLAMP_EXP, g->norm, il, 3u)) {
+                fprintf(stderr, "ds4: routed sweep: warm-up failed at layer %u\n", il);
+                (void)ds4_gpu_end_commands();
+                return;
+            }
+        }
+        if (!ds4_gpu_end_commands() || !ds4_gpu_synchronize()) {
+            fprintf(stderr, "ds4: routed sweep: warm-up drain failed\n");
+            return;
+        }
+    }
+    (void)ds4_gpu_take_span_ms();
+    for (uint32_t r = 0; r < reps; r++) {
         (void)ds4_gpu_take_span_ms();
         const double wall0 = now_sec();
         if (!ds4_gpu_begin_commands()) { fprintf(stderr, "ds4: routed sweep: no batch\n"); return; }
@@ -41531,7 +41589,7 @@ static void ds41_routed_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
         /* Written once, before anything is encoded, because every dispatch in
          * this buffer will read it. */
         if (!ds4_gpu_tensor_write(g->selected, 0,
-                                  g_sweep_ids[(r ? r - 1u : 0u) * 7u % DS4_N_LAYER],
+                                  g_sweep_ids[(r * 7u) % DS4_N_LAYER],
                                   sizeof(int32_t) * DS4_N_EXPERT_USED)) {
             fprintf(stderr, "ds4: routed sweep: selected write failed\n");
             (void)ds4_gpu_end_commands();
@@ -41560,15 +41618,12 @@ static void ds41_routed_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
         }
         if (!ds4_gpu_end_commands()) { fprintf(stderr, "ds4: routed sweep: drain failed\n"); return; }
         if (!ds4_gpu_synchronize()) { fprintf(stderr, "ds4: routed sweep: sync failed\n"); return; }
-        const double span = ds4_gpu_take_span_ms();
-        const double wall = (now_sec() - wall0) * 1000.0;
-        if (r == 0) continue;                       /* the warm-up pass */
         /* The GPU span only accrues where something waited on a command
          * buffer. If it is far below the host's own measurement of the same
          * region, it is not this buffer's span and the number is not a
          * bandwidth. */
-        ms[r - 1] = span;
-        wms[r - 1] = wall;
+        ms[r] = ds4_gpu_take_span_ms();
+        wms[r] = (now_sec() - wall0) * 1000.0;
         bytes = swept;
     }
     for (uint32_t a = 0; a + 1u < reps; a++)
@@ -41576,6 +41631,16 @@ static void ds41_routed_sweep(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
             if (ms[b] < ms[a]) { const double t = ms[a]; ms[a] = ms[b]; ms[b] = t; }
             if (wms[b] < wms[a]) { const double t = wms[a]; wms[a] = wms[b]; wms[b] = t; }
         }
+    uint32_t live_after = 0;
+    for (uint32_t r = 0; r < reps; r++)
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+            live_after += ds4_gpu_expert_addresses_live(il,
+                        g_sweep_ids[(r * 7u) % DS4_N_LAYER], DS4_N_EXPERT_USED);
+    if (live_after != want) {
+        fprintf(stderr, "ds4: routed sweep: %u addresses went away during the sweep; "
+                        "the number would not be a bandwidth\n", want - live_after);
+        return;
+    }
     const double med = ms[reps / 2], wmed = wms[reps / 2];
     fprintf(stderr,
             "ds4: routed sweep %s: %.3f GB over %u layers x %d laps, GPU span %.2f ms "

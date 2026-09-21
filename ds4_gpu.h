@@ -360,6 +360,10 @@ void ds4_gpu_gate_repair_counters(uint64_t *resident, uint64_t *absent);
 void ds4_gpu_expert_residency_counts(uint64_t *adds, uint64_t *removes,
                                      uint64_t *commits);
 
+/* Of n ids, how many the GPU can reach in this layer's live address table.
+ * A zero address makes the masked kernel read nothing without saying so. */
+uint32_t ds4_gpu_expert_addresses_live(uint32_t layer, const int32_t *ids, uint32_t n);
+
 /* One layer's routed stage encoded into the open batch and nothing else: the
  * production masked kernels over the live address table, no validate, repair,
  * accounting or readback. which is 1 for gate/up, 2 for down, 3 for both. */

@@ -41915,6 +41915,28 @@ static int ds4_gpu_routed_moe_one_gated(
     return 1;
 }
 
+/* How many of these ids the GPU can actually reach in this layer's table.
+ *
+ * A zero address is not an error the masked kernel reports: it reads nothing
+ * and finishes early, which is how a sweep once claimed four times this
+ * machine's memory bandwidth. Counting them is the check that a measurement
+ * read what it says it read. */
+uint32_t ds4_gpu_expert_addresses_live(uint32_t layer, const int32_t *ids, uint32_t n) {
+    id<MTLBuffer> tg = nil, tu = nil, td = nil;
+    if (!ids || !ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td)) return 0;
+    const uint64_t *ga = (const uint64_t *)[tg contents];
+    const uint64_t *ua = (const uint64_t *)[tu contents];
+    const uint64_t *da = (const uint64_t *)[td contents];
+    if (!ga || !ua || !da) return 0;
+    uint32_t live = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const int32_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        if (ga[id] && ua[id] && da[id]) live++;
+    }
+    return live;
+}
+
 /* The routed stage for one layer, encoded into the open batch and nothing
  * else: the same masked kernels against the same live address table the
  * production gated path uses, with no validate, no repair, no accounting and
