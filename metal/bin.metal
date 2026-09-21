@@ -29,6 +29,7 @@ struct ds4_metal_args_bin {
 
 struct ds4_metal_args_add3 {
     uint32_t n;
+    uint32_t bf16;
 };
 
 constant short FC_bin_op [[function_constant(FC_BIN + 0)]];
@@ -202,7 +203,8 @@ kernel void kernel_add2_f32(
         device float *out,
         uint i [[thread_position_in_grid]]) {
     if (i >= args.n) return;
-    out[i] = a[i] + b[i];
+    const float v = a[i] + b[i];
+    out[i] = args.bf16 ? ds4_round_bf16(v) : v;
 }
 
 kernel void kernel_add3_f32(

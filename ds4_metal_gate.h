@@ -49,14 +49,17 @@ int  ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n);
 void ds4_gpu_gate_clear_route(void);
 unsigned long long ds4_gpu_gate_ungatable(void);
 unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);  /* NOT launches */
+unsigned long long ds4_gpu_gate_slots_total(void);   /* slots taken, all segments */
 unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failures */
 void ds4_gpu_gate_print_ungatable(void);
+void ds4_gpu_gate_print_sites(unsigned long long tokens);
 
 static int        g_gate_layers;
 static id<MTLBuffer> g_gate_grid;
 static id<MTLBuffer> g_gate_miss;
 static id<MTLBuffer> g_gate_route;     /* {valid, layer, ids[6]} a layer */
 static _Atomic uint32_t g_gate_next_slot;
+static _Atomic unsigned long long g_gate_slots_total;
 static uint32_t   g_gate_layer_base[DS4_GATE_MAX_LAYER];
 static _Atomic unsigned long long g_gate_ungatable;
 static _Atomic int g_gate_active;             /* dispatches are being gated now */
@@ -111,6 +114,79 @@ static void ds4_gate_note_ungatable(uintptr_t caller, MTLSize th, MTLSize tpt) {
     os_unfair_lock_unlock(&g_gate_site_lock);
 }
 
+/* Where a token's gated dispatches come from. Off unless
+ * DS4_METAL_V41_GATE_CENSUS is set: it is a lock and a scan on a path that
+ * runs three thousand times a token, so it prices itself into any run that
+ * has it on. The count is what a fusion is worth - a call site issuing six
+ * dispatches a layer is forty-eight a token, and the indirect form makes each
+ * of those 2.25 us of GPU time, not the 0.70 us a plain dispatch costs. */
+#define DS4_GATE_SITES 192u
+/* Two frames, because the encoder that issues the dispatch is shared: knowing
+ * that 759 of them come from the quantize encoder does not say which of its
+ * nineteen call sites in a layer they are, and the fusion is chosen per call
+ * site. */
+static struct { uintptr_t caller, parent; uint64_t count; uint32_t w, h, d, tw, th_, td; }
+    g_gate_sites[DS4_GATE_SITES];
+static uint32_t g_gate_n_sites;
+
+static int ds4_gate_census_on(void) {
+    static int checked, on;
+    if (!checked) { checked = 1; on = getenv("DS4_METAL_V41_GATE_CENSUS") != NULL; }
+    return on;
+}
+
+static void ds4_gate_note_slot(uintptr_t caller, uintptr_t parent,
+                               MTLSize tg, MTLSize tpt) {
+    const uintptr_t slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    const uintptr_t unslid = caller - slide;
+    const uintptr_t punslid = parent ? parent - slide : 0;
+    os_unfair_lock_lock(&g_gate_site_lock);
+    for (uint32_t i = 0; i < g_gate_n_sites; i++)
+        if (g_gate_sites[i].caller == unslid && g_gate_sites[i].parent == punslid) {
+            g_gate_sites[i].count++;
+            os_unfair_lock_unlock(&g_gate_site_lock);
+            return;
+        }
+    if (g_gate_n_sites < DS4_GATE_SITES) {
+        const uint32_t i = g_gate_n_sites++;
+        g_gate_sites[i].caller = unslid;
+        g_gate_sites[i].parent = punslid;
+        g_gate_sites[i].count = 1;
+        g_gate_sites[i].w = (uint32_t)tg.width;
+        g_gate_sites[i].h = (uint32_t)tg.height;
+        g_gate_sites[i].d = (uint32_t)tg.depth;
+        g_gate_sites[i].tw = (uint32_t)tpt.width;
+        g_gate_sites[i].th_ = (uint32_t)tpt.height;
+        g_gate_sites[i].td = (uint32_t)tpt.depth;
+    }
+    os_unfair_lock_unlock(&g_gate_site_lock);
+}
+
+void ds4_gpu_gate_print_sites(unsigned long long tokens) {
+    if (!ds4_gate_census_on() || tokens == 0) return;
+    os_unfair_lock_lock(&g_gate_site_lock);
+    /* Heaviest first, by repeatedly taking the largest remaining count and
+     * clearing it. The table is rebuilt from scratch for the next window, so
+     * every figure printed belongs to the window named beside it. */
+    for (;;) {
+        uint32_t best = DS4_GATE_SITES;
+        uint64_t best_c = 0;
+        for (uint32_t i = 0; i < g_gate_n_sites; i++)
+            if (g_gate_sites[i].count > best_c) { best = i; best_c = g_gate_sites[i].count; }
+        if (best == DS4_GATE_SITES) break;
+        fprintf(stderr, "ds4: gated dispatch site 0x%llx from 0x%llx: %.1f a token, "
+                        "groups %ux%ux%u of %ux%ux%u\n",
+                (unsigned long long)g_gate_sites[best].caller,
+                (unsigned long long)g_gate_sites[best].parent,
+                (double)best_c / (double)tokens,
+                g_gate_sites[best].w, g_gate_sites[best].h, g_gate_sites[best].d,
+                g_gate_sites[best].tw, g_gate_sites[best].th_, g_gate_sites[best].td);
+        g_gate_sites[best].count = 0;
+    }
+    g_gate_n_sites = 0;
+    os_unfair_lock_unlock(&g_gate_site_lock);
+}
+
 void ds4_gpu_gate_print_ungatable(void) {
     os_unfair_lock_lock(&g_gate_site_lock);
     for (uint32_t i = 0; i < g_gate_n_ungatable_sites; i++)
@@ -149,6 +225,9 @@ static void ds4_gpu_dispatch(id<MTLComputeCommandEncoder> enc, MTLSize tg, MTLSi
     NSUInteger off = 0;
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
         ds4_gate_take_slot(tg, &off)) {
+        if (ds4_gate_census_on())
+            ds4_gate_note_slot((uintptr_t)__builtin_return_address(0),
+                               (uintptr_t)__builtin_return_address(1), tg, tpt);
         [enc dispatchThreadgroupsWithIndirectBuffer:g_gate_grid
                                indirectBufferOffset:off
                               threadsPerThreadgroup:tpt];
@@ -212,6 +291,16 @@ void ds4_gpu_gate_segment_begin(void) {
 void ds4_gpu_gate_segment_end(void) {
     if (!g_gate_layers) return;
     atomic_store_explicit(&g_gate_active, 0, memory_order_relaxed);
+    /* The slot counter is per segment; a token is several segments. Carry the
+     * total so the indirect form's cost can be priced against a count that was
+     * observed rather than one estimated from the call sites. */
+    atomic_fetch_add_explicit(&g_gate_slots_total,
+                              atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed),
+                              memory_order_relaxed);
+}
+
+unsigned long long ds4_gpu_gate_slots_total(void) {
+    return atomic_load_explicit(&g_gate_slots_total, memory_order_relaxed);
 }
 
 void ds4_gpu_gate_layer_begin(uint32_t il) {

@@ -1156,6 +1156,69 @@ int ds4_gpu_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps);
 
+/* Producers that fold the BF16 rounding into their own store, replacing the
+ * separate pass that used to follow them. The matvec forms report through
+ * `rounded` whether the path they took could honour it; when it is 0 the
+ * caller must still run the pass. See metal/dense.metal's
+ * helper_mv_reduce_and_write and metal/norm.metal. */
+int ds4_gpu_hc_expand_split_bf16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+int ds4_gpu_swiglu_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        uint32_t                n,
+        float                   limit,
+        float                   alpha);
+int ds4_gpu_add_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n);
+int ds4_gpu_rms_norm_weight_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps);
+int ds4_gpu_matmul_q8_0_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        int                    *rounded);
+int ds4_gpu_matmul_f16_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        int                    *rounded);
+int ds4_gpu_matmul_f32_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        int                    *rounded);
+
 int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

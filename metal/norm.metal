@@ -11,6 +11,7 @@ struct ds4_metal_args_norm {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    int32_t  round_bf16;
 };
 
 // RMSNorm over one activation row, optionally fusing the learned weight
@@ -65,16 +66,18 @@ kernel void kernel_rms_norm_fuse_impl(
     const float scale = 1.0f/sqrt(mean + args.eps);
 
     device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
+    /* The BF16 rounding that used to be a separate pass over this row. The
+     * value stored is the one that pass would have re-read, so rounding it
+     * here is the same bits. */
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
-        if (F == 1) {
-            y[i00] = (x[i00]*scale);
-        }
+        T v = (x[i00]*scale);
         if (F == 2) {
-            y[i00] = (x[i00]*scale)*f0[i00];
+            v = v*f0[i00];
         }
         if (F == 3) {
-            y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
+            v = v*f0[i00] + f1[i00];
         }
+        y[i00] = args.round_bf16 ? ds4_round_bf16(v) : v;
     }
 }
 

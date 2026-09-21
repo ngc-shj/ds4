@@ -23,6 +23,7 @@ struct ds4_metal_args_mul_mv {
     int nr0;
     short r2;
     short r3;
+    int round_bf16;
 };
 
 struct ds4_metal_args_compressor_pair_store {
@@ -78,7 +79,8 @@ static inline void helper_mv_reduce_and_write(
         const int ne01,
         ushort tiisg,
         ushort sgitg,
-        threadgroup char * shmem) {
+        threadgroup char * shmem,
+        bool round_bf16 = false) {
     constexpr short NW = N_SIMDWIDTH;
 
     threadgroup float * shmem_f32[NR0];
@@ -107,7 +109,7 @@ static inline void helper_mv_reduce_and_write(
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
         if (tiisg == 0 && sgitg == 0) {
-            dst_f32[r0 + row] = tot;
+            dst_f32[r0 + row] = round_bf16 ? ds4_round_bf16(tot) : tot;
         }
     }
 }
@@ -179,7 +181,7 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem, args.round_bf16);
 }
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
@@ -1239,7 +1241,7 @@ void kernel_mul_mv_t_t_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem, args.round_bf16);
 }
 
 template<typename T0, typename T1, typename args_t>
@@ -1357,7 +1359,7 @@ void kernel_mul_mv_t_t_4_impl(
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem, args.round_bf16);
 }
 
 template<typename T0, typename T04, typename T1, typename T14, typename args_t>

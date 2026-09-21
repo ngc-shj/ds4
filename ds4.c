@@ -40430,8 +40430,74 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
+/* Let the producer round its own output instead of following it with a
+ * dispatch that reads the row back and rounds it. The stored f32 is the value
+ * that pass would have read, so the bits are the same, and six prompts up to
+ * 2048 tokens were compared byte for byte before this became the default.
+ * DS4_METAL_V41_FUSE_BF16=0 restores the separate pass. */
+static bool ds41_fuse_bf16(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_FUSE_BF16");
+        checked = 1;
+        on = !e || strcmp(e, "0") != 0;
+    }
+    return on != 0;
+}
+
+/* Rounds in the producer where the chosen path can. `*rounded` stays 0 on a
+ * path that cannot, and the caller then runs the pass it always ran. */
+static bool metal_graph_matmul_plain_bf16_tensor(
+        ds4_gpu_tensor *out, const ds4_model *model, const ds4_tensor *w,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t n_tok, int *rounded) {
+    *rounded = 0;
+    if (w->type == DS4_TENSOR_F16) {
+        return ds4_gpu_matmul_f16_bf16_tensor(out, model->map, model->size,
+            w->abs_offset, in_dim, out_dim, x, n_tok, rounded) != 0;
+    }
+    if (w->type == DS4_TENSOR_F32) {
+        return ds4_gpu_matmul_f32_bf16_tensor(out, model->map, model->size,
+            w->abs_offset, in_dim, out_dim, x, n_tok, rounded) != 0;
+    }
+    if (w->type == DS4_TENSOR_Q8_0) {
+        return ds4_gpu_matmul_q8_0_bf16_tensor(out, model->map, model->size,
+            w->abs_offset, in_dim, out_dim, x, n_tok, rounded) != 0;
+    }
+    return metal_graph_matmul_plain_tensor(out, model, w, in_dim, out_dim, x, n_tok);
+}
+
+/* SwiGLU into shared_mid, rounded by the kernel when the fusion is on. */
+static bool ds41_shared_swiglu(ds41_gpu_graph *g) {
+    if (ds41_fuse_bf16()) {
+        return ds4_gpu_swiglu_bf16_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                          DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
+    }
+    return ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                 DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+           ds41_bf16(g->shared_mid, DS4_N_FF_EXP);
+}
+
+/* HC expand into `out`, likewise. */
+static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+                           const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split) {
+    if (ds41_fuse_bf16()) {
+        return ds4_gpu_hc_expand_split_bf16_tensor(out, block, residual, split,
+                                                   DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    return ds4_gpu_hc_expand_split_tensor(out, block, residual, split,
+                                          DS4_N_EMBD, DS4_N_HC) &&
+           ds41_bf16(out, DS4_N_EMBD * DS4_N_HC);
+}
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+    if (round && ds41_fuse_bf16()) {
+        int rounded = 0;
+        if (!metal_graph_matmul_plain_bf16_tensor(out, m, weight, weight->dim[0],
+                                                  weight->dim[1], in, 1, &rounded)) return false;
+        return rounded || ds41_bf16(out, (uint32_t)weight->dim[1]);
+    }
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
@@ -40558,6 +40624,10 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+    if (ds41_fuse_bf16()) {
+        return ds4_gpu_rms_norm_weight_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) != 0;
+    }
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
@@ -40607,14 +40677,14 @@ static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
-                                  const ds4_layer_weights *l) {
+                                  const ds4_layer_weights *l, bool round) {
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     if (!ds41_attention_low(g, m, l)) return false;
     return g->tp_world == 2 ?
         metal_graph_matmul_dense_quant_kslice(g->block, m, l->attn_output_b,
             8192, (uint64_t)g->tp_rank * groups * 1024u,
             (uint64_t)groups * 1024u, DS4_N_EMBD, g->low, 0) :
-        ds41_matmul(g->block, m, l->attn_output_b, g->low, false);
+        ds41_matmul(g->block, m, l->attn_output_b, g->low, round);
 }
 
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
@@ -40734,9 +40804,12 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
-    return ds41_attention_output(g, m, l) &&
+    /* With two ranks the sum comes after the projection, so the rounding has
+     * to wait for it; alone, the projection is the last writer. */
+    const bool fuse_out = ds41_fuse_bf16() && g->tp_world != 2;
+    return ds41_attention_output(g, m, l, fuse_out) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+           (fuse_out || ds41_bf16(g->block, DS4_N_EMBD));
 }
 
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
@@ -40774,9 +40847,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_here && !shared_queued &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
+        !ds41_shared_swiglu(g) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
 #ifndef __APPLE__
@@ -40854,9 +40925,7 @@ static DS4_MAYBE_UNUSED bool ds41_moe_route_row(ds41_gpu_graph *g, const ds4_mod
                !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true)) {
         return false;
     }
-    return ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
-        ds41_bf16(g->shared_mid, DS4_N_FF_EXP) &&
+    return ds41_shared_swiglu(g) &&
         ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
 }
 
@@ -40881,6 +40950,9 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
+    /* The owner path has no add to fold into, so it keeps the pass. */
+    if (!shared_owner && ds41_fuse_bf16())
+        return ds4_gpu_add_bf16_tensor(g->block, routed, g->shared, DS4_N_EMBD) != 0;
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
         ds41_bf16(g->block, DS4_N_EMBD);
 }
@@ -40926,8 +40998,7 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand(g->after_attn, g->block, g->residual, g->attn_split) &&
         ds41_hc_mix(g, m, l, true) &&
         ds4_gpu_hc_weighted_sum_split_bf16_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_norm(g->norm, g->x, m, l->ffn_norm);
@@ -41210,8 +41281,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
+    return ds41_hc_expand(g->residual, g->block, g->after_attn, g->ffn_split) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
@@ -41897,6 +41967,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                             uint32_t n_sel, uint32_t n_total);
     extern unsigned long long ds4_gpu_gate_ungatable(void);
     extern unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);
+    extern unsigned long long ds4_gpu_gate_slots_total(void);
     extern unsigned long long ds4_gpu_gate_slots_left_live(void);
     extern void ds4_gpu_gate_print_ungatable(void);
     extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
@@ -42167,7 +42238,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * an abort count from that report could not be divided by each other. */
         if (ok && (g_gate_tokens % 64ull) == 0ull) {
             const double dt = 64.0;
-            static unsigned long long w_cbs, w_aborts, w_bytes, w_touched;
+            static unsigned long long w_cbs, w_aborts, w_bytes, w_touched,
+                                      w_slots, w_after;
             static double w_encode, w_wait, w_entry, w_repair, w_account,
                           w_tail, w_wall, w_gpu;
             fprintf(stderr,
@@ -42177,7 +42249,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 "ds4:   one token, exclusive, same window: entry %.2f + encode %.2f "
                 "+ commit-to-done %.2f + repair-load %.2f + accounting %.2f + tail %.2f "
                 "= %.2f of a %.2f ms wall, residual %.2f\n"
-                "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n",
+                "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n"
+                "ds4:   %.1f gated dispatches a token, %.1f of them behind an abort\n",
                 g_gate_tokens - 63ull, g_gate_tokens,
                 (double)(g_gate_cbs - w_cbs) / dt,
                 (double)(g_gate_aborts - w_aborts) / dt,
@@ -42199,15 +42272,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                  (g_gt_repair_ms - w_repair) - (g_gt_account_ms - w_account) -
                  (g_gt_tail_ms - w_tail)) / dt,
                 (g_gt_gpu_ms - w_gpu) / dt,
-                ((g_gate_wait_ms - w_wait) - (g_gt_gpu_ms - w_gpu)) / dt);
+                ((g_gate_wait_ms - w_wait) - (g_gt_gpu_ms - w_gpu)) / dt,
+                (double)(ds4_gpu_gate_slots_total() - w_slots) / dt,
+                (double)(g_gate_after - w_after) / dt);
             w_cbs = g_gate_cbs; w_aborts = g_gate_aborts; w_bytes = g_gate_bytes;
             w_touched = g_gate_touched; w_encode = g_gate_encode_ms;
             w_wait = g_gate_wait_ms; w_entry = g_gt_entry_ms;
             w_repair = g_gt_repair_ms; w_account = g_gt_account_ms;
             w_tail = g_gt_tail_ms; w_wall = g_gt_wall_ms; w_gpu = g_gt_gpu_ms;
+            w_slots = ds4_gpu_gate_slots_total(); w_after = g_gate_after;
             (void)ds4_gate_report_cache(g_gate_tokens, g_gate_route_fp);
             ds4_gpu_stage_report(g_gate_tokens);
             ds4_gpu_gate_print_ungatable();
+            { extern void ds4_gpu_gate_print_sites(unsigned long long);
+              ds4_gpu_gate_print_sites(64ull); }
         }
     }
     ds4_gpu_ledger_token_end();
@@ -43046,7 +43124,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             row.q = queries[i];
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l);
+                ds41_attention_output(&row, model, l, false);
         }
         DS41_BSTAGE(stage_attn);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);

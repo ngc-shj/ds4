@@ -63,6 +63,7 @@ struct ds4_metal_args_dsv4_hc_split_weighted_sum_norm {
 };
 
 struct ds4_metal_args_dsv4_hc_expand {
+    uint64_t bf16;
     int64_t  n_embd;
     int64_t  n_hc;
     int64_t  n_tokens;
@@ -644,7 +645,8 @@ kernel void kernel_dsv4_hc_expand(
         acc += comb_v * res_v;
     }
 
-    *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+    *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) =
+        args.bf16 ? ds4_round_bf16(acc) : acc;
 }
 
 // HC=4 specialization of the post/expand step. One thread computes all four
@@ -689,7 +691,8 @@ kernel void kernel_dsv4_hc_expand4(
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 2*args.nb_comb1 + t*args.nb_comb2)) * r2;
         acc += *((device const float *) (comb + dst_hc*args.nb_comb0 + 3*args.nb_comb1 + t*args.nb_comb2)) * r3;
 
-        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) = acc;
+        *((device float *) (dst + d*args.nb0 + dst_hc*args.nb1 + t*args.nb2)) =
+            args.bf16 ? ds4_round_bf16(acc) : acc;
     }
 }
 

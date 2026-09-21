@@ -1,4 +1,5 @@
 struct ds4_metal_args_glu {
+    uint64_t bf16;
     int32_t  ne00;
     uint64_t nb01;
     int32_t  ne10;
@@ -35,7 +36,8 @@ kernel void kernel_swiglu_f32(
 
         const float silu = x0 / (1.0f + exp(-x0));
 
-        dst_row[i0] = silu*x1*args.alpha;
+        const float v = silu*x1*args.alpha;
+        dst_row[i0] = args.bf16 ? ds4_round_bf16(v) : v;
     }
 }
 
@@ -59,5 +61,6 @@ kernel void kernel_swiglu_flat_f32(
     }
 
     const float silu = x0 / (1.0f + exp(-x0));
-    dst_f32[i] = silu*x1*args.alpha;
+    const float v = silu*x1*args.alpha;
+    dst_f32[i] = args.bf16 ? ds4_round_bf16(v) : v;
 }
