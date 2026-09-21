@@ -35401,12 +35401,20 @@ static int ds4_router_fuse_transform_on(void) {
     return on;
 }
 
-/* Off by default, and it has to be: kernel_dsv4_router_weights_one sums its six
- * entries in index order where the generic path's sum_rows reduces them in a
- * tree, and six floats are enough for that to change the last bits. Measured,
- * not assumed - with it on, the first correctness prompt hashes e7f14292
- * against the baseline's d68de436. Making it usable means matching the
- * reduction order, not flipping this flag. */
+/* Off by default. kernel_dsv4_router_weights_one sums its six entries in index
+ * order where the generic path's sum_rows reduces them in a tree, and with it
+ * on the first correctness prompt hashes e7f14292 against the baseline's
+ * d68de436.
+ *
+ * proto/routerbits.m says which of the three differences is responsible, over
+ * twenty thousand rounds: folding `x / sum` and `* 1.5` into one expression
+ * changes nothing at all (0 of 20,000, so no reassociation and no reciprocal
+ * substitution at this width), and the sum order changes the result in 94.64%
+ * of them. Six addends are few, but sqrt(softplus(x)) spreads them over a
+ * decade and a half and the exponents do not line up.
+ *
+ * So this is usable once the kernel's sum is written to match sum_rows - a
+ * strided per-thread partial then a simdgroup reduction - and not before. */
 static int ds4_router_fuse_weights_on(void) {
     static int checked, on;
     if (!checked) {
