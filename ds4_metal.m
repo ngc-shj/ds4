@@ -21528,7 +21528,17 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
             ds4_gpu_get_mul_mv_pipeline(concat ? "kernel_qwen4_q8_concat" :
                 (use_lanes ? "kernel_mul_mv_q8_0_f32_lanes" : "kernel_mul_mv_q8_0_f32_pair"),
                 dispatch0.nsg);
-        if (!pipeline) return 0;
+        if (!pipeline) {
+            fprintf(stderr, "ds4: no %s pipeline\n",
+                    use_lanes ? "kernel_mul_mv_q8_0_f32_lanes" : "kernel_mul_mv_q8_0_f32_pair");
+            return 0;
+        }
+        /* Compiling is not running: say which form actually went out. */
+        static uint64_t n_pair, n_lanes;
+        if (use_lanes) n_lanes++; else n_pair++;
+        if (((n_pair + n_lanes) % 20000ull) == 0ull)
+            fprintf(stderr, "ds4: q8 pair dispatches: %llu paired, %llu laned\n",
+                    (unsigned long long)n_pair, (unsigned long long)n_lanes);
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -21543,7 +21553,10 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:4];
         [enc setBuffer:out0buf offset:ds4_gpu_tensor_offset(out0) atIndex:5];
         [enc setBuffer:out1buf offset:ds4_gpu_tensor_offset(out1) atIndex:6];
-        [enc setThreadgroupMemoryLength:2u * dispatch0.smem atIndex:0];
+        /* The pair form has one threadgroup do both matrices and needs both
+         * reductions; a lane threadgroup does one, and reserving twice the
+         * threadgroup memory it uses only costs occupancy. */
+        [enc setThreadgroupMemoryLength:(use_lanes ? 1u : 2u) * dispatch0.smem atIndex:0];
         const uint64_t max_out_dim = concat ? out0_dim + out1_dim : (out0_dim > out1_dim ? out0_dim : out1_dim);
         ds4_gpu_dispatch(enc,
             MTLSizeMake(((NSUInteger)max_out_dim + (NSUInteger)dispatch0.nr0 - 1u) /

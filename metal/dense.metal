@@ -347,7 +347,6 @@ kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
 // have independent weight ranges and output extents. Keep the standalone Q8_0
 // lane/block traversal and two-stage reduction verbatim for each bank; only
 // the activation load and threadgroup scheduling are shared.
-[[host_name("kernel_mul_mv_q8_0_f32_pair")]]
 /* Two independent Q8_0 matvecs over the same input, as ONE dispatch whose z
  * extent carries the lanes.
  *
@@ -383,6 +382,7 @@ kernel void kernel_mul_mv_q8_0_f32_lanes(
     }
 }
 
+[[host_name("kernel_mul_mv_q8_0_f32_pair")]]
 kernel void kernel_mul_mv_q8_0_f32_pair(
         constant ds4_metal_args_mul_mv & args0,
         constant ds4_metal_args_mul_mv & args1,
