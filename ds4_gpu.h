@@ -106,7 +106,8 @@ void ds4_gpu_dsv41_spec_counts(unsigned long long *spec_lanes,
                                unsigned long long *layers,
                                unsigned long long *compared,
                                unsigned long long *differing,
-                               unsigned long long *far);
+                               unsigned long long *far,
+                               unsigned long long *saved);
 int ds4_gpu_routed_moe_one_gated_available(uint32_t layer_index, uint32_t gate_type,
                                            uint32_t down_type, uint32_t n_expert);
 void ds4_gpu_end_concurrent_section(void);

@@ -7055,6 +7055,7 @@ typedef struct {
     /* Do not read the weights buffer at all; see the speculation's use of it.
      * Mirrors ds4_metal_dsv4_moe_swiglu_weight_args in metal/moe.metal. */
     uint32_t defer_weight;
+    uint32_t mask_slot;   /* which layer's lane mask this pass reads */
 } ds4_gpu_dsv4_moe_swiglu_weight_args;
 
 typedef struct {
@@ -34410,14 +34411,21 @@ int ds4_gpu_dsv41_spec_match(const ds4_gpu_tensor *actual,
                              uint32_t width, uint32_t n_lane, uint32_t layer,
                              uint32_t compare);
 
+/* One slot a layer. A continuation after an abort reads the mask its own
+ * layer's match wrote, which a single shared word could not survive: the
+ * layers that follow are encoded before the abort is known. */
+#define DS4_ROUTED_LANE_MASK_SLOTS 64u
+
 static id<MTLBuffer> ds4_gpu_routed_lane_mask_buffer(void) {
     if (!g_routed_lane_mask) {
-        g_routed_lane_mask = [g_device newBufferWithLength:sizeof(uint32_t)
-                                                   options:MTLResourceStorageModeShared];
+        g_routed_lane_mask =
+            [g_device newBufferWithLength:DS4_ROUTED_LANE_MASK_SLOTS * sizeof(uint32_t)
+                                  options:MTLResourceStorageModeShared];
         if (g_routed_lane_mask) {
             /* The mask says which lanes a speculation filled. Nothing has,
              * until a match writes it. */
-            *(uint32_t *)[g_routed_lane_mask contents] = 0u;
+            memset([g_routed_lane_mask contents], 0,
+                   DS4_ROUTED_LANE_MASK_SLOTS * sizeof(uint32_t));
             g_routed_lane_mask.label = @"ds4_routed_lane_mask";
         }
     }
@@ -34454,7 +34462,8 @@ void ds4_gpu_dsv41_spec_counts(unsigned long long *spec_lanes,
                                unsigned long long *layers,
                                unsigned long long *compared,
                                unsigned long long *differing,
-                               unsigned long long *far) {
+                               unsigned long long *far,
+                               unsigned long long *saved) {
     const uint32_t *c = g_spec_counts ? (const uint32_t *)[g_spec_counts contents] : NULL;
     if (spec_lanes)  *spec_lanes  = c ? c[0] : 0ull;
     if (reused_lanes) *reused_lanes = c ? c[1] : 0ull;
@@ -34463,6 +34472,7 @@ void ds4_gpu_dsv41_spec_counts(unsigned long long *spec_lanes,
     if (compared)    *compared    = c ? c[4] : 0ull;
     if (differing)   *differing   = c ? c[5] : 0ull;
     if (far)         *far         = c ? c[6] : 0ull;
+    if (saved)       *saved       = c ? c[7] : 0ull;
 }
 
 /* Copy the gate and up rows of every lane the speculation got right into the
@@ -34512,6 +34522,8 @@ int ds4_gpu_dsv41_spec_match(const ds4_gpu_tensor *actual,
     [enc setBytes:&width length:sizeof(width) atIndex:10];
     [enc setBytes:&n_lane length:sizeof(n_lane) atIndex:11];
     [enc setBytes:&compare length:sizeof(compare) atIndex:12];
+    const uint32_t mask_slot = layer % DS4_ROUTED_LANE_MASK_SLOTS;
+    [enc setBytes:&mask_slot length:sizeof(mask_slot) atIndex:13];
     ds4_gpu_dispatch(enc, MTLSizeMake(n_lane, 1, 1), MTLSizeMake(256, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "speculative lane match");
@@ -34586,6 +34598,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     [enc setBuffer:ids        offset:ids_off     atIndex:9];
     [enc setBuffer:weights    offset:weights_off atIndex:10];
     [enc setBuffer:ds4_gpu_routed_lane_mask_buffer() offset:0 atIndex:11];
+    [enc setBuffer:ds4_gpu_spec_counts_buffer() offset:0 atIndex:12];
     if (entries) {
         for (uint32_t i = 0; i < 6; i++) {
             if ((split->active_mask & (1u << i)) == 0) continue;
@@ -42389,6 +42402,7 @@ static int ds4_gpu_routed_moe_one_gated(
         .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
         .weight_stride = sizeof(float), .write_clamped = 0, .clamp_value = clamp,
         .defer_weight = spec ? 1u : 0u,
+        .mask_slot = layer_index % DS4_ROUTED_LANE_MASK_SLOTS,
     };
     /* 0x3f is every lane; 0xffffffff tells the kernel to read the mask a
      * speculation's match left in the lane-mask buffer. */

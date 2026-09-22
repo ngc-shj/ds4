@@ -41124,6 +41124,19 @@ static int ds41_spec_section(void) {
     return on;
 }
 
+/* Whether a continuation reuses what the speculation left in gate and up.
+ * 0 is the control: the same speculation, thrown away at every layer that
+ * aborts, which is what this looked like before the carry existed. */
+static int ds41_spec_resume(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_SPEC_RESUME");
+        checked = 1;
+        on = e && e[0] ? atoi(e) != 0 : 1;
+    }
+    return on;
+}
+
 static int ds41_oracle_mode(void) {
     static int checked, mode;
     if (!checked) {
@@ -42688,6 +42701,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * token being fed in, and indexing a log by it lines every token up
          * with some other token's route. */
         const int32_t *oracle_token = ds41_oracle_route((uint32_t)g_gate_tokens);
+        /* Which layers of this token have a speculation's rows sitting in
+         * gate and up with their mask still in the layer's slot. A layer that
+         * aborts is re-encoded from the MoE, and without this the
+         * continuation recomputed every lane the match had already filled -
+         * which is most of them, and is what the first measurement of this
+         * was actually pricing. */
+        uint64_t spec_filled = 0;
         if (oracle_token &&
             !ds4_gpu_tensor_write(g->oracle_selected, 0, oracle_token,
                 (uint64_t)DS4_N_LAYER * DS4_N_EXPERT_USED * sizeof(int32_t)))
@@ -42773,6 +42793,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                  * continuation never speculates - by then the route is known. */
                 uint32_t l1_mask = 0x3fu;
                 bool speculated_here = false;
+                /* The abort switched off everything behind this layer's
+                 * validate - which is the pass that would have consumed the
+                 * match - so the rows and the mask are still exactly as the
+                 * match left them, and no later layer's match ran to
+                 * overwrite the slot. The continuation computes the lanes the
+                 * repair just brought in, and only those. */
+                if (resuming && il < 64u && ((spec_filled >> il) & 1ull) &&
+                    ds41_spec_resume())
+                    l1_mask = 0xffffffffu;
                 if (!resuming) {
                     resume_overlap = use_overlap ? 1 : 0;
                     ok = ds41_graph_before_moe(g, m, gl, il);
@@ -42826,7 +42855,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                         speculated_here = ok;
                         /* mode 2 keeps the speculation but throws the match
                          * away, which prices the contention on its own. */
-                        if (ok && ds41_oracle_mode() == 1) l1_mask = 0xffffffffu;
+                        if (ok && ds41_oracle_mode() == 1) {
+                            l1_mask = 0xffffffffu;
+                            if (il < 64u) spec_filled |= 1ull << il;
+                        }
                     } else if (ok) {
                         ok = use_overlap ?
                                  ds41_moe_route_only(g, m, gl, (uint32_t)token) :
@@ -43140,7 +43172,7 @@ spec_done:;
                                       w_sec_att, w_sec_open,
                                       w_spec_lanes, w_spec_reused, w_spec_left,
                                       w_spec_layers, w_spec_cmp, w_spec_diff,
-                                      w_spec_far;
+                                      w_spec_far, w_spec_saved;
             static double w_ahead_ms;
             unsigned long long sec_att = 0, sec_open = 0;
             ds4_gpu_concurrent_section_counts(&sec_att, &sec_open);
@@ -43149,10 +43181,10 @@ spec_done:;
              * lanes it computed and how many it saved. */
             unsigned long long spec_lanes = 0, spec_reused = 0, spec_left = 0,
                                spec_layers = 0, spec_cmp = 0, spec_diff = 0,
-                               spec_far = 0;
+                               spec_far = 0, spec_saved = 0;
             ds4_gpu_dsv41_spec_counts(&spec_lanes, &spec_reused, &spec_left,
                                       &spec_layers, &spec_cmp, &spec_diff,
-                                      &spec_far);
+                                      &spec_far, &spec_saved);
             static double w_encode, w_wait, w_entry, w_repair, w_account,
                           w_tail, w_wall, w_gpu;
             fprintf(stderr,
@@ -43169,8 +43201,8 @@ spec_done:;
                 "spent encoding under the GPU\n"
                 "ds4:   concurrent sections: %.2f attempted, %.2f opened a token\n"
                 "ds4:   speculation: %.2f layers a token, %.2f lanes computed, "
-                "%.2f reused, %.2f left to compute; compared %.2f lanes, "
-                "%.2f floats differ, %.2f of them by more than an ulp\n",
+                "%.2f matched, %.2f GEMVs actually saved, %.2f left to compute; "
+                "compared %.2f lanes, %.2f floats differ, %.2f by more than an ulp\n",
                 g_gate_tokens - 63ull, g_gate_tokens,
                 (double)(g_gate_cbs - w_cbs) / dt,
                 (double)(g_gate_aborts - w_aborts) / dt,
@@ -43204,12 +43236,14 @@ spec_done:;
                 (double)(spec_layers - w_spec_layers) / dt,
                 (double)(spec_lanes - w_spec_lanes) / dt,
                 (double)(spec_reused - w_spec_reused) / dt,
+                (double)(spec_saved - w_spec_saved) / dt,
                 (double)(spec_left - w_spec_left) / dt,
                 (double)(spec_cmp - w_spec_cmp) / dt,
                 (double)(spec_diff - w_spec_diff) / dt,
                 (double)(spec_far - w_spec_far) / dt);
             w_sec_att = sec_att; w_sec_open = sec_open;
             w_spec_cmp = spec_cmp; w_spec_diff = spec_diff; w_spec_far = spec_far;
+            w_spec_saved = spec_saved;
             w_spec_lanes = spec_lanes; w_spec_reused = spec_reused;
             w_spec_left = spec_left; w_spec_layers = spec_layers;
             w_cbs = g_gate_cbs; w_aborts = g_gate_aborts; w_bytes = g_gate_bytes;

@@ -468,6 +468,10 @@ struct ds4_metal_dsv4_moe_swiglu_weight_args {
      * be bound to them; the mid it writes is scratch either way, because what
      * a speculation is run for is its gate and up. */
     uint32_t defer_weight;
+    /* Which layer's lane mask this pass reads. One slot a layer, not one
+     * shared word: a continuation after an abort reads the mask its own
+     * layer's match wrote, and between the two the token has moved on. */
+    uint32_t mask_slot;
 };
 
 struct ds4_metal_dsv4_moe_sum6_args {
@@ -4153,6 +4157,7 @@ kernel void kernel_dsv41_spec_match(
         constant uint & width,
         constant uint & n_lane,
         constant uint & compare,
+        constant uint & mask_slot,
         uint  tg  [[threadgroup_position_in_grid]],
         uint  tid [[thread_position_in_threadgroup]],
         uint  nth [[threads_per_threadgroup]]) {
@@ -4178,8 +4183,9 @@ kernel void kernel_dsv41_spec_match(
             if (hit) { reused++; m |= (1u << i); }
         }
         /* Which lanes are filled, for the pass that has already been encoded
-         * and cannot be told on the host. */
-        lane_mask[0] = m;
+         * and cannot be told on the host - and for the continuation of this
+         * layer if it aborts, which is encoded later still. */
+        lane_mask[mask_slot] = m;
         /* What the arm actually did, for the window report: lanes the
          * speculation computed, lanes it saved, lanes still to compute. */
         atomic_fetch_add_explicit(counts + 0, spec_live, memory_order_relaxed);
@@ -4237,6 +4243,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         device const char * ids,
         device const char * weights,
         device const uint32_t * lane_mask,
+        device atomic_uint * spec_counts,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -4256,44 +4263,47 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
     if ((mask & (1u << (uint)idx)) == 0) {
         return;
     }
-    const bool reused = after_spec && ((lane_mask[0] >> (uint)idx) & 1u) != 0u;
+    const bool reused = after_spec && ((lane_mask[act.mask_slot] >> (uint)idx) & 1u) != 0u;
 
     tgpig.z = 0;
 
-    const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
-    if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
-        return;
-    }
-    const uint64_t gate_addr = gate_addrs[(uint)i02];
-    const uint64_t up_addr = up_addrs[(uint)i02];
-    if (gate_addr == 0 || up_addr == 0) {
-        return;
-    }
-
-    const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;
-
-    device const char *src0_gate_cur =
-        reinterpret_cast<device const char *>(gate_addr);
-    device const char *src0_up_cur =
-        reinterpret_cast<device const char *>(up_addr);
-    device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
-
     device char *dst_gate_cur = dst_gate + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
     device char *dst_up_cur   = dst_up   + (idx * args.ne0 + i12 * args.ne1 * args.ne0) * sizeof(float);
 
-    ds4_metal_args_mul_mv args0 = {
-        args.ne00, args.ne01, 1,
-        args.nb00, args.nb01, args.nb02, args.nb02,
-        args.ne10, 1, 1,
-        args.nb10, args.nb11, args.nb12, args.nb12,
-        args.ne0, 1, args.nr0, 1, 1,
-    };
-
     /* A reused lane's gate and up rows were written by the match from a
-     * speculation that ran this same GEMV over this same expert and input.
-     * Everything below reads them exactly as if this dispatch had. */
+     * speculation that ran this same GEMV over this same expert and input,
+     * so everything below reads them exactly as if this dispatch had - and
+     * nothing above is needed. Reading the address table would be worse than
+     * wasteful here: a continuation runs after gate_repair, which may have
+     * evicted an expert this lane no longer needs, and an early return on a
+     * null address would leave mid unwritten. */
     if (!reused) {
+        const int32_t i02 = ((device const int32_t *)(ids + iid1 * args.nbi1))[idx];
+        if (i02 < 0 || i02 >= args.ne02 || i02 >= 384) {
+            return;
+        }
+        const uint64_t gate_addr = gate_addrs[(uint)i02];
+        const uint64_t up_addr = up_addrs[(uint)i02];
+        if (gate_addr == 0 || up_addr == 0) {
+            return;
+        }
+
+        const int64_t i11 = idx % args.ne11;
+        device const char *src0_gate_cur =
+            reinterpret_cast<device const char *>(gate_addr);
+        device const char *src0_up_cur =
+            reinterpret_cast<device const char *>(up_addr);
+        device const char *src1_cur = src1 + i11 * args.nb11 + i12 * args.nb12;
+
+        ds4_metal_args_mul_mv args0 = {
+            args.ne00, args.ne01, 1,
+            args.nb00, args.nb01, args.nb02, args.nb02,
+            args.ne10, 1, 1,
+            args.nb10, args.nb11, args.nb12, args.nb12,
+            args.ne0, 1, args.nr0, 1, 1,
+        };
+
         kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
                 args0,
                 src0_gate_cur,
@@ -4305,6 +4315,12 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
                 tgpig,
                 tiisg,
                 sgitg);
+    } else if (tgpig.x == 0 && sgitg == 0 && tiisg == 0) {
+        /* A GEMV this dispatch did not have to do, counted where it was
+         * actually avoided. A lane the match copied is not yet a lane saved:
+         * if the layer aborts, the pass that would have consumed it is
+         * switched off and the continuation recomputes it. */
+        atomic_fetch_add_explicit(spec_counts + 7, 1u, memory_order_relaxed);
     }
 
     const short NSG = FC_mul_mv_nsg;
