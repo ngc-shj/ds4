@@ -40687,15 +40687,20 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul(g->block, m, l->attn_output_b, g->low, round);
 }
 
+/* `hoisted`: the compressor projections have already gone out, merged with
+ * the rest of the layer's narrow matvecs (ds41_narrow_merged_project). */
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
-                                   const ds4_layer_weights *l, uint32_t il) {
+                                   const ds4_layer_weights *l, uint32_t il,
+                                   bool hoisted) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (ds41_kv_source(il)) {
-        if (!ds41_matmul(g->pool_kv, m, l->attn_compressor_kv, g->norm, ratio == 1)) return false;
+        if (!hoisted &&
+            !ds41_matmul(g->pool_kv, m, l->attn_compressor_kv, g->norm, ratio == 1)) return false;
         if (ratio == 2) {
-            if (!ds41_matmul(g->pool_score, m, l->attn_compressor_gate, g->norm, false) ||
+            if ((!hoisted &&
+                 !ds41_matmul(g->pool_score, m, l->attn_compressor_gate, g->norm, false)) ||
                 !ds4_gpu_dsv41_pool2(g->latent, g->pool_kv, g->pool_score,
                     g->previous_kv[owner], g->previous_score[owner], 512, 1, pos)) return false;
         } else if (!ds4_gpu_tensor_copy(g->latent, 0, g->pool_kv, 0, 512u * 4u)) return false;
@@ -40741,7 +40746,8 @@ static bool ds41_attention_pick(ds41_gpu_graph *g, uint32_t il) {
 }
 
 static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *m,
-                                            const ds4_layer_weights *l, uint32_t il) {
+                                            const ds4_layer_weights *l, uint32_t il,
+                                            bool hoisted) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -40749,7 +40755,8 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
         if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
             !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
-            !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
+            (!hoisted &&
+             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true)) ||
 #ifdef __APPLE__
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
                 g->index_cache[owner], n_comp, DS4_N_INDEXER_HEAD, 128, 1.0f / 64.0f, false)) return false;
@@ -40762,14 +40769,158 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
 }
 
 static bool ds41_attention_select(ds41_gpu_graph *g, const ds4_model *m,
-                                  const ds4_layer_weights *l, uint32_t il) {
-    return ds41_attention_publish(g, m, l, il) &&
-        ds41_attention_select_published(g, m, l, il);
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  bool hoisted) {
+    return ds41_attention_publish(g, m, l, il, hoisted) &&
+        ds41_attention_select_published(g, m, l, il, hoisted);
+}
+
+/* On with DS4_METAL_V41_NARROW_SECTION=1. */
+static bool ds41_narrow_merge_on(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_NARROW_SECTION");
+        checked = 1;
+        on = e && e[0] && atoi(e) != 0;
+    }
+    return on;
+}
+
+/* The projection only. A rounding the producer could not fold into its own
+ * store reads back the row it just wrote, so inside a concurrent section it
+ * would race the dispatch it depends on; report it instead and let the caller
+ * issue it once the section has closed. */
+static bool ds41_matmul_deferred(ds4_gpu_tensor *out, const ds4_model *m,
+                                 const ds4_tensor *weight, const ds4_gpu_tensor *in,
+                                 bool round, bool *late) {
+    *late = false;
+    if (round && ds41_fuse_bf16()) {
+        int rounded = 0;
+        if (!metal_graph_matmul_plain_bf16_tensor(out, m, weight, weight->dim[0],
+                                                  weight->dim[1], in, 1, &rounded)) return false;
+        *late = !rounded;
+        return true;
+    }
+    if (!metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0],
+                                         weight->dim[1], in, 1)) return false;
+    *late = round;
+    return true;
+}
+
+/* The five projections a V4.1 decode layer hangs off `norm`: q_a and kv from
+ * the attention projection, the KV compressor and its gate from the publish,
+ * and the indexer's from the selection. V4.1 is low-rank and compressed
+ * throughout, so all five are narrow - 32 to 1280 rows out of 7168 in - and a
+ * narrow output is few threadgroups: one to twenty-four on a forty-core GPU.
+ * Metal serialises dispatches within an encoder, so they wait for each other
+ * while leaving most of the machine idle. ds4-macos/proto/narrowmv.m measures
+ * the five at their real geometry: 172.8 ms one after another, 39.9 overlapped.
+ *
+ * They read nothing but `norm` and write five disjoint tensors, so overlapping
+ * them reorders no dependency, and each kernel is the one that ran before -
+ * same rows, same reduction tree, same store. Only where the dispatches sit
+ * changes, which is why the output is expected to be identical bit for bit.
+ *
+ * Only the projections move. The norms, the pooling and the indexer scoring
+ * stay where they are, each reading one of these outputs. */
+static bool ds41_narrow_merged_project(ds41_gpu_graph *g, const ds4_model *m,
+                                       const ds4_layer_weights *l, uint32_t il) {
+    const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    struct { ds4_gpu_tensor *out; const ds4_tensor *w; bool round; } lane[5];
+    uint32_t n = 0;
+    lane[n].out = g->qr; lane[n].w = l->attn_q_a; lane[n++].round = true;
+    lane[n].out = g->kv; lane[n].w = l->attn_kv;  lane[n++].round = true;
+    if (ds41_kv_source(il)) {
+        lane[n].out = g->pool_kv; lane[n].w = l->attn_compressor_kv;
+        lane[n++].round = ratio == 1;
+        if (ratio == 2) {
+            lane[n].out = g->pool_score; lane[n].w = l->attn_compressor_gate;
+            lane[n++].round = false;
+        }
+    }
+    if (n_comp && ds41_index_source(il)) {
+        lane[n].out = g->index_weights; lane[n].w = l->indexer_proj;
+        lane[n++].round = true;
+    }
+
+    bool late[5] = { false }, ok = true;
+    const bool section = ds4_gpu_begin_concurrent_section() != 0;
+    /* Compiling is not running, and a section that failed to open leaves the
+     * five exactly where they were: say which one happened, once. */
+    static int said;
+    if (!said) {
+        said = 1;
+        fprintf(stderr, "ds4: narrow projection merge ran with %u lanes, "
+                        "concurrent section %s\n", n, section ? "open" : "REFUSED");
+    }
+    for (uint32_t i = 0; ok && i < n; i++)
+        ok = ds41_matmul_deferred(lane[i].out, m, lane[i].w, g->norm,
+                                  lane[i].round, &late[i]);
+    if (section) ds4_gpu_end_concurrent_section();
+    for (uint32_t i = 0; ok && i < n; i++)
+        if (late[i]) ok = ds41_bf16(lane[i].out, (uint32_t)lane[i].w->dim[1]);
+    return ok;
+}
+
+/* What is left of the projection once the two matvecs have been hoisted: each
+ * of these reads one of them. */
+static bool ds41_attention_project_tail(ds41_gpu_graph *g, const ds4_model *m,
+                                        const ds4_layer_weights *l) {
+    const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    return ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+        ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
+                         g->tp_rank * q_dim, q_dim) &&
+        ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+}
+
+/* On with DS4_METAL_V41_ATTN_LANES=1. */
+static bool ds41_attn_lanes_on(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_ATTN_LANES");
+        checked = 1;
+        on = e && e[0] && atoi(e) != 0;
+    }
+    return on;
 }
 
 static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l) {
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
+    /* q_a and kv read the same `norm`, neither depends on the other, and they
+     * go out one after the other as 24 and 10 threadgroups on a forty-core
+     * GPU. Carried as the two lanes of one dispatch they are 34 at once, and
+     * proto/narrowmv.m finds the rate of a narrow projection tracking its
+     * threadgroup count almost exactly - so this is the part of the machine
+     * the two were leaving idle, collected without an encoder boundary, which
+     * the same file prices at 22.2 us.
+     *
+     * Both are Q8_0 over the same 7168 inputs; the lane form needs no more
+     * than that, the widths may differ. Per lane the kernel is the standalone
+     * one, so the arithmetic and its order are untouched - the byte
+     * comparison is what says so.
+     *
+     * The rounding folds into each lane's own store the way it does for the
+     * standalone matvec, so this is one dispatch where there were two. */
+    if (ds41_attn_lanes_on() &&
+        l->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+        l->attn_kv->type == DS4_TENSOR_Q8_0 &&
+        l->attn_q_a->dim[0] == l->attn_kv->dim[0]) {
+        static int said;
+        if (!said) { said = 1; fprintf(stderr, "ds4: q_a/kv lane pair ran\n"); }
+        const int fold = ds41_fuse_bf16() ? 1 : 0;
+        return ds4_gpu_matmul_q8_0_lanes_tensor(g->qr, g->kv, m->map, m->size,
+                   l->attn_q_a->abs_offset, l->attn_kv->abs_offset,
+                   l->attn_q_a->dim[0], l->attn_q_a->dim[1], l->attn_kv->dim[1],
+                   g->norm, 1, fold, fold) &&
+            (fold || (ds41_bf16(g->qr, (uint32_t)l->attn_q_a->dim[1]) &&
+                      ds41_bf16(g->kv, (uint32_t)l->attn_kv->dim[1]))) &&
+            ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
+            ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
+                             g->tp_rank * q_dim, q_dim) &&
+            ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
+    }
     return ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) &&
         ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) &&
         ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr,
@@ -40785,13 +40936,18 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
-    if (!projected && !ds41_attention_project(g, m, l)) return false;
+    const bool merged = !projected && ds41_narrow_merge_on();
+    if (!projected) {
+        if (merged ? (!ds41_narrow_merged_project(g, m, l, il) ||
+                      !ds41_attention_project_tail(g, m, l))
+                   : !ds41_attention_project(g, m, l)) return false;
+    }
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
-        !ds41_attention_select(g, m, l, il)) return false;
+        !ds41_attention_select(g, m, l, il, merged)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
@@ -41232,8 +41388,8 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 #define DS41_SELECT_ROW(name, width) row.name = g->rows_view[t].name;
         DS41_PREFILL_ROWS(DS41_SELECT_ROW)
 #undef DS41_SELECT_ROW
-        if (!batch_publish && !ds41_attention_publish(&row, m, l, il)) return false;
-        if (!batch_index && !ds41_attention_select_published(&row, m, l, il)) return false;
+        if (!batch_publish && !ds41_attention_publish(&row, m, l, il, false)) return false;
+        if (!batch_index && !ds41_attention_select_published(&row, m, l, il, false)) return false;
     }
     if (batch_index && !ds41_index_batch(g, m, l, il, count)) return false;
     bool ok;
@@ -42694,7 +42850,7 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds41_graph_before_attention(&row, m, l, il);
             }
             if (ok && publish) {
-                ok = ds41_attention_publish(&row, m, l, il);
+                ok = ds41_attention_publish(&row, m, l, il, false);
             } else if (ok) {
                 if (!batch_attention)
                     ok = ds41_matmul(row.kv, m, l->attn_kv, row.norm, true) &&
