@@ -9881,6 +9881,42 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder) {
     g_parallel_gate_up_smem = 0;
 }
 
+/* A section of the segment's encoder whose dispatches may run at once.
+ *
+ * Metal serialises dispatches inside a compute encoder unless the encoder was
+ * created concurrent, so a projection narrow enough to ask for ten
+ * threadgroups leaves a forty-core GPU almost idle and the next one waits for
+ * it anyway. ds4-macos/proto/narrowmv.m measures the five that hang off a
+ * V4.1 layer's `norm`: 172.8 ms one after another against 39.9 overlapped,
+ * the same kernels and the same bytes.
+ *
+ * Only independent dispatches may go inside. The encoder boundaries on either
+ * side are what orders them against everything else - the abort gate's
+ * validate included, since it is encoded outside the section and a boundary
+ * is a barrier - and the caller is responsible for the section holding
+ * nothing that reads what another dispatch in it writes.
+ *
+ * Boundaries are not free: the same file measures one at 22.2 us. */
+int ds4_gpu_begin_concurrent_section(void) {
+    if (!g_batch_cb || g_batch_encoder_concurrent ||
+        g_parallel_q8_pending || g_parallel_ffn_mode != 0) return 0;
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = YES;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    if (!enc || enc.dispatchType != MTLDispatchTypeConcurrent) {
+        ds4_gpu_close_batch_encoder();
+        g_batch_encoder_concurrent = NO;
+        return 0;
+    }
+    return 1;
+}
+
+void ds4_gpu_end_concurrent_section(void) {
+    if (!g_batch_encoder_concurrent) return;
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = NO;
+}
+
 void ds4_gpu_parallel_ffn_abort(void) {
     ds4_gpu_parallel_ffn_reset_state(YES);
 }
@@ -21717,7 +21753,8 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         uint64_t                out0_dim,
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                n_tok, bool concat) {
+        uint64_t                n_tok, bool concat, bool force_lanes,
+        int round0, int round1) {
     if (concat && (!in_dim || ((out0_dim | out1_dim) & 1u))) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out0 || !out1 || !model_map || !x || n_tok != 1 ||
@@ -21772,11 +21809,16 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         ds4_gpu_q8_0_matvec_args args1 = ds4_gpu_make_q8_0_mv_args(in_dim, out1_dim);
         args0.nr0 = dispatch0.nr0;
         args1.nr0 = dispatch1.nr0;
+        /* The same fold the standalone matvec does: the producer rounds in its
+         * own store rather than a pass that reads the row back. */
+        args0.round_bf16 = round0 ? 1 : 0;
+        args1.round_bf16 = round1 ? 1 : 0;
         /* The lane form puts both matrices in the grid instead of in the
          * loop, so the threadgroups in flight are what two separate dispatches
          * would have rather than half of it. */
         const char *mode_env = getenv("DS4_METAL_V41_SHARED_PAIR_MODE");
-        const int use_lanes = !concat && mode_env && mode_env[0] && atoi(mode_env) == 2;
+        const int use_lanes = !concat &&
+            (force_lanes || (mode_env && mode_env[0] && atoi(mode_env) == 2));
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(concat ? "kernel_qwen4_q8_concat" :
                 (use_lanes ? "kernel_mul_mv_q8_0_f32_lanes" : "kernel_mul_mv_q8_0_f32_pair"),
@@ -21839,7 +21881,37 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, false);
+    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, false, false, 0, 0);
+}
+
+/* Two independent Q8_0 projections over the same activation, as one dispatch
+ * whose z extent carries the two. The pair form the call above defaults to
+ * does the opposite: it keeps one matrix's grid and has each threadgroup walk
+ * both, so the threadgroups in flight are what one projection asked for. That
+ * is the wrong direction for a narrow projection, which is short of
+ * threadgroups and not of bandwidth - ds4-macos/proto/narrowmv.m puts q_a at
+ * 24 threadgroups and 46 GB/s against the 560 a dense projection reaches, and
+ * finds the rate tracking the threadgroup count across the whole range.
+ *
+ * Per lane this is the standalone kernel, unchanged, so each output is the
+ * same bits it was. */
+int ds4_gpu_matmul_q8_0_lanes_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        int                     round0,
+        int                     round1) {
+    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size,
+        weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok,
+        false, true, round0, round1);
 }
 
 int ds4_gpu_qwen4_q8_pair_tensor(
@@ -21854,7 +21926,7 @@ int ds4_gpu_qwen4_q8_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
-    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, true);
+    return ds4_gpu_matmul_q8_0_pair_impl(out0, out1, model_map, model_size, weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim, x, n_tok, true, false, 0, 0);
 }
 
 int ds4_gpu_matmul_q8_0_f16_out_tensor(

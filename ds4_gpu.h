@@ -79,6 +79,8 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
+int ds4_gpu_begin_concurrent_section(void);  /* independent dispatches may overlap */
+void ds4_gpu_end_concurrent_section(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
@@ -791,6 +793,20 @@ int ds4_gpu_matmul_quant_rows_scalar_tensor(
  * Backends that return nonzero from a fused half-output operation must also
  * implement the matching half-input HC expansion helpers below.
  */
+int ds4_gpu_matmul_q8_0_lanes_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        int                     round0,
+        int                     round1);
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
