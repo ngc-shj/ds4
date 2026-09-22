@@ -42421,7 +42421,10 @@ static int ds4_gpu_routed_moe_one_gated(
         shadow_down = e && e[0] ? atoi(e) : 0;
     }
     ds4_gpu_stage(DS4_STAGE_ROUTED_GATE_UP);
-    if (which & 1u)
+    /* Not the speculation's copy of this call: the point of the diagnostic is
+     * what one completion pass costs, and duplicating both halves would price
+     * the two together. */
+    if ((which & 1u) && !spec)
     for (int sh = 0; sh < shadow_gate; sh++)
         if (!ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
                 g_batch_cb, g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
