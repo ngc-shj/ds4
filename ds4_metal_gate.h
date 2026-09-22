@@ -35,25 +35,32 @@
 #define DS4_GATE_MAX_SLOTS 65536u
 #define DS4_GATE_MAX_LAYER 64u
 #define DS4_GATE_MISS_WORDS 16u
+/* How many segments may be in flight at once. Encode-ahead needs two; the ring
+ * is four so a wrap cannot alias a buffer that has not been waited on. */
+#define DS4_GATE_MISS_SLOTS 4u
 
 void ds4_gpu_gate_probe(id<MTLDevice> device);
 int  ds4_gpu_gate_layers(void);                 /* 0 when off */
-void ds4_gpu_gate_segment_begin(void);
+void ds4_gpu_gate_token_begin(void);  /* resets the slot cursor; once a token */
+uint32_t ds4_gpu_gate_segment_begin(void);            /* returns its miss slot */
+void ds4_gpu_gate_segment_rewind(uint32_t slot);  /* undo a speculative segment */
+uint32_t ds4_gpu_gate_encode_slot(void);   /* the slot being encoded right now */
 void ds4_gpu_gate_segment_end(void);
 void ds4_gpu_gate_layer_begin(uint32_t il);
 int  ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
                                   uint32_t n_sel, uint32_t n_total);   /* in ds4_metal.m */
 uint32_t ds4_gpu_gate_slots_used(void);
-int  ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n);
+int  ds4_gpu_gate_read_miss(uint32_t slot, uint32_t *layer, uint32_t *mask,
+                            int32_t *ids, uint32_t *n);
 int  ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n);
 void ds4_gpu_gate_clear_route(void);
 unsigned long long ds4_gpu_gate_ungatable(void);
-unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void);  /* NOT launches */
+unsigned long long ds4_gpu_gate_slots_encoded_after_abort(uint32_t slot);
 unsigned long long ds4_gpu_gate_slots_total(void);   /* slots taken, all segments */
 unsigned long long ds4_gpu_gate_direct_total(void); /* prefix dispatches left plain */
 int  ds4_gpu_gate_armed(void);       /* a validate has been encoded in this buffer */
 void ds4_gpu_gate_arm(void);
-unsigned long long ds4_gpu_gate_slots_left_live(void);            /* gate failures */
+unsigned long long ds4_gpu_gate_slots_left_live(uint32_t slot);  /* gate failures */
 void ds4_gpu_gate_print_ungatable(void);
 void ds4_gpu_gate_print_sites(unsigned long long tokens);
 void ds4_gpu_gate_census_settle(uint32_t aborted_layer);  /* after the buffer completes */
@@ -67,6 +74,13 @@ static _Atomic unsigned long long g_gate_slots_total;
 static uint32_t   g_gate_layer_base[DS4_GATE_MAX_LAYER];
 static _Atomic unsigned long long g_gate_ungatable;
 static _Atomic int g_gate_active;             /* dispatches are being gated now */
+/* Which miss slot the segment being encoded owns, and where in the grid table
+ * its slots start. The cursor is not rewound between segments any more: two
+ * segments may be encoded before either is waited on, and the second must not
+ * write over grid entries the first is still reading on the GPU. */
+static uint32_t g_gate_seg_seq;
+static uint32_t g_gate_encode_slot;
+static uint32_t g_gate_seg_slot_base[DS4_GATE_MISS_SLOTS];
 /* Nothing in a command buffer can have aborted before the first validate in
  * it: the miss record is cleared on the host before the buffer is built, the
  * previous buffer has already completed, and the validate kernel is the only
@@ -378,7 +392,8 @@ void ds4_gpu_gate_probe(id<MTLDevice> device) {
     if (n > (long)DS4_GATE_MAX_LAYER) n = DS4_GATE_MAX_LAYER;
     g_gate_grid = [device newBufferWithLength:DS4_GATE_MAX_SLOTS * 3u * sizeof(uint32_t)
                                       options:MTLResourceStorageModeShared];
-    g_gate_miss = [device newBufferWithLength:DS4_GATE_MISS_WORDS * sizeof(uint32_t)
+    g_gate_miss = [device newBufferWithLength:DS4_GATE_MISS_SLOTS * DS4_GATE_MISS_WORDS *
+                                             sizeof(uint32_t)
                                       options:MTLResourceStorageModeShared];
     g_gate_route = [device newBufferWithLength:DS4_GATE_MAX_LAYER * 8u * sizeof(uint32_t)
                                        options:MTLResourceStorageModeShared];
@@ -392,27 +407,78 @@ void ds4_gpu_gate_probe(id<MTLDevice> device) {
     fprintf(stderr, "ds4: abort gate on for the first %d layers\n", g_gate_layers);
 }
 
-void ds4_gpu_gate_segment_begin(void) {
+/* Once a token, before the first segment: the only point at which rewinding
+ * the grid cursor is safe, because nothing is in flight. */
+void ds4_gpu_gate_token_begin(void) {
     if (!g_gate_layers) return;
+    atomic_store_explicit(&g_gate_next_slot, 0u, memory_order_relaxed);
+    g_gate_seg_seq = 0;
+    g_gate_encode_slot = 0;
+    if (g_gate_miss)
+        memset([g_gate_miss contents], 0,
+               DS4_GATE_MISS_SLOTS * DS4_GATE_MISS_WORDS * sizeof(uint32_t));
+}
+
+uint32_t ds4_gpu_gate_encode_slot(void) { return g_gate_encode_slot; }
+
+/* A speculative segment that is dropped must give its slots back, or the
+ * cursor climbs across the token until it passes DS4_GATE_MAX_SLOTS and
+ * ds4_gate_take_slot starts refusing - at which point dispatches quietly go out
+ * plain and an abort can no longer switch them off. The cursor only ever moves
+ * forward while a buffer is in flight, so rewinding it here, after the drop and
+ * before the next segment is encoded, is safe. */
+void ds4_gpu_gate_segment_rewind(uint32_t slot) {
+    if (!g_gate_layers) return;
+    const uint32_t base = g_gate_seg_slot_base[slot % DS4_GATE_MISS_SLOTS];
+    const uint32_t now = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
+    /* segment_end has already counted this segment's slots, and the buffer is
+     * being dropped, so the GPU will never see them. Take them back out:
+     * "gated dispatches a token" has to mean what ran, or the window-by-window
+     * work comparison between an arm that speculates and one that does not is
+     * not comparing the same thing. */
+    if (now > base)
+        atomic_fetch_sub_explicit(&g_gate_slots_total, now - base, memory_order_relaxed);
+    atomic_store_explicit(&g_gate_next_slot, base, memory_order_relaxed);
+    if (g_gate_seg_seq) g_gate_seg_seq--;
+}
+
+uint32_t ds4_gpu_gate_segment_begin(void) {
+    if (!g_gate_layers) return 0;
     atomic_store_explicit(&g_gate_armed, 0, memory_order_relaxed);
     if (ds4_gate_census_on()) {
         memset(g_gate_slot_site, 0xff, sizeof(g_gate_slot_site));
         memset(g_gate_validate_from, 0, sizeof(g_gate_validate_from));
     }
-    atomic_store_explicit(&g_gate_next_slot, 0u, memory_order_relaxed);
-    memset([g_gate_miss contents], 0, DS4_GATE_MISS_WORDS * sizeof(uint32_t));
+    /* This segment's own miss word only: the previous segment may still be
+     * running and writing its own. */
+    const uint32_t slot = g_gate_seg_seq++ % DS4_GATE_MISS_SLOTS;
+    g_gate_encode_slot = slot;
+    g_gate_seg_slot_base[slot] = atomic_load_explicit(&g_gate_next_slot,
+                                                      memory_order_relaxed);
+    if (g_gate_miss)
+        memset((uint32_t *)[g_gate_miss contents] + slot * DS4_GATE_MISS_WORDS, 0,
+               DS4_GATE_MISS_WORDS * sizeof(uint32_t));
     memset(g_gate_layer_base, 0, sizeof(g_gate_layer_base));
     atomic_store_explicit(&g_gate_active, 1, memory_order_relaxed);
+    return slot;
 }
 
 void ds4_gpu_gate_segment_end(void) {
     if (!g_gate_layers) return;
     atomic_store_explicit(&g_gate_active, 0, memory_order_relaxed);
-    /* The slot counter is per segment; a token is several segments. Carry the
-     * total so the indirect form's cost can be priced against a count that was
-     * observed rather than one estimated from the call sites. */
-    atomic_fetch_add_explicit(&g_gate_slots_total,
-                              atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed),
+    /* Carry the total so the indirect form's cost is priced against a count
+     * that was observed rather than estimated from the call sites.
+     *
+     * This used to add the cursor itself, which was that segment's own count
+     * only because the cursor was rewound between segments. It is not any
+     * more - encode-ahead needs it to run on across a token so a speculative
+     * segment's slots cannot land on top of the one still in flight - so add
+     * what this segment took, not where the cursor now stands. Adding the
+     * absolute value made the reported dispatches a token about seven times
+     * too large, which is the average segment's position in the token. */
+    const uint32_t now = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
+    const uint32_t base = g_gate_seg_slot_base[g_gate_encode_slot % DS4_GATE_MISS_SLOTS];
+    atomic_fetch_add_explicit(&g_gate_slots_total, now > base ? now - base : 0u,
                               memory_order_relaxed);
 }
 
@@ -429,9 +495,10 @@ void ds4_gpu_gate_layer_begin(uint32_t il) {
  * count of slots taken, NOT of kernels that ran: nothing here observes a
  * launch, and with one gated layer it is zero only because there is nothing
  * behind it. It cannot be used to explain a wrong answer. */
-unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void) {
+unsigned long long ds4_gpu_gate_slots_encoded_after_abort(uint32_t slot) {
     if (!g_gate_layers || !g_gate_miss) return 0;
-    const uint32_t *m = (const uint32_t *)[g_gate_miss contents];
+    const uint32_t *m = (const uint32_t *)[g_gate_miss contents] +
+                        (slot % DS4_GATE_MISS_SLOTS) * DS4_GATE_MISS_WORDS;
     if (m[0] == 0u) return 0;
     const uint32_t aborted = m[0] - 1u;
     const uint32_t used = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
@@ -446,9 +513,10 @@ unsigned long long ds4_gpu_gate_slots_encoded_after_abort(void) {
  * write did not reach it, or the host rewrote the slot after the GPU zeroed
  * it. This is observable, and it is the number that may be used to explain a
  * wrong answer. */
-unsigned long long ds4_gpu_gate_slots_left_live(void) {
+unsigned long long ds4_gpu_gate_slots_left_live(uint32_t slot) {
     if (!g_gate_layers || !g_gate_miss || !g_gate_grid) return 0;
-    const uint32_t *m = (const uint32_t *)[g_gate_miss contents];
+    const uint32_t *m = (const uint32_t *)[g_gate_miss contents] +
+                        (slot % DS4_GATE_MISS_SLOTS) * DS4_GATE_MISS_WORDS;
     if (m[0] == 0u) return 0;
     const uint32_t aborted = m[0] - 1u;
     const uint32_t used = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
@@ -477,9 +545,11 @@ void ds4_gpu_gate_clear_route(void) {
                              DS4_GATE_MAX_LAYER * 8u * sizeof(uint32_t));
 }
 
-int ds4_gpu_gate_read_miss(uint32_t *layer, uint32_t *mask, int32_t *ids, uint32_t *n) {
+int ds4_gpu_gate_read_miss(uint32_t slot, uint32_t *layer, uint32_t *mask,
+                           int32_t *ids, uint32_t *n) {
     if (!g_gate_layers || !g_gate_miss) return 0;
-    const uint32_t *m = (const uint32_t *)[g_gate_miss contents];
+    const uint32_t *m = (const uint32_t *)[g_gate_miss contents] +
+                        (slot % DS4_GATE_MISS_SLOTS) * DS4_GATE_MISS_WORDS;
     if (m[0] == 0u) return 0;
     if (layer) *layer = m[0] - 1u;
     if (mask) *mask = m[1];

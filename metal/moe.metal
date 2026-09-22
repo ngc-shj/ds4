@@ -4111,6 +4111,59 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
         sgitg);
 }
 
+/* Reuse what a speculation got right, lane by lane.
+ *
+ * The speculation ran the routed gate/up for a predicted set of experts into
+ * spec_mid while the router was still deciding the real one. Whole-set
+ * agreement is rare - 7.9% at lead 1 - but per expert it is 65.8%, about four
+ * of six, and those four are already computed with the same kernel from the
+ * same input, so they are the same bits. Copy each match into the lane the
+ * real route wants it in, and leave a mask of the lanes that still have to be
+ * computed for the pass after the validate.
+ *
+ * One threadgroup a lane. The mask is written by a single thread that redoes
+ * all six searches, so no ordering between threadgroups is needed.
+ */
+kernel void kernel_dsv41_spec_match(
+        device const int32_t * actual,
+        device const int32_t * predicted,
+        device const float * spec_mid,
+        device       float * mid,
+        device uint32_t * lane_mask,
+        device const uint64_t * gate_addrs,
+        constant uint & width,
+        constant uint & n_lane,
+        uint  tg  [[threadgroup_position_in_grid]],
+        uint  tid [[thread_position_in_threadgroup]],
+        uint  nth [[threads_per_threadgroup]]) {
+    const uint a = tg;
+    if (a == 0 && tid == 0) {
+        uint32_t m = 0;
+        for (uint i = 0; i < n_lane; i++) {
+            bool hit = false;
+            for (uint p = 0; p < n_lane; p++)
+                hit = hit || (predicted[p] == actual[i] && predicted[p] >= 0 &&
+                              gate_addrs[predicted[p]] != 0);
+            if (!hit) m |= (1u << i);
+        }
+        lane_mask[0] = m;
+    }
+    if (a >= n_lane) return;
+    /* A predicted expert that is not in this layer's address table was never
+     * computed - the masked kernel reads a null address and finishes early -
+     * so its spec_mid row holds whatever the last token left there. Only a
+     * resident prediction counts as a match. Nothing is ever loaded for a
+     * prediction: a miss costs a wasted lane and nothing else. */
+    int found = -1;
+    for (uint p = 0; p < n_lane && found < 0; p++)
+        if (predicted[p] == actual[a] && predicted[p] >= 0 &&
+            gate_addrs[predicted[p]] != 0) found = (int)p;
+    if (found < 0) return;
+    device const float * src = spec_mid + (uint)found * width;
+    device       float * dst = mid + a * width;
+    for (uint i = tid; i < width; i += nth) dst[i] = src[i];
+}
+
 kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -4123,6 +4176,7 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         device       char * dst_mid,
         device const char * ids,
         device const char * weights,
+        device const uint32_t * lane_mask,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -4130,7 +4184,13 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     const int iid1 = tgpig.z / args.nei0;
     const int idx  = tgpig.z % args.nei0;
-    if ((split.active_mask & (1u << (uint)idx)) == 0) {
+    /* Which lanes to compute is usually settled on the host, but a pass that
+     * only fills in what a speculation did not match cannot be: the match is
+     * decided on the GPU, while this dispatch is already encoded. All ones
+     * means read it from the buffer instead. */
+    const uint32_t mask = split.active_mask == 0xffffffffu
+        ? lane_mask[0] : split.active_mask;
+    if ((mask & (1u << (uint)idx)) == 0) {
         return;
     }
 

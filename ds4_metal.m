@@ -9776,6 +9776,27 @@ int ds4_gpu_flush_commands(void) {
     return 1;
 }
 
+/* Encode-ahead needs the two halves of end_commands apart: commit the segment
+ * and carry on encoding the next one into a fresh buffer, then wait for the
+ * committed one only. flush_commands already does the first half. */
+int ds4_gpu_wait_committed(void) {
+    return ds4_gpu_wait_pending_command_buffers("command batch");
+}
+
+/* Throw away what has been encoded but not committed. The segment after an
+ * abort is encoded speculatively, and when the guess is wrong the commands are
+ * dropped rather than submitted - nothing has reached the GPU, so there is no
+ * work to undo, only a buffer to release. */
+int ds4_gpu_discard_commands(void) {
+    if (!g_batch_cb) return 1;
+    ds4_gpu_parallel_ffn_reset_state(YES);
+    ds4_gpu_close_batch_encoder();
+    g_batch_cb = nil;
+    g_batch_has_work = NO;
+    g_stream_expert_cache_batch_seq = 0;
+    return 1;
+}
+
 int ds4_gpu_commands_active(void) {
     return g_batch_cb != nil;
 }
@@ -15872,7 +15893,11 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     [enc setBuffer:table_up offset:0 atIndex:2];
     [enc setBuffer:table_down offset:0 atIndex:3];
     [enc setBuffer:g_gate_grid offset:0 atIndex:4];
-    [enc setBuffer:g_gate_miss offset:0 atIndex:5];
+    /* The segment being encoded owns one miss word of the ring; the one before
+     * it may still be running and writing its own. */
+    [enc setBuffer:g_gate_miss
+            offset:(NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t)
+           atIndex:5];
     [enc setBytes:&layer length:sizeof(layer) atIndex:6];
     [enc setBytes:&n_sel length:sizeof(n_sel) atIndex:7];
     [enc setBytes:&gate_from length:sizeof(gate_from) atIndex:8];
@@ -34358,6 +34383,68 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     return 1;
 }
 
+/* Which routed lanes still have to be computed. The host cannot know it when
+ * the pass is encoded - the match against the speculation happens on the GPU
+ * between the two - so the mask lives in a buffer the kernel reads. */
+static id<MTLBuffer> g_routed_lane_mask;
+
+int ds4_gpu_dsv41_spec_match(const ds4_gpu_tensor *actual,
+                             const ds4_gpu_tensor *predicted, uint32_t pred_elem_off,
+                             const ds4_gpu_tensor *spec_mid, ds4_gpu_tensor *mid,
+                             uint32_t width, uint32_t n_lane, uint32_t layer);
+
+static id<MTLBuffer> ds4_gpu_routed_lane_mask_buffer(void) {
+    if (!g_routed_lane_mask) {
+        g_routed_lane_mask = [g_device newBufferWithLength:sizeof(uint32_t)
+                                                   options:MTLResourceStorageModeShared];
+        if (g_routed_lane_mask) {
+            *(uint32_t *)[g_routed_lane_mask contents] = 0x3fu;
+            g_routed_lane_mask.label = @"ds4_routed_lane_mask";
+        }
+    }
+    return g_routed_lane_mask;
+}
+
+/* Copy every lane the speculation got right into the lane the real route
+ * wants, and leave the mask of what is still to compute. */
+int ds4_gpu_dsv41_spec_match(const ds4_gpu_tensor *actual,
+                             const ds4_gpu_tensor *predicted, uint32_t pred_elem_off,
+                             const ds4_gpu_tensor *spec_mid, ds4_gpu_tensor *mid,
+                             uint32_t width, uint32_t n_lane, uint32_t layer) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!actual || !predicted || !spec_mid || !mid || !width || !n_lane) return 0;
+    static id<MTLComputePipelineState> pso;
+    if (!pso) {
+        pso = ds4_gpu_get_pipeline("kernel_dsv41_spec_match");
+        if (!pso) { fprintf(stderr, "ds4: no kernel_dsv41_spec_match\n"); return 0; }
+    }
+    id<MTLBuffer> ab = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)actual);
+    id<MTLBuffer> pb = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)predicted);
+    id<MTLBuffer> sb = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)spec_mid);
+    id<MTLBuffer> mb = ds4_gpu_tensor_buffer(mid);
+    id<MTLBuffer> lm = ds4_gpu_routed_lane_mask_buffer();
+    id<MTLBuffer> tg = nil, tu = nil, td = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td)) return 0;
+    if (!ab || !pb || !sb || !mb || !lm || !tg) return 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:ab offset:ds4_gpu_tensor_offset((ds4_gpu_tensor *)actual) atIndex:0];
+    [enc setBuffer:pb offset:ds4_gpu_tensor_offset((ds4_gpu_tensor *)predicted) +
+                              (NSUInteger)pred_elem_off * sizeof(int32_t) atIndex:1];
+    [enc setBuffer:sb offset:ds4_gpu_tensor_offset((ds4_gpu_tensor *)spec_mid) atIndex:2];
+    [enc setBuffer:mb offset:ds4_gpu_tensor_offset(mid) atIndex:3];
+    [enc setBuffer:lm offset:0 atIndex:4];
+    [enc setBuffer:tg offset:0 atIndex:5];
+    [enc setBytes:&width length:sizeof(width) atIndex:6];
+    [enc setBytes:&n_lane length:sizeof(n_lane) atIndex:7];
+    ds4_gpu_dispatch(enc, MTLSizeMake(n_lane, 1, 1), MTLSizeMake(256, 1, 1));
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "speculative lane match");
+}
+
 static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -34426,6 +34513,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     [enc setBuffer:dst_mid    offset:dst_mid_off atIndex:8];
     [enc setBuffer:ids        offset:ids_off     atIndex:9];
     [enc setBuffer:weights    offset:weights_off atIndex:10];
+    [enc setBuffer:ds4_gpu_routed_lane_mask_buffer() offset:0 atIndex:11];
     if (entries) {
         for (uint32_t i = 0; i < 6; i++) {
             if ((split->active_mask & (1u << i)) == 0) continue;
@@ -42174,7 +42262,7 @@ static int ds4_gpu_routed_moe_one_gated(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in,
-        uint32_t layer_index, uint32_t which) {
+        uint32_t layer_index, uint32_t which, uint32_t sel_elem_off, uint32_t lane_mask) {
 #define DS4_GATED_DECLINE(why) do { \
         static int said; \
         if (!said) { said = 1; \
@@ -42195,6 +42283,10 @@ static int ds4_gpu_routed_moe_one_gated(
     if (!ds4_gpu_stream_expert_cache_addr_buffers(layer_index, &table_gate,
                                                   &table_up, &table_down))
         DS4_GATED_DECLINE("no address table");
+    /* A speculative call points at a recorded route elsewhere in the same
+     * buffer, while the router beside it writes the live one. */
+    const NSUInteger sel_off = ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected) +
+        (NSUInteger)sel_elem_off * sizeof(int32_t);
     id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x), gatebuf = ds4_gpu_tensor_buffer(gate);
     id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up), midbuf = ds4_gpu_tensor_buffer(mid);
     id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
@@ -42218,7 +42310,10 @@ static int ds4_gpu_routed_moe_one_gated(
         .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
         .weight_stride = sizeof(float), .write_clamped = 0, .clamp_value = clamp,
     };
-    const ds4_gpu_stream_expert_split_args all_lanes = { .active_mask = 0x3fu, .accumulate = 0u };
+    /* 0x3f is every lane; 0xffffffff tells the kernel to read the mask a
+     * speculation's match left in the lane-mask buffer. */
+    const ds4_gpu_stream_expert_split_args all_lanes =
+        { .active_mask = lane_mask ? lane_mask : 0x3fu, .accumulate = 0u };
     /* The envelope cannot be split by sampling - this device has no
      * dispatch-boundary counters - so a pass is timed by how much the envelope
      * grows when it is encoded again. Running it twice reads the same inputs
@@ -42239,7 +42334,7 @@ static int ds4_gpu_routed_moe_one_gated(
                 &gate_args, &act_args, &all_lanes, NULL, table_gate, table_up,
                 xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
                 upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
-                selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
+                selbuf, sel_off, wbuf,
                 ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights),
                 ds4_gpu_routed_mv_smem(gate_type), 2, false)) return 0;
     if ((which & 1u) && !ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
@@ -42247,7 +42342,7 @@ static int ds4_gpu_routed_moe_one_gated(
             &gate_args, &act_args, &all_lanes, NULL, table_gate, table_up,
             xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
             upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
-            selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected), wbuf,
+            selbuf, sel_off, wbuf,
             ds4_gpu_tensor_offset((ds4_gpu_tensor *)weights),
             ds4_gpu_routed_mv_smem(gate_type), 2, false)) return 0;
     ds4_gpu_stage(DS4_STAGE_ROUTED_DOWN);
@@ -42257,13 +42352,13 @@ static int ds4_gpu_routed_moe_one_gated(
                 g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
                 &down_args, &all_lanes, NULL, table_down,
                 midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out),
-                selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected),
+                selbuf, sel_off,
                 ds4_gpu_routed_mv_smem(down_type), 2)) return 0;
     if ((which & 2u) && !ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
             g_batch_cb, g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline,
             &down_args, &all_lanes, NULL, table_down,
             midbuf, ds4_gpu_tensor_offset(mid), outbuf, ds4_gpu_tensor_offset(out),
-            selbuf, ds4_gpu_tensor_offset((ds4_gpu_tensor *)selected),
+            selbuf, sel_off,
             ds4_gpu_routed_mv_smem(down_type), 2)) return 0;
     return 1;
 }
@@ -42303,13 +42398,17 @@ int ds4_gpu_routed_moe_one_gated_level(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which) {
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which,
+        uint32_t sel_elem_off, uint32_t lane_mask) {
+    const uint32_t sel_pass = sel_elem_off;
+    const uint32_t mask_pass = lane_mask;
     ds4_gpu_host_split_note(DS4_HOST_SPLIT_GRAPH);
     g_routed_current_layer = layer_index;
     return ds4_gpu_routed_moe_one_gated(out, gate, up, mid, gate_type, down_type,
             gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-            n_total_expert, n_expert, clamp, x, NULL, layer_index, which);
+            n_total_expert, n_expert, clamp, x, NULL, layer_index, which,
+            sel_pass, mask_pass);
 }
 
 /* Whether the gated routed path will take this layer, asked before the MoE is
@@ -42347,10 +42446,13 @@ int ds4_gpu_routed_sweep_encode(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which) {
+    const uint32_t sel_pass = 0u;
+    const uint32_t mask_pass = 0x3fu;
     return ds4_gpu_routed_moe_one_gated(out, gate, up, mid, gate_type, down_type,
             gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim, selected, weights,
-            n_total_expert, n_expert, clamp, x, NULL, layer_index, which);
+            n_total_expert, n_expert, clamp, x, NULL, layer_index, which,
+            sel_pass, mask_pass);
 }
 
 static int ds4_gpu_routed_moe_one_resident(
@@ -42635,7 +42737,7 @@ int ds4_gpu_routed_moe_one_tensor(
             gate_type, down_type, gate_expert_bytes, gate_row_bytes,
             down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim,
             out_dim, selected, weights, n_total_expert, n_expert, clamp,
-            x, add_in, layer_index, 3u)) return 1;
+            x, add_in, layer_index, 3u, 0u, 0x3fu)) return 1;
     /* One layer at a time, and only when asked: the resident path is compared
      * against this one before any of the other thirty-nine follow it. */
     {

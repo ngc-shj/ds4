@@ -78,6 +78,8 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
+int ds4_gpu_wait_committed(void);     /* wait for what flush_commands committed */
+int ds4_gpu_discard_commands(void);   /* drop an encoded, uncommitted buffer */
 int ds4_gpu_commands_active(void);
 int ds4_gpu_begin_concurrent_section(void);  /* independent dispatches may overlap */
 int ds4_gpu_concurrent_section_barrier(void);  /* a level break inside one */
@@ -89,7 +91,12 @@ int ds4_gpu_routed_moe_one_gated_level(
         uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
-        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which);
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which,
+        uint32_t sel_elem_off, uint32_t lane_mask);
+int ds4_gpu_dsv41_spec_match(const ds4_gpu_tensor *actual,
+                             const ds4_gpu_tensor *predicted, uint32_t pred_elem_off,
+                             const ds4_gpu_tensor *spec_mid, ds4_gpu_tensor *mid,
+                             uint32_t width, uint32_t n_lane, uint32_t layer);
 int ds4_gpu_routed_moe_one_gated_available(uint32_t layer_index, uint32_t gate_type,
                                            uint32_t down_type, uint32_t n_expert);
 void ds4_gpu_end_concurrent_section(void);
