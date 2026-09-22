@@ -41038,26 +41038,59 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 /* Router and shared expert: the part of a row's MoE that does not depend on
  * the selected ids reaching the host. Encoded for every row before the batch
  * pays its single readback. */
-/* On with DS4_METAL_V41_FFN_OVERLAP=1. */
-static bool ds41_ffn_overlap_on(void) {
-    static int checked, on;
+/* DS4_METAL_V41_FFN_OVERLAP: 0 is what ships, 1 the overlap, 2 the serial
+ * control that isolates it. The bisect arrangements 3, 5 and 6 are known to
+ * crash and are reachable only with DS4_METAL_V41_FFN_OVERLAP_DIAG set; any
+ * other value stops the process rather than quietly meaning 1, which is what
+ * a truthy test of the environment used to do. */
+static int ds41_ffn_overlap_mode(void) {
+    static int checked, mode;
     if (!checked) {
         const char *e = getenv("DS4_METAL_V41_FFN_OVERLAP");
+        const char *diag = getenv("DS4_METAL_V41_FFN_OVERLAP_DIAG");
         checked = 1;
-        on = e && e[0] && atoi(e) != 0;
+        char *end = NULL;
+        mode = 0;
+        if (e && e[0]) {
+            const long v = strtol(e, &end, 10);
+            if (!end || *end || v < 0 || v > 9)
+                ds4_die("DS4_METAL_V41_FFN_OVERLAP must be a small number");
+            mode = (int)v;
+        }
+        const bool known = mode == 0 || mode == 1 || mode == 2;
+        const bool bisect = (mode == 3 || mode == 5 || mode == 6) && diag && diag[0];
+        if (!known && !bisect)
+            ds4_die("DS4_METAL_V41_FFN_OVERLAP must be 0 (what ships), 1 (the "
+                    "shared/routed overlap) or 2 (the serial control); 3, 5 and 6 "
+                    "are crashing bisects and need DS4_METAL_V41_FFN_OVERLAP_DIAG");
     }
-    return on;
+    return mode;
 }
+
+static bool ds41_ffn_overlap_on(void) { return ds41_ffn_overlap_mode() != 0; }
 
 /* The shared expert in the levels the routed experts also have: 1 is gate and
  * up, 2 the SwiGLU between them, 3 the down projection. Split so that the two
  * branches can be interleaved level by level inside one concurrent section;
  * run one after another it is the same three calls in the same order. */
+/* `late`, when given, collects the roundings the producer could not fold into
+ * its own store, for the caller to issue once the concurrent section has been
+ * closed. A rounding pass reads back the row the dispatch before it wrote, and
+ * Metal orders nothing inside a concurrent encoder, so issuing it there is a
+ * race on any build where the fold does not take: FUSE_BF16 off, a producer
+ * that cannot fold, or the paired shared form, which has no fold at all.
+ * NULL means issue it inline, which is what the path that ships does. */
 static bool ds41_moe_shared_stage(ds41_gpu_graph *g, const ds4_model *m,
-                                  const ds4_layer_weights *l, int stage) {
+                                  const ds4_layer_weights *l, int stage,
+                                  bool late[2]) {
+    if (late) late[0] = late[1] = false;
     if (stage == 2) return ds41_shared_swiglu(g);
-    if (stage == 3)
-        return ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
+    if (stage == 3) {
+        if (!late)
+            return ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true);
+        return ds41_matmul_deferred(g->shared, m, l->ffn_down_shexp, g->shared_mid,
+                                    true, &late[0]);
+    }
     /* The shared expert's gate and up read different weights from the same
      * input, so they can go out as one dispatch with two lanes instead of two
      * dispatches. Same arithmetic and same order of accumulation, so the
@@ -41081,23 +41114,40 @@ static bool ds41_moe_shared_stage(ds41_gpu_graph *g, const ds4_model *m,
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_gate_shexp->dim[0] == l->ffn_up_shexp->dim[0];
     if (can_pair) {
-        return ds4_gpu_matmul_q8_0_pair_tensor(g->shared_gate, g->shared_up,
-                   m->map, m->size,
-                   l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                   l->ffn_gate_shexp->dim[0], l->ffn_gate_shexp->dim[1],
-                   l->ffn_up_shexp->dim[1], g->norm, 1) &&
-               ds41_bf16(g->shared_gate, (uint32_t)l->ffn_gate_shexp->dim[1]) &&
+        /* The pair kernel has no producer-side fold, so both roundings are
+         * always separate passes. */
+        if (!ds4_gpu_matmul_q8_0_pair_tensor(g->shared_gate, g->shared_up,
+                m->map, m->size,
+                l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                l->ffn_gate_shexp->dim[0], l->ffn_gate_shexp->dim[1],
+                l->ffn_up_shexp->dim[1], g->norm, 1)) return false;
+        if (late) { late[0] = late[1] = true; return true; }
+        return ds41_bf16(g->shared_gate, (uint32_t)l->ffn_gate_shexp->dim[1]) &&
                ds41_bf16(g->shared_up, (uint32_t)l->ffn_up_shexp->dim[1]);
     }
-    return ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) &&
-           ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true);
+    if (!late)
+        return ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) &&
+               ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true);
+    return ds41_matmul_deferred(g->shared_gate, m, l->ffn_gate_shexp, g->norm,
+                                true, &late[0]) &&
+           ds41_matmul_deferred(g->shared_up, m, l->ffn_up_shexp, g->norm,
+                                true, &late[1]);
+}
+
+/* Issue the roundings a section deferred, now that it is closed. */
+static bool ds41_moe_shared_round(ds41_gpu_graph *g, const ds4_layer_weights *l,
+                                  int stage, const bool late[2]) {
+    if (stage == 3)
+        return !late[0] || ds41_bf16(g->shared, DS4_N_EMBD);
+    return (!late[0] || ds41_bf16(g->shared_gate, (uint32_t)l->ffn_gate_shexp->dim[1])) &&
+           (!late[1] || ds41_bf16(g->shared_up, (uint32_t)l->ffn_up_shexp->dim[1]));
 }
 
 static bool ds41_moe_shared_row(ds41_gpu_graph *g, const ds4_model *m,
                                 const ds4_layer_weights *l) {
-    return ds41_moe_shared_stage(g, m, l, 1) &&
-           ds41_moe_shared_stage(g, m, l, 2) &&
-           ds41_moe_shared_stage(g, m, l, 3);
+    return ds41_moe_shared_stage(g, m, l, 1, NULL) &&
+           ds41_moe_shared_stage(g, m, l, 2, NULL) &&
+           ds41_moe_shared_stage(g, m, l, 3, NULL);
 }
 
 /* The router alone. The shared expert follows it everywhere except in the
@@ -41137,9 +41187,8 @@ static DS4_MAYBE_UNUSED bool ds41_moe_experts_row(ds41_gpu_graph *g, const ds4_m
 
 /* One level of the routed experts: 1 is the gate/up pair-SwiGLU, 2 the down
  * sum. The arguments are ds41_moe_experts_row's, unchanged. */
-static bool ds41_moe_experts_level(ds41_gpu_graph *g, const ds4_model *m,
-                                   const ds4_layer_weights *l, uint32_t il,
-                                   uint32_t which) {
+static bool ds41_moe_experts_level(ds41_gpu_graph *g, const ds4_layer_weights *l,
+                                   uint32_t il, uint32_t which) {
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
@@ -41174,72 +41223,110 @@ static bool ds41_moe_experts_level(ds41_gpu_graph *g, const ds4_model *m,
  *
  * If the section will not open, the same calls go out in the same order and
  * nothing overlaps - correct, and no faster. */
-static bool ds41_ffn_level_break(void) {
-    ds4_gpu_end_concurrent_section();
-    return ds4_gpu_begin_concurrent_section() != 0;
-}
-
+/* The routed experts and the shared expert read the same `norm` and write
+ * different tensors; nothing joins them until the add in ds41_moe_finish. Yet
+ * they are issued one after the other, so 1.50 GB of shared weights a token
+ * and 2.19 GiB of routed wait for each other instead of sharing the machine.
+ *
+ * Their levels line up, and `ds4_gpu_routed_moe_one_gated` already takes a
+ * `which` bitmask, so no new kernel is needed:
+ *
+ *   section   routed gate/up/SwiGLU, 1728 groups || shared gate 1152, up 1152
+ *   ------    shared SwiGLU, one small dispatch, nothing to overlap it with
+ *   section   routed down sum, 640               || shared down 2560
+ *
+ * Each dispatch is the one that ran before - same kernel, same grid, same
+ * inputs, same order of accumulation - so the answer does not move, and the
+ * byte comparison is what says so.
+ *
+ * The shared expert moves here from before the validate. That puts it behind
+ * this layer's own abort gate, which is safe only because the continuation
+ * covers it: on an abort it does not run at all, and the continuation, which
+ * re-runs the routed stage, re-runs it once.
+ *
+ * Why two sections rather than one with the SwiGLU inside it: every
+ * arrangement that put the SwiGLU or the finish add inside a concurrent
+ * encoder, or made one the first dispatch after one, segfaulted inside AGX in
+ * insertIndirectTGOptKernel - every dispatch here is indirect, because the
+ * gate sends them through the grid table. The modes below are the bisect that
+ * found the boundary; proto/indirconc.m reproduces none of it outside the
+ * engine, so what the placement is really doing is not understood. This
+ * arrangement is the one that both works and overlaps what is worth
+ * overlapping, and the SwiGLU is a single small dispatch either way.
+ *
+ *   =1 the arrangement above    =2 the same order, no sections at all
+ *   =3 one section, no level breaks    =5 shared gate/up alone in a section
+ *   =6 shared levels with barriers, routed outside
+ */
 static bool ds41_moe_experts_overlapped(ds41_gpu_graph *g, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t il) {
-    /* =2 reorders the two branches into levels without opening the section,
-     * which separates the reordering from the concurrency. */
-    static int mode = -1;
-    if (mode < 0) {
-        const char *e = getenv("DS4_METAL_V41_FFN_OVERLAP");
-        mode = e && e[0] ? atoi(e) : 0;
-    }
-    const bool section = mode != 2 && ds4_gpu_begin_concurrent_section() != 0;
-    /* Compiling is not running, and a section that failed to open leaves the
-     * two branches exactly where they were: say which one happened, once. */
+    const int mode = ds41_ffn_overlap_mode();
+    /* Compiling is not running: say once which arrangement went out. */
     static int said;
     if (!said) {
         said = 1;
-        fprintf(stderr, "ds4: shared/routed FFN overlap ran, concurrent section %s\n",
-                section ? "open" : "REFUSED");
+        fprintf(stderr, "ds4: shared/routed FFN overlap ran, mode %d\n", mode);
     }
-    /* The level break is an encoder boundary rather than a barrier inside the
-     * encoder. A memoryBarrier followed by an indirect dispatch - which every
-     * dispatch here is, because the abort gate sends them through the grid
-     * table - segfaults inside AGX's insertIndirectTGOptKernel. A boundary
-     * orders the same thing and this measurement puts eighty of them a token
-     * below what it can see. */
-    /* =5: the section holds only the shared gate and up, and the routed
-     * experts stay outside it entirely. Crash bisect: it says whether the
-     * fault follows the routed masked kernel into a concurrent encoder. */
-    /* =6: the shared expert's own three levels inside one section, ordered by
-     * barriers, with the routed experts outside. Crash bisect: it says whether
-     * a memory barrier and an indirect dispatch can share a concurrent
-     * encoder at all, which is what the whole DAG plan rests on. */
-    if (mode == 6) {
-        bool ok6 = ds41_moe_shared_stage(g, m, l, 1);
-        if (ok6 && section) ok6 = ds4_gpu_concurrent_section_barrier() != 0;
-        ok6 = ok6 && ds41_moe_shared_stage(g, m, l, 2);
-        if (ok6 && section) ok6 = ds4_gpu_concurrent_section_barrier() != 0;
-        ok6 = ok6 && ds41_moe_shared_stage(g, m, l, 3);
-        if (section) ds4_gpu_end_concurrent_section();
-        return ok6 && ds41_moe_experts_level(g, m, l, il, 1u) &&
-               ds41_moe_experts_level(g, m, l, il, 2u);
+    /* Roundings the producers could not fold. They read back what the
+     * dispatch before them wrote, so they never go inside a section. Mode 2
+     * defers them too: it is the control for the sections alone, and an arm
+     * that differed in dispatch order as well would not be that. */
+    bool late1[2] = { false, false }, late3[2] = { false, false };
+
+    if (mode == 2) {
+        return ds41_moe_experts_level(g, l, il, 1u) &&
+               ds41_moe_shared_stage(g, m, l, 1, late1) &&
+               ds41_moe_shared_round(g, l, 1, late1) &&
+               ds41_moe_shared_stage(g, m, l, 2, NULL) &&
+               ds41_moe_experts_level(g, l, il, 2u) &&
+               ds41_moe_shared_stage(g, m, l, 3, late3) &&
+               ds41_moe_shared_round(g, l, 3, late3);
     }
-    if (mode == 5) {
-        bool ok5 = ds41_moe_shared_stage(g, m, l, 1);
-        if (section) ds4_gpu_end_concurrent_section();
-        return ok5 && ds41_moe_shared_stage(g, m, l, 2) &&
-               ds41_moe_shared_stage(g, m, l, 3) &&
-               ds41_moe_experts_level(g, m, l, il, 1u) &&
-               ds41_moe_experts_level(g, m, l, il, 2u);
+
+    if (mode == 3 || mode == 5 || mode == 6) {
+        /* The bisect arrangements, behind DS4_METAL_V41_FFN_OVERLAP_DIAG and
+         * kept because they are the evidence for the shape below. All of them
+         * crash except 5; see V4.1-TUNING.md. */
+        const bool sec = ds4_gpu_begin_concurrent_section() != 0;
+        bool b;
+        if (mode == 5) {
+            b = ds41_moe_shared_stage(g, m, l, 1, NULL);
+            if (sec) ds4_gpu_end_concurrent_section();
+            return b && ds41_moe_shared_stage(g, m, l, 2, NULL) &&
+                   ds41_moe_shared_stage(g, m, l, 3, NULL) &&
+                   ds41_moe_experts_level(g, l, il, 1u) &&
+                   ds41_moe_experts_level(g, l, il, 2u);
+        }
+        if (mode == 6) {
+            b = ds41_moe_shared_stage(g, m, l, 1, NULL);
+            if (b && sec) b = ds4_gpu_concurrent_section_barrier() != 0;
+            b = b && ds41_moe_shared_stage(g, m, l, 2, NULL);
+            if (b && sec) b = ds4_gpu_concurrent_section_barrier() != 0;
+            b = b && ds41_moe_shared_stage(g, m, l, 3, NULL);
+            if (sec) ds4_gpu_end_concurrent_section();
+            return b && ds41_moe_experts_level(g, l, il, 1u) &&
+                   ds41_moe_experts_level(g, l, il, 2u);
+        }
+        b = ds41_moe_experts_level(g, l, il, 1u) &&
+            ds41_moe_shared_stage(g, m, l, 1, NULL) &&
+            ds41_moe_shared_stage(g, m, l, 2, NULL) &&
+            ds41_moe_experts_level(g, l, il, 2u) &&
+            ds41_moe_shared_stage(g, m, l, 3, NULL);
+        if (sec) ds4_gpu_end_concurrent_section();
+        return b;
     }
-    bool ok = ds41_moe_experts_level(g, m, l, il, 1u) &&
-              ds41_moe_shared_stage(g, m, l, 1);
-    /* =3 drops the level breaks, which makes the answer wrong - shared SwiGLU
-     * may run before the gate and up it reads. Crash bisect only: it says
-     * whether the fault is the breaks or the section's contents. */
-    if (ok && section && mode != 3) ok = ds41_ffn_level_break();
-    ok = ok && ds41_moe_shared_stage(g, m, l, 2);
-    if (ok && section && mode != 3) ok = ds41_ffn_level_break();
-    ok = ok && ds41_moe_experts_level(g, m, l, il, 2u) &&
-               ds41_moe_shared_stage(g, m, l, 3);
-    if (section) ds4_gpu_end_concurrent_section();
-    return ok;
+
+    const bool s1 = ds4_gpu_begin_concurrent_section() != 0;
+    bool ok = ds41_moe_experts_level(g, l, il, 1u) &&
+              ds41_moe_shared_stage(g, m, l, 1, late1);
+    if (s1) ds4_gpu_end_concurrent_section();
+    ok = ok && ds41_moe_shared_round(g, l, 1, late1) &&
+               ds41_moe_shared_stage(g, m, l, 2, NULL);
+    const bool s2 = ok && ds4_gpu_begin_concurrent_section() != 0;
+    ok = ok && ds41_moe_experts_level(g, l, il, 2u) &&
+               ds41_moe_shared_stage(g, m, l, 3, late3);
+    if (s2) ds4_gpu_end_concurrent_section();
+    return ok && ds41_moe_shared_round(g, l, 3, late3);
 }
 
 static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
@@ -42429,6 +42516,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (gate_n > gate_lo) {
         uint32_t start = gate_lo;
         int resume_from_moe = 0;
+        /* Which shape the layer being resumed was issued in. A continuation
+         * re-runs the routed stage and nothing else, so it has to re-run the
+         * same shape: deciding again could issue the shared expert twice, or
+         * not at all, if availability changed between the two passes. */
+        int resume_overlap = -1;
         /* The ordinary loop drains at layer 13, before layer 14 overwrites the
          * first Engram table's shared input. A gated segment has to respect
          * the same boundary: it is not a gate decision, it is the graph's. */
@@ -42493,13 +42585,30 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 if (full_resume < 0)
                     full_resume = getenv("DS4_METAL_V41_ABORT_GATE_FULL_RESUME") != NULL;
                 ds41_gate_trace(g, il, "in ");
-                if (!(il == start && resume_from_moe && !full_resume)) {
+                const bool resuming = il == start && resume_from_moe && !full_resume;
+                /* Decided before the router goes out, not after a level has
+                 * been asked: the shape of the whole layer follows from it,
+                 * and the fallback is then exactly the path that ships rather
+                 * than a half-issued layer the expert cache would account
+                 * twice. */
+                const bool use_overlap = resuming && resume_overlap >= 0
+                    ? resume_overlap != 0
+                    : (ds41_ffn_overlap_on() &&
+                       ds4_gpu_routed_moe_one_gated_available(il,
+                           gl->ffn_gate_exps->type, gl->ffn_down_exps->type,
+                           DS4_N_EXPERT_USED) != 0);
+                if (!resuming) {
+                    resume_overlap = use_overlap ? 1 : 0;
                     ok = ds41_graph_before_moe(g, m, gl, il) &&
-                         ds41_moe_route_row(g, m, gl, (uint32_t)token) &&
+                         (use_overlap ?
+                              ds41_moe_route_only(g, m, gl, (uint32_t)token) :
+                              ds41_moe_route_row(g, m, gl, (uint32_t)token)) &&
                          ds4_gpu_gate_encode_validate(g->selected, il,
                                                       DS4_N_EXPERT_USED, DS4_N_EXPERT);
                 }
-                if (ok) ok = ds41_moe_experts_row(g, m, gl, il) &&
+                if (ok) ok = (use_overlap ?
+                                  ds41_moe_experts_overlapped(g, m, gl, il) :
+                                  ds41_moe_experts_row(g, m, gl, il)) &&
                              ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
                 if (ok) ds41_gate_trace(g, il, "out");
             }
@@ -42670,7 +42779,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * an abort count from that report could not be divided by each other. */
         if (ok && (g_gate_tokens % 64ull) == 0ull) {
             const double dt = 64.0;
+            unsigned long long sec_att = 0, sec_open = 0;
+            ds4_gpu_concurrent_section_counts(&sec_att, &sec_open);
             static unsigned long long w_cbs, w_aborts, w_bytes, w_touched,
+                                      w_sec_att, w_sec_open,
                                       w_slots, w_after, w_direct;
             static double w_encode, w_wait, w_entry, w_repair, w_account,
                           w_tail, w_wall, w_gpu;
@@ -42684,8 +42796,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n"
                 "ds4:   %.1f gated dispatches a token, %.1f of them behind an abort; "
                 "%.1f sent plain ahead of a buffer's first validate\n"
-                "ds4:   encode-ahead: %.2f segments used, %.2f dropped, %.2f ms a token "
-                "spent encoding under the GPU\n",
+                "ds4:   concurrent sections: %.2f attempted, %.2f opened a token\n",
                 g_gate_tokens - 63ull, g_gate_tokens,
                 (double)(g_gate_cbs - w_cbs) / dt,
                 (double)(g_gate_aborts - w_aborts) / dt,
@@ -42710,7 +42821,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 ((g_gate_wait_ms - w_wait) - (g_gt_gpu_ms - w_gpu)) / dt,
                 (double)(ds4_gpu_gate_slots_total() - w_slots) / dt,
                 (double)(g_gate_after - w_after) / dt,
-                (double)(ds4_gpu_gate_direct_total() - w_direct) / dt);
+                (double)(ds4_gpu_gate_direct_total() - w_direct) / dt,
+                (double)(sec_att - w_sec_att) / dt,
+                (double)(sec_open - w_sec_open) / dt);
+            w_sec_att = sec_att; w_sec_open = sec_open;
             w_cbs = g_gate_cbs; w_aborts = g_gate_aborts; w_bytes = g_gate_bytes;
             w_touched = g_gate_touched; w_encode = g_gate_encode_ms;
             w_wait = g_gate_wait_ms; w_entry = g_gt_entry_ms;

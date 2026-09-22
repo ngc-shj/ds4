@@ -9897,9 +9897,26 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder) {
  * nothing that reads what another dispatch in it writes.
  *
  * Boundaries are not free: the same file measures one at 22.2 us. */
+/* Asking for a section and getting one are different things: it declines when
+ * the batch is closed or an FFN overlap already owns the encoder, and the
+ * caller then runs serially and correctly. A measurement that does not check
+ * these two counters cannot tell an overlap that did nothing from one that
+ * never happened. */
+static _Atomic unsigned long long g_section_attempted, g_section_opened;
+
 int ds4_gpu_begin_concurrent_section(void) {
-    if (!g_batch_cb || g_batch_encoder_concurrent ||
-        g_parallel_q8_pending || g_parallel_ffn_mode != 0) return 0;
+    atomic_fetch_add_explicit(&g_section_attempted, 1u, memory_order_relaxed);
+    /* Nesting is not a decline. Returning 0 here would tell the caller to fall
+     * back to serial, but there is no serial encoder to fall back to - its
+     * dispatches would join the section already open and run beside the work
+     * they were meant to follow. No caller nests today; if one ever does, it
+     * must fail loudly rather than silently lose its ordering. */
+    if (g_batch_encoder_concurrent) {
+        fprintf(stderr, "ds4: a concurrent section is already open; nesting one "
+                        "inside it would drop the caller's ordering\n");
+        abort();
+    }
+    if (!g_batch_cb || g_parallel_q8_pending || g_parallel_ffn_mode != 0) return 0;
     ds4_gpu_close_batch_encoder();
     g_batch_encoder_concurrent = YES;
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
@@ -9908,7 +9925,16 @@ int ds4_gpu_begin_concurrent_section(void) {
         g_batch_encoder_concurrent = NO;
         return 0;
     }
+    atomic_fetch_add_explicit(&g_section_opened, 1u, memory_order_relaxed);
     return 1;
+}
+
+void ds4_gpu_concurrent_section_counts(unsigned long long *attempted,
+                                       unsigned long long *opened) {
+    if (attempted) *attempted = atomic_load_explicit(&g_section_attempted,
+                                                     memory_order_relaxed);
+    if (opened) *opened = atomic_load_explicit(&g_section_opened,
+                                               memory_order_relaxed);
 }
 
 /* A level break inside the section. Metal makes either barrier form an
@@ -42284,6 +42310,28 @@ int ds4_gpu_routed_moe_one_gated_level(
             gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim, selected, weights,
             n_total_expert, n_expert, clamp, x, NULL, layer_index, which);
+}
+
+/* Whether the gated routed path will take this layer, asked before the MoE is
+ * entered and with no side effect of its own.
+ *
+ * Falling back after the first level has been asked is not good enough: the
+ * ordinary routed call does the expert cache's accounting, and the validator
+ * has already logged the route, so the layer would be accounted twice - the
+ * token clock, last_used, use_count, the route hotness, the prunes and the hit
+ * counter. The output would still be right and the cache policy would drift.
+ * So the caller decides which shape the whole layer takes before it issues the
+ * router, and the fallback is then exactly the path that ships. */
+int ds4_gpu_routed_moe_one_gated_available(uint32_t layer_index, uint32_t gate_type,
+                                           uint32_t down_type, uint32_t n_expert) {
+    id<MTLBuffer> tg = nil, tu = nil, td = nil;
+    return g_batch_cb && n_expert == 6 && g_tp_split_world == 1 &&
+           ds4_gpu_expert_residency_wanted() &&
+           gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+           down_type == DS4_METAL_TENSOR_Q2_K &&
+           g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
+           g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil &&
+           ds4_gpu_stream_expert_cache_addr_buffers(layer_index, &tg, &tu, &td) != 0;
 }
 
 /* The routed stage for one layer, encoded into the open batch and nothing

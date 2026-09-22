@@ -90,7 +90,11 @@ int ds4_gpu_routed_moe_one_gated_level(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which);
+int ds4_gpu_routed_moe_one_gated_available(uint32_t layer_index, uint32_t gate_type,
+                                           uint32_t down_type, uint32_t n_expert);
 void ds4_gpu_end_concurrent_section(void);
+void ds4_gpu_concurrent_section_counts(unsigned long long *attempted,
+                                       unsigned long long *opened);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
