@@ -463,6 +463,11 @@ struct ds4_metal_dsv4_moe_swiglu_weight_args {
     uint64_t weight_stride;
     uint32_t write_clamped;
     float clamp_value;
+    /* Do not read the weights buffer at all. A speculation is encoded beside
+     * the router that writes route_weights, so it may neither read them nor
+     * be bound to them; the mid it writes is scratch either way, because what
+     * a speculation is run for is its gate and up. */
+    uint32_t defer_weight;
 };
 
 struct ds4_metal_dsv4_moe_sum6_args {
@@ -4113,55 +4118,110 @@ kernel void kernel_mul_mv_addr_iq2_xxs_f32(
 
 /* Reuse what a speculation got right, lane by lane.
  *
- * The speculation ran the routed gate/up for a predicted set of experts into
- * spec_mid while the router was still deciding the real one. Whole-set
- * agreement is rare - 7.9% at lead 1 - but per expert it is 65.8%, about four
- * of six, and those four are already computed with the same kernel from the
- * same input, so they are the same bits. Copy each match into the lane the
- * real route wants it in, and leave a mask of the lanes that still have to be
- * computed for the pass after the validate.
+ * The speculation ran the routed gate/up GEMV for a predicted set of experts
+ * into its own gate and up while the router was still deciding the real set.
+ * Whole-set agreement is rare - 7.9% at lead 1 - but per expert it is 65.8%,
+ * about four of six, and those four are the same expert against the same
+ * input, so the GEMV wrote the same bits. Copy each match into the lane the
+ * real route wants it in, and leave the mask of which lanes are already
+ * filled for the pass after the validate.
  *
- * One threadgroup a lane. The mask is written by a single thread that redoes
- * all six searches, so no ordering between threadgroups is needed.
+ * The seam is the GEMV's output, not the activation's. Putting it after the
+ * activation - storing silu*u and multiplying by the route weight here - does
+ * not survive a byte comparison: the shipping kernel computes
+ * silu*u*route_weight as one chain through a reciprocal, and under Metal's
+ * fast math that chain does not round the same way when it is cut in two.
+ * About half of a 2048-wide row came back one ulp out. Cut before the
+ * activation instead and the whole expression stays where it was, reading
+ * gate and up values that are bit for bit what it would have computed.
+ *
+ * One threadgroup a lane. The mask and the counters are written by a single
+ * thread that redoes all six searches, so no ordering between threadgroups is
+ * needed.
  */
 kernel void kernel_dsv41_spec_match(
         device const int32_t * actual,
         device const int32_t * predicted,
-        device const float * spec_mid,
-        device       float * mid,
+        device const float * spec_gate,
+        device const float * spec_up,
+        device       float * gate,
+        device       float * up,
         device uint32_t * lane_mask,
         device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device atomic_uint * counts,
         constant uint & width,
         constant uint & n_lane,
+        constant uint & compare,
         uint  tg  [[threadgroup_position_in_grid]],
         uint  tid [[thread_position_in_threadgroup]],
         uint  nth [[threads_per_threadgroup]]) {
+    /* A predicted expert that is not in this layer's address table was never
+     * computed - the masked kernel reads a null address and finishes early -
+     * so its speculative rows hold whatever the last token left there. Both
+     * halves of the pair have to be there: the kernel writes neither if
+     * either address is null, so a prediction resident in gate alone would
+     * hand back the previous token's row. Nothing is ever loaded for a
+     * prediction: a miss costs a wasted lane and nothing else. */
+#define DS4_SPEC_RESIDENT(e) \
+    ((e) >= 0 && (e) < 384 && gate_addrs[(e)] != 0 && up_addrs[(e)] != 0)
     const uint a = tg;
-    if (a == 0 && tid == 0) {
-        uint32_t m = 0;
+    if (a == 0 && tid == 0 && !compare) {
+        uint32_t m = 0, reused = 0, spec_live = 0;
+        for (uint p = 0; p < n_lane; p++)
+            if (DS4_SPEC_RESIDENT(predicted[p])) spec_live++;
         for (uint i = 0; i < n_lane; i++) {
             bool hit = false;
             for (uint p = 0; p < n_lane; p++)
-                hit = hit || (predicted[p] == actual[i] && predicted[p] >= 0 &&
-                              gate_addrs[predicted[p]] != 0);
-            if (!hit) m |= (1u << i);
+                hit = hit || (predicted[p] == actual[i] &&
+                              DS4_SPEC_RESIDENT(predicted[p]));
+            if (hit) { reused++; m |= (1u << i); }
         }
+        /* Which lanes are filled, for the pass that has already been encoded
+         * and cannot be told on the host. */
         lane_mask[0] = m;
+        /* What the arm actually did, for the window report: lanes the
+         * speculation computed, lanes it saved, lanes still to compute. */
+        atomic_fetch_add_explicit(counts + 0, spec_live, memory_order_relaxed);
+        atomic_fetch_add_explicit(counts + 1, reused, memory_order_relaxed);
+        atomic_fetch_add_explicit(counts + 2, n_lane - reused, memory_order_relaxed);
+        atomic_fetch_add_explicit(counts + 3, 1u, memory_order_relaxed);
     }
     if (a >= n_lane) return;
-    /* A predicted expert that is not in this layer's address table was never
-     * computed - the masked kernel reads a null address and finishes early -
-     * so its spec_mid row holds whatever the last token left there. Only a
-     * resident prediction counts as a match. Nothing is ever loaded for a
-     * prediction: a miss costs a wasted lane and nothing else. */
     int found = -1;
     for (uint p = 0; p < n_lane && found < 0; p++)
-        if (predicted[p] == actual[a] && predicted[p] >= 0 &&
-            gate_addrs[predicted[p]] != 0) found = (int)p;
+        if (predicted[p] == actual[a] && DS4_SPEC_RESIDENT(predicted[p]))
+            found = (int)p;
     if (found < 0) return;
-    device const float * src = spec_mid + (uint)found * width;
-    device       float * dst = mid + a * width;
-    for (uint i = tid; i < width; i += nth) dst[i] = src[i];
+    device const float * sg = spec_gate + (uint)found * width;
+    device const float * su = spec_up   + (uint)found * width;
+    device       float * dg = gate + a * width;
+    device       float * du = up   + a * width;
+    if (compare) {
+        /* Diagnostic: gate and up already hold what the real pass computed
+         * for every lane, so this says whether reusing the rows would have
+         * been the same bits rather than leaving it to be inferred from a
+         * changed answer. */
+        uint bad = 0, far = 0;
+        for (uint i = tid; i < width; i += nth) {
+            const uint x[2] = { as_type<uint>(sg[i]), as_type<uint>(su[i]) };
+            const uint y[2] = { as_type<uint>(dg[i]), as_type<uint>(du[i]) };
+            for (uint k = 0; k < 2; k++) {
+                if (x[k] == y[k]) continue;
+                bad++;
+                /* One ulp apart is a rounding difference; further apart is a
+                 * different number, and the two say different things about
+                 * what to fix. */
+                if (x[k] > y[k] ? x[k] - y[k] > 1u : y[k] - x[k] > 1u) far++;
+            }
+        }
+        if (bad) atomic_fetch_add_explicit(counts + 5, bad, memory_order_relaxed);
+        if (far) atomic_fetch_add_explicit(counts + 6, far, memory_order_relaxed);
+        if (tid == 0) atomic_fetch_add_explicit(counts + 4, 1u, memory_order_relaxed);
+        return;
+    }
+    for (uint i = tid; i < width; i += nth) { dg[i] = sg[i]; du[i] = su[i]; }
+#undef DS4_SPEC_RESIDENT
 }
 
 kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
@@ -4187,12 +4247,16 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
     /* Which lanes to compute is usually settled on the host, but a pass that
      * only fills in what a speculation did not match cannot be: the match is
      * decided on the GPU, while this dispatch is already encoded. All ones
-     * means read it from the buffer instead. */
-    const uint32_t mask = split.active_mask == 0xffffffffu
-        ? lane_mask[0] : split.active_mask;
+     * says every lane runs and the buffer says which of them already have
+     * their gate and up rows - those skip the GEMV and go straight to the
+     * activation, which is the whole point of cutting the seam there: the
+     * expression below runs for every lane, wherever its inputs came from. */
+    const bool after_spec = split.active_mask == 0xffffffffu;
+    const uint32_t mask = after_spec ? 0x3fu : split.active_mask;
     if ((mask & (1u << (uint)idx)) == 0) {
         return;
     }
+    const bool reused = after_spec && ((lane_mask[0] >> (uint)idx) & 1u) != 0u;
 
     tgpig.z = 0;
 
@@ -4226,17 +4290,22 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
         args.ne0, 1, args.nr0, 1, 1,
     };
 
-    kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
-        args0,
-        src0_gate_cur,
-        src0_up_cur,
-        src1_cur,
-        dst_gate_cur,
-        dst_up_cur,
-        shmem,
-        tgpig,
-        tiisg,
-        sgitg);
+    /* A reused lane's gate and up rows were written by the match from a
+     * speculation that ran this same GEMV over this same expert and input.
+     * Everything below reads them exactly as if this dispatch had. */
+    if (!reused) {
+        kernel_mul_mv_iq2_xxs_pair_f32_impl<N_R0_IQ2_XXS>(
+                args0,
+                src0_gate_cur,
+                src0_up_cur,
+                src1_cur,
+                dst_gate_cur,
+                dst_up_cur,
+                shmem,
+                tgpig,
+                tiisg,
+                sgitg);
+    }
 
     const short NSG = FC_mul_mv_nsg;
     const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
@@ -4244,9 +4313,19 @@ kernel void kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32(
     device float *up_f32 = (device float *)dst_up_cur;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
     device float *mid_f32 = (device float *)(dst_mid + pair_row * act.mid_row_stride);
-    device const float *route_w = (device const float *)(weights + pair_row * act.weight_stride);
     const float c = act.clamp_value;
-    const float route_weight = route_w[0];
+    /* A speculation is encoded beside the router that writes route_weights:
+     * it may not read them, and it is not even bound to them. What it writes
+     * to mid is thrown away - what it is run for is gate and up - so it
+     * multiplies by one. The expression itself is untouched, and has to be:
+     * the whole chain from the division to the weight is one rounding under
+     * fast math, and splitting it is what cost this a byte comparison. */
+    float route_weight = 1.0f;
+    if (!act.defer_weight) {
+        device const float *route_w =
+            (device const float *)(weights + pair_row * act.weight_stride);
+        route_weight = route_w[0];
+    }
 
     if (tiisg == 0) {
         for (int row = 0; row < N_R0_IQ2_XXS && first_row + row < args.ne0; ++row) {

@@ -92,11 +92,21 @@ int ds4_gpu_routed_moe_one_gated_level(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which,
-        uint32_t sel_elem_off, uint32_t lane_mask);
+        uint32_t sel_elem_off, uint32_t lane_mask, uint32_t spec);
 int ds4_gpu_dsv41_spec_match(const ds4_gpu_tensor *actual,
                              const ds4_gpu_tensor *predicted, uint32_t pred_elem_off,
-                             const ds4_gpu_tensor *spec_mid, ds4_gpu_tensor *mid,
-                             uint32_t width, uint32_t n_lane, uint32_t layer);
+                             const ds4_gpu_tensor *spec_gate,
+                             const ds4_gpu_tensor *spec_up,
+                             ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+                             uint32_t width, uint32_t n_lane, uint32_t layer,
+                             uint32_t compare);
+void ds4_gpu_dsv41_spec_counts(unsigned long long *spec_lanes,
+                               unsigned long long *reused_lanes,
+                               unsigned long long *left_lanes,
+                               unsigned long long *layers,
+                               unsigned long long *compared,
+                               unsigned long long *differing,
+                               unsigned long long *far);
 int ds4_gpu_routed_moe_one_gated_available(uint32_t layer_index, uint32_t gate_type,
                                            uint32_t down_type, uint32_t n_expert);
 void ds4_gpu_end_concurrent_section(void);

@@ -40172,6 +40172,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(selected, DS4_N_EXPERT_USED) X(route_weights, DS4_N_EXPERT_USED) \
     X(oracle_selected, DS4_N_EXPERT_USED * DS4_N_LAYER) \
     X(spec_mid, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
+    X(spec_gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
+    X(spec_up, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(gate, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(up, DS4_N_EXPERT_USED * DS4_N_FF_EXP) X(mid, DS4_N_EXPERT_USED * DS4_N_FF_EXP) \
     X(experts, DS4_N_EXPERT_USED * DS4_N_EMBD) X(routed, DS4_N_EMBD) \
@@ -41052,8 +41054,16 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
  * DS4_METAL_V41_ORACLE=<log>  and  DS4_METAL_V41_ORACLE_MODE=1 to reuse the
  * speculative result, 2 to throw it away and run the real level anyway, which
  * prices the contention on its own.
+ *
+ * Nothing speculates without a log. The reuse machinery is the shape the
+ * production path would use, but the predictor is not attached to it: the
+ * lead-1 probe behind DS4_METAL_V41_ROUTE_PREDICT is still a separate
+ * measurement. Connecting it is worth doing only if the ceiling below wins.
+ *
+ * `seq` is the token's position in the log - how many tokens have been
+ * decoded - not the vocabulary id of anything.
  */
-static const int32_t *ds41_oracle_route(uint32_t token) {
+static const int32_t *ds41_oracle_route(uint32_t seq) {
     static int tried;
     static int32_t *ids;
     static uint64_t tokens;
@@ -41097,8 +41107,21 @@ static const int32_t *ds41_oracle_route(uint32_t token) {
         fprintf(stderr, "ds4: oracle route log holds %llu tokens\n",
                 (unsigned long long)tokens);
     }
-    if (!ids || token >= tokens) return NULL;
-    return ids + (uint64_t)token * DS4_N_LAYER * DS4_N_EXPERT_USED;
+    if (!ids || seq >= tokens) return NULL;
+    return ids + (uint64_t)seq * DS4_N_LAYER * DS4_N_EXPERT_USED;
+}
+
+/* Whether the speculation shares a section with the router's projection at
+ * all. 0 encodes the two in order, which is the control that prices the
+ * contention: same dispatches, same results, no overlap. */
+static int ds41_spec_section(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_SPEC_SECTION");
+        checked = 1;
+        on = e && e[0] ? atoi(e) != 0 : 1;
+    }
+    return on;
 }
 
 static int ds41_oracle_mode(void) {
@@ -41226,8 +41249,14 @@ static bool ds41_moe_shared_row(ds41_gpu_graph *g, const ds4_model *m,
 /* The router alone. The shared expert follows it everywhere except in the
  * gated decode loop with the FFN overlap on, where it is issued beside the
  * routed experts instead. */
-static bool ds41_moe_route_only(ds41_gpu_graph *g, const ds4_model *m,
-                                const ds4_layer_weights *l, uint32_t token) {
+/* The router in its two halves: 1 is the projection that writes route_logits,
+ * 2 the selection that reads them. 3 is both and is what every ordinary caller
+ * wants. They are separable because the second reads what the first wrote:
+ * a concurrent section does not order two dispatches inside it, so anything
+ * sharing a section with this chain may share it with the first half only. */
+static bool ds41_moe_route_stage(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t token,
+                                 uint32_t which) {
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
     /* Diagnostic: encode the router N extra times. It reads `norm` and writes
@@ -41243,18 +41272,26 @@ static bool ds41_moe_route_only(ds41_gpu_graph *g, const ds4_model *m,
         const char *e = getenv("DS4_METAL_V41_SHADOW_ROUTER");
         shadow = e && e[0] ? atoi(e) : 0;
     }
-    for (int sh = 0; sh < shadow; sh++) {
+    for (int sh = 0; which == 3u && sh < shadow; sh++) {
         if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
             !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
                 m->map, m->size, bias->abs_offset, 0, 0, token,
                 DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
                 g->route_logits)) return false;
     }
-    return ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) &&
-        ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
+    if ((which & 1u) &&
+        !ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false)) return false;
+    if ((which & 2u) &&
+        !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
-            g->route_logits) != 0;
+            g->route_logits)) return false;
+    return true;
+}
+
+static bool ds41_moe_route_only(ds41_gpu_graph *g, const ds4_model *m,
+                                const ds4_layer_weights *l, uint32_t token) {
+    return ds41_moe_route_stage(g, m, l, token, 3u);
 }
 
 static DS4_MAYBE_UNUSED bool ds41_moe_route_row(ds41_gpu_graph *g, const ds4_model *m,
@@ -41283,18 +41320,23 @@ static DS4_MAYBE_UNUSED bool ds41_moe_experts_row(ds41_gpu_graph *g, const ds4_m
 static bool ds41_moe_experts_level(ds41_gpu_graph *g, const ds4_layer_weights *l,
                                    uint32_t il, uint32_t which,
                                    const ds4_gpu_tensor *sel, uint32_t sel_off,
-                                   ds4_gpu_tensor *mid_to, uint32_t lane_mask) {
+                                   ds4_gpu_tensor *mid_to, uint32_t lane_mask,
+                                   uint32_t spec) {
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
-    return ds4_gpu_routed_moe_one_gated_level(g->routed, g->gate, g->up,
+    /* A speculation writes its GEMV somewhere the real pass will not overwrite
+     * before the match has read it; its mid is scratch, because what the
+     * speculation is run for is gate and up. */
+    return ds4_gpu_routed_moe_one_gated_level(g->routed,
+            spec ? g->spec_gate : g->gate, spec ? g->spec_up : g->up,
             mid_to ? mid_to : g->mid,
             l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, sel ? sel : g->selected,
             g->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm,
-            il, which, sel_off, lane_mask) != 0;
+            il, which, sel_off, lane_mask, spec) != 0;
 }
 
 /* The routed experts and the shared expert read the same `norm` and write
@@ -41372,11 +41414,11 @@ static bool ds41_moe_experts_overlapped(ds41_gpu_graph *g, const ds4_model *m,
     bool late1[2] = { false, false }, late3[2] = { false, false };
 
     if (mode == 2) {
-        return ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask) &&
+        return ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask, 0u) &&
                ds41_moe_shared_stage(g, m, l, 1, late1) &&
                ds41_moe_shared_round(g, l, 1, late1) &&
                ds41_moe_shared_stage(g, m, l, 2, NULL) &&
-               ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu) &&
+               ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u) &&
                ds41_moe_shared_stage(g, m, l, 3, late3) &&
                ds41_moe_shared_round(g, l, 3, late3);
     }
@@ -41392,8 +41434,8 @@ static bool ds41_moe_experts_overlapped(ds41_gpu_graph *g, const ds4_model *m,
             if (sec) ds4_gpu_end_concurrent_section();
             return b && ds41_moe_shared_stage(g, m, l, 2, NULL) &&
                    ds41_moe_shared_stage(g, m, l, 3, NULL) &&
-                   ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask) &&
-                   ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu);
+                   ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask, 0u) &&
+                   ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u);
         }
         if (mode == 6) {
             b = ds41_moe_shared_stage(g, m, l, 1, NULL);
@@ -41402,13 +41444,13 @@ static bool ds41_moe_experts_overlapped(ds41_gpu_graph *g, const ds4_model *m,
             if (b && sec) b = ds4_gpu_concurrent_section_barrier() != 0;
             b = b && ds41_moe_shared_stage(g, m, l, 3, NULL);
             if (sec) ds4_gpu_end_concurrent_section();
-            return b && ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask) &&
-                   ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu);
+            return b && ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask, 0u) &&
+                   ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u);
         }
-        b = ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask) &&
+        b = ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask, 0u) &&
             ds41_moe_shared_stage(g, m, l, 1, NULL) &&
             ds41_moe_shared_stage(g, m, l, 2, NULL) &&
-            ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu) &&
+            ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u) &&
             ds41_moe_shared_stage(g, m, l, 3, NULL);
         if (sec) ds4_gpu_end_concurrent_section();
         return b;
@@ -41418,13 +41460,13 @@ static bool ds41_moe_experts_overlapped(ds41_gpu_graph *g, const ds4_model *m,
     /* l1_mask is 0x3f normally and 0xffffffff when a speculation has already
      * filled some lanes: the kernel then reads which are left from the buffer
      * the match wrote. */
-    bool ok = ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask) &&
+    bool ok = ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, l1_mask, 0u) &&
               ds41_moe_shared_stage(g, m, l, 1, late1);
     if (s1) ds4_gpu_end_concurrent_section();
     ok = ok && ds41_moe_shared_round(g, l, 1, late1) &&
                ds41_moe_shared_stage(g, m, l, 2, NULL);
     const bool s2 = ok && ds4_gpu_begin_concurrent_section() != 0;
-    ok = ok && ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu) &&
+    ok = ok && ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u) &&
                ds41_moe_shared_stage(g, m, l, 3, late3);
     if (s2) ds4_gpu_end_concurrent_section();
     return ok && ds41_moe_shared_round(g, l, 3, late3);
@@ -42639,8 +42681,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         int resume_overlap = -1;
         /* One token's recorded routes, written once. Writing a layer's slice
          * as the layer is encoded would put a host store to a shared buffer
-         * under a segment that may still be reading it. */
-        const int32_t *oracle_token = ds41_oracle_route((uint32_t)token);
+         * under a segment that may still be reading it.
+         *
+         * The index is how many tokens have been through here, which is the
+         * order the log was written in. `token` is the vocabulary id of the
+         * token being fed in, and indexing a log by it lines every token up
+         * with some other token's route. */
+        const int32_t *oracle_token = ds41_oracle_route((uint32_t)g_gate_tokens);
         if (oracle_token &&
             !ds4_gpu_tensor_write(g->oracle_selected, 0, oracle_token,
                 (uint64_t)DS4_N_LAYER * DS4_N_EXPERT_USED * sizeof(int32_t)))
@@ -42725,6 +42772,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                  * issued beside the router that is still deciding it. A
                  * continuation never speculates - by then the route is known. */
                 uint32_t l1_mask = 0x3fu;
+                bool speculated_here = false;
                 if (!resuming) {
                     resume_overlap = use_overlap ? 1 : 0;
                     ok = ds41_graph_before_moe(g, m, gl, il);
@@ -42735,16 +42783,47 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                          * the match copies every lane it got right into the
                          * lane the real route wants and leaves the rest in a
                          * mask for the pass after the validate. */
-                        const bool sec = ds4_gpu_begin_concurrent_section() != 0;
-                        ok = ds41_moe_experts_level(g, gl, il, 1u,
-                                 g->oracle_selected, il * DS4_N_EXPERT_USED,
-                                 g->spec_mid, 0x3fu) &&
-                             ds41_moe_route_only(g, m, gl, (uint32_t)token);
-                        if (sec) ds4_gpu_end_concurrent_section();
+                        /* The router is a chain - its projection writes
+                         * route_logits and its selection reads them - and a
+                         * concurrent section does not order two dispatches
+                         * inside it. So the section holds the speculation and
+                         * the projection, and the selection goes after it.
+                         * Encoding the whole router into the section is what
+                         * made the first version of this differ from the
+                         * baseline even in the mode that throws the
+                         * speculation away. */
+                        /* mode 4 predicts with the real route, encoded
+                         * after the router rather than beside it. Every lane
+                         * then matches at its own index, so the speculative
+                         * dispatch and the real one are the same ids in the
+                         * same order and differ only in whether the store
+                         * carries the weight. It isolates the arithmetic from
+                         * everything the permutation could be doing. */
+                        const bool self = ds41_oracle_mode() == 4;
+                        const ds4_gpu_tensor *pred = self ? g->selected
+                                                          : g->oracle_selected;
+                        const uint32_t pred_off = self ? 0u
+                                                       : il * DS4_N_EXPERT_USED;
+                        if (self)
+                            ok = ds41_moe_route_stage(g, m, gl, (uint32_t)token, 3u) &&
+                                 ds41_moe_experts_level(g, gl, il, 1u, pred, pred_off,
+                                     g->spec_mid, 0x3fu, 1u);
+                        else {
+                            const bool sec = ds41_spec_section() &&
+                                             ds4_gpu_begin_concurrent_section() != 0;
+                            ok = ds41_moe_experts_level(g, gl, il, 1u,
+                                     pred, pred_off, g->spec_mid, 0x3fu, 1u) &&
+                                 ds41_moe_route_stage(g, m, gl, (uint32_t)token, 1u);
+                            if (sec) ds4_gpu_end_concurrent_section();
+                            ok = ok && ds41_moe_route_stage(g, m, gl, (uint32_t)token, 2u);
+                        }
+                        /* The speculation stored silu*u; the match applies the
+                         * weight the router has just written. */
                         ok = ok && ds4_gpu_dsv41_spec_match(g->selected,
-                                 g->oracle_selected, il * DS4_N_EXPERT_USED,
-                                 g->spec_mid, g->mid, DS4_N_FF_EXP,
-                                 DS4_N_EXPERT_USED, il) != 0;
+                                 pred, pred_off, g->spec_gate, g->spec_up,
+                                 g->gate, g->up, DS4_N_FF_EXP,
+                                 DS4_N_EXPERT_USED, il, 0u) != 0;
+                        speculated_here = ok;
                         /* mode 2 keeps the speculation but throws the match
                          * away, which prices the contention on its own. */
                         if (ok && ds41_oracle_mode() == 1) l1_mask = 0xffffffffu;
@@ -42760,6 +42839,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                   ds41_moe_experts_overlapped(g, m, gl, il, l1_mask) :
                                   ds41_moe_experts_row(g, m, gl, il)) &&
                              ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
+                /* mode 3 runs the real level for every lane, as mode 2 does,
+                 * and then asks the match whether reusing each row it matched
+                 * would have been the same bits. A changed answer says the
+                 * reuse is wrong somewhere; this says where. */
+                if (ok && speculated_here &&
+                    (ds41_oracle_mode() == 3 || ds41_oracle_mode() == 4))
+                    ok = ds4_gpu_dsv41_spec_match(g->selected,
+                             ds41_oracle_mode() == 4 ? g->selected : g->oracle_selected,
+                             ds41_oracle_mode() == 4 ? 0u : il * DS4_N_EXPERT_USED,
+                             g->spec_gate, g->spec_up, g->gate, g->up,
+                             DS4_N_FF_EXP, DS4_N_EXPERT_USED, il, 1u) != 0;
                 if (ok) ds41_gate_trace(g, il, "out");
             }
             ds4_gpu_gate_segment_end();
@@ -43047,10 +43137,22 @@ spec_done:;
             static unsigned long long w_cbs, w_aborts, w_bytes, w_touched,
                                       w_slots, w_after, w_direct,
                                       w_ahead_used, w_ahead_dropped,
-                                      w_sec_att, w_sec_open;
+                                      w_sec_att, w_sec_open,
+                                      w_spec_lanes, w_spec_reused, w_spec_left,
+                                      w_spec_layers, w_spec_cmp, w_spec_diff,
+                                      w_spec_far;
             static double w_ahead_ms;
             unsigned long long sec_att = 0, sec_open = 0;
             ds4_gpu_concurrent_section_counts(&sec_att, &sec_open);
+            /* Counted on the GPU as the match runs, not inferred from a recall
+             * rate: an arm that speculates has to be able to say how many
+             * lanes it computed and how many it saved. */
+            unsigned long long spec_lanes = 0, spec_reused = 0, spec_left = 0,
+                               spec_layers = 0, spec_cmp = 0, spec_diff = 0,
+                               spec_far = 0;
+            ds4_gpu_dsv41_spec_counts(&spec_lanes, &spec_reused, &spec_left,
+                                      &spec_layers, &spec_cmp, &spec_diff,
+                                      &spec_far);
             static double w_encode, w_wait, w_entry, w_repair, w_account,
                           w_tail, w_wall, w_gpu;
             fprintf(stderr,
@@ -43065,7 +43167,10 @@ spec_done:;
                 "%.1f sent plain ahead of a buffer's first validate\n"
                 "ds4:   encode-ahead: %.2f segments used, %.2f dropped, %.2f ms a token "
                 "spent encoding under the GPU\n"
-                "ds4:   concurrent sections: %.2f attempted, %.2f opened a token\n",
+                "ds4:   concurrent sections: %.2f attempted, %.2f opened a token\n"
+                "ds4:   speculation: %.2f layers a token, %.2f lanes computed, "
+                "%.2f reused, %.2f left to compute; compared %.2f lanes, "
+                "%.2f floats differ, %.2f of them by more than an ulp\n",
                 g_gate_tokens - 63ull, g_gate_tokens,
                 (double)(g_gate_cbs - w_cbs) / dt,
                 (double)(g_gate_aborts - w_aborts) / dt,
@@ -43095,8 +43200,18 @@ spec_done:;
                 (double)(g_gate_ahead_dropped - w_ahead_dropped) / dt,
                 (g_gate_ahead_ms - w_ahead_ms) / dt,
                 (double)(sec_att - w_sec_att) / dt,
-                (double)(sec_open - w_sec_open) / dt);
+                (double)(sec_open - w_sec_open) / dt,
+                (double)(spec_layers - w_spec_layers) / dt,
+                (double)(spec_lanes - w_spec_lanes) / dt,
+                (double)(spec_reused - w_spec_reused) / dt,
+                (double)(spec_left - w_spec_left) / dt,
+                (double)(spec_cmp - w_spec_cmp) / dt,
+                (double)(spec_diff - w_spec_diff) / dt,
+                (double)(spec_far - w_spec_far) / dt);
             w_sec_att = sec_att; w_sec_open = sec_open;
+            w_spec_cmp = spec_cmp; w_spec_diff = spec_diff; w_spec_far = spec_far;
+            w_spec_lanes = spec_lanes; w_spec_reused = spec_reused;
+            w_spec_left = spec_left; w_spec_layers = spec_layers;
             w_cbs = g_gate_cbs; w_aborts = g_gate_aborts; w_bytes = g_gate_bytes;
             w_touched = g_gate_touched; w_encode = g_gate_encode_ms;
             w_wait = g_gate_wait_ms; w_entry = g_gt_entry_ms;
