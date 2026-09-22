@@ -163,7 +163,7 @@ static void ds4_gate_note_ungatable(uintptr_t caller, MTLSize th, MTLSize tpt) {
  * has it on. The count is what a fusion is worth - a call site issuing six
  * dispatches a layer is forty-eight a token, and the indirect form makes each
  * of those 2.25 us of GPU time, not the 0.70 us a plain dispatch costs. */
-#define DS4_GATE_SITES 192u
+#define DS4_GATE_SITES 512u
 /* Two frames, because the encoder that issues the dispatch is shared: knowing
  * that 759 of them come from the quantize encoder does not say which of its
  * nineteen call sites in a layer they are, and the fusion is chosen per call
@@ -204,7 +204,14 @@ static uint32_t ds4_gate_note_slot(uintptr_t caller, uintptr_t parent,
     const uintptr_t punslid = parent ? parent - slide : 0;
     os_unfair_lock_lock(&g_gate_site_lock);
     for (uint32_t i = 0; i < g_gate_n_sites; i++)
-        if (g_gate_sites[i].caller == unslid && g_gate_sites[i].parent == punslid) {
+        /* The grid is part of the key, not a sample of it: one call site
+         * serves projections of several widths, and which of them are short
+         * of threadgroups is the whole question. Keyed on the caller alone,
+         * the shape printed was whichever width arrived first. */
+        if (g_gate_sites[i].caller == unslid && g_gate_sites[i].parent == punslid &&
+            g_gate_sites[i].w == (uint32_t)tg.width &&
+            g_gate_sites[i].h == (uint32_t)tg.height &&
+            g_gate_sites[i].d == (uint32_t)tg.depth) {
             g_gate_sites[i].count++;
             os_unfair_lock_unlock(&g_gate_site_lock);
             return i;
