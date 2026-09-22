@@ -9911,6 +9911,20 @@ int ds4_gpu_begin_concurrent_section(void) {
     return 1;
 }
 
+/* A level break inside the section. Metal makes either barrier form an
+ * execution barrier for every dispatch already encoded in this concurrent
+ * encoder, so this is what orders one level's consumers after the level
+ * before it while leaving the dispatches within a level free to overlap.
+ * ds4-macos/proto/barrier.m prices it at 0.31 us against the 2.06 us a
+ * dispatch that overlapping collects. */
+int ds4_gpu_concurrent_section_barrier(void) {
+    if (!g_batch_encoder_concurrent || !g_batch_cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    if (!enc || enc.dispatchType != MTLDispatchTypeConcurrent) return 0;
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    return 1;
+}
+
 void ds4_gpu_end_concurrent_section(void) {
     if (!g_batch_encoder_concurrent) return;
     ds4_gpu_close_batch_encoder();
@@ -42248,6 +42262,28 @@ uint32_t ds4_gpu_expert_addresses_live(uint32_t layer, const int32_t *ids, uint3
         if (ga[id] && ua[id] && da[id]) live++;
     }
     return live;
+}
+
+/* The gated routed stage one level at a time, so the shared expert can be
+ * encoded beside it in the same concurrent section instead of before it.
+ * `which` is 1 for the gate/up pair-SwiGLU and 2 for the down sum. Splitting
+ * the call encodes exactly the dispatches the single call encodes, in the
+ * same order, because that is how the function is written. */
+int ds4_gpu_routed_moe_one_gated_level(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which) {
+    ds4_gpu_host_split_note(DS4_HOST_SPLIT_GRAPH);
+    g_routed_current_layer = layer_index;
+    return ds4_gpu_routed_moe_one_gated(out, gate, up, mid, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim, selected, weights,
+            n_total_expert, n_expert, clamp, x, NULL, layer_index, which);
 }
 
 /* The routed stage for one layer, encoded into the open batch and nothing

@@ -80,6 +80,16 @@ int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
 int ds4_gpu_begin_concurrent_section(void);  /* independent dispatches may overlap */
+int ds4_gpu_concurrent_section_barrier(void);  /* a level break inside one */
+int ds4_gpu_routed_moe_one_gated_level(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which);
 void ds4_gpu_end_concurrent_section(void);
 #include "ds4_deepseek41_gpu.h"
 #ifdef __APPLE__
