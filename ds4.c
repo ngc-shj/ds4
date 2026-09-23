@@ -42916,6 +42916,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
              * opened, while the one before it runs. */
             uint32_t spec_start = 0, spec_end = 0, spec_slot = 0;
             bool speculated = false;
+            /* The ahead buffer has to remember the same execution shape that
+             * the ordinary loop records in resume_overlap.  The old code
+             * looked only at the global overlap switch while encoding ahead,
+             * skipping routed_moe_one_gated_available() entirely, and then
+             * left resume_overlap pointing at the preceding segment.  An
+             * abort in the ahead buffer could therefore be continued with a
+             * different shared/routed layout from the one that produced it. */
+            int spec_resume_overlap = -1;
             if (ds41_gate_encode_ahead() && chunk_end < gate_n) {
                 spec_start = chunk_end;
                 spec_end = (spec_start < 14u && gate_n > 14u) ? 14u : gate_n;
@@ -42928,22 +42936,38 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                  * at the head of a segment today, which is why this does not
                  * show up as a wrong answer - but that is the boundary being
                  * lucky, not the write being safe. Do not speculate them. */
-                for (uint32_t il = spec_start; il < spec_end; il++)
-                    if (ds41_engram_layer(il)) { spec_end = il; break; }
+                for (uint32_t il = spec_start; il < spec_end; il++) {
+                    const ds4_layer_weights *sl = &w->layer[il];
+                    /* Encoding ahead cannot take the ordinary routed path:
+                     * it reads selected IDs back to the host, but the router
+                     * producing them is in the command buffer still running.
+                     * Only the address-table gated path is truly device
+                     * resident and therefore legal to encode before its
+                     * inputs exist.  The old fallback ran that host-driven
+                     * path on unfinished inputs, producing corrupt text and
+                     * spending 100+ ms/token inside what was called encode. */
+                    const bool resident_gated =
+                        ds41_ffn_overlap_on() &&
+                        ds4_gpu_routed_moe_one_gated_available(
+                            il, sl->ffn_gate_exps->type,
+                            sl->ffn_down_exps->type,
+                            DS4_N_EXPERT_USED) != 0;
+                    if (ds41_engram_layer(il) || !resident_gated) {
+                        spec_end = il;
+                        break;
+                    }
+                }
                 if (spec_end <= spec_start) goto spec_done;
+                spec_resume_overlap = 1;
                 spec_slot = ds4_gpu_gate_segment_begin();
                 for (uint32_t il = spec_start; ok && il < spec_end; il++) {
                     ds4_gpu_gate_layer_begin(il);
                     const ds4_layer_weights *sl = &w->layer[il];
                     ok = ds41_graph_before_moe(g, m, sl, il) &&
-                         (ds41_ffn_overlap_on() ?
-                              ds41_moe_route_only(g, m, sl, (uint32_t)token) :
-                              ds41_moe_route_row(g, m, sl, (uint32_t)token)) &&
+                         ds41_moe_route_only(g, m, sl, (uint32_t)token) &&
                          ds4_gpu_gate_encode_validate(g->selected, il,
                                                       DS4_N_EXPERT_USED, DS4_N_EXPERT) &&
-                         (ds41_ffn_overlap_on() ?
-                              ds41_moe_experts_overlapped(g, m, sl, il, 0x3fu) :
-                              ds41_moe_experts_row(g, m, sl, il)) &&
+                         ds41_moe_experts_overlapped(g, m, sl, il, 0x3fu) &&
                          ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
                 }
                 ds4_gpu_gate_segment_end();
@@ -43006,6 +43030,7 @@ spec_done:;
                     g_gt_repair_ms += (now_sec() - sr0) * 1000.0;
                     start = sbad;
                     resume_from_moe = 1;
+                    resume_overlap = spec_resume_overlap;
                     continue;
                 }
                 start = chunk_end;
