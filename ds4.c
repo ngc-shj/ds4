@@ -42687,11 +42687,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         ds4_gpu_gate_token_begin();
         uint32_t start = gate_lo;
         int resume_from_moe = 0;
-        /* Which shape the layer being resumed was issued in. A continuation
-         * re-runs the routed stage and nothing else, so it has to re-run the
-         * same shape: deciding again could issue the shared expert twice, or
-         * not at all, if availability changed between the two passes. */
-        int resume_overlap = -1;
+        /* Which shape each layer was issued in. A continuation re-runs the
+         * routed stage and nothing else, so it has to re-run the same shape:
+         * deciding again could issue the shared expert twice, or not at all,
+         * if availability changed between the two passes. Recorded per layer
+         * rather than as the last shape encoded: the layer that aborts need
+         * not be the last one its segment encoded, and with the pipeline
+         * running a segment is continued a pass or more after it went out -
+         * by which time one variable is describing some other segment.
+         * 0xff is "not encoded yet". */
+        uint8_t seg_overlap[DS4_MAX_LAYER];
+        memset(seg_overlap, 0xff, sizeof(seg_overlap));
+        /* The one buffer of lookahead, carried across passes. Each pass
+         * commits a segment and encodes the next one into the buffer the
+         * commit opened, so the encoding of every segment but the first sits
+         * underneath a GPU that is running the segment before it. The old
+         * shape hid one segment and then waited for the next with nothing
+         * underneath it, which is why it recovered about half of the host
+         * encode rather than all of it. */
+        bool prepared = false;
+        uint32_t prep_slot = 0, prep_start = 0, prep_end = 0;
         /* One token's recorded routes, written once. Writing a layer's slice
          * as the layer is encoded would put a host store to a shared buffer
          * under a segment that may still be reading it.
@@ -42739,13 +42754,38 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                 const char *e = getenv("DS4_METAL_V41_ABORT_GATE_SEG");
                 seg_max = e && e[0] ? atoi(e) : 0;
             }
-            uint32_t chunk_end = (start < 14u && gate_n > 14u) ? 14u : gate_n;
-            if (seg_max > 0 && chunk_end - start > (uint32_t)seg_max)
-                chunk_end = start + (uint32_t)seg_max;
-            const uint32_t seg_slot = ds4_gpu_gate_segment_begin();
             const double seg_t0 = now_sec();
-            if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) { ok = false; break; }
-            for (uint32_t il = start; ok && il < chunk_end; il++) {
+            double seg_t1 = seg_t0;
+            uint32_t chunk_end = 0, seg_slot = 0;
+            /* A segment the previous pass encoded under the running GPU is
+             * adopted rather than encoded again: this pass has nothing to
+             * encode and goes straight to the commit. A pass that aborts
+             * drops its prepared buffer, so reaching here with one means the
+             * previous segment ran whole and the layer it prepared is the
+             * layer this pass wants. */
+            const bool adopt = prepared;
+            if (adopt) {
+                if (prep_start != start || resume_from_moe) {
+                    fprintf(stderr, "ds4: prepared segment covers %u..%u, "
+                            "not %u\n", prep_start, prep_end, start);
+                    ok = false;
+                    break;
+                }
+                seg_slot = prep_slot;
+                chunk_end = prep_end;
+                prepared = false;
+                g_gate_ahead_used++;
+            } else {
+                chunk_end = (start < 14u && gate_n > 14u) ? 14u : gate_n;
+                if (seg_max > 0 && chunk_end - start > (uint32_t)seg_max)
+                    chunk_end = start + (uint32_t)seg_max;
+                seg_slot = ds4_gpu_gate_segment_begin();
+                if (!ds4_gpu_commands_active() && !ds4_gpu_begin_commands()) {
+                    ok = false;
+                    break;
+                }
+            }
+            for (uint32_t il = adopt ? chunk_end : start; ok && il < chunk_end; il++) {
                 ds4_gpu_gate_layer_begin(il);
                 const ds4_layer_weights *gl = &w->layer[il];
                 /* The ordinary loop writes this before a layer that reads it;
@@ -42782,8 +42822,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                  * and the fallback is then exactly the path that ships rather
                  * than a half-issued layer the expert cache would account
                  * twice. */
-                const bool use_overlap = resuming && resume_overlap >= 0
-                    ? resume_overlap != 0
+                const bool use_overlap = resuming && seg_overlap[il] != 0xffu
+                    ? seg_overlap[il] != 0
                     : (ds41_ffn_overlap_on() &&
                        ds4_gpu_routed_moe_one_gated_available(il,
                            gl->ffn_gate_exps->type, gl->ffn_down_exps->type,
@@ -42803,7 +42843,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                     ds41_spec_resume())
                     l1_mask = 0xffffffffu;
                 if (!resuming) {
-                    resume_overlap = use_overlap ? 1 : 0;
+                    seg_overlap[il] = use_overlap ? 1u : 0u;
                     ok = ds41_graph_before_moe(g, m, gl, il);
                     if (ok && oracle_token && use_overlap) {
                         /* The speculation runs the routed gate/up for the
@@ -42884,10 +42924,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                              DS4_N_FF_EXP, DS4_N_EXPERT_USED, il, 1u) != 0;
                 if (ok) ds41_gate_trace(g, il, "out");
             }
-            ds4_gpu_gate_segment_end();
-            /* Everything up to here is the host encoding; the commit and the
-             * wait are timed apart because only one of them is the GPU's. */
-            const double seg_t1 = now_sec();
+            if (!adopt) {
+                ds4_gpu_gate_segment_end();
+                /* Everything up to here is the host encoding; the commit and
+                 * the wait are timed apart because only one of them is the
+                 * GPU's. An adopted segment adds nothing here: its encode was
+                 * charged to the pass that ran it underneath the GPU. */
+                seg_t1 = now_sec();
+            }
             if (!ok) break;
             /* Encode-ahead. The host's 2.4 ms a token of encoding and the GPU's
              * 36 ms of execution currently alternate: the loop commits, blocks,
@@ -42912,18 +42956,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
              * instead of rewinding between segments. */
             if (!ds4_gpu_flush_commands()) { ok = false; break; }
             const double seg_t2 = now_sec();
-            /* Speculate the next segment into the buffer flush_commands just
-             * opened, while the one before it runs. */
+            /* Encode the next segment into the buffer flush_commands just
+             * opened, while the one before it runs. This happens on every
+             * pass, the adopted ones included, which is what keeps a prepared
+             * buffer permanently one step behind the GPU. */
             uint32_t spec_start = 0, spec_end = 0, spec_slot = 0;
-            bool speculated = false;
-            /* The ahead buffer has to remember the same execution shape that
-             * the ordinary loop records in resume_overlap.  The old code
-             * looked only at the global overlap switch while encoding ahead,
-             * skipping routed_moe_one_gated_available() entirely, and then
-             * left resume_overlap pointing at the preceding segment.  An
-             * abort in the ahead buffer could therefore be continued with a
-             * different shared/routed layout from the one that produced it. */
-            int spec_resume_overlap = -1;
             if (ds41_gate_encode_ahead() && chunk_end < gate_n) {
                 spec_start = chunk_end;
                 spec_end = (spec_start < 14u && gate_n > 14u) ? 14u : gate_n;
@@ -42958,11 +42995,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                     }
                 }
                 if (spec_end <= spec_start) goto spec_done;
-                spec_resume_overlap = 1;
                 spec_slot = ds4_gpu_gate_segment_begin();
                 for (uint32_t il = spec_start; ok && il < spec_end; il++) {
                     ds4_gpu_gate_layer_begin(il);
                     const ds4_layer_weights *sl = &w->layer[il];
+                    /* Only layers the check above found resident-gated reach
+                     * here, so the shape is the overlapped one - recorded the
+                     * same way the ordinary path records its own, because the
+                     * continuation after an abort in this segment reads it
+                     * one or more passes from now. */
+                    seg_overlap[il] = 1u;
                     ok = ds41_graph_before_moe(g, m, sl, il) &&
                          ds41_moe_route_only(g, m, sl, (uint32_t)token) &&
                          ds4_gpu_gate_encode_validate(g->selected, il,
@@ -42971,7 +43013,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                          ds41_moe_finish(g, il) && ds41_graph_after_moe(g);
                 }
                 ds4_gpu_gate_segment_end();
-                speculated = ok;
+                if (ok) {
+                    prepared = true;
+                    prep_slot = spec_slot;
+                    prep_start = spec_start;
+                    prep_end = spec_end;
+                }
             }
 spec_done:;
             const double seg_t2b = now_sec();
@@ -42997,52 +43044,17 @@ spec_done:;
                 /* Nothing aborted, so every slot this buffer took ran. Any
                  * layer out of range says that to the census. */
                 ds4_gpu_gate_census_settle(UINT32_MAX);
-                if (speculated) {
-                    /* Already encoded and correct: send it and move past it. */
-                    g_gate_ahead_used++;
-                    if (!ds4_gpu_flush_commands()) { ok = false; break; }
-                    if (!ds4_gpu_wait_committed()) { ok = false; break; }
-                    g_gt_gpu_ms += ds4_gpu_take_span_ms();
-                    g_gate_cbs++;
-                    uint32_t sbad = 0, smask = 0, sn = 0;
-                    int32_t sids[16];
-                    if (!ds4_gpu_gate_read_miss(spec_slot, &sbad, &smask, sids, &sn)) {
-                        ds4_gpu_gate_census_settle(UINT32_MAX);
-                        start = spec_end;
-                        resume_from_moe = 0;
-                        continue;
-                    }
-                    ds4_gpu_gate_census_settle(sbad);
-                    g_gate_aborts++;
-                    g_gate_after += ds4_gpu_gate_slots_encoded_after_abort(spec_slot);
-                    g_gate_live += ds4_gpu_gate_slots_left_live(spec_slot);
-                    const double sr0 = now_sec();
-                    const ds4_layer_weights *sbl = &w->layer[sbad];
-                    uint64_t sg_row = 0, sd_row = 0;
-                    if (!tensor_nbytes(sbl->ffn_gate_exps->type, DS4_N_EMBD, &sg_row) ||
-                        !tensor_nbytes(sbl->ffn_down_exps->type, DS4_N_FF_EXP, &sd_row) ||
-                        !ds4_gpu_gate_repair(m->map, m->size, sbad, sids, sn, DS4_N_EXPERT,
-                                             sbl->ffn_gate_exps->abs_offset,
-                                             sbl->ffn_up_exps->abs_offset,
-                                             sbl->ffn_down_exps->abs_offset,
-                                             sg_row * DS4_N_FF_EXP, sd_row * DS4_N_EMBD,
-                                             smask, &g_gate_bytes)) { ok = false; break; }
-                    g_gt_repair_ms += (now_sec() - sr0) * 1000.0;
-                    start = sbad;
-                    resume_from_moe = 1;
-                    resume_overlap = spec_resume_overlap;
-                    continue;
-                }
                 start = chunk_end;
                 resume_from_moe = 0;
                 continue;
             }
-            if (speculated) {
+            if (prepared) {
                 /* This segment aborted, so what was encoded after it is wrong.
                  * It was never committed, so dropping it costs nothing. */
                 g_gate_ahead_dropped++;
                 if (!ds4_gpu_discard_commands()) { ok = false; break; }
-                ds4_gpu_gate_segment_rewind(spec_slot);
+                ds4_gpu_gate_segment_rewind(prep_slot);
+                prepared = false;
             }
             ds4_gpu_gate_census_settle(bad);
             g_gate_aborts++;
