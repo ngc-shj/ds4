@@ -378,10 +378,17 @@ static id<DS4Encoder> ds4_gpu_timeline_new_encoder(
     ds4_gpu_timeline_hook_encoder(enc);
     return enc;
 }
+/* Defined by the Metal 4 backend below, declared here because the two call
+ * sites that matter - a blit into the batch buffer, a residency set attached
+ * to the Metal 3 queue - are above it. */
+void ds4_gpu_mtl4_note_metal3_work(const char *what);
+void ds4_gpu_queue_residency_added(id set);
+
 /* Blit encoder with timeline sampling (blit passes are otherwise invisible
  * to the encoder timeline and show up as gaps). */
 static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, const char *label,
                                                      uint32_t n_ops) {
+    if (cb == g_batch_cb) ds4_gpu_mtl4_note_metal3_work(label);
     DS4TimelineBatch *b = g_timeline_batch;
     if (!g_timeline_enabled || !b || cb != g_batch_cb) return [cb blitCommandEncoder];
     const uint32_t per_buffer = DS4_TIMELINE_SAMPLES_PER_BUFFER / 2;
@@ -1481,6 +1488,9 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
     return cb;
 }
 
+#include "ds4_metal_enc_trace.h"
+#include "ds4_metal_mtl4.h"
+
 static id<DS4Encoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
@@ -1499,9 +1509,11 @@ static id<DS4Encoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
             if (g_batch_enc) return g_batch_enc;
         }
         if (!g_batch_enc) {
-            g_batch_enc = (id<DS4Encoder>)(g_batch_encoder_concurrent
+            id<DS4Encoder> m4 = nil;
+            if (@available(macOS 26.0, *)) m4 = ds4_mtl4_encoder();
+            g_batch_enc = ds4_enc_trace_wrap(m4 ? m4 : (id<DS4Encoder>)(g_batch_encoder_concurrent
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
-                : [cb computeCommandEncoder]);
+                : [cb computeCommandEncoder]));
         }
         return g_batch_enc;
     }
@@ -1762,6 +1774,7 @@ static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label);
 
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
+    if (@available(macOS 26.0, *)) { if (!ds4_mtl4_wait_all()) ok = 0; }
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
         if (!ds4_gpu_wait_command_buffer(pending, label)) ok = 0;
     }
@@ -2399,6 +2412,7 @@ static int ds4_gpu_model_residency_request_views(void) {
             g_queue &&
             [g_queue respondsToSelector:@selector(addResidencySet:)]) {
             [g_queue addResidencySet:g_model_residency_set];
+            ds4_gpu_queue_residency_added(g_model_residency_set);
             g_model_residency_added_to_queue = 1;
         }
         g_model_residency_count = g_model_view_count;
@@ -9645,6 +9659,26 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     /* C inference callers have no surrounding autorelease pool. In particular,
      * validation-layer blit bookkeeping otherwise accumulates across tokens. */
     @autoreleasepool {
+        /* With the Metal 4 backend holding the region this goes into the
+         * compute encoder it already has. Left in the Metal 3 buffer it would
+         * run after the whole segment rather than in place, because the two
+         * queues have no ordering of their own - a wrong answer no barrier
+         * inside the Metal 4 encoder can reach. */
+        /* Traced from here rather than from an encoder: the Metal 3 form of
+         * this is a blit encoder, which the trace never sees, and a stream
+         * missing every copy cannot be compared with one that has them. */
+        ds4_enc_trace("cpy b%u+%lu b%u+%lu %llu\n",
+                      ds4_enc_trace_buf_id(s.buffer),
+                      (unsigned long)(s.offset + src_offset),
+                      ds4_enc_trace_buf_id(d.buffer),
+                      (unsigned long)(d.offset + dst_offset),
+                      (unsigned long long)bytes);
+        if (@available(macOS 26.0, *)) {
+            if (ds4_mtl4_copy(s.buffer, (NSUInteger)(s.offset + src_offset),
+                              d.buffer, (NSUInteger)(d.offset + dst_offset),
+                              (NSUInteger)bytes))
+                return 1;
+        }
         ds4_gpu_close_batch_encoder();
         g_batch_has_work = YES;
         id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "tensor_copy", 1u);
@@ -9782,6 +9816,7 @@ int ds4_gpu_begin_commands(void) {
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
     ds4_gpu_timeline_attach(g_batch_cb);
+    if (@available(macOS 26.0, *)) (void)ds4_mtl4_begin();
     return g_batch_cb != nil;
 }
 
@@ -9799,6 +9834,12 @@ int ds4_gpu_flush_commands(void) {
     if (!g_batch_cb) return 0;
 
     ds4_gpu_close_batch_encoder();
+    /* The segment's work is in the Metal 4 buffer when this backend is on, so
+     * that is what goes out. It is committed and not waited for: the engine
+     * encodes the next segment into a fresh buffer before it asks for this
+     * one's result. */
+    int mtl4_committed = 0;
+    if (@available(macOS 26.0, *)) mtl4_committed = ds4_mtl4_commit();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
@@ -9811,6 +9852,7 @@ int ds4_gpu_flush_commands(void) {
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
     ds4_gpu_timeline_attach(g_batch_cb);
+    if (mtl4_committed) { if (@available(macOS 26.0, *)) (void)ds4_mtl4_begin(); }
     if (!g_batch_cb) {
         (void)ds4_gpu_wait_pending_command_buffers("command batch");
         [g_transient_buffers removeAllObjects];
@@ -9834,6 +9876,7 @@ int ds4_gpu_discard_commands(void) {
     if (!g_batch_cb) return 1;
     ds4_gpu_parallel_ffn_reset_state(YES);
     ds4_gpu_close_batch_encoder();
+    if (@available(macOS 26.0, *)) ds4_mtl4_discard();
     g_batch_cb = nil;
     g_batch_has_work = NO;
     g_stream_expert_cache_batch_seq = 0;
@@ -10558,6 +10601,7 @@ int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
 
         ds4_gpu_close_batch_encoder();
         const uint64_t value = ++g_selected_readback_event_value;
+        ds4_gpu_mtl4_note_metal3_work("selected readback signal");
         [g_batch_cb encodeSignalEvent:g_selected_readback_event value:value];
         g_batch_has_work = YES;
         *event_value = value;
@@ -12067,6 +12111,7 @@ static uint64_t ds4_gpu_encode_selected_signal(void) {
         }
         ds4_gpu_close_batch_encoder();
         const uint64_t value = ++g_selected_readback_event_value;
+        ds4_gpu_mtl4_note_metal3_work("selected readback signal");
         [g_batch_cb encodeSignalEvent:g_selected_readback_event value:value];
         g_batch_has_work = YES;
         return value;
@@ -12204,6 +12249,9 @@ int ds4_gpu_end_commands(void) {
     }
     ds4_gpu_parallel_ffn_reset_state(YES);
     ds4_gpu_close_batch_encoder();
+    if (@available(macOS 26.0, *)) {
+        if (ds4_mtl4_commit()) (void)ds4_mtl4_wait_all();
+    }
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
@@ -14931,6 +14979,7 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
                     if (!g_stream_expert_residency_on_queue && g_queue &&
                         [g_queue respondsToSelector:@selector(addResidencySet:)]) {
                         [g_queue addResidencySet:g_stream_expert_residency_set];
+                        ds4_gpu_queue_residency_added(g_stream_expert_residency_set);
                         g_stream_expert_residency_on_queue = 1;
                     }
                 }
@@ -15669,6 +15718,7 @@ static uint64_t ds4_gpu_encode_resident_service_wait(void) {
         }
         ds4_gpu_close_batch_encoder();
         const uint64_t value = ++g_resident_service_value;
+        ds4_gpu_mtl4_note_metal3_work("resident service wait");
         [g_batch_cb encodeWaitForEvent:g_resident_service_event value:value];
         return value;
     }
@@ -42691,6 +42741,7 @@ static int ds4_gpu_routed_moe_one_resident(
     if (no_blit < 0) no_blit = getenv("DS4_METAL_V41_RESIDENT_NO_BLIT") != NULL;
     if (!no_blit) ds4_gpu_close_batch_encoder();
     if (!no_blit) {
+        ds4_gpu_mtl4_note_metal3_work("resident selected copy");
         id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
         if (!blit) DS4_RESIDENT_DECLINE("no blit encoder");
         [blit copyFromBuffer:selbuf

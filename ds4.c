@@ -42631,6 +42631,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern unsigned long long ds4_gpu_gate_slots_total(void);
     extern unsigned long long ds4_gpu_gate_direct_total(void);
     extern void ds4_gpu_gate_census_settle(uint32_t aborted_layer);
+    /* The Metal 4 backend owns the gated region, and nothing else: the
+     * boundary is a drain the graph already performs, so the two backends
+     * never hold work at the same time. */
+    extern void ds4_gpu_mtl4_region_begin(void);
+    extern void ds4_gpu_mtl4_region_end(void);
+    extern void ds4_gpu_mtl4_counts(unsigned long long *segments,
+                                    unsigned long long *dispatches,
+                                    unsigned long long *m3_work);
     extern int ds4_gpu_wait_committed(void);
     extern int ds4_gpu_discard_commands(void);
     extern void ds4_gpu_gate_segment_rewind(uint32_t slot);
@@ -42685,6 +42693,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     uint32_t gate_done = 0;
     if (gate_n > gate_lo) {
         ds4_gpu_gate_token_begin();
+        ds4_gpu_mtl4_region_begin();
         uint32_t start = gate_lo;
         int resume_from_moe = 0;
         /* Which shape each layer was issued in. A continuation re-runs the
@@ -43077,6 +43086,7 @@ spec_done:;
             start = bad;
             resume_from_moe = 1;
         }
+        ds4_gpu_mtl4_region_end();
         if (ok && ds4_gpu_gate_ungatable() != 0 &&
             getenv("DS4_METAL_V41_ABORT_GATE_NO_THREADS") == NULL) {
             fprintf(stderr, "ds4: abort gate saw %llu dispatches it could not gate\n",
@@ -43278,6 +43288,22 @@ spec_done:;
                 (double)(spec_cmp - w_spec_cmp) / dt,
                 (double)(spec_diff - w_spec_diff) / dt,
                 (double)(spec_far - w_spec_far) / dt);
+        /* Proof the Metal 4 path ran, and that the Metal 3 buffer stayed out
+         * of the region while it did. Byte identity from a backend that
+         * quietly declined is byte identity from the backend it declined to. */
+        {
+            static unsigned long long w_m4_seg, w_m4_disp;
+            unsigned long long m4_seg = 0, m4_disp = 0, m4_m3 = 0;
+            ds4_gpu_mtl4_counts(&m4_seg, &m4_disp, &m4_m3);
+            if (m4_seg || m4_m3)
+                fprintf(stderr,
+                        "ds4:   Metal 4: %.2f command buffers, %.1f dispatches a token; "
+                        "%llu pieces of Metal 3 work inside a segment\n",
+                        (double)(m4_seg - w_m4_seg) / dt,
+                        (double)(m4_disp - w_m4_disp) / dt, m4_m3);
+            w_m4_seg = m4_seg;
+            w_m4_disp = m4_disp;
+        }
             w_sec_att = sec_att; w_sec_open = sec_open;
             w_spec_cmp = spec_cmp; w_spec_diff = spec_diff; w_spec_far = spec_far;
             w_spec_saved = spec_saved;
