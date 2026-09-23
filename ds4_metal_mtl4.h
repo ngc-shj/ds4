@@ -51,6 +51,7 @@
 
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_wait_committed(void);
+int ds4_gpu_wait_committed(void);
 static void ds4_gpu_close_batch_encoder(void);
 
 /* Device flushes to the GPU coherence point; ResourceAlias additionally
@@ -120,11 +121,36 @@ static NSMutableArray *g_mtl4_pool;          /* DS4MTL4Buffer, all of them */
 static DS4MTL4Encoder *g_mtl4_enc API_AVAILABLE(macos(26.0));
 static DS4MTL4Buffer *g_mtl4_cur API_AVAILABLE(macos(26.0));
 static id<MTLSharedEvent> g_mtl4_event;
+/* The Metal 3 -> Metal 4 edge at the region entry. A token arrives with the
+ * embedding already in the batch buffer and the Metal 4 queue has no ordering
+ * against it, so something has to express the dependency. A host wait does,
+ * and costs the whole of that buffer's execution before the first segment can
+ * even be encoded; an event costs nothing on the host - Metal 3 signals it at
+ * the end of the buffer and the Metal 4 queue waits for it, leaving the CPU
+ * free to encode the first segment while the embedding is still running.
+ * DS4_METAL_V41_MTL4_SEAM_WAIT=1 puts the host wait back, as the control. */
+static id<MTLSharedEvent> g_mtl4_seam_event;
+static uint64_t g_mtl4_seam_stamp;
+
+static int ds4_mtl4_seam_wait(void) {
+    static int checked, on;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_MTL4_SEAM_WAIT");
+        checked = 1;
+        on = e && e[0] ? atoi(e) != 0 : 0;
+    }
+    return on;
+}
 static uint64_t g_mtl4_stamp;                /* last value handed to a commit */
 static uint64_t g_mtl4_done;                 /* last value waited for */
 static int g_mtl4_region;                    /* inside the gated region */
 
 static unsigned long long g_mtl4_dispatches, g_mtl4_segments, g_mtl4_copies_m3;
+/* Buffers actually sent, against segments begun: the two differ by the ones
+ * an abort discards, and reporting begins as though they were submissions is
+ * how a submission count stops being one. */
+static unsigned long long g_mtl4_commits;
+extern unsigned long long g_ds4_m3_commits, g_ds4_m3_skipped;
 
 /* Counted rather than assumed: work the engine puts in the Metal 3 batch
  * buffer while a Metal 4 buffer is open runs after it, not in place. The
@@ -134,10 +160,14 @@ static int ds4_mtl4_open(void);
 
 void ds4_gpu_mtl4_counts(unsigned long long *segments,
                          unsigned long long *dispatches,
-                         unsigned long long *m3_work) {
-    if (segments) *segments = g_mtl4_segments;
+                         unsigned long long *m3_work,
+                         unsigned long long *m3_sent,
+                         unsigned long long *m3_skipped) {
+    if (segments) *segments = g_mtl4_commits;
     if (dispatches) *dispatches = g_mtl4_dispatches;
     if (m3_work) *m3_work = g_mtl4_copies_m3;
+    if (m3_sent) *m3_sent = g_ds4_m3_commits;
+    if (m3_skipped) *m3_skipped = g_ds4_m3_skipped;
 }
 
 void ds4_gpu_mtl4_note_metal3_work(const char *what) {
@@ -510,6 +540,7 @@ static int ds4_mtl4_commit(void) {
         id<MTL4CommandBuffer> one = b.cb;
         [g_mtl4_queue commit:&one count:1];
         b.stamp = ++g_mtl4_stamp;
+        g_mtl4_commits++;
         [g_mtl4_queue signalEvent:g_mtl4_event value:b.stamp];
         g_mtl4_cur = nil;
         return 1;
@@ -572,7 +603,24 @@ static id<DS4Encoder> ds4_mtl4_encoder(void) {
     g_mtl4_enc.enc = e;
     g_mtl4_enc.table = g_mtl4_table;
     g_mtl4_enc.owner = g_mtl4_cur;
-    g_mtl4_enc.barrierEveryDispatch = YES;
+    /* A barrier after every dispatch reproduces the serial Metal 3 encoder,
+     * and for a serial encoder that is what the engine asked for. A
+     * concurrent section is the opposite: the engine opened it because the
+     * dispatches in a level are independent, and it puts an explicit barrier
+     * at each level break itself. Serialising those here threw away the
+     * parallelism the section exists to express, and left Metal 4 running a
+     * graph more serial than the one Metal 3 runs.
+     *
+     * DS4_METAL_V41_MTL4_SERIAL=1 puts it back, which is the control. */
+    {
+        static int checked, serial;
+        if (!checked) {
+            const char *e = getenv("DS4_METAL_V41_MTL4_SERIAL");
+            checked = 1;
+            serial = e && e[0] ? atoi(e) != 0 : 0;
+        }
+        g_mtl4_enc.barrierEveryDispatch = serial || !g_batch_encoder_concurrent;
+    }
     return (id<DS4Encoder>)g_mtl4_enc;
 }
 
@@ -605,9 +653,23 @@ void ds4_gpu_mtl4_region_begin(void) {
          * reads it. Drain first: this is the seam between the two backends,
          * and it is a wait, not a barrier, because nothing else orders two
          * queues. */
-        if (g_batch_cb && g_batch_has_work) {
+        if (!ds4_mtl4_ready()) return;
+        if (g_batch_cb && g_batch_has_work && ds4_mtl4_seam_wait()) {
             if (!ds4_gpu_flush_commands()) return;
             if (!ds4_gpu_wait_committed()) return;
+        } else if (g_batch_cb && g_batch_has_work) {
+            if (!g_mtl4_seam_event) {
+                g_mtl4_seam_event = [g_device newSharedEvent];
+                if (!g_mtl4_seam_event) return;
+            }
+            ds4_gpu_close_batch_encoder();
+            [g_batch_cb encodeSignalEvent:g_mtl4_seam_event
+                                    value:++g_mtl4_seam_stamp];
+            g_m3_cb_has_work = YES;
+            if (!ds4_gpu_flush_commands()) return;
+            /* Applies to everything committed to this queue after it, which
+             * is every segment of the region. */
+            [g_mtl4_queue waitForEvent:g_mtl4_seam_event value:g_mtl4_seam_stamp];
         }
         ds4_gpu_close_batch_encoder();
         g_mtl4_region = 1;

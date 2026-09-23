@@ -99,7 +99,18 @@ static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<DS4Encoder> g_batch_enc;
 static BOOL g_batch_encoder_concurrent;
+/* Whether the logical batch - the segment the engine is building - has any
+ * GPU work in it, whichever backend is carrying it. */
 static BOOL g_batch_has_work;
+/* Whether the Metal 3 command buffer itself holds commands. With the Metal 4
+ * backend on it usually does not, and committing it anyway submits an empty
+ * buffer a segment and then waits for it: about seventeen of those a token,
+ * which the "no Metal 3 work inside a segment" counter cannot see, because
+ * there is indeed no work in it - that is the point. */
+static BOOL g_m3_cb_has_work;
+/* Whether the encoder the engine is holding belongs to the Metal 4 backend. */
+static BOOL g_batch_enc_is_mtl4;
+unsigned long long g_ds4_m3_commits, g_ds4_m3_skipped;
 
 /* ---- Encoder timeline diagnostic (DS4_METAL_ENCODER_TIMELINE=<file>) ----
  * Gives every batch dispatch group its own compute pass with stage-boundary
@@ -388,7 +399,10 @@ void ds4_gpu_queue_residency_added(id set);
  * to the encoder timeline and show up as gaps). */
 static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, const char *label,
                                                      uint32_t n_ops) {
-    if (cb == g_batch_cb) ds4_gpu_mtl4_note_metal3_work(label);
+    if (cb == g_batch_cb) {
+        ds4_gpu_mtl4_note_metal3_work(label);
+        g_m3_cb_has_work = YES;
+    }
     DS4TimelineBatch *b = g_timeline_batch;
     if (!g_timeline_enabled || !b || cb != g_batch_cb) return [cb blitCommandEncoder];
     const uint32_t per_buffer = DS4_TIMELINE_SAMPLES_PER_BUFFER / 2;
@@ -1506,15 +1520,17 @@ static id<DS4Encoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
                         cb, g_batch_encoder_concurrent,
                         (uintptr_t)__builtin_return_address(0));
             }
-            if (g_batch_enc) return g_batch_enc;
+            if (g_batch_enc) { g_m3_cb_has_work = YES; return g_batch_enc; }
         }
         if (!g_batch_enc) {
             id<DS4Encoder> m4 = nil;
             if (@available(macOS 26.0, *)) m4 = ds4_mtl4_encoder();
+            g_batch_enc_is_mtl4 = m4 != nil;
             g_batch_enc = ds4_enc_trace_wrap(m4 ? m4 : (id<DS4Encoder>)(g_batch_encoder_concurrent
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder]));
         }
+        if (!g_batch_enc_is_mtl4) g_m3_cb_has_work = YES;
         return g_batch_enc;
     }
     id<DS4Encoder> enc = (id<DS4Encoder>)[cb computeCommandEncoder];
@@ -1531,6 +1547,7 @@ static void ds4_gpu_close_batch_encoder(void) {
     if (!g_batch_enc) return;
     [g_batch_enc endEncoding];
     g_batch_enc = nil;
+    g_batch_enc_is_mtl4 = NO;
 }
 
 static double g_gpu_busy_accum;
@@ -9680,7 +9697,7 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                 return 1;
         }
         ds4_gpu_close_batch_encoder();
-        g_batch_has_work = YES;
+        g_batch_has_work = g_m3_cb_has_work = YES;
         id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "tensor_copy", 1u);
         if (!blit) return 0;
         [blit copyFromBuffer:s.buffer
@@ -9813,7 +9830,7 @@ int ds4_gpu_begin_commands(void) {
     g_batch_cb_created_ms = ds4_gpu_now_ms();
     ds4_gpu_ledger_origin("begin");
     g_batch_cb = ds4_gpu_new_command_buffer();
-    g_batch_has_work = NO;
+    g_batch_has_work = g_m3_cb_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
     ds4_gpu_timeline_attach(g_batch_cb);
     if (@available(macOS 26.0, *)) (void)ds4_mtl4_begin();
@@ -9840,18 +9857,31 @@ int ds4_gpu_flush_commands(void) {
      * one's result. */
     int mtl4_committed = 0;
     if (@available(macOS 26.0, *)) mtl4_committed = ds4_mtl4_commit();
-    id<MTLCommandBuffer> cb = g_batch_cb;
-    g_batch_cb = nil;
-    g_batch_has_work = NO;
-    [cb commit];
-    [g_pending_cbs addObject:cb];
+    /* An empty Metal 3 buffer is not submitted. With the Metal 4 backend
+     * holding the region it is empty at every segment boundary, and
+     * committing it anyway was a submission and a wait a segment for a buffer
+     * with nothing in it. The buffer stays open and keeps its identity; what
+     * advances either way is the logical batch, which is what the expert
+     * cache's in-flight sequence is keyed on and what the wait completes. */
+    if (g_m3_cb_has_work) {
+        id<MTLCommandBuffer> cb = g_batch_cb;
+        g_batch_cb = nil;
+        [cb commit];
+        [g_pending_cbs addObject:cb];
+        g_ds4_m3_commits++;
+    } else {
+        g_ds4_m3_skipped++;
+    }
+    g_batch_has_work = g_m3_cb_has_work = NO;
     ds4_gpu_stream_expert_cache_note_batch_committed();
 
     ds4_gpu_ledger_origin("flush");
-    g_batch_cb = ds4_gpu_new_command_buffer();
-    g_batch_has_work = NO;
+    if (!g_batch_cb) {
+        g_batch_cb = ds4_gpu_new_command_buffer();
+        ds4_gpu_timeline_attach(g_batch_cb);
+    }
+    g_batch_has_work = g_m3_cb_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
-    ds4_gpu_timeline_attach(g_batch_cb);
     if (mtl4_committed) { if (@available(macOS 26.0, *)) (void)ds4_mtl4_begin(); }
     if (!g_batch_cb) {
         (void)ds4_gpu_wait_pending_command_buffers("command batch");
@@ -9878,7 +9908,7 @@ int ds4_gpu_discard_commands(void) {
     ds4_gpu_close_batch_encoder();
     if (@available(macOS 26.0, *)) ds4_mtl4_discard();
     g_batch_cb = nil;
-    g_batch_has_work = NO;
+    g_batch_has_work = g_m3_cb_has_work = NO;
     g_stream_expert_cache_batch_seq = 0;
     return 1;
 }
@@ -10603,7 +10633,8 @@ int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
         const uint64_t value = ++g_selected_readback_event_value;
         ds4_gpu_mtl4_note_metal3_work("selected readback signal");
         [g_batch_cb encodeSignalEvent:g_selected_readback_event value:value];
-        g_batch_has_work = YES;
+        g_m3_cb_has_work = YES;
+        g_batch_has_work = g_m3_cb_has_work = YES;
         *event_value = value;
         return 1;
     }
@@ -10623,7 +10654,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
         ds4_gpu_close_batch_encoder();
         id<MTLCommandBuffer> cb = g_batch_cb;
         g_batch_cb = nil;
-        g_batch_has_work = NO;
+        g_batch_has_work = g_m3_cb_has_work = NO;
         [cb commit];
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
@@ -10648,7 +10679,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
 
         ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
-        g_batch_has_work = NO;
+        g_batch_has_work = g_m3_cb_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
         if (!g_batch_cb) {
             (void)ds4_gpu_wait_pending_command_buffers(what);
@@ -11576,6 +11607,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         } else {
             ds4_gpu_close_batch_encoder();
             [g_batch_cb encodeSignalEvent:g_tp_gpu_event value:seq];
+            g_m3_cb_has_work = YES;
         }
         const bool poll_gate =
             !event_arrival && g_tp_poll_gates && !g_ssd_streaming_mode &&
@@ -11618,6 +11650,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
             ds4_gpu_end_compute_encoder(g_batch_cb, enc);
         } else {
             [g_batch_cb encodeWaitForEvent:g_tp_cpu_event value:seq];
+            g_m3_cb_has_work = YES;
         }
         pthread_mutex_lock(&g_tp_mutex);
         if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
@@ -11678,8 +11711,10 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
         } else {
             ds4_gpu_close_batch_encoder();
             [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
+            g_m3_cb_has_work = YES;
         }
         [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
+        g_m3_cb_has_work = YES;
         pthread_mutex_lock(&g_tp_mutex);
         if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
             pthread_mutex_unlock(&g_tp_mutex);
@@ -11721,6 +11756,7 @@ static uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     const uint64_t seq = ++g_tp_batch_seq;
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
+    g_m3_cb_has_work = YES;
     pthread_mutex_lock(&g_tp_mutex);
     if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
         pthread_mutex_unlock(&g_tp_mutex);
@@ -11747,6 +11783,7 @@ static int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
     if (!g_batch_cb || seq == 0) return 0;
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
+    g_m3_cb_has_work = YES;
     return 1;
 }
 
@@ -12113,7 +12150,8 @@ static uint64_t ds4_gpu_encode_selected_signal(void) {
         const uint64_t value = ++g_selected_readback_event_value;
         ds4_gpu_mtl4_note_metal3_work("selected readback signal");
         [g_batch_cb encodeSignalEvent:g_selected_readback_event value:value];
-        g_batch_has_work = YES;
+        g_m3_cb_has_work = YES;
+        g_batch_has_work = g_m3_cb_has_work = YES;
         return value;
     }
     return 0;
@@ -12138,7 +12176,7 @@ static int ds4_gpu_commit_and_wait_selected(uint64_t value, const char *label) {
         /* The caller keeps encoding this layer, so it needs a batch again. */
         ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
-        g_batch_has_work = NO;
+        g_batch_has_work = g_m3_cb_has_work = NO;
         if (!g_batch_cb) {
             (void)ds4_gpu_wait_pending_command_buffers(label ? label : "selected-id readback");
             [g_transient_buffers removeAllObjects];
@@ -12186,7 +12224,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         g_batch_cb = nil;
         const uint64_t value = ++g_selected_readback_event_value;
         [cb encodeSignalEvent:g_selected_readback_event value:value];
-        g_batch_has_work = YES;
+        g_batch_has_work = g_m3_cb_has_work = YES;
         [cb commit];
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
@@ -12222,7 +12260,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 
         ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
-        g_batch_has_work = NO;
+        g_batch_has_work = g_m3_cb_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
         if (!g_batch_cb) {
             (void)ds4_gpu_wait_pending_command_buffers(label ? label : "selected-id readback");
@@ -12234,7 +12272,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         ds4_gpu_close_batch_encoder();
         id<MTLCommandBuffer> cb = g_batch_cb;
         g_batch_cb = nil;
-        g_batch_has_work = NO;
+        g_batch_has_work = g_m3_cb_has_work = NO;
         if (ds4_gpu_finish_command_buffer(cb, 1, label ? label : "selected-id readback") == 0) {
             return 0;
         }
@@ -12254,7 +12292,7 @@ int ds4_gpu_end_commands(void) {
     }
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
-    g_batch_has_work = NO;
+    g_batch_has_work = g_m3_cb_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
@@ -15720,6 +15758,7 @@ static uint64_t ds4_gpu_encode_resident_service_wait(void) {
         const uint64_t value = ++g_resident_service_value;
         ds4_gpu_mtl4_note_metal3_work("resident service wait");
         [g_batch_cb encodeWaitForEvent:g_resident_service_event value:value];
+        g_m3_cb_has_work = YES;
         return value;
     }
     return 0;
@@ -18792,7 +18831,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                 UINT64_MAX : read_bytes + bytes;
         }
         [blit endEncoding];
-        g_batch_has_work = YES;
+        g_batch_has_work = g_m3_cb_has_work = YES;
     } else {
         ok = ds4_gpu_stream_expert_pread_tasks(tasks,
                                                n_tasks,

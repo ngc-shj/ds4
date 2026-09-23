@@ -42638,7 +42638,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     extern void ds4_gpu_mtl4_region_end(void);
     extern void ds4_gpu_mtl4_counts(unsigned long long *segments,
                                     unsigned long long *dispatches,
-                                    unsigned long long *m3_work);
+                                    unsigned long long *m3_work,
+                                    unsigned long long *m3_sent,
+                                    unsigned long long *m3_skipped);
     extern int ds4_gpu_wait_committed(void);
     extern int ds4_gpu_discard_commands(void);
     extern void ds4_gpu_gate_segment_rewind(uint32_t slot);
@@ -43292,17 +43294,23 @@ spec_done:;
          * of the region while it did. Byte identity from a backend that
          * quietly declined is byte identity from the backend it declined to. */
         {
-            static unsigned long long w_m4_seg, w_m4_disp;
-            unsigned long long m4_seg = 0, m4_disp = 0, m4_m3 = 0;
-            ds4_gpu_mtl4_counts(&m4_seg, &m4_disp, &m4_m3);
+            static unsigned long long w_m4_seg, w_m4_disp, w_m3_sent, w_m3_skip;
+            unsigned long long m4_seg = 0, m4_disp = 0, m4_m3 = 0,
+                               m3_sent = 0, m3_skip = 0;
+            ds4_gpu_mtl4_counts(&m4_seg, &m4_disp, &m4_m3, &m3_sent, &m3_skip);
             if (m4_seg || m4_m3)
                 fprintf(stderr,
-                        "ds4:   Metal 4: %.2f command buffers, %.1f dispatches a token; "
+                        "ds4:   Metal 4: %.2f command buffers sent, %.1f dispatches "
+                        "a token; Metal 3: %.2f sent, %.2f empty ones not sent; "
                         "%llu pieces of Metal 3 work inside a segment\n",
                         (double)(m4_seg - w_m4_seg) / dt,
-                        (double)(m4_disp - w_m4_disp) / dt, m4_m3);
+                        (double)(m4_disp - w_m4_disp) / dt,
+                        (double)(m3_sent - w_m3_sent) / dt,
+                        (double)(m3_skip - w_m3_skip) / dt, m4_m3);
             w_m4_seg = m4_seg;
             w_m4_disp = m4_disp;
+            w_m3_sent = m3_sent;
+            w_m3_skip = m3_skip;
         }
             w_sec_att = sec_att; w_sec_open = sec_open;
             w_spec_cmp = spec_cmp; w_spec_diff = spec_diff; w_spec_far = spec_far;
