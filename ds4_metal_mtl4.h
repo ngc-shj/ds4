@@ -51,7 +51,6 @@
 
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_wait_committed(void);
-int ds4_gpu_wait_committed(void);
 static void ds4_gpu_close_batch_encoder(void);
 
 /* Device flushes to the GPU coherence point; ResourceAlias additionally
