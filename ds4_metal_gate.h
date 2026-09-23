@@ -331,7 +331,7 @@ static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
  * behind. With the gate off this is one message; with it on, the dispatch
  * takes a slot in the grid table and goes out indirect, so the layer that
  * aborts can zero the rest. */
-static void ds4_gpu_dispatch(id<MTLComputeCommandEncoder> enc, MTLSize tg, MTLSize tpt) {
+static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {
     NSUInteger off = 0;
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
         !atomic_load_explicit(&g_gate_armed, memory_order_relaxed) &&
@@ -363,7 +363,7 @@ static void ds4_gpu_dispatch(id<MTLComputeCommandEncoder> enc, MTLSize tg, MTLSi
  * both of its call sites were rounded up to whole threadgroups, their kernels
  * already bounds-checking - so one arriving here while a segment is gated is
  * counted and named rather than left running after an abort. */
-static void ds4_gpu_dispatch_threads(id<MTLComputeCommandEncoder> enc, MTLSize th, MTLSize tpt) {
+static void ds4_gpu_dispatch_threads(id<DS4Encoder> enc, MTLSize th, MTLSize tpt) {
     /* One of these ahead of the buffer's first validate is certain to run, so
      * it is not something the gate failed to switch off. */
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
