@@ -45704,7 +45704,7 @@ static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
                         shapes[si].name, rows);
                 goto next;
             }
-            for (uint32_t tile = 2; tile <= 4u; tile *= 2u) {
+            for (uint32_t tile = 2; tile <= 8u; tile *= 2u) {
                 if (!ds4_gpu_begin_commands() ||
                     !ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(tst, m->map, m->size,
                         t->abs_offset, width, outputs, in, rows, tile) ||
@@ -45737,6 +45737,33 @@ static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
                             (unsigned long long)(first / outputs),
                             (unsigned long long)(first % outputs),
                             (double)a[first], (double)b[first], worst);
+                }
+            }
+            /* =2 also times each variant. What the scan column cannot say is
+             * whether a pass reaches DRAM; an apparent bandwidth above what
+             * the machine has says it did not, and the cache absorbed it. */
+            if (atoi(env) >= 2 && rows == 8u) {
+                const int laps = 20;
+                for (uint32_t br = 1; br <= 8u; br *= 2u) {
+                    for (int warm = 0; warm < 2; warm++) {
+                        if (!ds4_gpu_begin_commands()) break;
+                        for (int q = 0; q < laps; q++)
+                            (void)(br == 1u
+                                ? ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(tst,
+                                      m->map, m->size, t->abs_offset, width, outputs, in, rows)
+                                : ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(tst,
+                                      m->map, m->size, t->abs_offset, width, outputs, in, rows, br));
+                        const double t0 = now_sec();
+                        (void)ds4_gpu_end_commands();
+                        if (warm == 0) continue;
+                        const double ms = (now_sec() - t0) * 1000.0 / laps;
+                        const uint32_t passes = (rows + br - 1u) / br;
+                        const double gbs = ms > 0 ?
+                            (double)t->bytes * passes / (ms / 1e3) / 1e9 : 0.0;
+                        fprintf(stderr, "  %-14s rows=8 BR=%u: %6.3f ms, %u scans, "
+                                "%6.1f GB/s apparent\n",
+                                shapes[si].name, br, ms, passes, gbs);
+                    }
                 }
             }
         next:

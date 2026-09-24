@@ -345,6 +345,23 @@ kernel void kernel_mul_mv_q8_0_f32_rows2(
     kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, 2, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+/* BR=8 holds sumf[8][NR0] and yl[8][NQ] live across the K walk, so whether it
+ * beats two BR=4 tiles is a register-pressure question and not an arithmetic
+ * one: the accumulation order per (batch row, output row) is the same as BR=2,
+ * BR=4 and the single row. Measured per shape, not assumed. */
+[[host_name("kernel_mul_mv_q8_0_f32_rows8")]]
+kernel void kernel_mul_mv_q8_0_f32_rows8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, 8, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 [[host_name("kernel_mul_mv_q8_0_f32_rows4")]]
 kernel void kernel_mul_mv_q8_0_f32_rows4(
         constant ds4_metal_args_mul_mv & args,

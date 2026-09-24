@@ -897,7 +897,7 @@ void ds4_gpu_expert_release_set(ds4_gpu_expert_lease *lease);
 uint64_t ds4_gpu_expert_addr_generation(void);
 
 /* The same shape as the exact decode-rows matvec, through a kernel that reads
- * each weight block once for row_tile activation rows. row_tile is 2 or 4. */
+ * each weight block once for row_tile activation rows. row_tile is 2, 4 or 8. */
 int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

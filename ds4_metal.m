@@ -21676,7 +21676,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         uint32_t              n_rows,
         uint32_t              row_tile) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (row_tile != 2u && row_tile != 4u) return 0;
+    if (row_tile != 2u && row_tile != 4u && row_tile != 8u) return 0;
     if (!out || !x || !model_map || n_rows == 0 ||
         n_rows > INT32_MAX || in_dim == 0 || out_dim == 0 ||
         (in_dim & 31u) != 0 || in_dim > UINT32_MAX ||
@@ -21713,8 +21713,9 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         args.nr0 = dispatch.nr0;
 
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
-                row_tile == 2u ? "kernel_mul_mv_q8_0_f32_rows2"
-                               : "kernel_mul_mv_q8_0_f32_rows4",
+                row_tile == 2u ? "kernel_mul_mv_q8_0_f32_rows2" :
+                row_tile == 4u ? "kernel_mul_mv_q8_0_f32_rows4"
+                               : "kernel_mul_mv_q8_0_f32_rows8",
                 dispatch.nsg);
         if (!pipeline) return 0;
 
@@ -21734,7 +21735,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
             MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         if (row_tile == 2u) g_ds4_head_rows2_dispatches++;
-        else g_ds4_head_rows4_dispatches++;
+        else if (row_tile == 4u) g_ds4_head_rows4_dispatches++;
 
         return ds4_gpu_finish_command_buffer(
                 cb, owned, "Q8_0 weight-reuse decode-row matvec");
