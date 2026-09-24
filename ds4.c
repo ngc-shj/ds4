@@ -40650,6 +40650,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     /* Not cached in a static: the selftest's in-process A/B sets and unsets
      * this between arms, and a static hands both arms the same value and
      * reports no difference. */
+    static int exact_vocab = -1;
+    if (exact_vocab < 0) {
+        const char *ev = getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS");
+        exact_vocab = ev && ev[0] ? atoi(ev) != 0 : 0;
+    }
     const char *dense_tile_e = getenv("DS4_METAL_V41_DENSE_ROW_TILE");
     /* Per shape, from DS4_V41_ROWTILE_CHECK=2 on this machine: BR=4 is the
      * best tile everywhere, BR=2 ties it on the vocabulary head, and BR=8 is
@@ -40661,7 +40666,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * generic multi-row path, and turning the tile on for it would change what
      * the default produces rather than how fast it produces it. */
     const int dense_tile = dense_tile_e && dense_tile_e[0] ? atoi(dense_tile_e) :
-        (outputs == DS4_N_VOCAB ? 0 : 4);
+        outputs != DS4_N_VOCAB ? 4 : (exact_vocab ? 2 : 0);
     if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
         (dense_tile == 2 || dense_tile == 4)) {
         ds41_wread_note(weight, count, (uint32_t)dense_tile);
@@ -40685,11 +40690,6 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * reduction here too. DS4_METAL_V41_EXACT_VOCAB_ROWS=1 sends the head
      * through it; if the answer matches, the difference was a dispatch policy
      * and not arithmetic. */
-    static int exact_vocab = -1;
-    if (exact_vocab < 0) {
-        const char *e = getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS");
-        exact_vocab = e && e[0] ? atoi(e) != 0 : 0;
-    }
     if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
 #ifdef __APPLE__
         (outputs != DS4_N_VOCAB || exact_vocab) &&
