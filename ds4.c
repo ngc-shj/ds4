@@ -45361,6 +45361,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                              atoi(block_lv_e) != 0));
     const char *bak_e = getenv("DS4_METAL_V41_BLOCK_ATTN_K");
     const bool block_attn_k = bak_e && bak_e[0] && atoi(bak_e) != 0;
+    /* Layers 0 and 1 hold no compressed KV, so their rows differ only in how
+     * much of one sliding window they see. One staging of the union serves the
+     * block, and each row reads its own keys from its own base.
+     * DS4_METAL_V41_BLOCK_ATTN_RAW=1. */
+    const char *bar_e = getenv("DS4_METAL_V41_BLOCK_ATTN_RAW");
+    const bool block_attn_raw = bar_e && bar_e[0] && atoi(bar_e) != 0;
     const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
     const bool low_batch = block_levels && g->tp_world == 1 &&
                            (block_all || (low_b_e && low_b_e[0] && atoi(low_b_e) != 0));
@@ -45604,9 +45610,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     }
                     DS41_LEVEL_BREAK();
                     /* One dispatch for the block's K queries instead of K
-                     * pipelines of six. Each row keeps its own key range and
-                     * its own selection; the rows ride the kernel's batch
-                     * axis. DS4_METAL_V41_BLOCK_ATTN_K=1. */
+                     * pipelines of six, each still over its own copy of the
+                     * keys. The rows ride the kernel's batch axis and keep
+                     * their own key range and selection, which makes this an
+                     * exact-rows oracle rather than a shared scan - the raw
+                     * prefix every row has in common is staged K times.
+                     * DS4_METAL_V41_BLOCK_ATTN_K=1. */
                     if (ok && block_attn_k) {
                         uint32_t nr[DS4_TP_BATCH_MAX_ROWS], rs[DS4_TP_BATCH_MAX_ROWS];
                         uint32_t ncv[DS4_TP_BATCH_MAX_ROWS];
@@ -45620,7 +45629,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                         static bool said_k;
                         if (!said_k) { said_k = true;
                             fprintf(stderr, "ds4: V4.1 block attention, %u queries in one "
-                                    "dispatch\n", rows); }
+                                    "dispatch over one key copy each\n", rows); }
                         ok = ds4_gpu_attention_decode_heads_block_tensor(active.heads,
                                 model->map, model->size, sinks_off, active.q,
                                 g->raw_prefill, raw_cap, nr, rs,
@@ -45680,6 +45689,44 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                                active.low, rows, false);
                     levelled = ok;
                 }
+            }
+            /* No compressed KV on this layer, so the rows share one key
+             * range and nothing else differs. The raw-only shape is the only
+             * one where the sharing is expressible without a descriptor: the
+             * bases are avail-min(avail,SWA) over consecutive positions, which
+             * is the single stride nb13 can carry. */
+            if (ok && !levelled && ratio_l == 0u && block_attn_raw) {
+                uint32_t nr[DS4_TP_BATCH_MAX_ROWS], rs[DS4_TP_BATCH_MAX_ROWS];
+                for (int i = 0; i < count; i++) {
+                    const uint32_t avail = previous + (uint32_t)i + 1u;
+                    nr[i] = avail < 128u ? avail : 128u;
+                    rs[i] = avail - nr[i];
+                }
+                static bool said_raw;
+                if (!said_raw) { said_raw = true;
+                    fprintf(stderr, "ds4: V4.1 block attention, %u raw-only rows "
+                            "over one staging of their union\n", rows); }
+                ok = ds4_gpu_attention_decode_heads_raw_rows_tensor(active.heads, heads,
+                        model->map, model->size, sinks_off, active.q,
+                        (const ds4_gpu_tensor *const *)queries,
+                        g->raw_prefill, raw_cap, nr, rs, heads_n, DS4_N_HEAD_DIM,
+                        rows, DS4_ATTN_RAW_ROWS_SHARED |
+                            (getenv("DS4_METAL_V41_FIT_SPLITS")
+                                 ? DS4_ATTN_RAW_ROWS_FIT_SPLITS : 0u), NULL) != 0;
+                for (int i = 0; ok && i < count; i++) {
+                    ds41_gpu_graph row = *graphs[i];
+                    row.pos = positions[i];
+#define DS41_RAW_ROW(name, width) row.name = g->rows_view[i].name;
+                    DS41_PREFILL_ROWS(DS41_RAW_ROW)
+#undef DS41_RAW_ROW
+                    row.q = queries[i];
+                    row.heads = heads[i];
+                    ok = ds41_bf16(heads[i], heads_n * DS4_N_HEAD_DIM) &&
+                        ds41_rope(heads[i], heads_n, DS4_N_HEAD_DIM, il, positions[i], true) &&
+                        (batch_attn_out ? ds41_attention_low(&row, model, l)
+                                        : ds41_attention_output(&row, model, l, false));
+                }
+                levelled = ok;
             }
             for (int i = 0; ok && !levelled && i < count; i++) {
                 const uint32_t nc = ratio_l ? (positions[i] + 1u) / ratio_l : 0u;

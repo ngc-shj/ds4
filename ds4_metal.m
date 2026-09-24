@@ -33274,17 +33274,22 @@ static int ds4_gpu_attention_decode_heads_impl(
     return 1;
 }
 
-/* K queries in one dispatch. The rows of a speculative block share the raw KV
- * prefix, the projection weights and the mask rules; what differs is each
- * row's key count and its selected compressed set. So the rows go on the
- * kernel's batch axis - ne03, with ne_12_3 matching so ikv3 == iq3 and each
- * query reads its own K/V slice through nb13/nb23 - and every slice is padded
- * to one width with the tail masked, which DS4_V41_ROWTILE_CHECK=6 shows is
- * bit-identical to the unpadded count.
+/* K queries in one dispatch, each over its own copy of the keys.
  *
- * Each row therefore sees its own keys, in its own order, in the same chunks a
+ * The rows go on the kernel's batch axis - ne03, with ne_12_3 matching so
+ * ikv3 == iq3 and each query reads its own K/V slice through nb13/nb23 - and
+ * every slice is padded to one width with the tail masked, which
+ * DS4_V41_ROWTILE_CHECK=6 shows is bit-identical to the unpadded count. Each
+ * row therefore sees its own keys, in its own order, in the same chunks a
  * single row would, and the dst rows land at iq3*ne2*ne1 + iq2, which is
  * exactly the batch heads layout.
+ *
+ * What it does not do is share a scan. kv_stride is a whole padded key range
+ * per row, the staging loop below writes one of those for every row out of
+ * ranges that overlap almost completely, and the attend then reads them back
+ * separately. The rows of a block share their raw prefix; this puts K copies
+ * of it in the buffer. So the form is an exact-rows oracle for the batch-axis
+ * layout, and its cost measures dispatch folding only.
  */
 int ds4_gpu_attention_decode_heads_block_tensor(
         ds4_gpu_tensor       *heads,

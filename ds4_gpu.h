@@ -2307,6 +2307,15 @@ int ds4_gpu_attention_decode_heads_tensor(
  * concurrent section; the levels are separated by a barrier. */
 /* K queries of a block in one dispatch: rows on the kernel's batch axis, each
  * with its own key slice padded to a common width and its tail masked.
+ *
+ * Exact-rows, not K-wide. Every row gets its own staged copy of a key range
+ * that overlaps every other row's, and finds it through nb13/nb23; the mask
+ * fill and the KV stage are still a loop over the rows, inside here rather
+ * than in the caller. No KV scan is shared, so its null prices folding K
+ * dispatches into one grid and says nothing about the duplicated scan. What
+ * it is good for is a byte-exact oracle on the batch-axis layout; for a form
+ * that shares the scan see ds4_gpu_attention_decode_heads_raw_rows_tensor.
+ *
  * Encodes an ordered chain - mask, stage, attend, reduce - so it must not be
  * called inside a concurrent section. */
 int ds4_gpu_attention_decode_heads_block_tensor(
