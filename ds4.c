@@ -40496,8 +40496,11 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
            ds41_bf16(out, DS4_N_EMBD * DS4_N_HC);
 }
 
+static void ds41_wread_note(const ds4_tensor *t, uint32_t rows);
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
+    ds41_wread_note(weight, 1);
     if (round && ds41_fuse_bf16()) {
         int rounded = 0;
         if (!metal_graph_matmul_plain_bf16_tensor(out, m, weight, weight->dim[0],
@@ -40508,10 +40511,87 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
            (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
 }
 
+/* How many times a block reads each matrix, counted at the dispatch rather
+ * than derived from the shapes. One read for a K-row block is a matrix the
+ * block shares; K reads is a matrix every row fetches for itself, and that is
+ * the whole of the difference between a block operator and K single rows.
+ *
+ * DS4_V41_WEIGHT_READS=1 resets it around one k-row step and prints the table.
+ */
+typedef struct {
+    uint64_t offset;
+    uint64_t bytes;
+    uint32_t dispatches;
+    uint32_t rows;
+} ds41_wread;
+
+static ds41_wread g_wread[512];
+static int g_wread_on;
+
+static void ds41_wread_note(const ds4_tensor *t, uint32_t rows) {
+    if (!g_wread_on || !t) return;
+    const uint64_t key = t->abs_offset;
+    size_t h = (size_t)((key >> 6) % (sizeof(g_wread) / sizeof(g_wread[0])));
+    for (size_t n = 0; n < sizeof(g_wread) / sizeof(g_wread[0]); n++) {
+        ds41_wread *e = &g_wread[(h + n) % (sizeof(g_wread) / sizeof(g_wread[0]))];
+        if (e->dispatches && e->offset != key) continue;
+        e->offset = key; e->bytes = t->bytes;
+        e->dispatches++; e->rows += rows;
+        return;
+    }
+}
+
+static void ds41_wread_begin(void) {
+    memset(g_wread, 0, sizeof(g_wread));
+    g_wread_on = 1;
+}
+
+static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
+    g_wread_on = 0;
+    /* Name what can be named; an unnamed offset is still a read. */
+    fprintf(stderr, "ds4: matrices a %u-row block reads, at the dispatch:\n", k);
+    uint64_t shared_bytes = 0, per_row_bytes = 0;
+    uint32_t n_shared = 0, n_per_row = 0, n_other = 0;
+    for (size_t i = 0; i < sizeof(g_wread) / sizeof(g_wread[0]); i++) {
+        const ds41_wread *e = &g_wread[i];
+        if (!e->dispatches) continue;
+        const char *name = "?";
+        for (uint32_t il = 0; il < DS4_N_LAYER && name[0] == '?'; il++) {
+            const ds4_layer_weights *l = &w->layer[il];
+            const struct { const char *n; const ds4_tensor *t; } f[] = {
+                {"attn_q_a", l->attn_q_a}, {"attn_q_b", l->attn_q_b},
+                {"attn_kv", l->attn_kv}, {"attn_kv_a_mqa", l->attn_kv_a_mqa},
+                {"attn_output_a", l->attn_output_a}, {"attn_output_b", l->attn_output_b},
+                {"attn_compressor_kv", l->attn_compressor_kv},
+                {"attn_compressor_gate", l->attn_compressor_gate},
+                {"indexer_attn_q_b", l->indexer_attn_q_b},
+                {"indexer_attn_k", l->indexer_attn_k}, {"indexer_proj", l->indexer_proj},
+                {"shexp_gate", l->ffn_gate_shexp}, {"shexp_up", l->ffn_up_shexp},
+                {"shexp_down", l->ffn_down_shexp}, {"ffn_gate_inp", l->ffn_gate_inp},
+            };
+            for (size_t j = 0; j < sizeof(f) / sizeof(f[0]); j++)
+                if (f[j].t && f[j].t->abs_offset == e->offset) { name = f[j].n; break; }
+        }
+        if (name[0] == '?' && w->output && w->output->abs_offset == e->offset) name = "head";
+        const double per_block = (double)e->dispatches;
+        if (e->dispatches == 1) { n_shared++; shared_bytes += e->bytes; }
+        else if (e->rows == e->dispatches * 1u && e->dispatches >= k) { n_per_row++; per_row_bytes += e->bytes; }
+        else n_other++;
+        fprintf(stderr, "ds4:   %-22s %7.2f MB  %3.0f dispatches, %u rows total%s\n",
+                name, (double)e->bytes / 1e6, per_block, e->rows,
+                e->dispatches == 1 ? "  (shared)" :
+                e->rows == e->dispatches ? "  (once per row)" : "");
+    }
+    fprintf(stderr, "ds4:   %u shared (%.3f GB), %u once-per-row (%.3f GB, %.3f GB at %u rows), %u other\n",
+            n_shared, (double)shared_bytes / 1e9, n_per_row,
+            (double)per_row_bytes / 1e9, (double)per_row_bytes * k / 1e9, k, n_other);
+}
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
+    ds41_wread_note(weight, count);
     bool ok;
     /* The speculative verifier is layer-major: every Q8 projection sees the
      * same weight and several consecutive-token activations.  The old exact
@@ -40884,6 +40964,7 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l) {
+    ds41_wread_note(l->attn_output_a, 1);
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
@@ -45268,6 +45349,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                 l->attn_output_a->abs_offset, active.heads, rows) != 0;
                     } else {
                         for (int i = 0; ok && i < count; i++)
+                            ds41_wread_note(l->attn_output_a, 1);
+                        for (int i = 0; ok && i < count; i++)
                             ok = ds4_gpu_attention_output_low_q8_tensor(g->rows_view[i].low,
                                     model->map, model->size,
                                     l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * out_row,
@@ -45550,6 +45633,103 @@ void ds4_gpu_capture_fastpath_counts(uint64_t *fast, uint64_t *slow, uint64_t *f
 static int ds41_selftest_cmp(const void *a, const void *b) {
     const double x = *(const double *)a, y = *(const double *)b;
     return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* Does the weight-reuse rows kernel compute what the exact rows kernel
+ * computes? Asked at the operator boundary - the F32 straight out of the
+ * matmul - and not at the logits, because by the logits a difference has been
+ * through forty layers of two kernels, a rounding and a residual, and the
+ * first element that moved is no longer visible.
+ *
+ * DS4_V41_ROWTILE_CHECK=1. Runs every Q8 shape a block shares, at one, two,
+ * four and eight rows. rows=1 disagreeing is the kernel body; rows=1 agreeing
+ * and rows=2 disagreeing is the batch loop or the output layout.
+ */
+static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
+    const char *env = getenv("DS4_V41_ROWTILE_CHECK");
+    if (!env || !env[0] || atoi(env) == 0) return;
+    const ds4_layer_weights *l = &w->layer[0];
+    const struct { const char *name; const ds4_tensor *t; } shapes[] = {
+        { "attn_output_a", l->attn_output_a },
+        { "attn_output_b", l->attn_output_b },
+        { "shexp_gate",    l->ffn_gate_shexp },
+        { "shexp_up",      l->ffn_up_shexp },
+        { "shexp_down",    l->ffn_down_shexp },
+        { "head",          w->output },
+    };
+    fprintf(stderr, "ds4: V4.1 row-tile operator check (F32 out of the matmul)\n");
+    for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
+        const ds4_tensor *t = shapes[si].t;
+        if (!t || t->type != DS4_TENSOR_Q8_0) {
+            fprintf(stderr, "  %-14s skipped, not Q8_0\n", shapes[si].name);
+            continue;
+        }
+        const uint64_t width = (uint64_t)t->dim[0], outputs = (uint64_t)t->dim[1];
+        for (uint32_t rows = 1; rows <= 8u; rows *= 2u) {
+            const uint64_t in_bytes = (uint64_t)rows * width * sizeof(float);
+            const uint64_t out_bytes = (uint64_t)rows * outputs * sizeof(float);
+            ds4_gpu_tensor *in = ds4_gpu_tensor_alloc(in_bytes);
+            ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(out_bytes);
+            ds4_gpu_tensor *tst = ds4_gpu_tensor_alloc(out_bytes);
+            float *host_in = malloc((size_t)in_bytes);
+            float *a = malloc((size_t)out_bytes), *b = malloc((size_t)out_bytes);
+            if (!in || !ref || !tst || !host_in || !a || !b) goto next;
+            /* Deterministic, and different per row so a kernel that reads one
+             * row's activations for every row cannot pass. */
+            for (uint64_t i = 0; i < (uint64_t)rows * width; i++) {
+                const uint32_t h = (uint32_t)(i * 2654435761u + 12345u);
+                host_in[i] = (float)((int32_t)(h >> 8) % 2001 - 1000) / 1000.0f;
+            }
+            if (!ds4_gpu_tensor_write(in, 0, host_in, in_bytes)) goto next;
+            if (!ds4_gpu_begin_commands() ||
+                !ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ref, m->map, m->size,
+                    t->abs_offset, width, outputs, in, rows) ||
+                !ds4_gpu_end_commands() ||
+                !ds4_gpu_tensor_read(ref, 0, a, out_bytes)) {
+                fprintf(stderr, "  %-14s rows=%u exact kernel refused\n",
+                        shapes[si].name, rows);
+                goto next;
+            }
+            for (uint32_t tile = 2; tile <= 4u; tile *= 2u) {
+                if (!ds4_gpu_begin_commands() ||
+                    !ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(tst, m->map, m->size,
+                        t->abs_offset, width, outputs, in, rows, tile) ||
+                    !ds4_gpu_end_commands() ||
+                    !ds4_gpu_tensor_read(tst, 0, b, out_bytes)) {
+                    fprintf(stderr, "  %-14s rows=%u tile=%u refused\n",
+                            shapes[si].name, rows, tile);
+                    continue;
+                }
+                uint64_t first = UINT64_MAX, differ = 0;
+                double worst = 0;
+                for (uint64_t i = 0; i < (uint64_t)rows * outputs; i++) {
+                    if (memcmp(&a[i], &b[i], sizeof(float)) == 0) continue;
+                    differ++;
+                    const double d = fabs((double)a[i] - (double)b[i]);
+                    if (d > worst) worst = d;
+                    if (first == UINT64_MAX) first = i;
+                }
+                if (!differ) {
+                    fprintf(stderr, "  %-14s %5llux%-6llu rows=%u tile=%u: identical\n",
+                            shapes[si].name, (unsigned long long)width,
+                            (unsigned long long)outputs, rows, tile);
+                } else {
+                    fprintf(stderr, "  %-14s %5llux%-6llu rows=%u tile=%u: %llu of %llu differ, "
+                            "first at row %llu col %llu (%.9g vs %.9g), worst %.3g\n",
+                            shapes[si].name, (unsigned long long)width,
+                            (unsigned long long)outputs, rows, tile,
+                            (unsigned long long)differ,
+                            (unsigned long long)((uint64_t)rows * outputs),
+                            (unsigned long long)(first / outputs),
+                            (unsigned long long)(first % outputs),
+                            (double)a[first], (double)b[first], worst);
+                }
+            }
+        next:
+            free(host_in); free(a); free(b);
+            ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(tst);
+        }
+    }
 }
 
 static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
@@ -45859,6 +46039,14 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                     "where the reference led second place by %.6g\n",
                     batch_mismatch, (double)batch_gap);
         goto done;
+    }
+    if (getenv("DS4_V41_WEIGHT_READS")) {
+        ds41_wread_begin();
+        if (ds4_gpu_begin_commands() &&
+            ds41_graph_step_batch_logits(graphs, &tok[0], (int)k, (uint32_t)k, m, w, rowbuf))
+            (void)ds4_gpu_end_commands();
+        ds41_wread_report(w, (uint32_t)k);
+        DS41_SELFTEST_REWIND();
     }
     qsort(batch, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
     /* bm is the span of one block: begin_commands to the logits of all k rows.
@@ -81103,6 +81291,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         if (!selftest_done && s->ds41_graph_ready &&
             s->ds41_graph.pos == (uint32_t)s->checkpoint.len) {
             selftest_done = 1;
+            ds41_rowtile_check(&e->model, &e->weights);
             ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
         }
         if (!s->ds41_graph_ready ||
