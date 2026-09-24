@@ -40591,92 +40591,131 @@ static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
 extern double ds4_gpu_take_span_ms(void);
 extern unsigned long long g_ds4_head_rows2_dispatches, g_ds4_head_rows4_dispatches;
 
-static void ds41_head_bench(const ds4_model *m, const ds4_tensor *head,
-                            uint32_t rows) {
-    static int max_laps = -1;
-    if (max_laps < 0) {
-        const char *e = getenv("DS4_METAL_V41_HEAD_BENCH");
-        max_laps = e && e[0] ? atoi(e) : 0;
+/* The ceiling on sharing a weight between rows, per shape, before anything is
+ * implemented for it.
+ *
+ * The head taught the lesson this exists for: the exact decode-rows path at two
+ * rows costs 1.390 ms against a 0.703 GB weight, which is one pass and not two
+ * - running the rows back to back already shares most of the weight through
+ * cache. The dedicated kernel took it from 1.390 to 1.179 ms, 15%, and to
+ * within 3% of the bandwidth bound. Real, and 0.21 ms a step.
+ *
+ * So for every other shape the question is not "can a fused kernel be
+ * written" but "is there anything left to fuse". This measures B=1, exact B=2
+ * and fused B=2 for each Q8_0 weight a layer touches, in its own command
+ * buffer, in ABBA order, and multiplies the difference by how often the shape
+ * runs in a token. If the total is small, generalising the row-tile operator
+ * is a local optimisation and the executor is the work.
+ *
+ * DS4_METAL_V41_DENSE_BENCH=<laps> runs it once and prints a table.
+ */
+extern double ds4_gpu_take_span_ms(void);
+extern unsigned long long g_ds4_head_rows2_dispatches, g_ds4_head_rows4_dispatches;
+
+static double ds41_dense_bench_one(const ds4_model *m, const ds4_tensor *wt,
+                                   ds4_gpu_tensor *x, ds4_gpu_tensor *o,
+                                   uint32_t rows, uint32_t tile, int laps) {
+    const uint64_t K = (uint64_t)wt->dim[0], N = (uint64_t)wt->dim[1];
+    double best = 1e18;
+    for (int rep = 0; rep < 2; rep++) {
+        unsigned long long d2 = g_ds4_head_rows2_dispatches;
+        unsigned long long d4 = g_ds4_head_rows4_dispatches;
+        if (!ds4_gpu_begin_commands()) {
+            fprintf(stderr, "ds4: dense bench called with a buffer already open\n");
+            return -1.0;
+        }
+        int ok = 1;
+        for (int l = 0; ok && l < laps; l++) {
+            ok = tile == 0
+                ? ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(o, m->map, m->size,
+                      wt->abs_offset, K, N, x, rows)
+                : ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(o, m->map, m->size,
+                      wt->abs_offset, K, N, x, rows, tile);
+        }
+        if (!ds4_gpu_end_commands() || !ok) return -1.0;
+        const double span = ds4_gpu_take_span_ms();
+        const unsigned long long n2 = g_ds4_head_rows2_dispatches - d2;
+        const unsigned long long n4 = g_ds4_head_rows4_dispatches - d4;
+        const unsigned long long want = (unsigned long long)laps;
+        if ((tile == 2u && n2 != want) || (tile == 4u && n4 != want) ||
+            (tile == 0u && (n2 || n4))) {
+            fprintf(stderr, "ds4: dense bench asked tile=%u and dispatched "
+                    "rows2=%llu rows4=%llu\n", tile, n2, n4);
+            return -1.0;
+        }
+        if (span > 0.0 && span / laps < best) best = span / laps;
     }
-    if (max_laps <= 0) return;
+    return best > 1e17 ? -1.0 : best;
+}
+
+static void ds41_dense_bench(const ds4_model *m, const ds4_weights *w) {
+    static int laps = -1;
+    if (laps < 0) {
+        const char *e = getenv("DS4_METAL_V41_DENSE_BENCH");
+        laps = e && e[0] ? atoi(e) : 0;
+    }
+    if (laps <= 0) return;
     static int done;
     if (done) return;
     done = 1;
 
+    const ds4_layer_weights *l0 = &w->layer[0];
+    struct { const char *name; const ds4_tensor *t; uint32_t per_token; } shapes[] = {
+        { "head",          w->output,           1u },
+        { "attn_output_b", l0->attn_output_b,   (uint32_t)DS4_N_LAYER },
+        { "shexp_gate",    l0->ffn_gate_shexp,  (uint32_t)DS4_N_LAYER },
+        { "shexp_up",      l0->ffn_up_shexp,    (uint32_t)DS4_N_LAYER },
+        { "shexp_down",    l0->ffn_down_shexp,  (uint32_t)DS4_N_LAYER },
+    };
 
-    const uint64_t K = (uint64_t)head->dim[0], N = (uint64_t)head->dim[1];
-    const uint64_t wbytes = (K / 32u) * 34u * N;
-    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)rows * K * sizeof(float));
-    ds4_gpu_tensor *o = ds4_gpu_tensor_alloc((uint64_t)rows * N * sizeof(float));
-    if (!x || !o) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); return; }
-    /* Distinct activations a row, written from the host: the bench runs before
-     * a step rather than inside one, so it cannot borrow the step's. */
-    float *host = malloc((size_t)rows * K * sizeof(float));
-    if (!host) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); return; }
-    for (uint32_t r = 0; r < rows; r++)
-        for (uint64_t i = 0; i < K; i++)
-            host[(uint64_t)r * K + i] =
-                (float)(((i * 2654435761u + r * 40503u) & 0xffffu) - 32768) / 32768.0f;
-    const bool wrote = ds4_gpu_tensor_write(x, 0, host, (uint64_t)rows * K * sizeof(float));
-    free(host);
-    if (!wrote) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); return; }
-
-    fprintf(stderr, "ds4: head bench K=%llu N=%llu rows=%u weight %.3f GB a pass\n",
-            (unsigned long long)K, (unsigned long long)N, rows,
-            (double)wbytes / 1e9);
-
-    static const char *names[3] = { "exact", "rows2", "rows4" };
-    const int order[6] = { 0, 1, 2, 2, 1, 0 };
-    for (int laps = 1; laps <= max_laps; laps *= 2) {
-        double best[3] = { 1e18, 1e18, 1e18 };
-        for (int k = 0; k < 6; k++) {
-            const int v = order[k];
-            unsigned long long d2 = g_ds4_head_rows2_dispatches;
-            unsigned long long d4 = g_ds4_head_rows4_dispatches;
-            if (!ds4_gpu_begin_commands()) {
-                fprintf(stderr, "ds4: head bench cannot open a command buffer; "
-                        "it is being called with one already open\n");
-                continue;
-            }
-            int ok = 1;
-            for (int l = 0; ok && l < laps; l++) {
-                ok = v == 0
-                    ? ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(o, m->map, m->size,
-                          head->abs_offset, K, N, x, rows)
-                    : ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(o, m->map, m->size,
-                          head->abs_offset, K, N, x, rows, v == 1 ? 2u : 4u);
-            }
-            if (!ds4_gpu_end_commands() || !ok) {
-                fprintf(stderr, "ds4: head bench %s failed\n", names[v]);
-                continue;
-            }
-            const double span = ds4_gpu_take_span_ms();
-            /* The dispatch counters say which kernel actually ran. */
-            const unsigned long long n2 = g_ds4_head_rows2_dispatches - d2;
-            const unsigned long long n4 = g_ds4_head_rows4_dispatches - d4;
-            if ((v == 1 && n2 != (unsigned long long)laps) ||
-                (v == 2 && n4 != (unsigned long long)laps) ||
-                (v == 0 && (n2 || n4))) {
-                fprintf(stderr, "ds4: head bench %s dispatched rows2=%llu rows4=%llu "
-                        "for %d laps - not the arm it asked for\n",
-                        names[v], n2, n4, laps);
-                continue;
-            }
-            if (span > 0.0 && span / laps < best[v]) best[v] = span / laps;
+    fprintf(stderr, "ds4: dense bench, %d laps a measurement, own command "
+            "buffer, ABBA\n", laps);
+    double total_gain2 = 0.0;
+    for (size_t i = 0; i < sizeof(shapes)/sizeof(shapes[0]); i++) {
+        const ds4_tensor *wt = shapes[i].t;
+        if (!wt || wt->type != DS4_TENSOR_Q8_0) {
+            fprintf(stderr, "ds4:   %-14s skipped (%s)\n", shapes[i].name,
+                    wt ? "not Q8_0" : "absent");
+            continue;
         }
-        fprintf(stderr, "ds4: head bench laps=%2d:", laps);
-        for (int v = 0; v < 3; v++) {
-            if (best[v] > 1e17) { fprintf(stderr, "  %s=-", names[v]); continue; }
-            fprintf(stderr, "  %s=%.3f ms (%.0f GB/s)", names[v], best[v],
-                    (double)wbytes / (best[v] / 1e3) / 1e9);
+        const uint64_t K = (uint64_t)wt->dim[0], N = (uint64_t)wt->dim[1];
+        const uint64_t wbytes = (K / 32u) * 34u * N;
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(4u * K * sizeof(float));
+        ds4_gpu_tensor *o = ds4_gpu_tensor_alloc(4u * N * sizeof(float));
+        float *host = x && o ? malloc(4u * (size_t)K * sizeof(float)) : NULL;
+        if (!host) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); continue; }
+        for (uint32_t r = 0; r < 4u; r++)
+            for (uint64_t k = 0; k < K; k++)
+                host[(uint64_t)r * K + k] =
+                    (float)(((k * 2654435761u + r * 40503u) & 0xffffu) - 32768) / 32768.0f;
+        const bool wrote = ds4_gpu_tensor_write(x, 0, host, 4u * K * sizeof(float));
+        free(host);
+        if (!wrote) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); continue; }
+
+        const double b1 = ds41_dense_bench_one(m, wt, x, o, 1u, 0u, laps);
+        const double e2 = ds41_dense_bench_one(m, wt, x, o, 2u, 0u, laps);
+        const double f2 = ds41_dense_bench_one(m, wt, x, o, 2u, 2u, laps);
+        const double e4 = ds41_dense_bench_one(m, wt, x, o, 4u, 0u, laps);
+        const double f4 = ds41_dense_bench_one(m, wt, x, o, 4u, 4u, laps);
+        const double t2 = ds41_dense_bench_one(m, wt, x, o, 4u, 2u, laps);
+        fprintf(stderr, "ds4:   %-14s K=%-6llu N=%-7llu %.3f GB  "
+                "B1 %.3f | exactB2 %.3f fusedB2 %.3f | exactB4 %.3f "
+                "tile2B4 %.3f tile4B4 %.3f ms\n",
+                shapes[i].name, (unsigned long long)K, (unsigned long long)N,
+                (double)wbytes / 1e9, b1, e2, f2, e4, t2, f4);
+        if (e2 > 0 && f2 > 0) {
+            const double gain = (e2 - f2) * shapes[i].per_token;
+            total_gain2 += gain;
+            fprintf(stderr, "ds4:   %-14s fused B2 saves %.3f ms a step over "
+                    "%u uses a token\n", shapes[i].name, gain, shapes[i].per_token);
         }
-        if (best[0] < 1e17 && best[1] < 1e17)
-            fprintf(stderr, "  rows2/exact=%.3f", best[1] / best[0]);
-        fprintf(stderr, "\n");
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(o);
     }
-    ds4_gpu_tensor_free(x);
-    ds4_gpu_tensor_free(o);
+    fprintf(stderr, "ds4: dense bench total fused-B2 saving %.3f ms a step, "
+            "%.3f ms an output token at B=2\n", total_gain2, total_gain2 / 2.0);
 }
+
 #endif
 
 static bool ds41_output_projection(ds41_gpu_graph *g, ds4_gpu_tensor *out,
@@ -82202,9 +82241,8 @@ static int ds4_sessions_eval_batch_native(
 #endif
     /* Before anything opens a command buffer, so each timed dispatch gets one of
      * its own and a span that means something. */
-    if (getenv("DS4_METAL_V41_HEAD_BENCH") && e && e->weights.output &&
-        count >= 2 && !ds4_gpu_commands_active())
-        ds41_head_bench(&e->model, e->weights.output, (uint32_t)count);
+    if (e && count >= 2 && !ds4_gpu_commands_active())
+        ds41_dense_bench(&e->model, &e->weights);
     bool ok = ds4_gpu_begin_commands() != 0;
     const bool native_ds41 = ds4_session_is_ds41(items[0].session);
     const uint32_t prefill_rows = prefill ?
