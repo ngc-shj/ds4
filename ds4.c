@@ -40571,6 +40571,114 @@ static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
     return ds41_matmul_rows_batch(out, m, weight, in, first, count, 1);
 }
 
+#ifdef __APPLE__
+/* The head on its own, because the end-to-end number cannot carry this.
+ *
+ * One weight pass of the head is about 0.7 GB, which is a millisecond and a
+ * half of the machine's bandwidth; a token step at two rows is a hundred and
+ * thirty. Asking a 4% end-to-end difference whether the weight was read once
+ * or twice is asking it to resolve 1% while the machine drifts by more than
+ * that between runs - and it has drifted by 40% inside this session.
+ *
+ * So: the three variants back to back in one process, each in its own command
+ * buffer, timed by that buffer's GPU span, in ABBA order, over one, two and
+ * four laps so that a span which is not linear in the work is visible rather
+ * than averaged. No logits dump while timing; the byte comparison is a
+ * separate run.
+ *
+ * DS4_METAL_V41_HEAD_BENCH=<laps> runs it once, on the first batched head.
+ */
+extern double ds4_gpu_take_span_ms(void);
+extern unsigned long long g_ds4_head_rows2_dispatches, g_ds4_head_rows4_dispatches;
+
+static void ds41_head_bench(const ds4_model *m, const ds4_tensor *head,
+                            uint32_t rows) {
+    static int max_laps = -1;
+    if (max_laps < 0) {
+        const char *e = getenv("DS4_METAL_V41_HEAD_BENCH");
+        max_laps = e && e[0] ? atoi(e) : 0;
+    }
+    if (max_laps <= 0) return;
+    static int done;
+    if (done) return;
+    done = 1;
+
+
+    const uint64_t K = (uint64_t)head->dim[0], N = (uint64_t)head->dim[1];
+    const uint64_t wbytes = (K / 32u) * 34u * N;
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)rows * K * sizeof(float));
+    ds4_gpu_tensor *o = ds4_gpu_tensor_alloc((uint64_t)rows * N * sizeof(float));
+    if (!x || !o) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); return; }
+    /* Distinct activations a row, written from the host: the bench runs before
+     * a step rather than inside one, so it cannot borrow the step's. */
+    float *host = malloc((size_t)rows * K * sizeof(float));
+    if (!host) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); return; }
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint64_t i = 0; i < K; i++)
+            host[(uint64_t)r * K + i] =
+                (float)(((i * 2654435761u + r * 40503u) & 0xffffu) - 32768) / 32768.0f;
+    const bool wrote = ds4_gpu_tensor_write(x, 0, host, (uint64_t)rows * K * sizeof(float));
+    free(host);
+    if (!wrote) { ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(o); return; }
+
+    fprintf(stderr, "ds4: head bench K=%llu N=%llu rows=%u weight %.3f GB a pass\n",
+            (unsigned long long)K, (unsigned long long)N, rows,
+            (double)wbytes / 1e9);
+
+    static const char *names[3] = { "exact", "rows2", "rows4" };
+    const int order[6] = { 0, 1, 2, 2, 1, 0 };
+    for (int laps = 1; laps <= max_laps; laps *= 2) {
+        double best[3] = { 1e18, 1e18, 1e18 };
+        for (int k = 0; k < 6; k++) {
+            const int v = order[k];
+            unsigned long long d2 = g_ds4_head_rows2_dispatches;
+            unsigned long long d4 = g_ds4_head_rows4_dispatches;
+            if (!ds4_gpu_begin_commands()) {
+                fprintf(stderr, "ds4: head bench cannot open a command buffer; "
+                        "it is being called with one already open\n");
+                continue;
+            }
+            int ok = 1;
+            for (int l = 0; ok && l < laps; l++) {
+                ok = v == 0
+                    ? ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(o, m->map, m->size,
+                          head->abs_offset, K, N, x, rows)
+                    : ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(o, m->map, m->size,
+                          head->abs_offset, K, N, x, rows, v == 1 ? 2u : 4u);
+            }
+            if (!ds4_gpu_end_commands() || !ok) {
+                fprintf(stderr, "ds4: head bench %s failed\n", names[v]);
+                continue;
+            }
+            const double span = ds4_gpu_take_span_ms();
+            /* The dispatch counters say which kernel actually ran. */
+            const unsigned long long n2 = g_ds4_head_rows2_dispatches - d2;
+            const unsigned long long n4 = g_ds4_head_rows4_dispatches - d4;
+            if ((v == 1 && n2 != (unsigned long long)laps) ||
+                (v == 2 && n4 != (unsigned long long)laps) ||
+                (v == 0 && (n2 || n4))) {
+                fprintf(stderr, "ds4: head bench %s dispatched rows2=%llu rows4=%llu "
+                        "for %d laps - not the arm it asked for\n",
+                        names[v], n2, n4, laps);
+                continue;
+            }
+            if (span > 0.0 && span / laps < best[v]) best[v] = span / laps;
+        }
+        fprintf(stderr, "ds4: head bench laps=%2d:", laps);
+        for (int v = 0; v < 3; v++) {
+            if (best[v] > 1e17) { fprintf(stderr, "  %s=-", names[v]); continue; }
+            fprintf(stderr, "  %s=%.3f ms (%.0f GB/s)", names[v], best[v],
+                    (double)wbytes / (best[v] / 1e3) / 1e9);
+        }
+        if (best[0] < 1e17 && best[1] < 1e17)
+            fprintf(stderr, "  rows2/exact=%.3f", best[1] / best[0]);
+        fprintf(stderr, "\n");
+    }
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(o);
+}
+#endif
+
 static bool ds41_output_projection(ds41_gpu_graph *g, ds4_gpu_tensor *out,
                                    const ds4_model *m, const ds4_weights *w,
                                    const ds4_gpu_tensor *in, uint32_t rows) {
@@ -40583,6 +40691,34 @@ static bool ds41_output_projection(ds41_gpu_graph *g, ds4_gpu_tensor *out,
     }
     /* Head rows are independent; keep their original reduction and do not
      * add the BF16 rounding used by the attention row-slice helper. */
+#ifdef __APPLE__
+    /* DS4_METAL_V41_HEAD_ROW_TILE=2|4 sends the head through the kernel that
+     * reads a weight block once for that many activation rows. The head is the
+     * widest weight in the model and the first place row sharing is worth
+     * having; the exact decode-rows path stays as its oracle, and the two are
+     * compared by memcmp of the whole logits vector rather than by the token
+     * argmax picked. Only the head - the generic multi-row helper is not
+     * touched here. */
+    static int head_tile = -1;
+    if (head_tile < 0) {
+        const char *e = getenv("DS4_METAL_V41_HEAD_ROW_TILE");
+        head_tile = e && e[0] ? atoi(e) : 0;
+    }
+    if (rows >= 2 && (head_tile == 2 || head_tile == 4) &&
+        head.type == DS4_TENSOR_Q8_0) {
+        /* No silent fallback. An experiment that asks for this kernel and
+         * quietly gets the old one compares an arm against itself, which this
+         * work has already done once. */
+        if (!ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(out, m->map, m->size,
+                head.abs_offset, (uint64_t)head.dim[0], (uint64_t)head.dim[1],
+                in, rows, (uint32_t)head_tile)) {
+            fprintf(stderr, "ds4: head row tile %d refused for %lld x %lld rows=%u\n",
+                    head_tile, (long long)head.dim[0], (long long)head.dim[1], rows);
+            return false;
+        }
+        return true;
+    }
+#endif
     return ds41_matmul_batch(out, m, &head, in, rows, false);
 }
 
@@ -82064,6 +82200,11 @@ static int ds4_sessions_eval_batch_native(
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
+    /* Before anything opens a command buffer, so each timed dispatch gets one of
+     * its own and a span that means something. */
+    if (getenv("DS4_METAL_V41_HEAD_BENCH") && e && e->weights.output &&
+        count >= 2 && !ds4_gpu_commands_active())
+        ds41_head_bench(&e->model, e->weights.output, (uint32_t)count);
     bool ok = ds4_gpu_begin_commands() != 0;
     const bool native_ds41 = ds4_session_is_ds41(items[0].session);
     const uint32_t prefill_rows = prefill ?

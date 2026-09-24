@@ -21494,6 +21494,90 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     }
 }
 
+/* Same call as the exact decode-rows matvec, through the kernel that reads a
+ * weight block once for BR activation rows. The grid loses a factor of BR on
+ * its Y axis; everything the answer depends on is unchanged, which is what the
+ * byte comparison against the exact path checks. */
+/* How many times each row-tile head actually went out, so an experiment cannot
+ * compare an arm against itself. */
+unsigned long long g_ds4_head_rows2_dispatches, g_ds4_head_rows4_dispatches;
+
+int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        uint32_t              row_tile) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (row_tile != 2u && row_tile != 4u) return 0;
+    if (!out || !x || !model_map || n_rows == 0 ||
+        n_rows > INT32_MAX || in_dim == 0 || out_dim == 0 ||
+        (in_dim & 31u) != 0 || in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX ||
+        in_dim > UINT64_MAX / n_rows / sizeof(float) ||
+        out_dim > UINT64_MAX / n_rows / sizeof(float) ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t blocks = in_dim / 32u;
+        const uint64_t row_bytes = blocks * 34u;
+        if (!xbuf || !outbuf || out_dim > UINT64_MAX / row_bytes) return 0;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (weight_offset > model_size ||
+            weight_bytes > model_size - weight_offset) return 0;
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, weight_offset, weight_bytes, &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) dispatch.nsg = 8;
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.ne11 = (int32_t)n_rows;
+        args.nb12 = (uint64_t)n_rows * in_dim * sizeof(float);
+        args.nb13 = args.nb12;
+        args.ne1 = (int32_t)n_rows;
+        args.nr0 = dispatch.nr0;
+
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+                row_tile == 2u ? "kernel_mul_mv_q8_0_f32_rows2"
+                               : "kernel_mul_mv_q8_0_f32_rows4",
+                dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
+        ds4_gpu_dispatch(enc,
+            MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) / (NSUInteger)dispatch.nr0,
+                        ((NSUInteger)n_rows + row_tile - 1u) / row_tile, 1),
+            MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (row_tile == 2u) g_ds4_head_rows2_dispatches++;
+        else g_ds4_head_rows4_dispatches++;
+
+        return ds4_gpu_finish_command_buffer(
+                cb, owned, "Q8_0 weight-reuse decode-row matvec");
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

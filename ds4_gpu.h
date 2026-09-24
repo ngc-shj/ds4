@@ -864,6 +864,19 @@ int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         const ds4_gpu_tensor *x);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
+/* The same shape as the exact decode-rows matvec, through a kernel that reads
+ * each weight block once for row_tile activation rows. row_tile is 2 or 4. */
+int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        uint32_t              row_tile);
+
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
