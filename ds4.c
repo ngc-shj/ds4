@@ -46372,6 +46372,99 @@ static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
     }
 }
 
+/* How much of a step the attention core can possibly be. DS4_V41_ROWTILE_CHECK=8.
+ *
+ * DS4_METAL_V41_FIT_SPLITS halves the raw operator and moves the step by
+ * nothing the ABBA can separate from its own warm-up. Either the step did not
+ * change or the operator is not enough of it to matter, and those are not the
+ * same claim. This one is answerable without another A/B: time the core at the
+ * shapes the block actually runs, multiply by the layers, and read it against
+ * the step the same process reports. What comes out is a ceiling on every
+ * optimisation that touches the core and nothing else - the shared scan, a
+ * descriptor kernel, a query tile - because making the core free cannot buy
+ * more than the core costs.
+ *
+ * The gathered path is the one used by 38 of 40 layers, so it is timed with a
+ * compressed set, f32 and unmasked, which is what ds41_attention passes. */
+static void ds41_attn_share_check(const ds4_model *m, const ds4_weights *w) {
+    const ds4_layer_weights *l = &w->layer[2];
+    const uint32_t n_head = DS4_N_HEAD, hd = DS4_N_HEAD_DIM;
+    const uint32_t rows = 8, n_raw = 96, raw_cap = 256;
+    const uint32_t laps = 20, rounds = 4;
+    const uint32_t comps[3] = { 24, 48, 96 };
+
+    const uint64_t rowb = (uint64_t)n_head * hd * sizeof(float);
+    const uint64_t qb = (uint64_t)rows * rowb;
+    const uint64_t rawb = (uint64_t)raw_cap * hd * sizeof(float);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(qb);
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(rawb);
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(qb);
+    ds4_gpu_tensor *qrow[8] = {0}, *hrow[8] = {0}, *comp = NULL;
+    float *hq = malloc((size_t)qb), *hraw = malloc((size_t)rawb), *hc = NULL;
+    if (!q || !raw || !heads || !hq || !hraw) goto done;
+    for (uint64_t i = 0; i < qb / 4; i++)
+        hq[i] = 0.01f * (float)((i * 2654435761u >> 9) % 199 - 99);
+    for (uint64_t i = 0; i < rawb / 4; i++)
+        hraw[i] = 0.01f * (float)((i * 40503u >> 7) % 199 - 99);
+    if (!ds4_gpu_tensor_write(q, 0, hq, qb) || !ds4_gpu_tensor_write(raw, 0, hraw, rawb))
+        goto done;
+    for (uint32_t i = 0; i < rows; i++) {
+        qrow[i] = ds4_gpu_tensor_view(q, (uint64_t)i * rowb, rowb);
+        hrow[i] = ds4_gpu_tensor_view(heads, (uint64_t)i * rowb, rowb);
+        if (!qrow[i] || !hrow[i]) goto done;
+    }
+    fprintf(stderr, "ds4: attention core at block shapes, %u rows, %u raw keys, "
+            "%u layers of the model\n", rows, n_raw, DS4_N_LAYER);
+    for (uint32_t ci = 0; ci < 3u; ci++) {
+        const uint32_t n_comp = comps[ci];
+        const uint64_t cb2 = (uint64_t)n_comp * hd * sizeof(float);
+        comp = ds4_gpu_tensor_alloc(cb2);
+        hc = malloc((size_t)cb2);
+        if (!comp || !hc) goto next;
+        for (uint64_t i = 0; i < cb2 / 4; i++)
+            hc[i] = 0.01f * (float)((i * 2246822519u >> 11) % 199 - 99);
+        if (!ds4_gpu_tensor_write(comp, 0, hc, cb2)) goto next;
+        double best = 0;
+        for (uint32_t r = 0; r < rounds; r++) {
+            for (int warm = 0; warm < 2; warm++) {
+                if (!ds4_gpu_begin_commands()) goto next;
+                for (uint32_t lap = 0; lap < laps; lap++)
+                    for (uint32_t i = 0; i < rows; i++)
+                        if (!ds4_gpu_attention_decode_heads_tensor(hrow[i], m->map, m->size,
+                                l->attn_sinks->abs_offset, qrow[i], raw, n_raw, raw_cap, 0,
+                                comp, 0, n_comp, NULL, 0, n_head, hd)) {
+                            (void)ds4_gpu_end_commands();
+                            fprintf(stderr, "ds4:   n_comp=%u refused\n", n_comp);
+                            goto next;
+                        }
+                const double t0 = now_sec();
+                if (!ds4_gpu_end_commands()) goto next;
+                if (warm) {
+                    const double ms = (now_sec() - t0) * 1000.0 / laps;
+                    if (best == 0 || ms < best) best = ms;
+                }
+            }
+        }
+        /* The fastest of the rounds, not the mean: this is a ceiling, and a
+         * ceiling wants the arm's best case, not its average thermal state. */
+        fprintf(stderr, "ds4:   %3u keys (%u raw + %3u comp): %6.3f ms for %u rows, "
+                "%6.2f ms if every one of %u layers cost this\n",
+                n_raw + n_comp, n_raw, n_comp, best, rows,
+                best * (double)DS4_N_LAYER, DS4_N_LAYER);
+    next:
+        free(hc); hc = NULL;
+        if (comp) { ds4_gpu_tensor_free(comp); comp = NULL; }
+    }
+done:
+    for (uint32_t i = 0; i < rows; i++) {
+        if (qrow[i]) ds4_gpu_tensor_free(qrow[i]);
+        if (hrow[i]) ds4_gpu_tensor_free(hrow[i]);
+    }
+    free(hq); free(hraw); free(hc);
+    if (comp) ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(heads);
+}
+
 /* The three shapes a K-wide raw attention can take, on the layer 0/1 geometry
  * where there is no compressed KV to confound them. DS4_V41_ROWTILE_CHECK=7.
  *
@@ -46524,6 +46617,7 @@ done:
 static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
     const char *env = getenv("DS4_V41_ROWTILE_CHECK");
     if (!env || !env[0] || atoi(env) == 0) return;
+    if (atoi(env) >= 8) { ds41_attn_share_check(m, w); return; }
     if (atoi(env) >= 7) { ds41_attn_raw_arms_check(m, w); return; }
     if (atoi(env) >= 6) {
         fprintf(stderr, "ds4: masked padding against the unpadded key count:\n");
