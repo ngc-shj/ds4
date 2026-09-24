@@ -40497,10 +40497,12 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
 }
 
 static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br);
+static void ds41_wread_note_full(const ds4_tensor *t, uint32_t rows, uint32_t br,
+                                 uint8_t path, bool round);
 
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
-    ds41_wread_note(weight, 1, 1);
+    ds41_wread_note_full(weight, 1, 1, 6, round);
     if (round && ds41_fuse_bf16()) {
         int rounded = 0;
         if (!metal_graph_matmul_plain_bf16_tensor(out, m, weight, weight->dim[0],
@@ -40524,7 +40526,22 @@ typedef struct {
     uint32_t dispatches;
     uint32_t rows;
     uint32_t passes;
+    /* The kernel contract this tensor was dispatched under. Naming tensors is
+     * not enough to know what has been checked: two tensors of the same shape
+     * and type can still go to different kernels, and the same tensor can go
+     * to different ones depending on the row count and the rounding. */
+    uint32_t in_dim, out_dim;
+    int type;
+    uint8_t round;
+    uint8_t path;   /* 1 tile, 2 exact rows, 3 f16 rows, 4 f32 rows, 5 plain, 6 single */
+    uint8_t br;
 } ds41_wread;
+
+static const char *ds41_wread_path_name(uint8_t p) {
+    static const char *n[] = { "?", "tile", "exact-rows", "f16-rows", "f32-rows",
+                               "plain", "single", "grouped-low" };
+    return p < 8 ? n[p] : "?";
+}
 
 static ds41_wread g_wread[512];
 static int g_wread_on;
@@ -40553,7 +40570,8 @@ static void ds41_wread_note_route(const int32_t *ids, uint32_t rows, uint32_t us
  * weight. The exact kernel is br=1, so a k-row dispatch through it scans the
  * matrix k times - which is the counting this ledger got wrong when it took a
  * dispatch for a read. */
-static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br) {
+static void ds41_wread_note_full(const ds4_tensor *t, uint32_t rows, uint32_t br,
+                                 uint8_t path, bool round) {
     if (!g_wread_on || !t || rows == 0) return;
     if (br == 0) br = 1;
     const uint64_t key = t->abs_offset;
@@ -40562,16 +40580,111 @@ static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br) {
         ds41_wread *e = &g_wread[(h + n) % (sizeof(g_wread) / sizeof(g_wread[0]))];
         if (e->dispatches && e->offset != key) continue;
         e->offset = key; e->bytes = t->bytes;
+        e->in_dim = (uint32_t)t->dim[0]; e->out_dim = (uint32_t)t->dim[1];
+        e->type = t->type; e->round = round ? 1u : 0u; e->path = path; e->br = (uint8_t)br;
         e->dispatches++; e->rows += rows;
         e->passes += (rows + br - 1u) / br;
         return;
     }
 }
 
+static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br) {
+    ds41_wread_note_full(t, rows, br, br > 1u ? 1u : 2u, false);
+}
+
 static void ds41_wread_begin(void) {
     memset(g_wread, 0, sizeof(g_wread));
     g_wread_routed_sel = g_wread_routed_uniq = g_wread_routed_layers = 0;
     g_wread_on = 1;
+}
+
+/* Check every distinct Q8 contract the block actually dispatched, at one, two,
+ * four and eight rows, at both boundaries: the F32 straight out of the matmul
+ * and again after the BF16 rounding when the contract rounds. Driven by the
+ * ledger rather than by a list of tensor names, because a name does not say
+ * which kernel ran and a shape can reach more than one.
+ *
+ * Contracts the generic pair cannot express - the grouped low projection, F16
+ * and F32 paths - are listed as unchecked with the reason, not skipped
+ * silently. */
+static void ds41_contract_check(const ds4_model *m) {
+    fprintf(stderr, "ds4: contract check (F32 out of the matmul, and after BF16):\n");
+    for (size_t i = 0; i < sizeof(g_wread) / sizeof(g_wread[0]); i++) {
+        const ds41_wread *e = &g_wread[i];
+        if (!e->dispatches) continue;
+        bool dup = false;
+        for (size_t j = 0; j < i && !dup; j++) {
+            const ds41_wread *o = &g_wread[j];
+            dup = o->dispatches && o->type == e->type && o->in_dim == e->in_dim &&
+                  o->out_dim == e->out_dim && o->round == e->round && o->path == e->path;
+        }
+        if (dup) continue;
+        if (e->type != DS4_TENSOR_Q8_0 || e->path == 7u || e->path == 3u || e->path == 4u) {
+            fprintf(stderr, "ds4:   type=%d %6ux%-6u path=%-11s  not checked: %s\n",
+                    e->type, e->in_dim, e->out_dim, ds41_wread_path_name(e->path),
+                    e->type != DS4_TENSOR_Q8_0 ? "not Q8_0" :
+                    e->path == 7u ? "grouped projection, its own kernel" :
+                                    "not the decode-rows family");
+            continue;
+        }
+        const uint64_t width = e->in_dim, outputs = e->out_dim;
+        for (uint32_t rows = 1; rows <= 8u; rows *= 2u) {
+            const uint64_t in_bytes = (uint64_t)rows * width * sizeof(float);
+            const uint64_t out_bytes = (uint64_t)rows * outputs * sizeof(float);
+            ds4_gpu_tensor *in = ds4_gpu_tensor_alloc(in_bytes);
+            ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(out_bytes);
+            ds4_gpu_tensor *tst = ds4_gpu_tensor_alloc(out_bytes);
+            float *host_in = malloc((size_t)in_bytes);
+            float *a = malloc((size_t)out_bytes), *b = malloc((size_t)out_bytes);
+            if (!in || !ref || !tst || !host_in || !a || !b) goto next;
+            for (uint64_t x = 0; x < (uint64_t)rows * width; x++) {
+                const uint32_t h = (uint32_t)(x * 2654435761u + 12345u);
+                host_in[x] = (float)((int32_t)(h >> 8) % 2001 - 1000) / 1000.0f;
+            }
+            if (!ds4_gpu_tensor_write(in, 0, host_in, in_bytes)) goto next;
+            for (int stage = 0; stage < (e->round ? 2 : 1); stage++) {
+                if (!ds4_gpu_begin_commands() ||
+                    !ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(ref, m->map, m->size,
+                        e->offset, width, outputs, in, rows) ||
+                    (stage && !ds4_gpu_dsv41_quantize(ref, (uint32_t)outputs, rows, DS4_V41_BF16)) ||
+                    !ds4_gpu_end_commands() ||
+                    !ds4_gpu_tensor_read(ref, 0, a, out_bytes)) {
+                    fprintf(stderr, "ds4:   %6ux%-6u rows=%u: exact refused\n",
+                            (unsigned)width, (unsigned)outputs, rows);
+                    break;
+                }
+                for (uint32_t tile = 2; tile <= 8u; tile *= 2u) {
+                    if (!ds4_gpu_begin_commands() ||
+                        !ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(tst, m->map, m->size,
+                            e->offset, width, outputs, in, rows, tile) ||
+                        (stage && !ds4_gpu_dsv41_quantize(tst, (uint32_t)outputs, rows, DS4_V41_BF16)) ||
+                        !ds4_gpu_end_commands() ||
+                        !ds4_gpu_tensor_read(tst, 0, b, out_bytes)) continue;
+                    uint64_t first = UINT64_MAX, differ = 0;
+                    for (uint64_t x = 0; x < (uint64_t)rows * outputs; x++) {
+                        if (memcmp(&a[x], &b[x], sizeof(float)) == 0) continue;
+                        differ++;
+                        if (first == UINT64_MAX) first = x;
+                    }
+                    if (differ)
+                        fprintf(stderr, "ds4:   %6ux%-6u rows=%u tile=%u %s: %llu differ, "
+                                "first row %llu col %llu (%.9g vs %.9g)\n",
+                                (unsigned)width, (unsigned)outputs, rows, tile,
+                                stage ? "after BF16" : "F32",
+                                (unsigned long long)differ,
+                                (unsigned long long)(first / outputs),
+                                (unsigned long long)(first % outputs),
+                                (double)a[first], (double)b[first]);
+                }
+            }
+        next:
+            free(host_in); free(a); free(b);
+            ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(tst);
+        }
+        fprintf(stderr, "ds4:   type=%d %6ux%-6u round=%u path=%-11s checked rows 1/2/4/8, "
+                "tiles 2/4/8\n", e->type, e->in_dim, e->out_dim, e->round,
+                ds41_wread_path_name(e->path));
+    }
 }
 
 static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
@@ -40607,6 +40720,25 @@ static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
         fprintf(stderr, "ds4:   %-22s %7.2f MB  %2u dispatch, %2u rows, %2u scans = %7.2f MB\n",
                 name, (double)e->bytes / 1e6, e->dispatches, e->rows, e->passes,
                 (double)e->bytes * e->passes / 1e6);
+    }
+    /* Distinct kernel contracts, because a list of tensor names does not say
+     * what has been checked: the same shape can take a different kernel, and
+     * the same tensor a different one at a different row count. */
+    fprintf(stderr, "ds4: distinct kernel contracts this block dispatched:\n");
+    for (size_t i = 0; i < sizeof(g_wread) / sizeof(g_wread[0]); i++) {
+        const ds41_wread *e = &g_wread[i];
+        if (!e->dispatches) continue;
+        bool dup = false;
+        for (size_t j = 0; j < i && !dup; j++) {
+            const ds41_wread *o = &g_wread[j];
+            dup = o->dispatches && o->type == e->type && o->in_dim == e->in_dim &&
+                  o->out_dim == e->out_dim && o->round == e->round &&
+                  o->path == e->path && o->br == e->br;
+        }
+        if (dup) continue;
+        fprintf(stderr, "ds4:   type=%d %6ux%-6u round=%u path=%-11s BR=%u\n",
+                e->type, e->in_dim, e->out_dim, e->round,
+                ds41_wread_path_name(e->path), e->br);
     }
     if (g_wread_routed_layers) {
         uint64_t grow = 0, drow = 0, per_expert = 0;
@@ -40669,7 +40801,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         outputs != DS4_N_VOCAB ? 4 : (exact_vocab ? 2 : 0);
     if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
         (dense_tile == 2 || dense_tile == 4)) {
-        ds41_wread_note(weight, count, (uint32_t)dense_tile);
+        ds41_wread_note_full(weight, count, (uint32_t)dense_tile, 1, round);
         ok = ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count, (uint32_t)dense_tile);
         if (!ok) {
@@ -40695,11 +40827,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         (outputs != DS4_N_VOCAB || exact_vocab) &&
 #endif
         weight->type == DS4_TENSOR_Q8_0) {
-        ds41_wread_note(weight, count, 1);
+        ds41_wread_note_full(weight, count, 1, 2, round);
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
-        ds41_wread_note(weight, count, 1);
+        ds41_wread_note_full(weight, count, 1, 3, round);
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
@@ -40713,7 +40845,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y);
         }
     } else {
-        ds41_wread_note(weight, count, 1);
+        ds41_wread_note_full(weight, count, 1, 5, round);
         ok = metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);
     }
     return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
@@ -41026,7 +41158,7 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l) {
-    ds41_wread_note(l->attn_output_a, 1, 1);
+    ds41_wread_note_full(l->attn_output_a, 1, 1, 7, true);
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
@@ -45411,7 +45543,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                 l->attn_output_a->abs_offset, active.heads, rows) != 0;
                     } else {
                         for (int i = 0; ok && i < count; i++)
-                            ds41_wread_note(l->attn_output_a, 1, 1);
+                            ds41_wread_note_full(l->attn_output_a, 1, 1, 7, true);
                         for (int i = 0; ok && i < count; i++)
                             ok = ds4_gpu_attention_output_low_q8_tensor(g->rows_view[i].low,
                                     model->map, model->size,
@@ -46158,6 +46290,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
             ds41_graph_step_batch_logits(graphs, &tok[0], (int)k, (uint32_t)k, m, w, rowbuf))
             (void)ds4_gpu_end_commands();
         ds41_wread_report(w, (uint32_t)k);
+        if (atoi(getenv("DS4_V41_WEIGHT_READS")) >= 2) ds41_contract_check(m);
         DS41_SELFTEST_REWIND();
     }
     qsort(batch, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
