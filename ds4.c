@@ -45004,6 +45004,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const char *block_kv_e = getenv("DS4_METAL_V41_BLOCK_KV");
     const bool block_kv = block_ok && !block_attn &&
                           block_kv_e && block_kv_e[0] && atoi(block_kv_e) != 0;
+    const char *block_lv_e = getenv("DS4_METAL_V41_BLOCK_LEVELS");
+    const bool block_levels = block_kv && block_lv_e && block_lv_e[0] &&
+                              atoi(block_lv_e) != 0;
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     /* Which part of a k-row step actually grows with k. Splitting it costs a
      * command buffer boundary per stage, so the totals run high; the shares
@@ -45186,7 +45189,88 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             const uint32_t heads_n = DS4_N_HEAD / g->tp_world;
             const uint64_t sinks_off = l->attn_sinks->abs_offset +
                 (uint64_t)(g->tp_rank * heads_n) * sizeof(float);
-            for (int i = 0; ok && i < count; i++) {
+            /* Level-wise: each level's dispatches are one per row and
+             * independent, the barrier orders the levels, and every row keeps
+             * its own n_keys, nsg and kvpad variant - which is what keeps it
+             * bit-identical to canonical single decode. Needs the per-row
+             * gather slices and a compressed store on every row; the raw-only
+             * shape declines and falls through. */
+            bool levelled = false;
+            if (ok && block_levels && row_gather) {
+                bool all_comp = true;
+                for (int i = 0; i < count; i++)
+                    if (!(ratio_l && (positions[i] + 1u) / ratio_l)) all_comp = false;
+                if (all_comp) {
+                    const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
+                    const uint32_t group0 = g->tp_rank * groups;
+                    uint64_t out_row = 0;
+                    if (!tensor_nbytes(l->attn_output_a->type, 4096, &out_row)) ok = false;
+
+                    /* =2 runs the same levels without the section, so a
+                     * divergence separates the split from the concurrency. */
+                    /* One stride for the block: the widest row's key count. */
+                    uint32_t slot_keys = 0;
+                    for (int i = 0; i < count; i++) {
+                        const uint32_t nc = (positions[i] + 1u) / ratio_l;
+                        const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
+                        const uint32_t avail = previous + (uint32_t)i + 1u;
+                        const uint32_t nr = avail < 128u ? avail : 128u;
+                        if (nr + att > slot_keys) slot_keys = nr + att;
+                    }
+                    /* =2 runs the same levels without the section, so a
+                     * divergence separates the split from the concurrency. */
+                    const bool sec = ok && atoi(block_lv_e) != 2 &&
+                                     ds4_gpu_begin_concurrent_section() != 0;
+                    static bool said_lv;
+                    if (ok && !said_lv) { said_lv = true;
+                        fprintf(stderr, "ds4: V4.1 block attention by level, %u rows, "
+                                "concurrent section %s\n", rows,
+                                sec ? "open" : "declined"); }
+#define DS41_LEVEL_BREAK() do { if (sec) (void)ds4_gpu_concurrent_section_barrier(); } while (0)
+                    for (int i = 0; ok && i < count; i++) {
+                        const uint32_t nc = (positions[i] + 1u) / ratio_l;
+                        const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
+                        ok = ds4_gpu_dsv41_gather_kv(gathers[i], g->compressed[owner_l],
+                                g->rows_view[i].selected_comp, nc, att) != 0;
+                    }
+                    DS41_LEVEL_BREAK();
+                    for (int ph = 1; ok && ph <= 5; ph++) {
+                        for (int i = 0; ok && i < count; i++) {
+                            const uint32_t nc = (positions[i] + 1u) / ratio_l;
+                            const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
+                            const uint32_t avail = previous + (uint32_t)i + 1u;
+                            const uint32_t n_raw = avail < 128u ? avail : 128u;
+                            ok = ds4_gpu_attention_decode_heads_phase_tensor(heads[i],
+                                    model->map, model->size, sinks_off, queries[i],
+                                    g->raw_prefill, n_raw, raw_cap, avail - n_raw,
+                                    gathers[i], 0, att, NULL, 0, heads_n, DS4_N_HEAD_DIM,
+                                    (uint32_t)i, rows, slot_keys, ph) != 0;
+                        }
+                        DS41_LEVEL_BREAK();
+                    }
+                    for (int i = 0; ok && i < count; i++)
+                        ok = ds41_bf16(heads[i], heads_n * DS4_N_HEAD_DIM);
+                    DS41_LEVEL_BREAK();
+                    for (int i = 0; ok && i < count; i++)
+                        ok = ds41_rope(heads[i], heads_n, DS4_N_HEAD_DIM, il, positions[i], true);
+                    DS41_LEVEL_BREAK();
+                    for (int i = 0; ok && i < count; i++)
+                        ok = ds4_gpu_attention_output_low_q8_tensor(g->rows_view[i].low,
+                                model->map, model->size,
+                                l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * out_row,
+                                4096, 1024, groups, heads[i]) != 0;
+                    DS41_LEVEL_BREAK();
+                    for (int i = 0; ok && i < count; i++)
+                        ok = ds41_bf16(g->rows_view[i].low, groups * DS4_N_LORA_O);
+                    if (sec) ds4_gpu_end_concurrent_section();
+#undef DS41_LEVEL_BREAK
+                    if (ok && !batch_attn_out)
+                        ok = ds41_matmul_batch(active.block, model, l->attn_output_b,
+                                               active.low, rows, false);
+                    levelled = ok;
+                }
+            }
+            for (int i = 0; ok && !levelled && i < count; i++) {
                 const uint32_t nc = ratio_l ? (positions[i] + 1u) / ratio_l : 0u;
                 const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
                 const uint32_t avail = previous + (uint32_t)i + 1u;
@@ -45773,17 +45857,23 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
      * single step in tens of milliseconds and nothing about k: a 36 ms token
      * needs 3.6x however wide the block is. */
     const double sm = single[rounds / 2], bm = batch[rounds / 2] * (double)k;
+    /* An overlap that never opened its section and one that opened and bought
+     * nothing read the same in a timing. Say which. */
+    unsigned long long sec_attempted = 0, sec_opened = 0;
+    ds4_gpu_concurrent_section_counts(&sec_attempted, &sec_opened);
     fprintf(stderr,
             "  median single    : %.2f ms/token\n"
             "  median %ld-row step: %.2f ms = %.2fx one single step\n"
             "  perfect-draft ceiling: %.2f tok/s (100 tok/s requires <= %.2f ms/step)\n"
             "  block width      : %.2fx of %ld (needs %.2fx for 100 tok/s)\n"
+            "  concurrent       : %llu sections opened of %llu asked\n"
             "  marginal row cost: %.2f ms = %.0f%% of a standalone token\n"
             "  rollback         : %s\n"
             "  batch vs single  : %s (%ld rows checked)\n"
             "  break-even       : accept %.0f%% of drafted tokens to beat single\n",
             sm, k, bm, bm / sm, 1000.0 * (double)k / bm, 10.0 * (double)k,
             (double)k * sm / bm, k, sm / 10.0,
+            (unsigned long long)sec_opened, (unsigned long long)sec_attempted,
             (bm - sm) / (double)(k - 1), 100.0 * (bm - sm) / (double)(k - 1) / sm,
             rollback_mismatch < 0 ? "reproduces its own output" : "DIVERGED",
             !checked ? "not run" :
