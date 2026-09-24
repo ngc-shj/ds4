@@ -45357,10 +45357,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const char *attn_out_e = getenv("DS4_METAL_V41_BATCH_ATTN_OUT");
     const bool batch_attn_out = (!attn_out_e || !attn_out_e[0] || atoi(attn_out_e) != 0) &&
                                 g->tp_world == 1;
-    double stage_pre = 0, stage_attn = 0, stage_attn_out = 0, stage_moe = 0, stage_mark = 0;
+    double stage_pre = 0, stage_attn = 0, stage_attn_out = 0, stage_moe = 0,
+           stage_head = 0, stage_tail = 0, stage_setup = 0, stage_mark = 0;
+    /* Everything before the first layer: the row views, the Engram hash and
+     * its two disk reads a row, the token embedding. It sat outside every
+     * bucket and turned up as 17.6% of the step that nothing accounted for. */
+    const double stage_t0 = stage_ms ? now_sec() : 0.0;
     if (stage_ms) {
         ok = ok && ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
         stage_mark = now_sec();
+        stage_setup = (stage_mark - stage_t0) * 1000.0;
     }
 #define DS41_BSTAGE(acc) do { \
         if (ok && stage_ms) { \
@@ -45811,6 +45817,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     }
     if (ok && batch_logits)
         ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
+    DS41_BSTAGE(stage_head);
     if (ok && row_logits) {
         /* All rows share one session's tensors, so the tail below would leave
          * only the last row's logits behind. Take them from the batch buffer
@@ -45832,12 +45839,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     }
     ds4_gpu_tensor_free(batch_logits);
     if (stage_ms)
+    DS41_BSTAGE(stage_tail);
         stage_split_attn ?
             fprintf(stderr, "ds4: V4.1 batch step rows=%u pre %.1f ms, per-row attention "
                     "%.1f ms, per-row attention output %.1f ms, moe %.1f ms\n",
                     rows, stage_pre, stage_attn, stage_attn_out, stage_moe) :
             fprintf(stderr, "ds4: V4.1 batch step rows=%u pre %.1f ms, per-row attention "
-                    "%.1f ms, moe %.1f ms\n", rows, stage_pre, stage_attn, stage_moe);
+                    "%.1f ms, moe %.1f ms, head %.1f ms, setup %.1f ms, "
+                    "publish %.1f ms\n",
+                    rows, stage_pre, stage_attn, stage_moe, stage_head, stage_setup,
+                    stage_tail);
 #undef DS41_BSTAGE
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
@@ -46250,6 +46261,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
      * and DS4_V41_VERIFY_SELFTEST_AB times ds41_graph_step, which does not see
      * a batch-only change at all. Same rule applies: the variable has to be
      * read on every use, or both arms are the same arm. */
+    const bool nologits = getenv("DS4_V41_VERIFY_SELFTEST_NOLOGITS") != NULL;
     const char *bab = getenv("DS4_V41_VERIFY_SELFTEST_BATCH_AB");
     /* The same alternation, but the B arm supplies every layer's selected ids
      * from a capture instead of reading them back, so the forty synchronisation
@@ -46349,15 +46361,21 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         single[r] = (now_sec() - t0) * 1000.0 / (double)steps;
         DS41_SELFTEST_REWIND();
 
+/* Timing only: the batch pass without asking for the rows' logits on the host.
+ * ds41_graph_step_batch_logits drains the queue and reads k * 129280 floats
+ * back mid-step when row_logits is given - 4.1 MB at k=8 - and nothing has
+ * priced that. With NULL it skips the readback, and the correctness checks
+ * below go with it, so this is a measurement arm and not a usable path.
+ * DS4_V41_VERIFY_SELFTEST_NOLOGITS=1. */
 #define DS41_SELFTEST_BATCH_PASS(dst) do { \
         const double _bt0 = now_sec(); \
         for (long b = 0; ok && !nobatch && b < blocks; b++) { \
             ok = ds4_gpu_begin_commands() && \
                  ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k, \
-                                              m, w, rowbuf); \
+                                              m, w, nologits ? NULL : rowbuf); \
             if (ok) ok = ds4_gpu_end_commands() != 0; \
             else { (void)ds4_gpu_synchronize(); break; } \
-            for (long j = 0; j < k; j++) { \
+            for (long j = 0; !nologits && j < k; j++) { \
                 int arg = 0; \
                 const float *_row = rowbuf + (size_t)j * DS4_N_VOCAB; \
                 DS41_SELFTEST_ARGMAX(_row, arg); \
