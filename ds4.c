@@ -44543,10 +44543,54 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     ok = ds4_gpu_tensor_read(moe_rows[i].selected, 0, row_ids[i],
                                              (uint64_t)DS4_N_EXPERT_USED * sizeof(row_ids[0][0])) != 0;
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
-                for (int i = 0; ok && i < count; i++)
+                /* What one row's expert miss costs the rows that did not
+                 * miss. The rows are done one after another and the load is
+                 * host-side and synchronous, so a resident row waits for a
+                 * missing row's bytes even though it needs none of them. That
+                 * wait is the prize a wavefront executor is after, and it is
+                 * worth knowing its size before building one.
+                 * DS4_METAL_V41_WAVE_PROBE=1. */
+                extern uint64_t ds4_gpu_stream_expert_cache_miss_count(void);
+                static int wave = -1;
+                if (wave < 0) wave = getenv("DS4_METAL_V41_WAVE_PROBE") != NULL;
+                static double w_ms_miss, w_ms_res;
+                static unsigned long long w_steps, w_partial, w_reported;
+                double row_ms[DS4_TP_BATCH_MAX_ROWS] = { 0 };
+                int row_missed[DS4_TP_BATCH_MAX_ROWS] = { 0 };
+                for (int i = 0; ok && i < count; i++) {
+                    const uint64_t m0 = wave ? ds4_gpu_stream_expert_cache_miss_count() : 0;
+                    const double t0 = wave ? now_sec() : 0.0;
                     ok = ds4_gpu_routed_moe_set_row_slot((uint32_t)i) != 0 &&
                         ds4_gpu_routed_moe_set_selected_override(row_ids[i], DS4_N_EXPERT_USED) != 0 &&
                         ds41_moe_experts_row(&moe_rows[i], model, l, il);
+                    if (wave) {
+                        row_ms[i] = (now_sec() - t0) * 1000.0;
+                        row_missed[i] = ds4_gpu_stream_expert_cache_miss_count() > m0;
+                    }
+                }
+                if (wave && ok) {
+                    int n_miss = 0;
+                    for (int i = 0; i < count; i++) n_miss += row_missed[i];
+                    w_steps++;
+                    if (n_miss && n_miss < count) {
+                        w_partial++;
+                        for (int i = 0; i < count; i++) {
+                            if (row_missed[i]) w_ms_miss += row_ms[i];
+                            else w_ms_res += row_ms[i];
+                        }
+                    }
+                    if (w_steps - w_reported >= 2000ull) {
+                        w_reported = w_steps;
+                        fprintf(stderr, "ds4: wave probe %llu row-layers, %llu with some "
+                                "rows missing and some resident (%.1f%%); in those, "
+                                "%.1f ms total in missing rows and %.1f ms in resident "
+                                "rows - the missing total is the upper bound on what "
+                                "letting resident rows run ahead could hide\n",
+                                w_steps, w_partial,
+                                (double)w_partial / (double)w_steps * 100.0,
+                                w_ms_miss, w_ms_res);
+                    }
+                }
                 (void)ds4_gpu_routed_moe_set_selected_override(NULL, 0);
                 (void)ds4_gpu_routed_moe_set_row_slot(0);
             } else {

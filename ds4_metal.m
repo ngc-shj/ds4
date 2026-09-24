@@ -21498,6 +21498,12 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
  * weight block once for BR activation rows. The grid loses a factor of BR on
  * its Y axis; everything the answer depends on is unchanged, which is what the
  * byte comparison against the exact path checks. */
+/* The streaming cache's miss count, so a caller can see which row of a batch
+ * paid for a load. */
+uint64_t ds4_gpu_stream_expert_cache_miss_count(void) {
+    return g_stream_expert_cache_misses;
+}
+
 /* How many times each row-tile head actually went out, so an experiment cannot
  * compare an arm against itself. */
 unsigned long long g_ds4_head_rows2_dispatches, g_ds4_head_rows4_dispatches;
