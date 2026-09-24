@@ -40496,11 +40496,11 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
            ds41_bf16(out, DS4_N_EMBD * DS4_N_HC);
 }
 
-static void ds41_wread_note(const ds4_tensor *t, uint32_t rows);
+static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br);
 
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
-    ds41_wread_note(weight, 1);
+    ds41_wread_note(weight, 1, 1);
     if (round && ds41_fuse_bf16()) {
         int rounded = 0;
         if (!metal_graph_matmul_plain_bf16_tensor(out, m, weight, weight->dim[0],
@@ -40523,13 +40523,21 @@ typedef struct {
     uint64_t bytes;
     uint32_t dispatches;
     uint32_t rows;
+    uint32_t passes;
 } ds41_wread;
 
 static ds41_wread g_wread[512];
 static int g_wread_on;
 
-static void ds41_wread_note(const ds4_tensor *t, uint32_t rows) {
-    if (!g_wread_on || !t) return;
+/* br is the kernel's batch-row tile. One dispatch is not one read of the
+ * weight: the decode-rows kernels put the activation rows on the grid's Y
+ * axis, ceil(rows/br) threadgroups deep, and every one of them reads the whole
+ * weight. The exact kernel is br=1, so a k-row dispatch through it scans the
+ * matrix k times - which is the counting this ledger got wrong when it took a
+ * dispatch for a read. */
+static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br) {
+    if (!g_wread_on || !t || rows == 0) return;
+    if (br == 0) br = 1;
     const uint64_t key = t->abs_offset;
     size_t h = (size_t)((key >> 6) % (sizeof(g_wread) / sizeof(g_wread[0])));
     for (size_t n = 0; n < sizeof(g_wread) / sizeof(g_wread[0]); n++) {
@@ -40537,6 +40545,7 @@ static void ds41_wread_note(const ds4_tensor *t, uint32_t rows) {
         if (e->dispatches && e->offset != key) continue;
         e->offset = key; e->bytes = t->bytes;
         e->dispatches++; e->rows += rows;
+        e->passes += (rows + br - 1u) / br;
         return;
     }
 }
@@ -40548,10 +40557,11 @@ static void ds41_wread_begin(void) {
 
 static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
     g_wread_on = 0;
-    /* Name what can be named; an unnamed offset is still a read. */
-    fprintf(stderr, "ds4: matrices a %u-row block reads, at the dispatch:\n", k);
-    uint64_t shared_bytes = 0, per_row_bytes = 0;
-    uint32_t n_shared = 0, n_per_row = 0, n_other = 0;
+    /* Logical shader passes over the weight, not DRAM bytes. Whether a pass
+     * misses cache is not visible from here; this counts what the kernels were
+     * asked to scan. */
+    fprintf(stderr, "ds4: weight scans a %u-row block asks for (logical, not DRAM):\n", k);
+    uint64_t distinct = 0, scanned = 0;
     for (size_t i = 0; i < sizeof(g_wread) / sizeof(g_wread[0]); i++) {
         const ds41_wread *e = &g_wread[i];
         if (!e->dispatches) continue;
@@ -40573,25 +40583,25 @@ static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
                 if (f[j].t && f[j].t->abs_offset == e->offset) { name = f[j].n; break; }
         }
         if (name[0] == '?' && w->output && w->output->abs_offset == e->offset) name = "head";
-        const double per_block = (double)e->dispatches;
-        if (e->dispatches == 1) { n_shared++; shared_bytes += e->bytes; }
-        else if (e->rows == e->dispatches * 1u && e->dispatches >= k) { n_per_row++; per_row_bytes += e->bytes; }
-        else n_other++;
-        fprintf(stderr, "ds4:   %-22s %7.2f MB  %3.0f dispatches, %u rows total%s\n",
-                name, (double)e->bytes / 1e6, per_block, e->rows,
-                e->dispatches == 1 ? "  (shared)" :
-                e->rows == e->dispatches ? "  (once per row)" : "");
+        distinct += e->bytes;
+        scanned += (uint64_t)e->bytes * e->passes;
+        fprintf(stderr, "ds4:   %-22s %7.2f MB  %2u dispatch, %2u rows, %2u scans = %7.2f MB\n",
+                name, (double)e->bytes / 1e6, e->dispatches, e->rows, e->passes,
+                (double)e->bytes * e->passes / 1e6);
     }
-    fprintf(stderr, "ds4:   %u shared (%.3f GB), %u once-per-row (%.3f GB, %.3f GB at %u rows), %u other\n",
-            n_shared, (double)shared_bytes / 1e9, n_per_row,
-            (double)per_row_bytes / 1e9, (double)per_row_bytes * k / 1e9, k, n_other);
+    fprintf(stderr,
+            "ds4:   distinct %.3f GB, scanned %.3f GB (%.2fx), floor at one scan %.3f GB, "
+            "at ceil(%u/4) scans %.3f GB\n",
+            (double)distinct / 1e9, (double)scanned / 1e9,
+            distinct ? (double)scanned / (double)distinct : 0.0,
+            (double)distinct / 1e9, k,
+            (double)distinct * ((k + 3u) / 4u) / 1e9);
 }
 
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
-    ds41_wread_note(weight, count);
     bool ok;
     /* The speculative verifier is layer-major: every Q8 projection sees the
      * same weight and several consecutive-token activations.  The old exact
@@ -40606,6 +40616,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     const int dense_tile = dense_tile_e && dense_tile_e[0] ? atoi(dense_tile_e) : 0;
     if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
         (dense_tile == 2 || dense_tile == 4)) {
+        ds41_wread_note(weight, count, (uint32_t)dense_tile);
         ok = ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count, (uint32_t)dense_tile);
         if (!ok) {
@@ -40636,9 +40647,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         (outputs != DS4_N_VOCAB || exact_vocab) &&
 #endif
         weight->type == DS4_TENSOR_Q8_0) {
+        ds41_wread_note(weight, count, 1);
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
+        ds41_wread_note(weight, count, 1);
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
@@ -40652,6 +40665,7 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(y);
         }
     } else {
+        ds41_wread_note(weight, count, 1);
         ok = metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);
     }
     return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
@@ -40964,7 +40978,7 @@ static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_attention_low(ds41_gpu_graph *g, const ds4_model *m,
                                const ds4_layer_weights *l) {
-    ds41_wread_note(l->attn_output_a, 1);
+    ds41_wread_note(l->attn_output_a, 1, 1);
     const uint32_t groups = DS4_N_OUT_GROUP / g->tp_world;
     const uint32_t group0 = g->tp_rank * groups;
     uint64_t output_row;
@@ -45349,7 +45363,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                 l->attn_output_a->abs_offset, active.heads, rows) != 0;
                     } else {
                         for (int i = 0; ok && i < count; i++)
-                            ds41_wread_note(l->attn_output_a, 1);
+                            ds41_wread_note(l->attn_output_a, 1, 1);
                         for (int i = 0; ok && i < count; i++)
                             ok = ds4_gpu_attention_output_low_q8_tensor(g->rows_view[i].low,
                                     model->map, model->size,
