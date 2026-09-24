@@ -864,6 +864,38 @@ int ds4_gpu_matmul_q4_K_pair_decode_tensor(
         const ds4_gpu_tensor *x);
 
 /* Multi-row decode projections that preserve the one-row reduction order. */
+/* A lease on one row's whole selected expert set.
+ *
+ * Asking whether an expert is resident and then binding it later is a race
+ * against another row's repair: the slot can be taken in between. Acquiring the
+ * set pins what is there and reports the rest, so loading the missing ones
+ * cannot evict the resident ones, and the caller releases when the work that
+ * reads them has completed - not when it has been encoded. */
+int ds4_gpu_expert_load_set(const void *model_map, uint64_t model_size, uint32_t layer,
+                            const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                            uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                            uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                            uint32_t missing_mask, unsigned long long *bytes_loaded);
+
+#define DS4_EXPERT_LEASE_MAX 8u
+
+typedef struct {
+    uint32_t layer;
+    uint32_t n;
+    int32_t  ids[DS4_EXPERT_LEASE_MAX];
+    uint32_t missing_mask;     /* still to load */
+    uint32_t pinned_mask;      /* held by this lease */
+    uint64_t generation;       /* address-table generation when acquired */
+    uint8_t  held;
+} ds4_gpu_expert_lease;
+
+int  ds4_gpu_expert_acquire_set(uint32_t layer, const int32_t *ids, uint32_t n,
+                                ds4_gpu_expert_lease *lease);
+/* After a repair: pin what arrived. Returns 1 when the set is whole. */
+int  ds4_gpu_expert_lease_repin(ds4_gpu_expert_lease *lease);
+void ds4_gpu_expert_release_set(ds4_gpu_expert_lease *lease);
+uint64_t ds4_gpu_expert_addr_generation(void);
+
 /* The same shape as the exact decode-rows matvec, through a kernel that reads
  * each weight block once for row_tile activation rows. row_tile is 2 or 4. */
 int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(

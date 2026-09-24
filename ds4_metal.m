@@ -781,6 +781,12 @@ static uint32_t g_stream_expert_cache_entry_count;
 static uint32_t g_stream_expert_cache_budget_override;
 static uint64_t g_stream_expert_cache_hits;
 static uint64_t g_stream_expert_cache_misses;
+/* Every publish and every zeroing of an address table moves this on, so a lease
+ * can say whether the table it decided against is still the one the GPU reads. */
+static uint64_t g_stream_expert_addr_generation;
+/* How often an eviction was refused because a lease held the entry. A loader
+ * that cannot find a slot is the other side of this number. */
+unsigned long long g_ds4_pinned_eviction_refused;
 static uint64_t g_stream_expert_cache_evictions;
 static uint64_t g_stream_expert_cache_wraps;
 static uint64_t g_stream_expert_cache_clock;
@@ -1157,6 +1163,12 @@ typedef struct {
     NSUInteger down_inner;
     uint64_t inflight_seq;
     uint32_t slab_slot;
+    /* Leases held on this entry. inflight_seq protects an entry from the
+     * moment a dispatch binds it; a scheduler that decides a row's experts are
+     * resident and only encodes that row later needs the protection to start
+     * at the decision. Between the two, another row's repair can take the slot
+     * and the row binds a dead address. */
+    uint16_t pins;
     uint8_t valid;
     uint8_t slab_backed;
 } ds4_gpu_stream_expert_cache_entry;
@@ -15583,6 +15595,7 @@ static int ds4_gpu_stream_expert_cache_ensure_addr_buffers(uint32_t layer) {
 }
 
 static void ds4_gpu_stream_expert_cache_zero_addr_slot(uint32_t layer, uint32_t expert) {
+    g_stream_expert_addr_generation++;
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
         return;
@@ -15949,6 +15962,26 @@ static int ds4_gpu_gate_repair_inner(const void *model_map, uint64_t model_size,
     }
     if (bytes_loaded) *bytes_loaded += bytes;
     return 1;
+}
+
+/* The same load and publish the gate's repair performs, without requiring the
+ * gate. A scheduler that parks a row needs the bytes whether or not the abort
+ * gate is switched on, and ds4_gpu_gate_repair refuses when it is not: its
+ * first line is a g_gate_layers check, which is why the wave executor's first
+ * run failed on every repair. */
+int ds4_gpu_expert_load_set(const void *model_map, uint64_t model_size, uint32_t layer,
+                            const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                            uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                            uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                            uint32_t missing_mask, unsigned long long *bytes_loaded) {
+    if (n_sel > DS4_METAL_MAX_ROUTED_EXPERT_USED) return 0;
+    ds4_gpu_expert_residency_begin();
+    const int rc = ds4_gpu_gate_repair_inner(model_map, model_size, layer, ids, n_sel,
+                                             n_total, gate_offset, up_offset, down_offset,
+                                             gate_expert_bytes, down_expert_bytes,
+                                             missing_mask, bytes_loaded);
+    ds4_gpu_expert_residency_end();
+    return rc;
 }
 
 int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
@@ -16604,6 +16637,13 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     ds4_gpu_stream_expert_cache_entry *e =
         &g_stream_expert_cache[layer][expert];
     if (!e->valid) return;
+    /* DS4_METAL_V41_NO_LEASE_PIN=1 drops the guard, to separate "the loader
+     * cannot find a slot because leases hold them" from anything else. */
+    if (e->pins) {
+        static int checked, off;
+        if (!checked) { checked = 1; off = getenv("DS4_METAL_V41_NO_LEASE_PIN") != NULL; }
+        if (!off) { g_ds4_pinned_eviction_refused++; return; }
+    }
     if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
         return;
     }
@@ -21498,6 +21538,123 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
  * weight block once for BR activation rows. The grid loses a factor of BR on
  * its Y axis; everything the answer depends on is unchanged, which is what the
  * byte comparison against the exact path checks. */
+uint64_t ds4_gpu_expert_addr_generation(void) {
+    return g_stream_expert_addr_generation;
+}
+
+/* Acquire a whole selected set at once.
+ *
+ * A per-expert residency question answered one at a time is a race: the answer
+ * for the first expert can go stale while the sixth is being asked, and the
+ * repair that made it stale is another row's. This looks all n up, pins the
+ * ones that are there so no eviction can take them, and reports the rest as a
+ * mask for the caller to repair - with the pins already held, so loading the
+ * missing ones cannot evict the resident ones. That was the same failure in
+ * its single-row form: the gate re-checked all six after a repair because
+ * adding one could remove another.
+ *
+ * The lease is released by the caller once the work that reads these experts
+ * has completed, not once it has been encoded.
+ */
+int ds4_gpu_expert_acquire_set(uint32_t layer, const int32_t *ids, uint32_t n,
+                               ds4_gpu_expert_lease *lease) {
+    if (!ids || !lease || n == 0 || n > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) {
+        return 0;
+    }
+    memset(lease, 0, sizeof(*lease));
+    lease->layer = layer;
+    lease->n = n;
+    id<MTLBuffer> tg = nil, tu = nil, td = nil;
+    const int have_tables =
+        ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td) && tg && tu && td;
+    const uint64_t *ga = have_tables ? (const uint64_t *)[tg contents] : NULL;
+    const uint64_t *ua = have_tables ? (const uint64_t *)[tu contents] : NULL;
+    const uint64_t *da = have_tables ? (const uint64_t *)[td contents] : NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        const int32_t id = ids[i];
+        lease->ids[i] = id;
+        if (id < 0 || (uint32_t)id >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+            lease->missing_mask |= 1u << i;
+            continue;
+        }
+        ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][(uint32_t)id];
+        const int reachable = ga && e->valid &&
+            ga[id] != 0 && ua[id] != 0 && da[id] != 0;
+        if (!reachable) { lease->missing_mask |= 1u << i; continue; }
+        if (e->pins == UINT16_MAX) { lease->missing_mask |= 1u << i; continue; }
+        e->pins++;
+        lease->pinned_mask |= 1u << i;
+    }
+    lease->generation = g_stream_expert_addr_generation;
+    lease->held = 1;
+    return 1;
+}
+
+/* Pin the experts a repair has just brought in, so the set the caller decided
+ * on is whole before anything else can take a slot. */
+int ds4_gpu_expert_lease_repin(ds4_gpu_expert_lease *lease) {
+    if (!lease || !lease->held) return 0;
+    id<MTLBuffer> tg = nil, tu = nil, td = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_buffers(lease->layer, &tg, &tu, &td) ||
+        !tg || !tu || !td) return 0;
+    const uint64_t *ga = (const uint64_t *)[tg contents];
+    const uint64_t *ua = (const uint64_t *)[tu contents];
+    const uint64_t *da = (const uint64_t *)[td contents];
+    for (uint32_t i = 0; i < lease->n; i++) {
+        if (lease->pinned_mask & (1u << i)) continue;
+        const int32_t id = lease->ids[i];
+        if (id < 0 || (uint32_t)id >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return 0;
+        ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[lease->layer][(uint32_t)id];
+        if (!e->valid || ga[id] == 0 || ua[id] == 0 || da[id] == 0 ||
+            e->pins == UINT16_MAX) return 0;
+        e->pins++;
+        lease->pinned_mask |= 1u << i;
+        lease->missing_mask &= ~(1u << i);
+    }
+    lease->generation = g_stream_expert_addr_generation;
+    return lease->missing_mask == 0;
+}
+
+void ds4_gpu_expert_release_set(ds4_gpu_expert_lease *lease) {
+    if (!lease || !lease->held) return;
+    for (uint32_t i = 0; i < lease->n; i++) {
+        if (!(lease->pinned_mask & (1u << i))) continue;
+        const int32_t id = lease->ids[i];
+        if (id < 0 || (uint32_t)id >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[lease->layer][(uint32_t)id];
+        if (e->pins) e->pins--;
+    }
+    memset(lease, 0, sizeof(*lease));
+}
+
+/* Which of a row's selected experts have no address in the layer's table, as a
+ * bitmask. The gate's validate answers the same question on the GPU for a whole
+ * segment; a scheduler that parks one row of a batch has to ask it on the host,
+ * for one row, before it commits that row's routed dispatches. */
+uint32_t ds4_gpu_expert_missing_mask(uint32_t layer, const int32_t *ids, uint32_t n) {
+    if (!ids || n == 0 || n > 32u) return 0;
+    id<MTLBuffer> tg = nil, tu = nil, td = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td) ||
+        !tg || !tu || !td) {
+        return n >= 32u ? 0xffffffffu : (1u << n) - 1u;   /* nothing is reachable */
+    }
+    const uint64_t *ga = (const uint64_t *)[tg contents];
+    const uint64_t *ua = (const uint64_t *)[tu contents];
+    const uint64_t *da = (const uint64_t *)[td contents];
+    uint32_t mask = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const int32_t id = ids[i];
+        if (id < 0 || (uint32_t)id >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+            ga[id] == 0 || ua[id] == 0 || da[id] == 0) {
+            mask |= 1u << i;
+        }
+    }
+    return mask;
+}
+
 /* The streaming cache's miss count, so a caller can see which row of a batch
  * paid for a load. */
 uint64_t ds4_gpu_stream_expert_cache_miss_count(void) {

@@ -40511,6 +40511,28 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               uint32_t count, bool round) {
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
     bool ok;
+    /* The speculative verifier is layer-major: every Q8 projection sees the
+     * same weight and several consecutive-token activations.  The old exact
+     * rows kernel preserves arithmetic but rereads the weight once per row,
+     * which leaves the verifier on the single-token bandwidth floor.  Reuse
+     * the byte-exact row-tile primitive for every Q8 projection when asked,
+     * not only for the vocabulary head. */
+    static int dense_tile = -1;
+    if (dense_tile < 0) {
+        const char *e = getenv("DS4_METAL_V41_DENSE_ROW_TILE");
+        dense_tile = e && e[0] ? atoi(e) : 0;
+    }
+    if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
+        (dense_tile == 2 || dense_tile == 4)) {
+        ok = ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(out, m->map, m->size,
+            weight->abs_offset, width, outputs, in, count, (uint32_t)dense_tile);
+        if (!ok) {
+            fprintf(stderr, "ds4: dense row tile %d refused for %u x %u rows=%u\n",
+                    dense_tile, width, outputs, count);
+            return false;
+        }
+        return !round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16);
+    }
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch.
      *
@@ -44365,6 +44387,487 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
 /* row_logits, when given, collects every row's logits instead of only the
  * frontier row's. Speculative verification needs all of them: it compares each
  * drafted token against what the target model would have chosen there. */
+/* ---- the row wavefront ---------------------------------------------------
+ *
+ * The batch step walks forty layers with every row locked to the same one, so a
+ * row whose expert is not resident stops the rows that are: 37.5% of layers at
+ * two rows have both kinds in them, and in those the missing rows spend 15,487
+ * ms against the resident rows' 107. That is stall exposure rather than
+ * recoverable time, but it is two orders above what widening the dense kernels
+ * was worth.
+ *
+ * Rows are independent state machines. What groups them is arriving at the same
+ * stage at the same time, and nothing else.
+ *
+ *   FRONT_READY     needs attention and the router encoded
+ *   FRONT_INFLIGHT  encoded, ids not yet readable
+ *   ROUTE_READY     ids on the host, the set not yet leased
+ *   PARKED_LOADING  leased with holes, repair outstanding
+ *   ROUTED_READY    the whole set leased and pinned
+ *   ROUTED_INFLIGHT experts encoded, completion not yet seen
+ *   HEAD_READY      past the last layer
+ *   DONE            logits published
+ *
+ * encoded and completed are different things and are not conflated: a row holds
+ * a submission ticket, and a lease is released against the ticket's completion
+ * rather than against the encode.
+ *
+ * What is deliberately not here: placement-sparse expert space, MTLIO, Engram
+ * prefetch, expert-major grouping, TensorOps, and a continuous executor that
+ * takes a row past its own token without waiting for its peer. The last one
+ * needs the caller's one-token-per-call contract lifted, which is a server
+ * change; inside a call the rows are already independent.
+ */
+#define DS41_WAVE_MAX_ROWS 8u
+
+enum {
+    DS41_W_FRONT_READY = 0,
+    DS41_W_FRONT_INFLIGHT,
+    DS41_W_ROUTE_READY,
+    DS41_W_PARKED_LOADING,
+    DS41_W_ROUTED_READY,
+    DS41_W_ROUTED_INFLIGHT,
+    DS41_W_HEAD_READY,
+    DS41_W_DONE,
+};
+
+static const char *ds41_wave_state_name(uint8_t st) {
+    static const char *n[] = { "FRONT_READY", "FRONT_INFLIGHT", "ROUTE_READY",
+        "PARKED_LOADING", "ROUTED_READY", "ROUTED_INFLIGHT", "HEAD_READY", "DONE" };
+    return st < 8u ? n[st] : "?";
+}
+
+typedef struct {
+    ds41_gpu_graph g;          /* the row's graph, over its own views */
+    ds41_gpu_graph *session;
+    int token;
+    uint32_t pos;
+    uint32_t layer;
+    uint8_t state;
+    uint64_t epoch;            /* row generation, bumped on resume */
+    uint64_t ticket;           /* the submission its lease is released against */
+    ds4_gpu_expert_lease lease;
+    int32_t ids[DS4_MAX_EXPERT_USED];
+    uint32_t n_ids;
+    /* Order violations are the scheduler's own correctness. */
+    uint32_t last_layer;
+    uint8_t last_state;
+    uint32_t slot;             /* which routed scratch lane this row owns */
+    /* The views this row owns, kept so the graph can be refreshed from the
+     * session at every layer. The lockstep step re-copies *graphs[i] each
+     * layer and re-patches the views; carrying one copy across forty layers
+     * instead keeps whatever a stage wrote into the local copy, which the
+     * proven path discards. One row came out right and the other wrong until
+     * this matched. */
+    ds41_prefill_row view;
+    ds4_gpu_tensor *q_view, *heads_view;
+} ds41_wave_row;
+
+static void ds41_wave_refresh(ds41_wave_row *r) {
+    r->g = *r->session;
+#define DS41_WAVE_APPLY(name, width) r->g.name = r->view.name;
+    DS41_PREFILL_ROWS(DS41_WAVE_APPLY)
+#undef DS41_WAVE_APPLY
+    r->g.q = r->q_view;
+    r->g.heads = r->heads_view;
+    r->g.pos = r->pos;
+}
+
+/* Repair requests, shaped as a queue with a poll so the backend under it can
+ * become a service thread without the scheduler changing. It is not one yet:
+ * ds4_gpu_gate_repair touches the expert cache, the address tables and the
+ * residency set, none of which has been audited for a second thread, and
+ * guessing there is how this codebase has produced silent corruption before.
+ * So poll performs the work on the calling thread - but it is submitted at the
+ * park rather than when the scheduler runs out of other rows, which is the part
+ * that matters for when the bytes start moving. */
+typedef struct {
+    uint32_t rows[DS41_WAVE_MAX_ROWS];
+    uint64_t epochs[DS41_WAVE_MAX_ROWS];
+    uint32_t head, count;
+} ds41_repair_queue;
+
+static struct {
+    unsigned long long advanced_past_parked;
+    unsigned long long parks, resumes, repairs;
+    unsigned long long order_violations, lease_violations;
+    unsigned long long steps, tokens;
+    double repair_ms, resident_wait_ms, head_wait_ms;
+} g_ds41_wave;
+
+extern uint32_t ds4_gpu_expert_missing_mask(uint32_t layer, const int32_t *ids, uint32_t n);
+extern int ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
+                               const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                               uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                               uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                               uint32_t missing_mask, unsigned long long *bytes_loaded);
+
+static void ds41_wave_set_state(ds41_wave_row *r, uint8_t st) {
+    /* Within a row, a layer never goes backwards and a state never regresses
+     * inside a layer - except across the layer boundary, where the state
+     * restarts at FRONT_READY by design. */
+    if (r->layer < r->last_layer ||
+        (r->layer == r->last_layer && st < r->last_state && st != DS41_W_FRONT_READY)) {
+        g_ds41_wave.order_violations++;
+    }
+    r->last_layer = r->layer;
+    r->last_state = st;
+    r->state = st;
+}
+
+static bool ds41_wave_submit_front(ds41_wave_row **rows, uint32_t count,
+                                   const ds4_model *m, const ds4_weights *w) {
+    for (uint32_t i = 0; i < count; i++) {
+        ds41_wave_row *r = rows[i];
+        const ds4_layer_weights *l = &w->layer[r->layer];
+        ds41_wave_refresh(r);
+        if (!ds41_graph_before_moe(&r->g, m, l, r->layer) ||
+            !ds41_moe_route_row(&r->g, m, l, (uint32_t)r->token)) return false;
+        ds41_wave_set_state(r, DS41_W_FRONT_INFLIGHT);
+    }
+    return true;
+}
+
+static bool ds41_wave_submit_routed(ds41_wave_row **rows, uint32_t count,
+                                    const ds4_model *m, const ds4_weights *w,
+                                    uint64_t ticket) {
+    for (uint32_t i = 0; i < count; i++) {
+        ds41_wave_row *r = rows[i];
+        const ds4_layer_weights *l = &w->layer[r->layer];
+        /* The table must still be the one the lease decided against. Only
+         * meaningful when a lease was taken; a global generation cannot decide
+         * this anyway - any other layer's publish moves it - so this stays a
+         * diagnostic until the lease carries a generation per slot. */
+        if (r->lease.held && r->lease.generation != ds4_gpu_expert_addr_generation()) {
+            g_ds41_wave.lease_violations++;
+            return false;
+        }
+        /* The routed scratch is per row slot, and the lockstep step sets it
+         * for the same reason: without it two rows share the same lanes and
+         * one of them comes out wrong while the other looks fine, which is
+         * exactly what the first parkless wave run produced. */
+        if (!ds4_gpu_routed_moe_set_row_slot((uint32_t)(r->slot)) ||
+            !ds4_gpu_routed_moe_set_selected_override(r->ids, r->n_ids) ||
+            !ds41_moe_experts_row(&r->g, m, l, r->layer) ||
+            !ds41_moe_finish(&r->g, r->layer) ||
+            !ds41_graph_after_moe(&r->g)) {
+            (void)ds4_gpu_routed_moe_set_selected_override(NULL, 0);
+            (void)ds4_gpu_routed_moe_set_row_slot(0);
+            return false;
+        }
+        (void)ds4_gpu_routed_moe_set_selected_override(NULL, 0);
+        (void)ds4_gpu_routed_moe_set_row_slot(0);
+        r->ticket = ticket;
+        ds41_wave_set_state(r, DS41_W_ROUTED_INFLIGHT);
+    }
+    return true;
+}
+
+static void ds41_repair_push(ds41_repair_queue *q, uint32_t row, uint64_t epoch) {
+    if (q->count >= DS41_WAVE_MAX_ROWS) return;
+    const uint32_t at = (q->head + q->count) % DS41_WAVE_MAX_ROWS;
+    q->rows[at] = row;
+    q->epochs[at] = epoch;
+    q->count++;
+    g_ds41_wave.parks++;
+}
+
+/* One outstanding repair, performed here. Returns the row it completed, or -1. */
+static int ds41_repair_poll(ds41_repair_queue *q, ds41_wave_row *rows,
+                           const ds4_model *m, const ds4_weights *w) {
+    if (!q->count) return -1;
+    const uint32_t row = q->rows[q->head];
+    const uint64_t epoch = q->epochs[q->head];
+    q->head = (q->head + 1) % DS41_WAVE_MAX_ROWS;
+    q->count--;
+    ds41_wave_row *r = &rows[row];
+    if (r->epoch != epoch) return -1;      /* a stale request */
+    const ds4_layer_weights *l = &w->layer[r->layer];
+    uint64_t gate_row = 0, down_row = 0;
+    if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+        !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return -1;
+    unsigned long long bytes = 0;
+    const double t0 = now_sec();
+    const int ok = ds4_gpu_expert_load_set(m->map, m->size, r->layer, r->ids, r->n_ids,
+                                       DS4_N_EXPERT, l->ffn_gate_exps->abs_offset,
+                                       l->ffn_up_exps->abs_offset,
+                                       l->ffn_down_exps->abs_offset,
+                                       gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                       r->lease.missing_mask, &bytes);
+    g_ds41_wave.repair_ms += (now_sec() - t0) * 1000.0;
+    g_ds41_wave.repairs++;
+    if (!ok || !ds4_gpu_expert_lease_repin(&r->lease)) return -1;
+    r->epoch++;
+    g_ds41_wave.resumes++;
+    ds41_wave_set_state(r, DS41_W_ROUTED_READY);
+    return (int)row;
+}
+
+void ds4_gpu_wave_counts(unsigned long long *advanced, unsigned long long *parks,
+                         unsigned long long *violations, double *repair_ms) {
+    if (advanced) *advanced = g_ds41_wave.advanced_past_parked;
+    if (parks) *parks = g_ds41_wave.parks;
+    if (violations) *violations =
+        g_ds41_wave.order_violations + g_ds41_wave.lease_violations;
+    if (repair_ms) *repair_ms = g_ds41_wave.repair_ms;
+}
+
+static void ds41_wave_report(void) {
+    fprintf(stderr, "ds4: wave %llu tokens, %llu scheduler steps: %llu parks, "
+            "%llu resumes, %llu repairs in %.1f ms; resident stages completed "
+            "while a peer was parked %llu; order violations %llu, lease "
+            "violations %llu; resident wait on a peer %.1f ms, head wait %.1f ms\n",
+            g_ds41_wave.tokens, g_ds41_wave.steps, g_ds41_wave.parks,
+            g_ds41_wave.resumes, g_ds41_wave.repairs, g_ds41_wave.repair_ms,
+            g_ds41_wave.advanced_past_parked, g_ds41_wave.order_violations,
+            g_ds41_wave.lease_violations, g_ds41_wave.resident_wait_ms,
+            g_ds41_wave.head_wait_ms);
+}
+
+/* One token for each of `count` rows, with the rows independent.
+ *
+ * Reuses the batch workspace's row views and every single-row stage, so what is
+ * new here is only the order they run in. Returns false when it declines, and
+ * the caller falls back to the lockstep step.
+ */
+/* Three results, because a declined executor may safely fall back while an
+ * executor that failed after publishing KV/state may not be run a second
+ * time on the same sessions. */
+static DS4_MAYBE_UNUSED int ds41_graph_step_wave(ds41_gpu_graph *const *graphs,
+                                   const int *tokens, int count,
+                                   const ds4_model *model, const ds4_weights *weights) {
+    if (!graphs || !tokens || count < 2 || count > (int)DS41_WAVE_MAX_ROWS) return false;
+    ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
+    if (!g || g->tp_world != 1 || !g->streaming) return false;
+    const uint32_t rows = (uint32_t)count;
+    if (rows > g->prefill_cap) return false;
+
+    ds41_prefill_row active = {0};
+    bool ok = true;
+#define DS41_WAVE_VIEW(name, width) \
+    if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
+        (uint64_t)rows * (width) * sizeof(float))) != NULL;
+    DS41_PREFILL_ROWS(DS41_WAVE_VIEW)
+#undef DS41_WAVE_VIEW
+    const uint64_t head_bytes = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    ds4_gpu_tensor *queries[DS41_WAVE_MAX_ROWS] = {0};
+    ds4_gpu_tensor *heads[DS41_WAVE_MAX_ROWS] = {0};
+    for (uint32_t i = 0; ok && i < rows; i++) {
+        queries[i] = ds4_gpu_tensor_view(g->batch.q, (uint64_t)i * head_bytes, head_bytes);
+        heads[i] = ds4_gpu_tensor_view(g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
+        ok = queries[i] && heads[i];
+    }
+
+    /* On the heap: a row carries a whole ds41_gpu_graph by value and eight of
+     * them overflowed the decode thread's stack - the first wave run died in
+     * __chkstk_darwin, not in anything it was doing. */
+    ds41_wave_row *row = calloc(DS41_WAVE_MAX_ROWS, sizeof(*row));
+    ds4_engram_history history[DS41_WAVE_MAX_ROWS];
+    if (!row) return false;
+    const float initial_pre[] = {1, 0, 0, 0};
+    for (uint32_t i = 0; ok && i < rows; i++) {
+        ds41_gpu_graph *sg = graphs[i];
+        row[i].session = sg;
+#define DS41_WAVE_ROW(name, width) row[i].view.name = g->rows_view[i].name;
+        DS41_PREFILL_ROWS(DS41_WAVE_ROW)
+#undef DS41_WAVE_ROW
+        row[i].q_view = queries[i];
+        row[i].heads_view = heads[i];
+        row[i].token = tokens[i];
+        row[i].pos = sg->pos;
+        ds41_wave_refresh(&row[i]);
+        row[i].layer = 0;
+        row[i].slot = i;
+        row[i].state = DS41_W_FRONT_READY;
+        row[i].last_state = DS41_W_FRONT_READY;
+        uint32_t ids[2][DS4_ENGRAM_COLS];
+        history[i] = sg->history;
+        ok = ds4_engram_hash(&sg->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
+        for (unsigned t = 0; ok && t < 2; t++)
+            ok = ds4_engram_read(&sg->table[t], ids[t], DS4_ENGRAM_COLS, sg->rows[t]);
+        if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
+            ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
+                weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i],
+                DS4_N_EMBD, DS4_N_HC);
+    }
+    if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+
+    ds41_repair_queue queue;
+    memset(&queue, 0, sizeof(queue));
+    uint64_t ticket = 0;
+    /* Leases whose routed work is encoded but not yet completed. They are
+     * released at the next drain, which is where that work has run. */
+    uint32_t pending[DS41_WAVE_MAX_ROWS];
+    uint32_t n_pending = 0;
+    uint32_t guard = 0;
+    const uint32_t guard_max = (uint32_t)DS4_N_LAYER * 8u * rows + 64u;
+
+    while (ok) {
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < rows; i++) if (row[i].state == DS41_W_DONE) done++;
+        if (done == rows) break;
+        if (++guard > guard_max) {
+            fprintf(stderr, "ds4: wave did not settle\n");
+            ok = false;
+            break;
+        }
+        g_ds41_wave.steps++;
+        int progressed = 0;
+
+        /* Engram rows are a host write into a shared buffer, so a row entering
+         * an Engram layer needs the buffer to be its own. The views are, so
+         * this is per row and needs no drain. */
+        for (uint32_t i = 0; ok && i < rows; i++) {
+            if (row[i].state != DS41_W_FRONT_READY) continue;
+            if (!ds41_engram_layer(row[i].layer)) continue;
+            const unsigned t = row[i].layer == 1 ? 0u : 1u;
+            ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0,
+                                      row[i].session->rows[t],
+                                      sizeof(row[i].session->rows[t]));
+        }
+
+        /* FRONT for every row that wants it, as one group. */
+        ds41_wave_row *batch[DS41_WAVE_MAX_ROWS];
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < rows; i++)
+            if (row[i].state == DS41_W_FRONT_READY) batch[n++] = &row[i];
+        if (ok && n) {
+            ok = ds41_wave_submit_front(batch, n, model, weights);
+            progressed = 1;
+        }
+
+        /* One drain makes every in-flight row's ids readable, and is also where
+         * the previous round's routed work has completed. Routed completion
+         * is an independent reason to drain: after encoding ROUTED no row is
+         * FRONT_INFLIGHT yet. Tying this block only to `n` made the executor
+         * stop after layer zero and the caller then re-ran lockstep over the
+         * already-mutated attention/KV state. */
+        n = 0;
+        for (uint32_t i = 0; i < rows; i++)
+            if (row[i].state == DS41_W_FRONT_INFLIGHT) batch[n++] = &row[i];
+        if (ok && (n || n_pending)) {
+            uint32_t parked_before = 0;
+            for (uint32_t i = 0; i < rows; i++)
+                if (row[i].state == DS41_W_PARKED_LOADING) parked_before++;
+            if (!ds4_gpu_end_commands()) ok = false;
+            /* Everything encoded before this point has run. */
+            for (uint32_t k = 0; ok && k < n_pending; k++) {
+                ds4_gpu_expert_release_set(&row[pending[k]].lease);
+                if (row[pending[k]].state == DS41_W_ROUTED_INFLIGHT) {
+                    if (parked_before) g_ds41_wave.advanced_past_parked++;
+                    const uint8_t next = row[pending[k]].layer >= (uint32_t)DS4_N_LAYER
+                        ? DS41_W_HEAD_READY : DS41_W_FRONT_READY;
+                    ds41_wave_set_state(&row[pending[k]], next);
+                }
+            }
+            n_pending = 0;
+            if (ok && !ds4_gpu_begin_commands()) ok = false;
+            for (uint32_t k = 0; ok && k < n; k++) {
+                ds41_wave_row *r = batch[k];
+                r->n_ids = DS4_N_EXPERT_USED;
+                if (!ds4_gpu_tensor_read(r->g.selected, 0, r->ids,
+                        (uint64_t)DS4_N_EXPERT_USED * sizeof(r->ids[0]))) { ok = false; break; }
+                ds41_wave_set_state(r, DS41_W_ROUTE_READY);
+                /* Two things are being built here and they have to be
+                 * separated before either can be trusted: the loop that moves
+                 * rows between stages, and the lease that lets a row park
+                 * while its peers run. DS4_METAL_V41_WAVE_PARK=1 turns the
+                 * second on. Without it the routed stage loads whatever it
+                 * needs exactly as the lockstep step does, so what is under
+                 * test is the reordering alone - and a wrong answer then
+                 * belongs to the loop, the row views or the state machine,
+                 * not to the loader. */
+                static int park_env = -1;
+                if (park_env < 0) {
+                    const char *pe = getenv("DS4_METAL_V41_WAVE_PARK");
+                    park_env = pe && pe[0] ? atoi(pe) != 0 : 0;
+                }
+                if (!park_env) { ds41_wave_set_state(r, DS41_W_ROUTED_READY); continue; }
+                if (!ds4_gpu_expert_acquire_set(r->layer, r->ids, r->n_ids, &r->lease)) {
+                    ok = false; break;
+                }
+                if (r->lease.missing_mask) {
+                    ds41_wave_set_state(r, DS41_W_PARKED_LOADING);
+                    ds41_repair_push(&queue, (uint32_t)(r - row), r->epoch);
+                } else {
+                    ds41_wave_set_state(r, DS41_W_ROUTED_READY);
+                }
+            }
+            progressed = 1;
+        }
+
+        /* ROUTED for every row whose set is whole. */
+        n = 0;
+        for (uint32_t i = 0; i < rows; i++)
+            if (row[i].state == DS41_W_ROUTED_READY) batch[n++] = &row[i];
+        if (ok && n) {
+            ticket++;
+            ok = ds41_wave_submit_routed(batch, n, model, weights, ticket);
+            for (uint32_t k = 0; ok && k < n; k++) {
+                batch[k]->layer++;
+                pending[n_pending++] = (uint32_t)(batch[k] - row);
+            }
+            progressed = 1;
+        }
+
+        /* A row past the last layer takes its own head, without waiting for a
+         * peer: a token boundary that resynchronises would put back the
+         * lockstep the layers just lost. */
+        for (uint32_t i = 0; ok && i < rows; i++) {
+            if (row[i].state != DS41_W_HEAD_READY) continue;
+            ds41_gpu_graph *sg = row[i].session;
+            ok = ds4_gpu_tensor_copy(sg->residual, 0, g->rows_view[i].residual, 0,
+                                     (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
+                 ds4_gpu_tensor_copy(sg->pre, 0, g->rows_view[i].ffn_split, 0,
+                                     DS4_N_HC * sizeof(float)) &&
+                 ds4_gpu_hc_weighted_sum_tensor(sg->x, sg->residual, sg->pre,
+                                                DS4_N_EMBD, DS4_N_HC) &&
+                 ds41_bf16(sg->x, DS4_N_EMBD) &&
+                 ds41_norm(sg->norm, sg->x, model, weights->output_norm) &&
+                 ds41_output_projection(sg, sg->tp_logits_half ? sg->tp_logits_half : sg->logits,
+                                        model, weights, sg->norm, 1);
+            if (ok) {
+                sg->history = history[i];
+                sg->pos = row[i].pos + 1u;
+                ds41_wave_set_state(&row[i], DS41_W_DONE);
+                g_ds41_wave.tokens++;
+            }
+            progressed = 1;
+        }
+
+        /* Nothing could move, so the bytes a parked row needs are the only work
+         * left. Flush first: the GPU then runs what the resident rows encoded
+         * while the host waits for the load. */
+        if (ok && !progressed && queue.count) {
+            if (!ds4_gpu_flush_commands()) { ok = false; break; }
+            if (ds41_repair_poll(&queue, row, model, weights) < 0) {
+                fprintf(stderr, "ds4: wave repair failed at layer %u\n", row[0].layer);
+                ok = false;
+            }
+        } else if (ok && !progressed) {
+            fprintf(stderr, "ds4: wave stalled without routed completion or repair\n");
+            ok = false;
+        }
+    }
+
+    for (uint32_t k = 0; k < n_pending; k++)
+        ds4_gpu_expert_release_set(&row[pending[k]].lease);
+    for (uint32_t i = 0; i < rows; i++) ds4_gpu_expert_release_set(&row[i].lease);
+    for (uint32_t i = 0; i < rows; i++) {
+        ds4_gpu_tensor_free(queries[i]);
+        ds4_gpu_tensor_free(heads[i]);
+    }
+#define DS41_WAVE_FREE(name, width) ds4_gpu_tensor_free(active.name);
+    DS41_PREFILL_ROWS(DS41_WAVE_FREE)
+#undef DS41_WAVE_FREE
+    if (ok) {
+        static unsigned long long said;
+        if (g_ds41_wave.tokens - said >= 256ull) { said = g_ds41_wave.tokens; ds41_wave_report(); }
+    }
+    free(row);
+    return ok ? 1 : -1;
+}
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights,
@@ -82315,8 +82818,24 @@ static int ds4_sessions_eval_batch_native(
             graphs[prefill_rows + i] = &items[i].session->ds41_graph;
             tokens[prefill_rows + i] = items[i].token;
         }
-        ok = ok && ds41_graph_step_batch(graphs, tokens, count + (int)prefill_rows,
-                                          prefill_rows, &e->model, &e->weights);
+        /* DS4_METAL_V41_WAVE=1 runs the rows as independent state machines
+         * instead of locking them to the same layer. Declines for anything it
+         * does not cover - prefill rows, tensor parallel, a resident model -
+         * and the lockstep step then runs as before. */
+        static int wave_env = -1;
+        if (wave_env < 0) {
+            const char *we = getenv("DS4_METAL_V41_WAVE");
+            wave_env = we && we[0] ? atoi(we) != 0 : 0;
+        }
+        int waved = 0;
+        if (ok && wave_env && prefill_rows == 0)
+            waved = ds41_graph_step_wave(graphs, tokens, count, &e->model, &e->weights);
+        /* A negative result means wave started and mutated session state.
+         * Falling back would execute the token twice and can silently produce
+         * a plausible but wrong answer. Zero alone is a safe decline. */
+        ok = ok && (waved > 0 || (waved == 0 &&
+             ds41_graph_step_batch(graphs, tokens, count + (int)prefill_rows,
+                                          prefill_rows, &e->model, &e->weights)));
 #else
         ok = false;
 #endif
