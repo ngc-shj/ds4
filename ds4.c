@@ -41185,6 +41185,34 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            (fuse_out || ds41_bf16(g->block, DS4_N_EMBD));
 }
 
+/* ds41_attention() split at the point where a row stops writing and starts
+ * reading, so a block can run every row's writes first and then let the reads
+ * overlap. The arithmetic of each half is the projected=true path verbatim.
+ *
+ * The block does not publish into the 128-slot decode ring while it runs. It
+ * writes an immutable prefix and its own delta into one linear buffer, each
+ * row sees the range that is causal for its position, and the ring is
+ * committed once at the end. That is not a nicety: the ring aliases. With the
+ * ring, row K-1 writing slot (pos+K-1)%128 overwrites the key at position
+ * pos+K-1-128, which row 0 still needs whenever the window is full - so
+ * reordering the writes ahead of the reads is only correct in a linear buffer,
+ * and only looks correct below 128 positions. */
+static bool ds41_attention_block_pre(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_layer_weights *l, uint32_t il,
+                                     ds4_gpu_tensor *raw, uint32_t slot) {
+    const uint32_t pos = g->pos;
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    return ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) &&
+           ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) &&
+           ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) &&
+           ds4_gpu_tensor_copy(raw, (uint64_t)slot * 512u * 4u, g->kv, 0, 512u * 4u) &&
+           ds41_attention_publish(g, m, l, il, false) &&
+           /* The indexer belongs on this side too: it writes index_scores,
+            * index_packed and the block score buffers, all still shared, so
+            * leaving it among the reads keeps them a chain. */
+           ds41_attention_select_published(g, m, l, il, false);
+}
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -44956,11 +44984,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      *
      * The condition is the abstraction: same graph, and positions that step by
      * one. Anything else falls back to the per-row loop. */
-    bool block_attn = ok && count >= 2 && g->tp_world == 1;
-    for (int i = 1; block_attn && i < count; i++)
-        block_attn = graphs[i] == graphs[0] &&
-                     positions[i] == positions[0] + (uint32_t)i;
-    bool block_attn_low = false;
+    bool block_ok = ok && count >= 2 && g->tp_world == 1;
+    for (int i = 1; block_ok && i < count; i++)
+        block_ok = graphs[i] == graphs[0] &&
+                   positions[i] == positions[0] + (uint32_t)i;
+    bool block_attn = block_ok, block_attn_low = false;
     if (block_attn) {
         const char *e = getenv("DS4_METAL_V41_BLOCK_ATTN");
         const int mode = e && e[0] ? atoi(e) : 0;
@@ -44969,6 +44997,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
          * attention core or to the batched low projection and not to both. */
         block_attn_low = mode == 1;
     }
+    /* Block-local KV: the same per-row kernels, with every row's write done
+     * before any row's read, against an immutable prefix and the block's own
+     * delta in a linear buffer. Causality is the range each row is shown, not
+     * the order the rows ran in. */
+    const char *block_kv_e = getenv("DS4_METAL_V41_BLOCK_KV");
+    const bool block_kv = block_ok && !block_attn &&
+                          block_kv_e && block_kv_e[0] && atoi(block_kv_e) != 0;
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     /* Which part of a k-row step actually grows with k. Splitting it costs a
      * command buffer boundary per stage, so the totals run high; the shares
@@ -45095,7 +45130,101 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             if (ok) ok = ds41_matmul_batch(active.block, model, l->attn_output_b,
                                            active.low, rows, false);
         }
-        for (int i = 0; ok && !block_attn && i < count; i++) {
+        if (block_kv) {
+            const uint32_t start = positions[0];
+            const uint32_t previous = start < 127u ? start : 127u;
+            const uint32_t pre_start = (start - previous) % 128u;
+            const uint32_t first = previous < 128u - pre_start ? previous : 128u - pre_start;
+            const uint64_t row_bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+            const uint32_t raw_cap = g->prefill_cap + 128u;
+            static bool said_kv;
+            if (!said_kv) { said_kv = true;
+                fprintf(stderr, "ds4: V4.1 block-local KV delta, %u rows over %u "
+                        "prefix keys\n", rows, previous); }
+            if (ok && first)
+                ok = ds4_gpu_tensor_copy(g->raw_prefill, 0, g->window[il],
+                                         (uint64_t)pre_start * row_bytes,
+                                         (uint64_t)first * row_bytes) != 0;
+            if (ok && previous > first)
+                ok = ds4_gpu_tensor_copy(g->raw_prefill, (uint64_t)first * row_bytes,
+                                         g->window[il], 0,
+                                         (uint64_t)(previous - first) * row_bytes) != 0;
+            /* Writes. */
+            for (int i = 0; ok && i < count; i++) {
+                ds41_gpu_graph row = *graphs[i];
+                row.pos = positions[i];
+#define DS41_KV_PRE_ROW(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_KV_PRE_ROW)
+#undef DS41_KV_PRE_ROW
+                row.q = queries[i];
+                row.heads = heads[i];
+                ok = ds41_attention_block_pre(&row, model, l, il, g->raw_prefill,
+                                              previous + (uint32_t)i);
+            }
+            /* Reads, still serial, and the reason is one level down rather
+             * than here. ds4_gpu_attention_decode_heads_tensor is not a
+             * dispatch but six - mask fill, mask convert, KV stage, pad, the
+             * flash vec pass, the reduce - and it stages into
+             * g_flash_attn_kv_buffer, g_flash_attn_pad_buffer,
+             * g_flash_attn_tmp_buffer and the flash mask buffer, every one of
+             * them a process-global singleton, while g_decode_attn_rope_fuse
+             * is a global consumed by the first caller. A concurrent section
+             * over those calls also unorders each row's own six, and it
+             * diverged when tried.
+             *
+             * That is a singleton where the block wants a slot, not a property
+             * of the model: the scratch has to be block-shaped and the
+             * attention has to be exposed as three levels, so the rows can run
+             * stage-stage-..., barrier, attend-attend-..., barrier, reduce.
+             * Each row then keeps its own n_keys, nsg and kvpad variant, which
+             * is what keeps it bit-identical to canonical single decode.
+             * Folding the rows into one dispatch instead needs a common ne11,
+             * and that changes the kvpad variant for rows whose key count is
+             * not a multiple of 32. */
+            const uint32_t ratio_l = ds4_layer_compress_ratio(il);
+            const uint32_t owner_l = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+            const uint32_t heads_n = DS4_N_HEAD / g->tp_world;
+            const uint64_t sinks_off = l->attn_sinks->abs_offset +
+                (uint64_t)(g->tp_rank * heads_n) * sizeof(float);
+            for (int i = 0; ok && i < count; i++) {
+                const uint32_t nc = ratio_l ? (positions[i] + 1u) / ratio_l : 0u;
+                const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
+                const uint32_t avail = previous + (uint32_t)i + 1u;
+                const uint32_t n_raw = avail < 128u ? avail : 128u;
+                ds4_gpu_tensor *sel = row_gather ? gathers[i] : g->selected_kv;
+                ds41_gpu_graph row = *graphs[i];
+                row.pos = positions[i];
+#define DS41_KV_OUT_ROW(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_KV_OUT_ROW)
+#undef DS41_KV_OUT_ROW
+                row.q = queries[i];
+                row.heads = heads[i];
+                if (nc) ok = ds4_gpu_dsv41_gather_kv(sel, g->compressed[owner_l],
+                        g->rows_view[i].selected_comp, nc, att) != 0;
+                if (ok) ok = ds4_gpu_attention_decode_heads_tensor(heads[i],
+                        model->map, model->size, sinks_off, queries[i],
+                        g->raw_prefill, n_raw, raw_cap, avail - n_raw,
+                        sel, 0, att, NULL, 0, heads_n, DS4_N_HEAD_DIM) != 0;
+                if (ok) ok = ds41_bf16(heads[i], heads_n * DS4_N_HEAD_DIM) &&
+                        ds41_rope(heads[i], heads_n, DS4_N_HEAD_DIM, il, positions[i], true) &&
+                        (batch_attn_out ? ds41_attention_low(&row, model, l)
+                                        : ds41_attention_output(&row, model, l, false));
+            }
+            /* Commit, once. */
+            if (ok) {
+                const uint32_t n_all = previous + rows;
+                const uint32_t kept = n_all < 128u ? n_all : 128u;
+                const uint32_t slot = (start + rows - kept) % 128u;
+                const uint32_t part = kept < 128u - slot ? kept : 128u - slot;
+                ok = ds4_gpu_tensor_copy(g->window[il], (uint64_t)slot * row_bytes,
+                        g->raw_prefill, (uint64_t)(n_all - kept) * row_bytes,
+                        (uint64_t)part * row_bytes) != 0 &&
+                    (kept == part || ds4_gpu_tensor_copy(g->window[il], 0,
+                        g->raw_prefill, (uint64_t)(n_all - kept + part) * row_bytes,
+                        (uint64_t)(kept - part) * row_bytes) != 0);
+            }
+        }
+        for (int i = 0; ok && !block_attn && !block_kv && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
