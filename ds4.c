@@ -40519,11 +40519,11 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * which leaves the verifier on the single-token bandwidth floor.  Reuse
      * the byte-exact row-tile primitive for every Q8 projection when asked,
      * not only for the vocabulary head. */
-    static int dense_tile = -1;
-    if (dense_tile < 0) {
-        const char *e = getenv("DS4_METAL_V41_DENSE_ROW_TILE");
-        dense_tile = e && e[0] ? atoi(e) : 0;
-    }
+    /* Not cached in a static: the selftest's in-process A/B sets and unsets
+     * this between arms, and a static hands both arms the same value and
+     * reports no difference. */
+    const char *dense_tile_e = getenv("DS4_METAL_V41_DENSE_ROW_TILE");
+    const int dense_tile = dense_tile_e && dense_tile_e[0] ? atoi(dense_tile_e) : 0;
     if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
         (dense_tile == 2 || dense_tile == 4)) {
         ok = ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(out, m->map, m->size,
@@ -45007,6 +45007,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const char *block_lv_e = getenv("DS4_METAL_V41_BLOCK_LEVELS");
     const bool block_levels = block_kv && block_lv_e && block_lv_e[0] &&
                               atoi(block_lv_e) != 0;
+    const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
+    const bool low_batch = block_levels && g->tp_world == 1 &&
+                           low_b_e && low_b_e[0] && atoi(low_b_e) != 0;
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     /* Which part of a k-row step actually grows with k. Splitting it costs a
      * command buffer boundary per stage, so the totals run high; the shares
@@ -45254,14 +45257,25 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     for (int i = 0; ok && i < count; i++)
                         ok = ds41_rope(heads[i], heads_n, DS4_N_HEAD_DIM, il, positions[i], true);
                     DS41_LEVEL_BREAK();
-                    for (int i = 0; ok && i < count; i++)
-                        ok = ds4_gpu_attention_output_low_q8_tensor(g->rows_view[i].low,
+                    /* attn_output_a is 8 x 1024 rows of 4096 Q8 - about 36 MB
+                     * a layer - and every row reads all of it. One dispatch for
+                     * the block with the rows as a dimension reads it once.
+                     * DS4_METAL_V41_BLOCK_LOW_BATCH=1; the rounding comes with
+                     * it, so it replaces both levels. */
+                    if (ok && low_batch) {
+                        ok = ds4_gpu_dsv41_attention_output_low_batch(active.low,
                                 model->map, model->size,
-                                l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * out_row,
-                                4096, 1024, groups, heads[i]) != 0;
-                    DS41_LEVEL_BREAK();
-                    for (int i = 0; ok && i < count; i++)
-                        ok = ds41_bf16(g->rows_view[i].low, groups * DS4_N_LORA_O);
+                                l->attn_output_a->abs_offset, active.heads, rows) != 0;
+                    } else {
+                        for (int i = 0; ok && i < count; i++)
+                            ok = ds4_gpu_attention_output_low_q8_tensor(g->rows_view[i].low,
+                                    model->map, model->size,
+                                    l->attn_output_a->abs_offset + (uint64_t)group0 * 1024u * out_row,
+                                    4096, 1024, groups, heads[i]) != 0;
+                        DS41_LEVEL_BREAK();
+                        for (int i = 0; ok && i < count; i++)
+                            ok = ds41_bf16(g->rows_view[i].low, groups * DS4_N_LORA_O);
+                    }
                     if (sec) ds4_gpu_end_concurrent_section();
 #undef DS41_LEVEL_BREAK
                     if (ok && !batch_attn_out)
