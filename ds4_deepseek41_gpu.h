@@ -43,7 +43,8 @@ int ds4_gpu_dsv41_attention_output_low_batch(
         uint64_t                model_size,
         uint64_t                out_a_offset,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        int                     round_bf16);
 
 int ds4_gpu_dsv41_attention_output_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,

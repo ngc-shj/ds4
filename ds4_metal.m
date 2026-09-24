@@ -28252,10 +28252,13 @@ int ds4_gpu_dsv41_attention_output_low_batch(
         ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size,
         uint64_t out_a_offset,
-        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+        const ds4_gpu_tensor *heads, uint32_t n_tokens, int round_bf16) {
+    /* round_bf16 = 0 leaves the rounding to the caller. It is a second
+     * dispatch that reads what the first wrote, so a caller running this
+     * inside a concurrent section has to put it in its own level. */
     return ds4_gpu_attention_output_q8_batch_impl(NULL, low, low, low,
         model_map, model_size, out_a_offset, 0, 4096, 1024,
-        8, 5120, heads, n_tokens, true, 0, 0);
+        8, 5120, heads, n_tokens, round_bf16 != 0, 0, 0);
 }
 
 int ds4_gpu_dsv41_attention_output_batch(

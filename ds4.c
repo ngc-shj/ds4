@@ -45406,7 +45406,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             if (ok && block_attn_low)
                 ok = ds4_gpu_dsv41_attention_output_low_batch(active.low,
                         model->map, model->size, l->attn_output_a->abs_offset,
-                        active.heads, rows) != 0;
+                        active.heads, rows, 1) != 0;
             for (int i = 0; ok && !block_attn_low && i < count; i++) {
                 ds41_gpu_graph row = *graphs[i];
                 row.pos = positions[i];
@@ -45546,9 +45546,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                      * DS4_METAL_V41_BLOCK_LOW_BATCH=1; the rounding comes with
                      * it, so it replaces both levels. */
                     if (ok && low_batch) {
+                        ds41_wread_note_full(l->attn_output_a, rows, rows, 7, true);
                         ok = ds4_gpu_dsv41_attention_output_low_batch(active.low,
                                 model->map, model->size,
-                                l->attn_output_a->abs_offset, active.heads, rows) != 0;
+                                l->attn_output_a->abs_offset, active.heads, rows, 0) != 0;
+                        DS41_LEVEL_BREAK();
+                        if (ok) ok = ds41_bf16(active.low,
+                                               rows * DS4_N_OUT_GROUP * DS4_N_LORA_O);
                     } else {
                         for (int i = 0; ok && i < count; i++)
                             ds41_wread_note_full(l->attn_output_a, 1, 1, 7, true);
@@ -45879,6 +45883,66 @@ static int ds41_selftest_cmp(const void *a, const void *b) {
  * that were really counted.
  *
  * DS4_V41_ROWTILE_CHECK=3. */
+/* The grouped low projection has its own kernel, so the generic exact/tile
+ * pair cannot speak for it. Ask it directly: eight single-row calls against
+ * one batched call, compared at the same boundary the block would use - the
+ * BF16-rounded low, since both paths round. */
+static void ds41_grouped_low_check(const ds4_model *m, const ds4_weights *w) {
+    const ds4_layer_weights *l = &w->layer[0];
+    const ds4_tensor *t = l->attn_output_a;
+    if (!t || t->type != DS4_TENSOR_Q8_0) return;
+    const uint32_t groups = DS4_N_OUT_GROUP, rank = DS4_N_LORA_O;
+    const uint32_t hdim = groups * 4096u, ldim = groups * rank;
+    fprintf(stderr, "ds4: grouped low projection, single rows against the batch:\n");
+    for (uint32_t rows = 2; rows <= 8u; rows *= 2u) {
+        const uint64_t hb = (uint64_t)rows * hdim * sizeof(float);
+        const uint64_t lb = (uint64_t)rows * ldim * sizeof(float);
+        ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(hb);
+        ds4_gpu_tensor *ref = ds4_gpu_tensor_alloc(lb);
+        ds4_gpu_tensor *tst = ds4_gpu_tensor_alloc(lb);
+        float *hin = malloc((size_t)hb), *a = malloc((size_t)lb), *b = malloc((size_t)lb);
+        if (!heads || !ref || !tst || !hin || !a || !b) goto done;
+        for (uint64_t x = 0; x < (uint64_t)rows * hdim; x++) {
+            const uint32_t h = (uint32_t)(x * 2246822519u + 7u);
+            hin[x] = (float)((int32_t)(h >> 9) % 2001 - 1000) / 1000.0f;
+        }
+        if (!ds4_gpu_tensor_write(heads, 0, hin, hb)) goto done;
+        bool ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t i = 0; ok && i < rows; i++) {
+            ds4_gpu_tensor *hv = ds4_gpu_tensor_view(heads, (uint64_t)i * hdim * 4u, (uint64_t)hdim * 4u);
+            ds4_gpu_tensor *lv = ds4_gpu_tensor_view(ref, (uint64_t)i * ldim * 4u, (uint64_t)ldim * 4u);
+            uint64_t orow = 0;
+            ok = hv && lv && tensor_nbytes(t->type, 4096, &orow) &&
+                 ds4_gpu_attention_output_low_q8_tensor(lv, m->map, m->size,
+                     t->abs_offset, 4096, rank, groups, hv) != 0 &&
+                 ds4_gpu_dsv41_quantize(lv, ldim, 1, DS4_V41_BF16);
+            ds4_gpu_tensor_free(hv); ds4_gpu_tensor_free(lv);
+        }
+        ok = ok && ds4_gpu_end_commands() != 0 && ds4_gpu_tensor_read(ref, 0, a, lb);
+        ok = ok && ds4_gpu_begin_commands() != 0 &&
+             ds4_gpu_dsv41_attention_output_low_batch(tst, m->map, m->size,
+                 t->abs_offset, heads, rows, 1) != 0 &&
+             ds4_gpu_end_commands() != 0 && ds4_gpu_tensor_read(tst, 0, b, lb);
+        if (!ok) { fprintf(stderr, "ds4:   rows=%u refused\n", rows); goto done; }
+        uint64_t first = UINT64_MAX, differ = 0;
+        for (uint64_t x = 0; x < (uint64_t)rows * ldim; x++) {
+            if (memcmp(&a[x], &b[x], sizeof(float)) == 0) continue;
+            differ++; if (first == UINT64_MAX) first = x;
+        }
+        if (!differ)
+            fprintf(stderr, "ds4:   rows=%u: identical after BF16\n", rows);
+        else
+            fprintf(stderr, "ds4:   rows=%u: %llu of %llu differ, first row %llu col %llu "
+                    "(%.9g vs %.9g)\n", rows, (unsigned long long)differ,
+                    (unsigned long long)((uint64_t)rows * ldim),
+                    (unsigned long long)(first / ldim), (unsigned long long)(first % ldim),
+                    (double)a[first], (double)b[first]);
+    done:
+        free(hin); free(a); free(b);
+        ds4_gpu_tensor_free(heads); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(tst);
+    }
+}
+
 static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
     const struct { const char *name; size_t off; } kinds[] = {
         { "attn_output_b", offsetof(ds4_layer_weights, attn_output_b) },
@@ -45979,6 +46043,7 @@ static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
 static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
     const char *env = getenv("DS4_V41_ROWTILE_CHECK");
     if (!env || !env[0] || atoi(env) == 0) return;
+    if (atoi(env) >= 4) { ds41_grouped_low_check(m, w); return; }
     if (atoi(env) >= 3) { ds41_rowtile_sweep(m, w); return; }
     const ds4_layer_weights *l = &w->layer[0];
     const struct { const char *name; const ds4_tensor *t; } shapes[] = {
