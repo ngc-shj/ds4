@@ -40548,19 +40548,33 @@ static int g_wread_on;
 /* Routed experts are not matrices in the table above: a block selects six of
  * 384 a row, and what matters is how many of the K*6 selections are distinct. */
 static uint64_t g_wread_routed_sel, g_wread_routed_uniq, g_wread_routed_layers;
+/* How many rows chose each expert, not the average of that. The average cannot
+ * decide a tile: 1.83 rows an expert is consistent with everything being a
+ * singleton plus a few heavily shared, and with half the assignments sitting
+ * in pairs. g_wread_mult[j] counts assignments whose expert was chosen by j+1
+ * rows, so the BR each one could take is read off directly. */
+static uint64_t g_wread_mult[DS4_TP_BATCH_MAX_ROWS];
 
 int g_wread_on_probe(void) { return g_wread_on; }
 
 static void ds41_wread_note_route(const int32_t *ids, uint32_t rows, uint32_t used) {
     if (!g_wread_on || !ids) return;
-    bool seen[DS4_MAX_EXPERT] = { false };
+    static uint8_t mult[DS4_MAX_EXPERT];
+    memset(mult, 0, sizeof(mult));
     uint32_t uniq = 0;
     for (uint32_t r = 0; r < rows; r++)
         for (uint32_t j = 0; j < used; j++) {
             const int32_t id = ids[r * DS4_MAX_EXPERT_USED + j];
             if (id < 0 || (uint32_t)id >= DS4_N_EXPERT) continue;
-            if (!seen[id]) { seen[id] = true; uniq++; }
+            if (!mult[id]) uniq++;
+            if (mult[id] < 255) mult[id]++;
         }
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        if (!mult[e]) continue;
+        const uint32_t mu = mult[e] > DS4_TP_BATCH_MAX_ROWS ?
+            DS4_TP_BATCH_MAX_ROWS : mult[e];
+        g_wread_mult[mu - 1u] += mu;   /* assignments, not experts */
+    }
     g_wread_routed_sel += (uint64_t)rows * used;
     g_wread_routed_uniq += uniq;
     g_wread_routed_layers++;
@@ -40596,6 +40610,7 @@ static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br) {
 
 static void ds41_wread_begin(void) {
     memset(g_wread, 0, sizeof(g_wread));
+    memset(g_wread_mult, 0, sizeof(g_wread_mult));
     g_wread_routed_sel = g_wread_routed_uniq = g_wread_routed_layers = 0;
     g_wread_on = 1;
 }
@@ -40760,6 +40775,21 @@ static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
                 100.0 * (1.0 - (double)g_wread_routed_uniq / (double)g_wread_routed_sel),
                 (double)g_wread_routed_sel * per_expert / 1e9,
                 (double)g_wread_routed_uniq * per_expert / 1e9);
+        uint64_t tot = 0, br2 = 0, br4 = 0;
+        for (uint32_t j = 0; j < DS4_TP_BATCH_MAX_ROWS; j++) tot += g_wread_mult[j];
+        for (uint32_t j = 1; j < DS4_TP_BATCH_MAX_ROWS; j++) br2 += g_wread_mult[j];
+        for (uint32_t j = 3; j < DS4_TP_BATCH_MAX_ROWS; j++) br4 += g_wread_mult[j];
+        fprintf(stderr, "ds4:   multiplicity of an assignment's expert "
+                "(share of all %llu assignments):\n", (unsigned long long)tot);
+        for (uint32_t j = 0; j < DS4_TP_BATCH_MAX_ROWS; j++) {
+            if (!g_wread_mult[j]) continue;
+            fprintf(stderr, "ds4:     chosen by %u row%s: %8llu  %5.1f%%\n",
+                    j + 1u, j ? "s" : " ", (unsigned long long)g_wread_mult[j],
+                    tot ? 100.0 * (double)g_wread_mult[j] / (double)tot : 0.0);
+        }
+        fprintf(stderr, "ds4:     BR>=2 eligible %5.1f%%, BR>=4 eligible %5.1f%%\n",
+                tot ? 100.0 * (double)br2 / (double)tot : 0.0,
+                tot ? 100.0 * (double)br4 / (double)tot : 0.0);
     }
     fprintf(stderr,
             "ds4:   distinct %.3f GB, scanned %.3f GB (%.2fx), floor at one scan %.3f GB, "
