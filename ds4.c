@@ -41991,6 +41991,14 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
  * at the same two points in the ordinary loop and in the gated one, so the
  * first place the two runs disagree can be named rather than guessed at.
  * DS4_METAL_V41_GATE_TRACE=<layer>, first eight tokens only. */
+/* Reads GPU memory while the caller has only encoded the layer, so what it
+ * prints is a token or a segment behind - "in" and "out" come out identical
+ * for the first token because of it. Draining first makes the values current
+ * and changes the answer: with a drain per layer this model produced
+ * 11f8569e where the same build without it produced c6453f19. A probe that
+ * moves the thing it measures is the trap this branch has already paid for
+ * once; use a comparator that reads at a sync point the path performs anyway.
+ */
 static void ds41_gate_trace(ds41_gpu_graph *g, uint32_t il, const char *where) {
     static int want = -2;
     if (want == -2) {
@@ -44130,6 +44138,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     /* Which part of a k-row step actually grows with k. Splitting it costs a
      * command buffer boundary per stage, so the totals run high; the shares
      * between them are the point. */
+    /* DS4_METAL_V41_BATCH_SCAFFOLD=1 keeps the batch arena, the row views, the
+     * positions and the Engram uploads, and runs every layer through the
+     * single-row path instead of the batched stages. It is the control this
+     * path did not have: if it matches a single-row run byte for byte, the
+     * scaffolding is sound and the fault is in one of the batched stages; if
+     * it does not, no amount of bisecting those stages will find it.
+     *
+     * The eleven DS4_METAL_DISABLE_V41_BATCH_* flags are not that control -
+     * most of them are read by the prefill sweep, not here, and turning all
+     * of them on leaves this function's stages running. */
+    static int scaffold_env = -1;
+    if (scaffold_env < 0) {
+        const char *e = getenv("DS4_METAL_V41_BATCH_SCAFFOLD");
+        scaffold_env = e && e[0] ? atoi(e) != 0 : 0;
+    }
+    const bool scaffold = scaffold_env != 0;
     const bool stage_ms = getenv("DS4_V41_BATCH_STAGE_MS") != NULL;
     double stage_pre = 0, stage_attn = 0, stage_moe = 0, stage_mark = 0;
     if (stage_ms) {
@@ -44156,6 +44180,31 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     engram && (uint32_t)i < prefill_rows ? engram[i][table] : s->rows[table],
                     sizeof(s->rows[table]));
             }
+        }
+        if (scaffold) {
+            /* Whole layer a row, through the path the single-stream reference
+             * uses. The row slot keeps the routed scratch apart, which is the
+             * one thing the single-row path does not do for itself. */
+            for (int i = 0; ok && i < count; i++) {
+                ds41_gpu_graph row = *graphs[i];
+                row.pos = positions[i];
+#define DS41_SCAFFOLD_ROW(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_SCAFFOLD_ROW)
+#undef DS41_SCAFFOLD_ROW
+                row.q = queries[i];
+                row.heads = heads[i];
+                ok = ds4_gpu_routed_moe_set_row_slot((uint32_t)i) != 0 &&
+                     ds41_graph_layer(&row, model, l, il, tokens[i]);
+                /* The same per-layer hashes the single-row path prints, so the
+                 * two runs can be compared at a layer boundary rather than at
+                 * the token that first diverges. Row 0 only: a second row's
+                 * lines would interleave with it. */
+                if (ok && i == 0) ds41_gate_trace(&row, il, "bat");
+            }
+            (void)ds4_gpu_routed_moe_set_row_slot(0);
+            DS41_BSTAGE(stage_moe);
+            if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+            continue;
         }
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
