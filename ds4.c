@@ -45539,6 +45539,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                  * is what perfect expert sharing is worth, measured instead of
                  * derived from a byte count - which is the conversion that
                  * misled this work once already.
+                 * Scope, from the same run's cache line: 720 hits, 0.00
+                 * misses and 0.00 evictions a token, 5791 of 7930 entries
+                 * live. Every expert was resident, so what this prices is
+                 * duplicate reads of already-resident weights. It says
+                 * nothing about a regime that misses, which is the regime the
+                 * lease and MTLIO work was aimed at.
                  * DS4_METAL_V41_MOE_SAME_EXPERTS=1. */
                 const char *same_e = getenv("DS4_METAL_V41_MOE_SAME_EXPERTS");
                 if (ok && same_e && same_e[0] && atoi(same_e) != 0) {
