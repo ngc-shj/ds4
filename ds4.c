@@ -40165,6 +40165,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(index_scores, DS41_INDEX_BATCH * g->ctx) X(selected_comp, DS4_N_INDEXER_TOP_K) \
     X(index_packed, ds4_gpu_dsv41_indexer_packed_bytes(g->ctx, g->prefill_cap) / 4u) \
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
+    X(block_selected_kv, (uint64_t)DS4_TP_BATCH_MAX_ROWS * \
+                         DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
     X(block_mask, (g->ctx + 7u) / 8u) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
@@ -44899,6 +44901,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         malloc(prefill_rows * sizeof(*engram)) : NULL;
     ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
+    ds4_gpu_tensor *gathers[DS4_TP_BATCH_MAX_ROWS] = {0};
     bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
@@ -44906,10 +44909,27 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     DS41_PREFILL_ROWS(DS41_SESSION_VIEW)
 #undef DS41_SESSION_VIEW
     const uint64_t head_bytes = (uint64_t)(DS4_N_HEAD / g->tp_world) * DS4_N_HEAD_DIM * sizeof(float);
+    /* Every row gathered its selected KV into the one g->selected_kv and then
+     * read it back, so row i+1's gather could not start until row i's
+     * attention had finished reading - eight rows serialised on one buffer.
+     * That is a hazard this implementation created, not a dependency the model
+     * has: the rows differ in which keys they select, not in the keys.
+     *
+     * DS4_METAL_V41_ROW_GATHER=1 gives each row its own slice. Same kernel,
+     * same inputs, different addresses, so the answer cannot move.
+     * DS4_TP_BATCH_MAX_ROWS x 512 selected x 512 wide is 8 MiB. */
+    const uint64_t gather_bytes =
+        (uint64_t)DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM * sizeof(float);
+    const char *row_gather_e = getenv("DS4_METAL_V41_ROW_GATHER");
+    const bool row_gather = row_gather_e && row_gather_e[0] && atoi(row_gather_e) != 0 &&
+                            g->block_selected_kv != NULL;
     for (int i = 0; ok && i < count; i++) {
         queries[i] = ds4_gpu_tensor_view(g->batch.q, (uint64_t)i * head_bytes, head_bytes);
         heads[i] = ds4_gpu_tensor_view(g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
-        ok = queries[i] && heads[i];
+        if (row_gather)
+            gathers[i] = ds4_gpu_tensor_view(g->block_selected_kv,
+                                             (uint64_t)i * gather_bytes, gather_bytes);
+        ok = queries[i] && heads[i] && (!row_gather || gathers[i]);
     }
     const float initial_pre[] = {1, 0, 0, 0};
     for (int i = 0; ok && i < count; i++) {
@@ -45083,6 +45103,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
+            if (row_gather) row.selected_kv = gathers[i];
             ok = ds41_attention(&row, model, l, il, true);
             if (stage_split_attn) DS41_BSTAGE(stage_attn);
             if (ok && !batch_attn_out) {
@@ -45267,6 +45288,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     for (int i = 0; i < count; i++) {
         ds4_gpu_tensor_free(queries[i]);
         ds4_gpu_tensor_free(heads[i]);
+        ds4_gpu_tensor_free(gathers[i]);
     }
     free(engram);
     return ok;
