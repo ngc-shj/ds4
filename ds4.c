@@ -45447,11 +45447,12 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     fprintf(stderr,
             "  median single    : %.2f ms/token\n"
             "  median %ld-row step: %.2f ms = %.2fx one single step\n"
+            "  perfect-draft ceiling: %.2f tok/s (100 tok/s requires <= %.2f ms/step)\n"
             "  marginal row cost: %.2f ms = %.0f%% of a standalone token\n"
             "  rollback         : %s\n"
             "  batch vs single  : %s (%ld rows checked)\n"
             "  break-even       : accept %.0f%% of drafted tokens to beat single\n",
-            sm, k, bm, bm / sm,
+            sm, k, bm, bm / sm, 1000.0 * (double)k / bm, 10.0 * (double)k,
             (bm - sm) / (double)(k - 1), 100.0 * (bm - sm) / (double)(k - 1) / sm,
             rollback_mismatch < 0 ? "reproduces its own output" : "DIVERGED",
             !checked ? "not run" :
