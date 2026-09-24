@@ -45359,6 +45359,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const bool block_levels = block_kv &&
                               (block_all || (block_lv_e && block_lv_e[0] &&
                                              atoi(block_lv_e) != 0));
+    const char *bak_e = getenv("DS4_METAL_V41_BLOCK_ATTN_K");
+    const bool block_attn_k = bak_e && bak_e[0] && atoi(bak_e) != 0;
     const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
     const bool low_batch = block_levels && g->tp_world == 1 &&
                            (block_all || (low_b_e && low_b_e[0] && atoi(low_b_e) != 0));
@@ -45580,7 +45582,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     }
                     /* =2 runs the same levels without the section, so a
                      * divergence separates the split from the concurrency. */
-                    const bool sec = ok && (!block_lv_e || atoi(block_lv_e) != 2) &&
+                    /* The K-wide attention is one ordered chain of its own -
+                     * mask fill, stage, attend, reduce - so it must not be
+                     * encoded into a concurrent section. It does not want one
+                     * either: collapsing K pipelines into one dispatch is the
+                     * point, not overlapping them. */
+                    const bool sec = ok && !block_attn_k &&
+                                     (!block_lv_e || atoi(block_lv_e) != 2) &&
                                      ds4_gpu_begin_concurrent_section() != 0;
                     static bool said_lv;
                     if (ok && !said_lv) { said_lv = true;
@@ -45595,7 +45603,32 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                 g->rows_view[i].selected_comp, nc, att) != 0;
                     }
                     DS41_LEVEL_BREAK();
-                    for (int ph = 1; ok && ph <= 5; ph++) {
+                    /* One dispatch for the block's K queries instead of K
+                     * pipelines of six. Each row keeps its own key range and
+                     * its own selection; the rows ride the kernel's batch
+                     * axis. DS4_METAL_V41_BLOCK_ATTN_K=1. */
+                    if (ok && block_attn_k) {
+                        uint32_t nr[DS4_TP_BATCH_MAX_ROWS], rs[DS4_TP_BATCH_MAX_ROWS];
+                        uint32_t ncv[DS4_TP_BATCH_MAX_ROWS];
+                        for (int i = 0; i < count; i++) {
+                            const uint32_t nc = (positions[i] + 1u) / ratio_l;
+                            ncv[i] = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
+                            const uint32_t avail = previous + (uint32_t)i + 1u;
+                            nr[i] = avail < 128u ? avail : 128u;
+                            rs[i] = avail - nr[i];
+                        }
+                        static bool said_k;
+                        if (!said_k) { said_k = true;
+                            fprintf(stderr, "ds4: V4.1 block attention, %u queries in one "
+                                    "dispatch\n", rows); }
+                        ok = ds4_gpu_attention_decode_heads_block_tensor(active.heads,
+                                model->map, model->size, sinks_off, active.q,
+                                g->raw_prefill, raw_cap, nr, rs,
+                                g->block_selected_kv, gather_bytes, ncv,
+                                heads_n, DS4_N_HEAD_DIM, rows) != 0;
+                        DS41_LEVEL_BREAK();
+                    }
+                    for (int ph = 1; ok && !block_attn_k && ph <= 5; ph++) {
                         for (int i = 0; ok && i < count; i++) {
                             const uint32_t nc = (positions[i] + 1u) / ratio_l;
                             const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
@@ -46029,6 +46062,74 @@ static void ds41_grouped_low_check(const ds4_model *m, const ds4_weights *w) {
  *
  * The rows here are contiguous, which an expert-major worklist's would not be,
  * so this prices the arithmetic and not the gather. DS4_V41_ROWTILE_CHECK=5. */
+/* Gate for a K-wide attention kernel. One dispatch for K queries needs one
+ * ne11 for all of them, so the rows have to be padded to a common key count
+ * and the padding masked. Whether that is free is not a matter of opinion: the
+ * kernel is specialised on has_kvpad and on nsg, both derived from n_keys, so
+ * padding a row to a multiple of 32 moves it to a different variant.
+ *
+ * This runs one query against n_keys and against n_keys padded up to the next
+ * multiple of 32 with the tail masked, and compares the head output. If they
+ * agree, a block can pad to a common width and stay canonical; if not, the
+ * K-wide form has to keep per-row key counts and take the rows on a batch axis
+ * instead. DS4_V41_ROWTILE_CHECK=6. */
+static void ds41_attn_pad_check(const ds4_model *m, const ds4_weights *w) {
+    const ds4_layer_weights *l = &w->layer[1];
+    const uint32_t n_head = DS4_N_HEAD, hd = DS4_N_HEAD_DIM;
+    const uint32_t n_raw = 96, raw_cap = 128;
+    for (uint32_t n_comp = 17; n_comp <= 41u; n_comp += 12u) {
+        const uint32_t keys = n_raw + n_comp;
+        const uint32_t pad_to = (keys + 31u) / 32u * 32u;
+        const uint32_t extra = pad_to - keys;
+        const uint64_t qb = (uint64_t)n_head * hd * sizeof(float);
+        const uint64_t rawb = (uint64_t)raw_cap * hd * sizeof(float);
+        const uint64_t cb2 = (uint64_t)(n_comp + extra) * hd * sizeof(float);
+        ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(qb);
+        ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(rawb);
+        ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(cb2);
+        ds4_gpu_tensor *mask = ds4_gpu_tensor_alloc((uint64_t)(n_comp + extra) * sizeof(float));
+        ds4_gpu_tensor *h0 = ds4_gpu_tensor_alloc(qb), *h1 = ds4_gpu_tensor_alloc(qb);
+        float *hq = malloc((size_t)qb), *hraw = malloc((size_t)rawb);
+        float *hc = malloc((size_t)cb2), *hm = malloc((size_t)(n_comp + extra) * sizeof(float));
+        float *a = malloc((size_t)qb), *b = malloc((size_t)qb);
+        if (!q || !raw || !comp || !mask || !h0 || !h1 || !hq || !hraw || !hc || !hm || !a || !b)
+            goto next;
+        for (uint64_t i = 0; i < qb / 4; i++) hq[i] = 0.01f * (float)((i * 2654435761u >> 9) % 199 - 99);
+        for (uint64_t i = 0; i < rawb / 4; i++) hraw[i] = 0.01f * (float)((i * 40503u >> 7) % 199 - 99);
+        for (uint64_t i = 0; i < cb2 / 4; i++) hc[i] = 0.01f * (float)((i * 2246822519u >> 11) % 199 - 99);
+        for (uint32_t i = 0; i < n_comp + extra; i++) hm[i] = i < n_comp ? 0.0f : -INFINITY;
+        if (!ds4_gpu_tensor_write(q, 0, hq, qb) || !ds4_gpu_tensor_write(raw, 0, hraw, rawb) ||
+            !ds4_gpu_tensor_write(comp, 0, hc, cb2) ||
+            !ds4_gpu_tensor_write(mask, 0, hm, (uint64_t)(n_comp + extra) * sizeof(float))) goto next;
+        const uint64_t sinks = l->attn_sinks->abs_offset;
+        const bool ok0 = ds4_gpu_begin_commands() &&
+            ds4_gpu_attention_decode_heads_tensor(h0, m->map, m->size, sinks, q, raw,
+                n_raw, raw_cap, 0, comp, 0, n_comp, mask, 1, n_head, hd) &&
+            ds4_gpu_end_commands() && ds4_gpu_tensor_read(h0, 0, a, qb);
+        const bool ok1 = ds4_gpu_begin_commands() &&
+            ds4_gpu_attention_decode_heads_tensor(h1, m->map, m->size, sinks, q, raw,
+                n_raw, raw_cap, 0, comp, 0, n_comp + extra, mask, 1, n_head, hd) &&
+            ds4_gpu_end_commands() && ds4_gpu_tensor_read(h1, 0, b, qb);
+        if (!ok0 || !ok1) { fprintf(stderr, "ds4:   keys=%u refused\n", keys); goto next; }
+        uint64_t differ = 0, first = UINT64_MAX;
+        for (uint64_t i = 0; i < qb / 4; i++)
+            if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                differ++; if (first == UINT64_MAX) first = i;
+            }
+        fprintf(stderr, "ds4:   keys %u -> %u (+%u masked): %s",
+                keys, pad_to, extra, differ ? "DIVERGED" : "identical");
+        if (differ)
+            fprintf(stderr, " (%llu of %llu, first %llu: %.9g vs %.9g)",
+                    (unsigned long long)differ, (unsigned long long)(qb / 4),
+                    (unsigned long long)first, (double)a[first], (double)b[first]);
+        fprintf(stderr, "\n");
+    next:
+        free(hq); free(hraw); free(hc); free(hm); free(a); free(b);
+        ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(comp);
+        ds4_gpu_tensor_free(mask); ds4_gpu_tensor_free(h0); ds4_gpu_tensor_free(h1);
+    }
+}
+
 static void ds41_iq2_br_check(const ds4_model *m, const ds4_weights *w) {
     const ds4_layer_weights *l = &w->layer[1];
     const ds4_tensor *g = l->ffn_gate_exps, *u = l->ffn_up_exps;
@@ -46227,6 +46328,10 @@ static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
 static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
     const char *env = getenv("DS4_V41_ROWTILE_CHECK");
     if (!env || !env[0] || atoi(env) == 0) return;
+    if (atoi(env) >= 6) {
+        fprintf(stderr, "ds4: masked padding against the unpadded key count:\n");
+        ds41_attn_pad_check(m, w); return;
+    }
     if (atoi(env) >= 5) { ds41_iq2_br_check(m, w); return; }
     if (atoi(env) >= 4) { ds41_grouped_low_check(m, w); return; }
     if (atoi(env) >= 3) { ds41_rowtile_sweep(m, w); return; }
