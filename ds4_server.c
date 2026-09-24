@@ -13251,10 +13251,22 @@ static void *decode_worker_main(void *arg) {
             for (int i = 0; i < count; i++) ds4_session_invalidate(items[i].session);
         pthread_mutex_unlock(&s->inference_mu);
         if (log_batches) {
+            /* Which slot sits in which row, and at what position. A row-index
+             * fault in the batched path shows up as one request's output being
+             * wrong while the other's is right, and without this the row a
+             * request occupied is not recoverable from the log - arrival order
+             * is not it, because the slot is chosen by score. */
+            char rowbuf[256];
+            int n = 0;
+            for (int i = 0; i < count && n < (int)sizeof(rowbuf) - 24; i++) {
+                const int slot_id = (int)(members[i] - s->slots);
+                n += snprintf(rowbuf + n, sizeof(rowbuf) - (size_t)n,
+                              "%srow%d=slot%d", i ? " " : "", i, slot_id);
+            }
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s",
+                       "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s %s",
                        count, (now_sec() - batch_t0) * 1000.0,
-                       rc == 0 ? "ok" : "error");
+                       rc == 0 ? "ok" : "error", rowbuf);
         }
 
         pthread_mutex_lock(&s->model_mu);
