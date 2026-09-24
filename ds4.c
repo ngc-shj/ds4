@@ -45231,8 +45231,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * DS4_TP_BATCH_MAX_ROWS x 512 selected x 512 wide is 8 MiB. */
     const uint64_t gather_bytes =
         (uint64_t)DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM * sizeof(float);
+    /* One switch for the whole block executor, so the paired A/B can price it
+     * against the per-row executor inside a single process. The individual
+     * flags stay for bisecting; this is what a measurement of "the block
+     * executor" has to alternate, because alternating them one at a time
+     * prices pieces that are each below the noise. */
+    const char *block_all_e = getenv("DS4_METAL_V41_BLOCK");
+    const bool block_all = block_all_e && block_all_e[0] && atoi(block_all_e) != 0;
     const char *row_gather_e = getenv("DS4_METAL_V41_ROW_GATHER");
-    const bool row_gather = row_gather_e && row_gather_e[0] && atoi(row_gather_e) != 0 &&
+    const bool row_gather = (block_all ||
+                             (row_gather_e && row_gather_e[0] && atoi(row_gather_e) != 0)) &&
                             g->block_selected_kv != NULL;
     for (int i = 0; ok && i < count; i++) {
         queries[i] = ds4_gpu_tensor_view(g->batch.q, (uint64_t)i * head_bytes, head_bytes);
@@ -45286,13 +45294,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * the order the rows ran in. */
     const char *block_kv_e = getenv("DS4_METAL_V41_BLOCK_KV");
     const bool block_kv = block_ok && !block_attn &&
-                          block_kv_e && block_kv_e[0] && atoi(block_kv_e) != 0;
+                          (block_all || (block_kv_e && block_kv_e[0] && atoi(block_kv_e) != 0));
     const char *block_lv_e = getenv("DS4_METAL_V41_BLOCK_LEVELS");
-    const bool block_levels = block_kv && block_lv_e && block_lv_e[0] &&
-                              atoi(block_lv_e) != 0;
+    const bool block_levels = block_kv &&
+                              (block_all || (block_lv_e && block_lv_e[0] &&
+                                             atoi(block_lv_e) != 0));
     const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
     const bool low_batch = block_levels && g->tp_world == 1 &&
-                           low_b_e && low_b_e[0] && atoi(low_b_e) != 0;
+                           (block_all || (low_b_e && low_b_e[0] && atoi(low_b_e) != 0));
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     /* Which part of a k-row step actually grows with k. Splitting it costs a
      * command buffer boundary per stage, so the totals run high; the shares
@@ -45505,7 +45514,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     }
                     /* =2 runs the same levels without the section, so a
                      * divergence separates the split from the concurrency. */
-                    const bool sec = ok && atoi(block_lv_e) != 2 &&
+                    const bool sec = ok && (!block_lv_e || atoi(block_lv_e) != 2) &&
                                      ds4_gpu_begin_concurrent_section() != 0;
                     static bool said_lv;
                     if (ok && !said_lv) { said_lv = true;
@@ -46190,6 +46199,14 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     double *single_b = malloc((size_t)rounds * sizeof(double));
     double *batch = malloc((size_t)rounds * sizeof(double));
     double *batch_b = malloc((size_t)rounds * sizeof(double));
+    /* The reference pass's whole logits, so the batch pass can be compared
+     * against them instead of against its own argmax. Argmax has been too
+     * coarse three times in this work, and comparing two dump files only says
+     * two configurations agree - which they can while both disagree with a
+     * single row. 33 MB at k=8. */
+    float *refbuf = malloc((size_t)steps * DS4_N_VOCAB * sizeof(float));
+    long logit_mismatch = -1; uint64_t logit_elems = 0;
+    uint32_t logit_first_v = 0; float logit_a = 0, logit_b = 0;
     if (!lg || !rowbuf || !tok || !refgap || !tok2 || !single || !single_b || !batch ||
         !batch_b) goto done;
     /* Isolating the rollback: with no batch pass in between, a divergence can
@@ -46272,6 +46289,10 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     for (long i = 0; ok && i < steps; i++) {
         ok = ds41_graph_step(g, m, w, tok[i], lg);
         if (ok) DS41_SELFTEST_TOP2(lg, tok[i + 1], refgap[i + 1]);
+        /* Keep the reference logits, not just its argmax. */
+        if (ok && refbuf)
+            memcpy(refbuf + (size_t)i * DS4_N_VOCAB, lg,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
     }
     if (noreadback) {
         ds4_gpu_moe_selected_capture_stop();
@@ -46318,11 +46339,29 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
             else { (void)ds4_gpu_synchronize(); break; } \
             for (long j = 0; j < k; j++) { \
                 int arg = 0; \
-                DS41_SELFTEST_ARGMAX(rowbuf + (size_t)j * DS4_N_VOCAB, arg); \
+                const float *_row = rowbuf + (size_t)j * DS4_N_VOCAB; \
+                DS41_SELFTEST_ARGMAX(_row, arg); \
                 checked++; \
                 if (batch_mismatch < 0 && arg != tok[b * k + j + 1]) { \
                     batch_mismatch = b * k + j; \
                     batch_gap = refgap[b * k + j + 1]; \
+                } \
+                /* The whole logits, not the argmax. A block that verifies has \
+                 * to reproduce what a single row decided, and argmax has \
+                 * reported "identical" over a difference in every position \
+                 * three times in this work. Comparing two dump files is no \
+                 * better: both can agree and both disagree with a single row. */ \
+                if (refbuf) { \
+                    const float *_ref = refbuf + (size_t)(b * k + j) * DS4_N_VOCAB; \
+                    for (uint32_t _v = 0; _v < DS4_N_VOCAB; _v++) \
+                        if (memcmp(&_row[_v], &_ref[_v], sizeof(float)) != 0) { \
+                            logit_elems++; \
+                            if (logit_mismatch < 0) { \
+                                logit_mismatch = b * k + j; \
+                                logit_first_v = _v; \
+                                logit_a = _ref[_v]; logit_b = _row[_v]; \
+                            } \
+                        } \
                 } \
             } \
         } \
@@ -46464,6 +46503,26 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                     batch_mismatch, (double)batch_gap);
         goto done;
     }
+    /* Control for the instrument itself: a second single pass, compared
+     * against the stored reference the same way the batch pass is. If two
+     * single passes disagree here, the comparison is measuring something other
+     * than batch against single and nothing it says can be trusted. */
+    if (refbuf) {
+        DS41_SELFTEST_REWIND();
+        uint64_t ctrl = 0;
+        for (long i = 0; ok && i < steps; i++) {
+            ok = ds41_graph_step(g, m, w, tok[i], lg);
+            if (!ok) break;
+            const float *ref = refbuf + (size_t)i * DS4_N_VOCAB;
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                if (memcmp(&lg[v], &ref[v], sizeof(float)) != 0) ctrl++;
+        }
+        fprintf(stderr, "ds4: selftest control: a second single pass differs from the "
+                "reference in %llu of %llu logits\n",
+                (unsigned long long)ctrl,
+                (unsigned long long)((uint64_t)steps * DS4_N_VOCAB));
+        DS41_SELFTEST_REWIND();
+    }
     if (getenv("DS4_V41_WEIGHT_READS")) {
         ds41_wread_begin();
         if (ds4_gpu_begin_commands() &&
@@ -46497,6 +46556,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
             "  marginal row cost: %.2f ms = %.0f%% of a standalone token\n"
             "  rollback         : %s\n"
             "  batch vs single  : %s (%ld rows checked)\n"
+            "  batch logits     : %s\n"
             "  break-even       : accept %.0f%% of drafted tokens to beat single\n",
             sm, k, bm, bm / sm, 1000.0 * (double)k / bm, 10.0 * (double)k,
             (double)k * sm / bm, k, sm / 10.0,
@@ -46505,9 +46565,17 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
             rollback_mismatch < 0 ? "reproduces its own output" : "DIVERGED",
             !checked ? "not run" :
                 batch_mismatch < 0 ? "identical argmax" : "DIVERGED", checked,
+            !refbuf ? "not compared" :
+                logit_mismatch < 0 ? "identical to the single pass" :
+                                     "DIVERGED from the single pass",
             100.0 * bm / sm / (double)k);
     /* A divergence where the reference itself was a near tie says the greedy
      * pick flipped, not that the path is wrong. */
+    if (logit_mismatch >= 0)
+        fprintf(stderr, "  batch logits first differ at offset %ld, vocab %u: "
+                "single %.9g, batch %.9g (%llu elements over %ld rows)\n",
+                logit_mismatch, logit_first_v, (double)logit_a, (double)logit_b,
+                (unsigned long long)logit_elems, checked);
     if (rollback_mismatch >= 0)
         fprintf(stderr, "  rollback first diverged at offset %ld, "
                 "where the reference led second place by %.6g\n",
@@ -46526,7 +46594,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
 done:
     g->pos = pos0; g->history = hist0; g->valid = true;
     free(lg); free(rowbuf); free(tok); free(refgap); free(tok2); free(single);
-    free(single_b); free(batch); free(batch_b); free(carry);
+    free(single_b); free(batch); free(batch_b); free(refbuf); free(carry);
 }
 
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
