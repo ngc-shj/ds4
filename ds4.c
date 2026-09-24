@@ -40549,6 +40549,8 @@ static int g_wread_on;
  * 384 a row, and what matters is how many of the K*6 selections are distinct. */
 static uint64_t g_wread_routed_sel, g_wread_routed_uniq, g_wread_routed_layers;
 
+int g_wread_on_probe(void) { return g_wread_on; }
+
 static void ds41_wread_note_route(const int32_t *ids, uint32_t rows, uint32_t used) {
     if (!g_wread_on || !ids) return;
     bool seen[DS4_MAX_EXPERT] = { false };
@@ -42548,6 +42550,23 @@ static bool ds41_route_batch(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+/* The routed ledger's reader for the batched path. The per-row path reads the
+ * selected ids back anyway; this one does not, so it costs a drain and only
+ * runs while the ledger is on. */
+static bool ds41_wread_note_route_batch(ds41_prefill_row *b, uint32_t count) {
+    extern int g_wread_on_probe(void);
+    if (!g_wread_on_probe() || !b->selected) return true;
+    int32_t ids[DS4_TP_BATCH_MAX_ROWS][DS4_MAX_EXPERT_USED] = {{0}};
+    if (count > DS4_TP_BATCH_MAX_ROWS) return true;
+    if (!ds4_gpu_end_commands()) return false;
+    for (uint32_t i = 0; i < count; i++)
+        (void)ds4_gpu_tensor_read(b->selected,
+            (uint64_t)i * DS4_N_EXPERT_USED * sizeof(int32_t), ids[i],
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t));
+    ds41_wread_note_route(&ids[0][0], count, DS4_N_EXPERT_USED);
+    return ds4_gpu_begin_commands() != 0;
+}
+
 static bool ds41_moe_split_note(bool enabled, double *t0, uint32_t il,
                                 uint32_t count, const char *label) {
     if (!enabled) return true;
@@ -42578,6 +42597,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     }
     return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count) &&
+        ds41_wread_note_route_batch(b, count) &&
         ds41_moe_split_note(split_ms, &split_t0, il, count, "router") &&
         ((shared_owner && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
