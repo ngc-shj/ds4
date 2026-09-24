@@ -44953,16 +44953,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * projection. That costs two more command-buffer boundaries a row, so the
      * total inflates further and only the split's own ratio is readable. */
     const bool stage_split_attn = stage_ms && stage_env[0] == '2';
-    /* The per-row attention loop ends in attn_output_b, an 8192x5120 Q8 weight
-     * that every row reads separately - the rows differ in their activations
-     * and not in that weight. Hoisting it out of the loop leaves the attention
-     * core per row and sends one exact-rows matmul for the batch, which is the
-     * same kernel the vocabulary head was moved to in 6c25a41.
-     * DS4_METAL_V41_BATCH_ATTN_OUT=1, default off.
+    /* The per-row attention loop ended in attn_output_b, dispatched once a row.
+     * Sending one exact-rows matmul for the batch instead is faster in both
+     * ABBA orders and identical byte for byte at two, four and eight rows.
+     *
+     * What it is NOT is weight reuse: the exact decode-rows kernel puts the
+     * batch row on the grid's Y axis and every row still reads the whole
+     * weight - metal/dense.metal says so where it defines the fused kernel
+     * that does reuse it, and that one is a different path (HEAD_ROW_TILE,
+     * DENSE_ROW_TILE) which regressed when it was tried here. What is
+     * established is only that one dispatch beats eight; whether that is the
+     * dispatch count, the rows being resident together, or coalescing, this
+     * measurement does not say.
+     *
+     * DS4_METAL_V41_BATCH_ATTN_OUT=0 goes back to the per-row loop.
      * Read on every call and not cached: the selftest's in-process A/B sets and
      * unsets it between arms, and a static would hand both arms the same one. */
     const char *attn_out_e = getenv("DS4_METAL_V41_BATCH_ATTN_OUT");
-    const bool batch_attn_out = attn_out_e && attn_out_e[0] && atoi(attn_out_e) != 0 &&
+    const bool batch_attn_out = (!attn_out_e || !attn_out_e[0] || atoi(attn_out_e) != 0) &&
                                 g->tp_world == 1;
     double stage_pre = 0, stage_attn = 0, stage_attn_out = 0, stage_moe = 0, stage_mark = 0;
     if (stage_ms) {
@@ -45030,6 +45038,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true);
             if (stage_split_attn) DS41_BSTAGE(stage_attn);
+            if (ok && !batch_attn_out) {
+                static bool said_loop;
+                if (!said_loop) { said_loop = true;
+                    fprintf(stderr, "ds4: V4.1 batch attn_output_b dispatched per "
+                            "row (%u rows)\n", rows); }
+            }
             if (ok) ok = batch_attn_out ? ds41_attention_low(&row, model, l)
                                         : ds41_attention_output(&row, model, l, false);
             if (stage_split_attn) DS41_BSTAGE(stage_attn_out);
@@ -45037,6 +45051,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         if (ok && batch_attn_out) {
             /* Say so the first time each arm engages: an A/B on a variable the
              * code did not read is noise wearing a result's clothes. */
+            /* Both arms leave a mark. The default is on, so an A/B on this
+             * flag has to be written DS4_..._BATCH_ATTN_OUT=0 - unsetting it
+             * selects the hoist, not the loop, and two arms that both say
+             * "hoisted" are one arm. */
             static bool said;
             if (!said) { said = true;
                 fprintf(stderr, "ds4: V4.1 batch attn_output_b hoisted out of the "
@@ -45390,52 +45408,52 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         single[r] = (now_sec() - t0) * 1000.0 / (double)steps;
         DS41_SELFTEST_REWIND();
 
-        t0 = now_sec();
-        for (long b = 0; ok && !nobatch && b < blocks; b++) {
-            ok = ds4_gpu_begin_commands() &&
-                 ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k,
-                                              m, w, rowbuf);
-            if (ok) ok = ds4_gpu_end_commands() != 0;
-            else { (void)ds4_gpu_synchronize(); break; }
-            for (long j = 0; j < k; j++) {
-                int arg = 0;
-                DS41_SELFTEST_ARGMAX(rowbuf + (size_t)j * DS4_N_VOCAB, arg);
-                checked++;
-                if (batch_mismatch < 0 && arg != tok[b * k + j + 1]) {
-                    batch_mismatch = b * k + j;
-                    batch_gap = refgap[b * k + j + 1];
-                }
-            }
-        }
-        batch[r] = (now_sec() - t0) * 1000.0 / (double)steps;
-        DS41_SELFTEST_REWIND();
+#define DS41_SELFTEST_BATCH_PASS(dst) do { \
+        const double _bt0 = now_sec(); \
+        for (long b = 0; ok && !nobatch && b < blocks; b++) { \
+            ok = ds4_gpu_begin_commands() && \
+                 ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k, \
+                                              m, w, rowbuf); \
+            if (ok) ok = ds4_gpu_end_commands() != 0; \
+            else { (void)ds4_gpu_synchronize(); break; } \
+            for (long j = 0; j < k; j++) { \
+                int arg = 0; \
+                DS41_SELFTEST_ARGMAX(rowbuf + (size_t)j * DS4_N_VOCAB, arg); \
+                checked++; \
+                if (batch_mismatch < 0 && arg != tok[b * k + j + 1]) { \
+                    batch_mismatch = b * k + j; \
+                    batch_gap = refgap[b * k + j + 1]; \
+                } \
+            } \
+        } \
+        (dst) = (now_sec() - _bt0) * 1000.0 / (double)steps; \
+        DS41_SELFTEST_REWIND(); \
+    } while (0)
 
+        if (!bab || nobatch) DS41_SELFTEST_BATCH_PASS(batch[r]);
+
+        /* True ABBA, and not A-then-B every round. The rewind restores the
+         * session, not the expert cache, so whichever arm runs second starts
+         * warmer - a fixed order hands that advantage to the same arm every
+         * time and the bias lands entirely in the result. Alternating by round
+         * parity lets the two orders be reported separately: a change that is
+         * positive in both is a change, and one that is positive in only one
+         * is the cache. (DS4_V41_VERIFY_SELFTEST_AB, against the single-token
+         * path, still has the fixed order this replaced.) */
         if (bab && !nobatch) {
             char bab_name[128] = {0};
             const char *eq = strchr(bab, '=');
             const size_t nlen = eq ? (size_t)(eq - bab) : strlen(bab);
             snprintf(bab_name, sizeof(bab_name), "%.*s", (int)nlen, bab);
-            setenv(bab_name, eq ? eq + 1 : "1", 1);
-            t0 = now_sec();
-            for (long b = 0; ok && b < blocks; b++) {
-                ok = ds4_gpu_begin_commands() &&
-                     ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k,
-                                                  m, w, rowbuf);
-                if (ok) ok = ds4_gpu_end_commands() != 0;
-                else { (void)ds4_gpu_synchronize(); break; }
-                for (long j = 0; j < k; j++) {
-                    int arg = 0;
-                    DS41_SELFTEST_ARGMAX(rowbuf + (size_t)j * DS4_N_VOCAB, arg);
-                    checked++;
-                    if (batch_mismatch < 0 && arg != tok[b * k + j + 1]) {
-                        batch_mismatch = b * k + j;
-                        batch_gap = refgap[b * k + j + 1];
-                    }
-                }
-            }
-            batch_b[r] = (now_sec() - t0) * 1000.0 / (double)steps;
+            const char *bab_val = eq ? eq + 1 : "1";
+            const bool set_first = (r & 1) != 0;
+            double *first = set_first ? &batch_b[r] : &batch[r];
+            double *second = set_first ? &batch[r] : &batch_b[r];
+            if (set_first) setenv(bab_name, bab_val, 1); else unsetenv(bab_name);
+            DS41_SELFTEST_BATCH_PASS(*first);
+            if (set_first) unsetenv(bab_name); else setenv(bab_name, bab_val, 1);
+            DS41_SELFTEST_BATCH_PASS(*second);
             unsetenv(bab_name);
-            DS41_SELFTEST_REWIND();
         }
 
         if (ab) {
@@ -45483,25 +45501,37 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     /* Printed before anything is sorted: a round's two arms are a pair, and
      * pairing a sorted array against an unsorted one is not a pair at all. */
     if (bab) {
-        double *ua = malloc((size_t)rounds * sizeof(double));
-        double *sa = malloc((size_t)rounds * sizeof(double));
+        /* Each round is a pair taken back to back, so the delta is per round.
+         * Reported before anything is sorted, and split by which arm ran first:
+         * the two orders disagreeing is the expert cache talking, not the
+         * change. */
+        double *da = malloc((size_t)rounds * sizeof(double));
+        double *db = malloc((size_t)rounds * sizeof(double));
+        long na = 0, nb = 0;
         for (long r = 0; r < rounds; r++) {
-            fprintf(stderr, "  round %ld: %s unset %.2f ms/step, set %.2f ms/step\n",
-                    r, bab, batch[r] * (double)k, batch_b[r] * (double)k);
-            if (ua) ua[r] = batch[r];
-            if (sa) sa[r] = batch_b[r];
+            const bool set_first = (r & 1) != 0;
+            const double u = batch[r] * (double)k, v = batch_b[r] * (double)k;
+            const double d = u > 0 ? 100.0 * (v - u) / u : 0;
+            fprintf(stderr, "  round %ld (%s first): %s unset %.2f ms/step, "
+                    "set %.2f ms/step (%+.1f%%)\n",
+                    r, set_first ? "set" : "unset", bab, u, v, d);
+            if (set_first) { if (db) db[nb++] = d; }
+            else if (da) da[na++] = d;
         }
-        if (ua && sa) {
-            qsort(ua, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
-            qsort(sa, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
-            const double um = ua[rounds / 2] * (double)k, sm2 = sa[rounds / 2] * (double)k;
-            fprintf(stderr,
-                    "  %s: median %.2f ms/step unset, %.2f set (%+.1f%%), "
-                    "perfect-draft ceiling %.2f -> %.2f tok/s\n",
-                    bab, um, sm2, 100.0 * (sm2 - um) / um,
-                    1000.0 * (double)k / um, 1000.0 * (double)k / sm2);
+        if (da && na) {
+            qsort(da, (size_t)na, sizeof(double), ds41_selftest_cmp);
+            fprintf(stderr, "  unset-first rounds (%ld): median %+.1f%%\n", na, da[na / 2]);
         }
-        free(ua); free(sa);
+        if (db && nb) {
+            qsort(db, (size_t)nb, sizeof(double), ds41_selftest_cmp);
+            fprintf(stderr, "  set-first rounds   (%ld): median %+.1f%%\n", nb, db[nb / 2]);
+        }
+        if (da && db && na && nb)
+            fprintf(stderr, "  %s: %s\n", bab,
+                    da[na / 2] < 0 && db[nb / 2] < 0 ? "faster in BOTH orders" :
+                    da[na / 2] > 0 && db[nb / 2] > 0 ? "slower in BOTH orders" :
+                    "the two orders DISAGREE - this is the cache, not the change");
+        free(da); free(db);
     }
     if (ab) {
         for (long r = 0; r < rounds; r++)
@@ -45562,6 +45592,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         fprintf(stderr, "  batch first diverged at offset %ld, "
                 "where the reference led second place by %.6g\n",
                 batch_mismatch, (double)batch_gap);
+#undef DS41_SELFTEST_BATCH_PASS
 #undef DS41_SELFTEST_TOP2
 #undef DS41_SELFTEST_ARGMAX
 #undef DS41_SELFTEST_CARRY_BYTES
