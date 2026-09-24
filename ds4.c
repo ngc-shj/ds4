@@ -45612,16 +45612,27 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         goto done;
     }
     qsort(batch, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
+    /* bm is the span of one block: begin_commands to the logits of all k rows.
+     * Summing the stages inside it answers a different question - what the
+     * work costs - and the work is not what a speculative block is waiting on.
+     *
+     * Width is k single steps over that span. It is 1.0 when the executor gets
+     * nothing from having k rows and k when the block costs what one token
+     * costs. 100 tok/s needs 10 ms a token, so the width it asks for is the
+     * single step in tens of milliseconds and nothing about k: a 36 ms token
+     * needs 3.6x however wide the block is. */
     const double sm = single[rounds / 2], bm = batch[rounds / 2] * (double)k;
     fprintf(stderr,
             "  median single    : %.2f ms/token\n"
             "  median %ld-row step: %.2f ms = %.2fx one single step\n"
             "  perfect-draft ceiling: %.2f tok/s (100 tok/s requires <= %.2f ms/step)\n"
+            "  block width      : %.2fx of %ld (needs %.2fx for 100 tok/s)\n"
             "  marginal row cost: %.2f ms = %.0f%% of a standalone token\n"
             "  rollback         : %s\n"
             "  batch vs single  : %s (%ld rows checked)\n"
             "  break-even       : accept %.0f%% of drafted tokens to beat single\n",
             sm, k, bm, bm / sm, 1000.0 * (double)k / bm, 10.0 * (double)k,
+            (double)k * sm / bm, k, sm / 10.0,
             (bm - sm) / (double)(k - 1), 100.0 * (bm - sm) / (double)(k - 1) / sm,
             rollback_mismatch < 0 ? "reproduces its own output" : "DIVERGED",
             !checked ? "not run" :
