@@ -40797,8 +40797,16 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * The head keeps its own gate: without EXACT_VOCAB_ROWS it goes to the
      * generic multi-row path, and turning the tile on for it would change what
      * the default produces rather than how fast it produces it. */
+    /* Tall matrices want the smaller tile. The cold sweep over all forty layers
+     * (DS4_V41_ROWTILE_CHECK=3) has BR=4 beating BR=1 on 8192x5120 and
+     * 5120x2304, and losing to it on 1280x32768 - 24.45 ms against 23.32 -
+     * while BR=2 wins there at 21.35. The head, 5120x129280, is the same
+     * shape of loss. Both have out_dim at least four times in_dim, where the
+     * grid is deep enough that holding four activation rows costs more
+     * occupancy than it saves in scans. A blanket BR=4 was wrong for them. */
+    const int shape_tile = (uint64_t)outputs >= 4ull * width ? 2 : 4;
     const int dense_tile = dense_tile_e && dense_tile_e[0] ? atoi(dense_tile_e) :
-        outputs != DS4_N_VOCAB ? 4 : (exact_vocab ? 2 : 0);
+        outputs != DS4_N_VOCAB ? shape_tile : (exact_vocab ? 2 : 0);
     if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
         (dense_tile == 2 || dense_tile == 4)) {
         ds41_wread_note_full(weight, count, (uint32_t)dense_tile, 1, round);
@@ -45862,9 +45870,116 @@ static int ds41_selftest_cmp(const void *a, const void *b) {
  * four and eight rows. rows=1 disagreeing is the kernel body; rows=1 agreeing
  * and rows=2 disagreeing is the batch loop or the output layout.
  */
+/* The physical column, as close as this can get without a counter. Hammering
+ * one matrix says nothing about DRAM: it fits in cache and reads back at twice
+ * the machine's bandwidth. Sweeping every layer's copy of the same tensor puts
+ * the working set past any cache - forty attn_output_b is 1.78 GB - so what
+ * comes back is a rate the memory system actually sustained, and the BR=1
+ * against BR=4 difference is traffic that was really saved rather than scans
+ * that were really counted.
+ *
+ * DS4_V41_ROWTILE_CHECK=3. */
+static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
+    const struct { const char *name; size_t off; } kinds[] = {
+        { "attn_output_b", offsetof(ds4_layer_weights, attn_output_b) },
+        { "shexp_gate",    offsetof(ds4_layer_weights, ffn_gate_shexp) },
+        { "attn_q_b",      offsetof(ds4_layer_weights, attn_q_b) },
+    };
+    /* 1.78 GB of distinct weight still came back above this machine's peak, so
+     * that sweep was still being served from cache. The block's own dense
+     * footprint is 8.7 GB; walk every layer's copy of every one of these, in
+     * one timed region, to ask the memory system a question it cannot answer
+     * out of cache. */
+    {
+        const uint32_t rows_all = 8;
+        for (uint32_t br = 1; br <= 4u; br *= 2u) {
+            double best = 0; uint64_t swept = 0, distinct = 0;
+            for (int lap = 0; lap < 2; lap++) {
+                uint64_t bytes = 0, dist = 0;
+                if (!ds4_gpu_begin_commands()) break;
+                const double t0s = now_sec();
+                for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+                    for (size_t ki = 0; ki < sizeof(kinds) / sizeof(kinds[0]); ki++) {
+                        const ds4_tensor *t = *(ds4_tensor *const *)
+                            ((const char *)&w->layer[il] + kinds[ki].off);
+                        if (!t || t->type != DS4_TENSOR_Q8_0) continue;
+                        const uint64_t iw = (uint64_t)t->dim[0], ow = (uint64_t)t->dim[1];
+                        ds4_gpu_tensor *xi = ds4_gpu_tensor_alloc((uint64_t)rows_all * iw * 4u);
+                        ds4_gpu_tensor *xo = ds4_gpu_tensor_alloc((uint64_t)rows_all * ow * 4u);
+                        if (xi && xo) {
+                            (void)(br == 1u
+                                ? ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(xo, m->map,
+                                      m->size, t->abs_offset, iw, ow, xi, rows_all)
+                                : ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(xo, m->map,
+                                      m->size, t->abs_offset, iw, ow, xi, rows_all, br));
+                            bytes += t->bytes * ((rows_all + br - 1u) / br);
+                            dist += t->bytes;
+                        }
+                        ds4_gpu_tensor_free(xi); ds4_gpu_tensor_free(xo);
+                    }
+                (void)ds4_gpu_end_commands();
+                const double ms = (now_sec() - t0s) * 1000.0;
+                if (lap && ms > 0) { best = ms; swept = bytes; distinct = dist; }
+            }
+            if (best > 0)
+                fprintf(stderr, "ds4:   %-14s BR=%u: %7.2f ms, %.3f GB distinct, "
+                        "%.3f GB of scans = %6.1f GB/s sustained\n",
+                        "all three", br, best, (double)distinct / 1e9,
+                        (double)swept / 1e9, (double)swept / (best / 1e3) / 1e9);
+        }
+    }
+    const uint32_t rows = 8;
+    fprintf(stderr, "ds4: cold sweep over all %u layers, rows=%u "
+            "(working set past cache):\n", DS4_N_LAYER, rows);
+    for (size_t ki = 0; ki < sizeof(kinds) / sizeof(kinds[0]); ki++) {
+        const ds4_tensor *t0 =
+            *(ds4_tensor *const *)((const char *)&w->layer[0] + kinds[ki].off);
+        if (!t0 || t0->type != DS4_TENSOR_Q8_0) continue;
+        const uint64_t width = (uint64_t)t0->dim[0], outputs = (uint64_t)t0->dim[1];
+        ds4_gpu_tensor *in = ds4_gpu_tensor_alloc((uint64_t)rows * width * sizeof(float));
+        ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)rows * outputs * sizeof(float));
+        float *host_in = malloc((size_t)rows * width * sizeof(float));
+        if (!in || !out || !host_in) { free(host_in);
+            ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(out); continue; }
+        for (uint64_t x = 0; x < (uint64_t)rows * width; x++) host_in[x] = 0.001f * (float)(x % 997);
+        (void)ds4_gpu_tensor_write(in, 0, host_in, (uint64_t)rows * width * sizeof(float));
+        for (uint32_t br = 1; br <= 4u; br *= 2u) {
+            double best = 0; uint64_t swept = 0;
+            for (int lap = 0; lap < 3; lap++) {
+                uint64_t bytes = 0;
+                if (!ds4_gpu_begin_commands()) break;
+                const double t0s = now_sec();
+                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                    const ds4_tensor *t =
+                        *(ds4_tensor *const *)((const char *)&w->layer[il] + kinds[ki].off);
+                    if (!t || t->type != DS4_TENSOR_Q8_0) continue;
+                    const int okk = br == 1u
+                        ? ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
+                              t->abs_offset, width, outputs, in, rows)
+                        : ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(out, m->map, m->size,
+                              t->abs_offset, width, outputs, in, rows, br);
+                    if (!okk) break;
+                    bytes += t->bytes * ((rows + br - 1u) / br);
+                }
+                (void)ds4_gpu_end_commands();
+                const double ms = (now_sec() - t0s) * 1000.0;
+                const double gbs = ms > 0 ? (double)bytes / (ms / 1e3) / 1e9 : 0.0;
+                if (lap && (best == 0 || ms < best)) { best = ms; swept = bytes; (void)gbs; }
+            }
+            if (best > 0)
+                fprintf(stderr, "ds4:   %-14s BR=%u: %7.2f ms for %.3f GB of scans "
+                        "= %6.1f GB/s sustained\n",
+                        kinds[ki].name, br, best, (double)swept / 1e9,
+                        (double)swept / (best / 1e3) / 1e9);
+        }
+        free(host_in); ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(out);
+    }
+}
+
 static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
     const char *env = getenv("DS4_V41_ROWTILE_CHECK");
     if (!env || !env[0] || atoi(env) == 0) return;
+    if (atoi(env) >= 3) { ds41_rowtile_sweep(m, w); return; }
     const ds4_layer_weights *l = &w->layer[0];
     const struct { const char *name; const ds4_tensor *t; } shapes[] = {
         { "attn_output_a", l->attn_output_a },
