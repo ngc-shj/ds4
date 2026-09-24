@@ -898,6 +898,20 @@ uint64_t ds4_gpu_expert_addr_generation(void);
 
 /* The same shape as the exact decode-rows matvec, through a kernel that reads
  * each weight block once for row_tile activation rows. row_tile is 2, 4 or 8. */
+/* Diagnostic: the iq2 gate/up pair with an activation-row tile of 1, 2 or 4.
+ * Takes BR contiguous rows; an expert-major worklist would take the rows that
+ * chose one expert. */
+int ds4_gpu_iq2_pair_br_tensor(
+        ds4_gpu_tensor       *dst_gate,
+        ds4_gpu_tensor       *dst_up,
+        const ds4_gpu_tensor *w_gate,
+        const ds4_gpu_tensor *w_up,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        uint32_t              br);
+
 int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

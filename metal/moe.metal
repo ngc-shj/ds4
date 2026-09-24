@@ -3256,6 +3256,196 @@ void kernel_mul_mv_iq2_xxs_pair_f32_impl(
     }
 }
 
+/* The pair gate/up matvec with an activation-row tile. The weight side - the
+ * grid lookup that is the iq2 dequantisation, the signs and the scale - is
+ * read once per output row and applied to BR activation rows, which is what an
+ * expert-major worklist needs: the rows that chose the same expert share the
+ * dequantisation instead of each repeating it.
+ *
+ * Arithmetic per (activation row, output row) is the single-row one - the same
+ * l and j order into the same private accumulator, the same dg/du applied at
+ * the same point - so a BR tile is bit-identical to BR separate calls, as the
+ * Q8 row tile is.
+ */
+template<int nr0, int BR>
+void kernel_mul_mv_iq2_xxs_pair_br_f32_impl(
+        ds4_metal_args_mul_mv args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int rb = tgpig.y * BR;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    device const block_iq2_xxs * xg = (device const block_iq2_xxs *) (src0_gate + offset0);
+    device const block_iq2_xxs * xu = (device const block_iq2_xxs *) (src0_up   + offset0);
+
+    /* A tile past the last activation row reads the last one and stores
+     * nothing, keeping the inner loop free of per-row branches. */
+    device const float * y[BR];
+    for (short b = 0; b < BR; ++b) {
+        const int r1 = rb + b < args.ne1 ? rb + b : args.ne1 - 1;
+        const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+        y[b] = (device const float *)(src1 + offset1);
+    }
+
+    float yl[BR][32];
+    float sumg[BR][nr0];
+    float sumu[BR][nr0];
+    for (short b = 0; b < BR; ++b)
+        for (short r = 0; r < nr0; ++r) { sumg[b][r] = 0.f; sumu[b][r] = 0.f; }
+
+    const int nb32 = nb * (QK_K / 32);
+
+    threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
+    threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
+    {
+        int nval = 4;
+        int pos  = (32*sgitg + tiisg)*nval;
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        nval = 2;
+        pos  = (32*sgitg + tiisg)*nval;
+        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ds4_metal_ksigns_iq2xs[pos+i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int ix = tiisg;
+    device const float * y4[BR];
+    for (short b = 0; b < BR; ++b) y4[b] = y[b] + 32 * ix;
+
+    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        for (short b = 0; b < BR; ++b)
+            for (short i = 0; i < 32; ++i) yl[b][i] = y4[b][i];
+
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+
+        device const block_iq2_xxs * xgr = xg + ibl;
+        device const block_iq2_xxs * xur = xu + ibl;
+        device const uint16_t * qg = xgr->qs + 4 * ib;
+        device const uint16_t * qu = xur->qs + 4 * ib;
+        device const half * dhg = &xgr->d;
+        device const half * dhu = &xur->d;
+
+        for (short row = 0; row < nr0; row++) {
+            device const uint8_t * aux8g = (device const uint8_t *)qg;
+            device const uint8_t * aux8u = (device const uint8_t *)qu;
+            const uint32_t aux32g = qg[2] | (qg[3] << 16);
+            const uint32_t aux32u = qu[2] | (qu[3] << 16);
+            const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+            const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+            float sg[BR];
+            float su[BR];
+            for (short b = 0; b < BR; ++b) { sg[b] = 0.f; su[b] = 0.f; }
+            for (short l = 0; l < 4; ++l) {
+                /* Read once, apply to every activation row in the tile. */
+                const threadgroup uint8_t * gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                const threadgroup uint8_t * gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                const uint8_t signg = ssigns[(aux32g >> 7*l) & 127];
+                const uint8_t signu = ssigns[(aux32u >> 7*l) & 127];
+                for (short b = 0; b < BR; ++b) {
+                    for (short j = 0; j < 8; ++j) {
+                        const float v = yl[b][8*l + j];
+                        sg[b] += v * gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        su[b] += v * gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    }
+                }
+            }
+            for (short b = 0; b < BR; ++b) {
+                sumg[b][row] += dg * sg[b];
+                sumu[b][row] += du * su[b];
+            }
+
+            dhg += args.nb01/2;
+            dhu += args.nb01/2;
+            qg  += args.nb01/2;
+            qu  += args.nb01/2;
+        }
+
+        for (short b = 0; b < BR; ++b) y4[b] += 32 * 32;
+    }
+
+    for (short b = 0; b < BR; ++b) {
+        if (rb + b >= args.ne1) break;
+        device float * dst_gate_f32 = (device float *) dst_gate + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)(rb + b)*args.ne0;
+        device float * dst_up_f32   = (device float *) dst_up   + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)(rb + b)*args.ne0;
+        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+            const float sum_gate = simd_sum(sumg[b][row]);
+            const float sum_up   = simd_sum(sumu[b][row]);
+            if (tiisg == 0) {
+                dst_gate_f32[first_row + row] = sum_gate * 0.25f;
+                dst_up_f32[first_row + row]   = sum_up   * 0.25f;
+            }
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_iq2_xxs_pair_br1_f32")]]
+kernel void kernel_mul_mv_iq2_xxs_pair_br1_f32(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq2_xxs_pair_br_f32_impl<N_R0_IQ2_XXS, 1>(
+        args, src0_gate, src0_up, src1, dst_gate, dst_up, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_iq2_xxs_pair_br2_f32")]]
+kernel void kernel_mul_mv_iq2_xxs_pair_br2_f32(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq2_xxs_pair_br_f32_impl<N_R0_IQ2_XXS, 2>(
+        args, src0_gate, src0_up, src1, dst_gate, dst_up, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_iq2_xxs_pair_br4_f32")]]
+kernel void kernel_mul_mv_iq2_xxs_pair_br4_f32(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0_gate,
+        device const char * src0_up,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_iq2_xxs_pair_br_f32_impl<N_R0_IQ2_XXS, 4>(
+        args, src0_gate, src0_up, src1, dst_gate, dst_up, shmem, tgpig, tiisg, sgitg);
+}
+
 typedef void (kernel_mul_mv2_disp_t)(
         ds4_metal_args_mul_mv args,
         device const char * src0,

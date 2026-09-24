@@ -46023,6 +46023,100 @@ static void ds41_grouped_low_check(const ds4_model *m, const ds4_weights *w) {
     }
 }
 
+/* Does sharing an expert's dequantisation across activation rows pay, and does
+ * it change the answer? One routed expert's gate/up pair, eight rows, run as
+ * eight BR=1 tiles and as four BR=2 or two BR=4 tiles.
+ *
+ * The rows here are contiguous, which an expert-major worklist's would not be,
+ * so this prices the arithmetic and not the gather. DS4_V41_ROWTILE_CHECK=5. */
+static void ds41_iq2_br_check(const ds4_model *m, const ds4_weights *w) {
+    const ds4_layer_weights *l = &w->layer[1];
+    const ds4_tensor *g = l->ffn_gate_exps, *u = l->ffn_up_exps;
+    if (!g || !u || g->type != DS4_TENSOR_IQ2_XXS) {
+        fprintf(stderr, "ds4: iq2 tile check: experts are type %d, not IQ2_XXS\n",
+                g ? g->type : -1);
+        return;
+    }
+    const uint64_t in_dim = (uint64_t)g->dim[0], out_dim = (uint64_t)g->dim[1];
+    const uint32_t rows = 8;
+    const uint64_t xb = (uint64_t)rows * in_dim * sizeof(float);
+    const uint64_t ob = (uint64_t)rows * out_dim * sizeof(float);
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(xb);
+    ds4_gpu_tensor *rg = ds4_gpu_tensor_alloc(ob), *ru = ds4_gpu_tensor_alloc(ob);
+    ds4_gpu_tensor *tg = ds4_gpu_tensor_alloc(ob), *tu = ds4_gpu_tensor_alloc(ob);
+    ds4_gpu_tensor *wg = NULL, *wu = NULL;
+    float *hx = malloc((size_t)xb);
+    float *a = malloc((size_t)ob), *b = malloc((size_t)ob);
+    if (!x || !rg || !ru || !tg || !tu || !hx || !a || !b) goto done;
+    for (uint64_t i = 0; i < (uint64_t)rows * in_dim; i++) {
+        const uint32_t h = (uint32_t)(i * 2654435761u + 911u);
+        hx[i] = (float)((int32_t)(h >> 8) % 2001 - 1000) / 1000.0f;
+    }
+    if (!ds4_gpu_tensor_write(x, 0, hx, xb)) goto done;
+    /* The routed experts live in the streaming cache, not in the mapped model
+     * views, so the weight cannot be reached by model offset here. Copy one
+     * expert's gate and up out of the host mapping into plain tensors; what is
+     * being measured is the kernel, not where the bytes came from. */
+    {
+        const uint64_t wbytes = (in_dim / 256u) * 66u * out_dim;
+        wg = ds4_gpu_tensor_alloc(wbytes); wu = ds4_gpu_tensor_alloc(wbytes);
+        if (!wg || !wu ||
+            g->abs_offset + wbytes > m->size || u->abs_offset + wbytes > m->size ||
+            !ds4_gpu_tensor_write(wg, 0, (const char *)m->map + g->abs_offset, wbytes) ||
+            !ds4_gpu_tensor_write(wu, 0, (const char *)m->map + u->abs_offset, wbytes)) {
+            fprintf(stderr, "ds4: iq2 tile check could not stage the expert\n");
+            goto done;
+        }
+    }
+    fprintf(stderr, "ds4: iq2 gate/up pair %llux%llu, 8 activation rows:\n",
+            (unsigned long long)in_dim, (unsigned long long)out_dim);
+    double t1 = 0;
+    for (uint32_t br = 1; br <= 4u; br *= 2u) {
+        ds4_gpu_tensor *dg = br == 1u ? rg : tg, *du = br == 1u ? ru : tu;
+        const int laps = 30;
+        double ms = 0;
+        for (int warm = 0; warm < 2; warm++) {
+            if (!ds4_gpu_begin_commands()) goto done;
+            for (int q = 0; q < laps; q++)
+                if (!ds4_gpu_iq2_pair_br_tensor(dg, du, wg, wu,
+                        in_dim, out_dim, x, rows, br)) {
+                    (void)ds4_gpu_end_commands();
+                    fprintf(stderr, "ds4:   BR=%u refused\n", br); goto next;
+                }
+            const double t0 = now_sec();
+            (void)ds4_gpu_end_commands();
+            if (warm) ms = (now_sec() - t0) * 1000.0 / laps;
+        }
+        if (br == 1u) { t1 = ms; (void)ds4_gpu_tensor_read(rg, 0, a, ob); }
+        else {
+            (void)ds4_gpu_tensor_read(tg, 0, b, ob);
+            uint64_t differ = 0, first = UINT64_MAX;
+            for (uint64_t i = 0; i < (uint64_t)rows * out_dim; i++)
+                if (memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+                    differ++; if (first == UINT64_MAX) first = i;
+                }
+            fprintf(stderr, "ds4:   BR=%u: %6.3f ms (%.2fx BR=1), gate %s\n",
+                    br, ms, t1 > 0 ? t1 / ms : 0.0,
+                    differ ? "DIVERGED" : "identical to BR=1");
+            if (differ)
+                fprintf(stderr, "ds4:     %llu of %llu differ, first row %llu col %llu "
+                        "(%.9g vs %.9g)\n", (unsigned long long)differ,
+                        (unsigned long long)((uint64_t)rows * out_dim),
+                        (unsigned long long)(first / out_dim),
+                        (unsigned long long)(first % out_dim),
+                        (double)a[first], (double)b[first]);
+            goto next;
+        }
+        fprintf(stderr, "ds4:   BR=%u: %6.3f ms\n", br, ms);
+    next:;
+    }
+done:
+    free(hx); free(a); free(b);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(rg); ds4_gpu_tensor_free(ru);
+    ds4_gpu_tensor_free(tg); ds4_gpu_tensor_free(tu);
+    ds4_gpu_tensor_free(wg); ds4_gpu_tensor_free(wu);
+}
+
 static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
     const struct { const char *name; size_t off; } kinds[] = {
         { "attn_output_b", offsetof(ds4_layer_weights, attn_output_b) },
@@ -46133,6 +46227,7 @@ static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
 static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
     const char *env = getenv("DS4_V41_ROWTILE_CHECK");
     if (!env || !env[0] || atoi(env) == 0) return;
+    if (atoi(env) >= 5) { ds41_iq2_br_check(m, w); return; }
     if (atoi(env) >= 4) { ds41_grouped_low_check(m, w); return; }
     if (atoi(env) >= 3) { ds41_rowtile_sweep(m, w); return; }
     const ds4_layer_weights *l = &w->layer[0];

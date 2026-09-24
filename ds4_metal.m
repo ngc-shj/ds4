@@ -21665,6 +21665,77 @@ uint64_t ds4_gpu_stream_expert_cache_miss_count(void) {
  * compare an arm against itself. */
 unsigned long long g_ds4_head_rows2_dispatches, g_ds4_head_rows4_dispatches;
 
+/* Diagnostic driver for the activation-row tiled iq2 gate/up pair. Not a
+ * production path: it takes BR contiguous activation rows, where an
+ * expert-major worklist would take the rows that chose one expert. What it is
+ * for is pricing the sharing before the worklist is built, and checking that
+ * a tile is bit-identical to BR separate calls. */
+int ds4_gpu_iq2_pair_br_tensor(
+        ds4_gpu_tensor       *dst_gate,
+        ds4_gpu_tensor       *dst_up,
+        const ds4_gpu_tensor *w_gate,
+        const ds4_gpu_tensor *w_up,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        uint32_t              br) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (br != 1u && br != 2u && br != 4u) return 0;
+    if (!dst_gate || !dst_up || !x || !w_gate || !w_up || n_rows == 0 ||
+        in_dim == 0 || (in_dim % 256u) != 0 || out_dim == 0) return 0;
+
+    @autoreleasepool {
+        const uint64_t blocks = in_dim / 256u;
+        const uint64_t row_bytes = blocks * 66u;   /* sizeof(block_iq2_xxs) */
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> gbuf = ds4_gpu_tensor_buffer(dst_gate);
+        id<MTLBuffer> ubuf = ds4_gpu_tensor_buffer(dst_up);
+        id<MTLBuffer> wg = ds4_gpu_tensor_buffer(w_gate);
+        id<MTLBuffer> wu = ds4_gpu_tensor_buffer(w_up);
+        if (!xbuf || !gbuf || !ubuf || !wg || !wu) return 0;
+        const NSUInteger gate_inner = (NSUInteger)ds4_gpu_tensor_offset(w_gate);
+        const NSUInteger up_inner = (NSUInteger)ds4_gpu_tensor_offset(w_up);
+
+        const uint32_t nsg = 4, nr0 = 4;   /* N_R0_IQ2_XXS */
+        ds4_gpu_q8_0_matvec_args args = {
+            .ne00 = (int32_t)in_dim, .ne01 = (int32_t)out_dim, .ne02 = 1,
+            .nb00 = 66, .nb01 = row_bytes,
+            .nb02 = row_bytes * out_dim, .nb03 = row_bytes * out_dim,
+            .ne10 = (int32_t)in_dim, .ne11 = (int32_t)n_rows, .ne12 = 1,
+            .nb10 = sizeof(float), .nb11 = in_dim * sizeof(float),
+            .nb12 = (uint64_t)n_rows * in_dim * sizeof(float),
+            .nb13 = (uint64_t)n_rows * in_dim * sizeof(float),
+            .ne0 = (int32_t)out_dim, .ne1 = (int32_t)n_rows,
+            .nr0 = (int32_t)nr0, .r2 = 1, .r3 = 1,
+        };
+        const char *name = br == 1u ? "kernel_mul_mv_iq2_xxs_pair_br1_f32" :
+                           br == 2u ? "kernel_mul_mv_iq2_xxs_pair_br2_f32"
+                                    : "kernel_mul_mv_iq2_xxs_pair_br4_f32";
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(name, nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wg offset:gate_inner atIndex:1];
+        [enc setBuffer:wu offset:up_inner atIndex:2];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
+        [enc setBuffer:gbuf offset:ds4_gpu_tensor_offset(dst_gate) atIndex:4];
+        [enc setBuffer:ubuf offset:ds4_gpu_tensor_offset(dst_up) atIndex:5];
+        [enc setThreadgroupMemoryLength:(256u * 8u + 128u) atIndex:0];
+        ds4_gpu_dispatch(enc,
+            MTLSizeMake((NSUInteger)((out_dim + nsg * nr0 - 1u) / (nsg * nr0)),
+                        (NSUInteger)((n_rows + br - 1u) / br), 1),
+            MTLSizeMake(32, nsg, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "iq2 pair activation-row tile");
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
