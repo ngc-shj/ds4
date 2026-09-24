@@ -40512,10 +40512,24 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     const uint32_t width = (uint32_t)weight->dim[0], outputs = (uint32_t)weight->dim[1];
     bool ok;
     /* Small decode batches retain scalar reductions before BF16 and sparse
-     * routing boundaries. Preserve Metal's separate vocabulary-head dispatch. */
+     * routing boundaries. Preserve Metal's separate vocabulary-head dispatch.
+     *
+     * That exclusion is why a two-row session batch does not match a single
+     * row byte for byte: the head is the one matmul sent to the generic
+     * multi-row path instead of the exact one, and the generic path reduces
+     * differently. The exact-rows kernel is the same Q8_0 matvec with the
+     * batch row on the grid's Y axis, so it should hold the single-row
+     * reduction here too. DS4_METAL_V41_EXACT_VOCAB_ROWS=1 sends the head
+     * through it; if the answer matches, the difference was a dispatch policy
+     * and not arithmetic. */
+    static int exact_vocab = -1;
+    if (exact_vocab < 0) {
+        const char *e = getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS");
+        exact_vocab = e && e[0] ? atoi(e) != 0 : 0;
+    }
     if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
 #ifdef __APPLE__
-        outputs != DS4_N_VOCAB &&
+        (outputs != DS4_N_VOCAB || exact_vocab) &&
 #endif
         weight->type == DS4_TENSOR_Q8_0) {
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
@@ -41575,6 +41589,40 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_moe_finish(g, il);
 }
 
+/* The head's whole output, per position, so the two paths can be compared as
+ * bytes rather than through the token that argmax happened to pick. A hash of
+ * the text says the argmaxes agreed; this says the logits did.
+ *
+ * DS4_METAL_V41_LOGITS_DUMP=<path> writes "pos" then DS4_N_VOCAB floats a
+ * record. Reads a tensor the caller has already waited for, so it adds no
+ * synchronisation - the same rule the MoE probe follows.
+ */
+static void ds41_logits_dump(ds41_gpu_graph *g, uint32_t pos, int needs_drain) {
+    static int tried;
+    static FILE *fp;
+    if (!tried) {
+        const char *path = getenv("DS4_METAL_V41_LOGITS_DUMP");
+        tried = 1;
+        if (path && path[0]) fp = fopen(path, "wb");
+    }
+    if (!fp) return;
+    static float *buf;
+    if (!buf) buf = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (!buf || !g->logits) return;
+    /* The batch step leaves the copy into each session's logits encoded and
+     * unexecuted, so reading it there sees the previous step. The single path
+     * has already ended its buffer, which is why it needs none of this. The
+     * drain is at the end of a step rather than inside one, and the text hash
+     * with the dump on is checked against the hash without it. */
+    if (needs_drain && (!ds4_gpu_end_commands() || !ds4_gpu_begin_commands())) return;
+    if (!ds4_gpu_tensor_read(g->logits, 0, buf,
+                             (uint64_t)DS4_N_VOCAB * sizeof(float))) return;
+    const uint32_t p = pos;
+    fwrite(&p, sizeof(p), 1, fp);
+    fwrite(buf, sizeof(float), (size_t)DS4_N_VOCAB, fp);
+    fflush(fp);
+}
+
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
@@ -41583,8 +41631,10 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
     if (!ds4_gpu_end_commands()) ok = false;
-    return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
-                                     (uint64_t)DS4_N_VOCAB * sizeof(float));
+    ok = ok && ds4_gpu_tensor_read(g->logits, 0, logits,
+                                   (uint64_t)DS4_N_VOCAB * sizeof(float));
+    if (ok) ds41_logits_dump(g, g->pos, 0);
+    return ok;
 }
 
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
@@ -44382,6 +44432,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         if (batch_logits)
             ok = ds4_gpu_tensor_copy(s->tp_logits_half ? s->tp_logits_half : s->logits,
                 0, batch_logits, (uint64_t)i * logits_bytes, logits_bytes);
+        if (ok) ds41_logits_dump(s, positions[i], 1);
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
