@@ -4163,6 +4163,33 @@ static uint32_t ds4_gpu_flash_attn_vec_nsg(uint32_t n_keys, uint32_t nwg, uint32
     return nsg;
 }
 
+/* Split-K workgroups for a key count. The kernel hands workgroup iwg the key
+ * chunks iwg, iwg+NWG, ... so a count above ceil(n_keys/C) leaves workgroups
+ * with no chunk at all - and they still write a full DV partial and a (sum,max)
+ * pair for the reduce to read back. At decode, with a sliding window of 128
+ * keys, the fixed 32 means 28 of every 32 partials are empty. */
+/* The split-K partial scratch is reserved for the largest split count, not
+ * this call's. The scratch only ever grows, so a later call wanting more would
+ * reallocate it out from under dispatches already encoded into the same
+ * command buffer - which is how a fitted split count produced two single
+ * passes that disagreed on every logit. Reserving the maximum costs address
+ * space; what fitting the count saves is traffic. */
+static NSUInteger ds4_gpu_flash_attn_tmp_reserve(NSUInteger nrows, uint32_t head_dim) {
+    return nrows * (NSUInteger)head_dim * 32u * sizeof(float) +
+           nrows * (2u * 32u) * sizeof(float);
+}
+
+static uint32_t ds4_gpu_flash_attn_vec_fit_nwg(uint32_t n_keys, uint32_t ncpsg) {
+    const uint32_t chunks = (n_keys + ncpsg - 1u) / ncpsg;
+    /* Never one. At NWG == 1 the vec kernel normalises its own output and
+     * writes no (sum,max) pair, because nothing is meant to reduce after it;
+     * these callers always encode the reduce, and it would read a statistic
+     * that was never written. One key chunk therefore takes two splits, the
+     * second of which is empty and exactly neutral. */
+    if (chunks < 2u) return 2u;
+    return chunks < 32u ? chunks : 32u;
+}
+
 static int ds4_gpu_trace_allocs(void) {
     static int initialized;
     static int enabled;
@@ -29871,8 +29898,10 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
         uint32_t              raw_cap,
         uint32_t              raw_start,
         uint32_t              n_head,
-        uint32_t              head_dim) {
-    if (head_dim != 512 || n_head == 0 || n_raw == 0 || raw_cap < n_raw) {
+        uint32_t              head_dim,
+        uint32_t              nwg) {
+    if (head_dim != 512 || n_head == 0 || n_raw == 0 || raw_cap < n_raw ||
+        nwg == 0 || nwg > 32u) {
         return 0;
     }
 
@@ -29891,7 +29920,6 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     }
 
     const uint32_t ncpsg = 32;
-    const uint32_t nwg = 32;
     const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_raw, nwg, ncpsg);
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
     const NSUInteger row_bytes_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
@@ -29929,7 +29957,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
                                          "ds4_flash_attn_pad") ||
         !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_tmp_buffer,
                                          &g_flash_attn_tmp_bytes,
-                                         tmp_bytes,
+                                         ds4_gpu_flash_attn_tmp_reserve(nrows, head_dim),
                                          "ds4_flash_attn_tmp")) {
         return 0;
     }
@@ -31501,15 +31529,22 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         const char *e = getenv("DS4_METAL_FLASH_NWG");
         nwg_env = e ? atoi(e) : 0;
     }
-    uint32_t nwg = 32;
-    if (nwg_env > 0) {
-        nwg = (uint32_t)nwg_env;
-    } else {
-        /* 32 always: 8 groups at 128 keys saved 1 us in attention but made the
-         * later concurrent FFN block ~50 us slower (unexplained, measured);
-         * DS4_METAL_FLASH_NWG overrides for experiments. */
-        nwg = 32u;
-    }
+    /* The groups the key count actually has. A workgroup past the last chunk
+     * still writes a full DV partial and a (sum,max) pair for the reduce to
+     * read, so at a 128 key window 28 of every 32 partials are empty - and
+     * the buffer that carries them is bytes, not dispatches.
+     *
+     * The earlier note here said 8 groups made the following FFN 50 us slower
+     * and called it unexplained. The reduce read its partials at lane =
+     * thread_index_in_simdgroup, which runs to 31 whatever NWG is, so below 32
+     * it read the next rows' statistics: that arm was wrong, not slow.
+     * ds4_flash_attn_vec_reduce_row now gives the lanes above the split count
+     * this reduction's identity. */
+    const bool fit_splits = nwg_env == 0 &&
+                            getenv("DS4_METAL_V41_FIT_SPLITS") != NULL;
+    uint32_t nwg = nwg_env > 0 ? (uint32_t)nwg_env
+                 : fit_splits ? ds4_gpu_flash_attn_vec_fit_nwg(n_keys, ncpsg)
+                 : 32u;
     if (nwg > 32u) nwg = 32u;
     if (nwg < 1u) nwg = 1u;
     const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_keys, nwg, ncpsg);
@@ -31522,8 +31557,15 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     const NSUInteger pad_bytes = 2u * (NSUInteger)ncpsg * row_bytes_f16 +
                                  (NSUInteger)ncpsg * sizeof(uint16_t);
     const NSUInteger nrows = (NSUInteger)n_head;
-    const NSUInteger tmp_bytes = nrows * (NSUInteger)head_dim * (NSUInteger)nwg * sizeof(float) +
-                                 nrows * (2u * (NSUInteger)nwg) * sizeof(float);
+    /* The slot stride is the block's, not this row's. Rows of a block have
+     * different key counts, so a fitted split count differs between them, and
+     * a stride that followed one row's would put the next row's partials on
+     * top of it - the same shape of bug the KV slot width had. slot_keys is
+     * the block's widest row, so the stride it gives fits every row. */
+    const uint32_t slot_nwg = fit_splits
+        ? ds4_gpu_flash_attn_vec_fit_nwg(slot_keys, ncpsg) : nwg;
+    const NSUInteger tmp_bytes = nrows * (NSUInteger)head_dim * (NSUInteger)slot_nwg * sizeof(float) +
+                                 nrows * (2u * (NSUInteger)slot_nwg) * sizeof(float);
 
     const bool packed_shape =
         ds4_gpu_ported_m5_decode_feature_enabled(
@@ -31565,7 +31607,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
                                          "ds4_flash_attn_pad") ||
         !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_tmp_buffer,
                                          &g_flash_attn_tmp_bytes,
-                                         tmp_bytes * slots,
+                                         ds4_gpu_flash_attn_tmp_reserve(nrows, head_dim) * slots,
                                          "ds4_flash_attn_tmp")) {
         return 0;
     }
@@ -33180,7 +33222,10 @@ static int ds4_gpu_attention_decode_heads_impl(
                                                             raw_cap,
                                                             raw_start,
                                                             n_head,
-                                                            head_dim)) {
+                                                            head_dim,
+                                                            getenv("DS4_METAL_V41_FIT_SPLITS")
+                                                                ? ds4_gpu_flash_attn_vec_fit_nwg(n_raw, 32u)
+                                                                : 32u)) {
                 return 0;
             }
 
@@ -33397,6 +33442,247 @@ int ds4_gpu_attention_decode_heads_tensor(
         sinks_offset, q, raw_kv, n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16,
         n_comp, comp_mask, use_mask, n_head, head_dim, 0u, 1u, 0u,
         DS4_FLASH_PHASE_ALL);
+}
+
+/* Raw-only attention for the K rows of a block, in the shapes that separate
+ * what a K-wide form is supposed to buy. Layers 0 and 1 have no compressed
+ * KV, so nothing here is entangled with a selected set.
+ *
+ *   DS4_ATTN_RAW_ROWS_PER_ROW     K stagings, K dispatches. Canonical.
+ *   DS4_ATTN_RAW_ROWS_BATCH_AXIS  K stagings, one dispatch. The rows ride
+ *                                 ne03 and each reads its own copy through
+ *                                 nb13, so no scan is shared. This is the
+ *                                 shape ds4_gpu_attention_decode_heads_block_
+ *                                 tensor has: a host row loop moved inside.
+ *   DS4_ATTN_RAW_ROWS_SHARED      one staging of the union, one dispatch. The
+ *                                 rows read the same bytes at their own base.
+ *
+ * Only the third shares a KV scan, and it needs the row bases to be a uniform
+ * stride, because nb13 is the only thing the kernel has to express them with.
+ * A block's rows are consecutive positions of one session against a linear
+ * raw_prefill, so raw_start is avail-min(avail,SWA): the stride is one key
+ * once the window is full and zero before it. Anything else declines.
+ *
+ * SHARED is bit-identical to PER_ROW by construction in the full-window case -
+ * every row reads exactly its own SWA keys from its own base, at one ne11 that
+ * is already a multiple of the chunk, so it keeps its own chunking and its own
+ * kvpad variant. Before the window fills it pads to a common ne11 and masks
+ * the tail, which is the equivalence DS4_V41_ROWTILE_CHECK=6 measured.
+ */
+int ds4_gpu_attention_decode_heads_raw_rows_tensor(
+        ds4_gpu_tensor            *heads,
+        ds4_gpu_tensor    *const  *heads_rows,
+        const void                *model_map,
+        uint64_t                   model_size,
+        uint64_t                   sinks_offset,
+        const ds4_gpu_tensor      *q,
+        const ds4_gpu_tensor *const *q_rows,
+        const ds4_gpu_tensor      *raw_kv,
+        uint32_t                   raw_cap,
+        const uint32_t            *n_raw,
+        const uint32_t            *raw_start,
+        uint32_t                   n_head,
+        uint32_t                   head_dim,
+        uint32_t                   rows,
+        uint32_t                   mode,
+        uint64_t                  *staged_keys) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!heads || !q || !raw_kv || !n_raw || !raw_start || !model_map ||
+        rows == 0 || rows > 64u || n_head == 0 || head_dim != 512) return 0;
+    for (uint32_t i = 0; i < rows; i++)
+        if (n_raw[i] == 0 || n_raw[i] > raw_cap ||
+            raw_start[i] > raw_cap - n_raw[i]) return 0;
+
+    const bool fit = (mode & DS4_ATTN_RAW_ROWS_FIT_SPLITS) != 0;
+    const uint32_t shape = mode & ~DS4_ATTN_RAW_ROWS_FIT_SPLITS;
+    const uint32_t ncpsg = 32;
+
+    if (shape == DS4_ATTN_RAW_ROWS_PER_ROW) {
+        if (!heads_rows || !q_rows) return 0;
+        uint64_t staged = 0;
+        if (!fit) {
+            for (uint32_t i = 0; i < rows; i++) {
+                if (!ds4_gpu_attention_decode_heads_tensor(heads_rows[i], model_map,
+                        model_size, sinks_offset, q_rows[i], raw_kv, n_raw[i],
+                        raw_cap, raw_start[i], NULL, 0, 0, NULL, 0, n_head, head_dim))
+                    return 0;
+                staged += n_raw[i];
+            }
+            if (staged_keys) *staged_keys = staged;
+            return 1;
+        }
+        @autoreleasepool {
+            const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+            uint64_t sinks_inner = 0;
+            id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                               sinks_offset, sink_bytes,
+                                                               &sinks_inner);
+            if (!sinks_buf) return 0;
+            if (g_kv_task.pending && !ds4_gpu_kv_norm_task_flush()) return 0;
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            for (uint32_t i = 0; i < rows; i++) {
+                const uint32_t nwg = ds4_gpu_flash_attn_vec_fit_nwg(n_raw[i], ncpsg);
+                if (!ds4_gpu_encode_flash_attention_raw_heads(cb, heads_rows[i], sinks_buf,
+                        (NSUInteger)sinks_inner, q_rows[i], raw_kv, n_raw[i], raw_cap,
+                        raw_start[i], n_head, head_dim, nwg)) return 0;
+                staged += n_raw[i];
+            }
+            if (staged_keys) *staged_keys = staged;
+            return ds4_gpu_finish_command_buffer(cb, owned, "raw rows attention heads");
+        }
+    }
+    if (shape != DS4_ATTN_RAW_ROWS_BATCH_AXIS && shape != DS4_ATTN_RAW_ROWS_SHARED)
+        return 0;
+
+    @autoreleasepool {
+        uint32_t keys_max = 0;
+        for (uint32_t i = 0; i < rows; i++)
+            if (n_raw[i] > keys_max) keys_max = n_raw[i];
+        const uint32_t ne11 = (keys_max + ncpsg - 1u) / ncpsg * ncpsg;
+        const uint32_t nwg = fit ? ds4_gpu_flash_attn_vec_fit_nwg(ne11, ncpsg) : 32u;
+        const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(ne11, nwg, ncpsg);
+
+        /* The bases have to be one stride for nb13 to say them. */
+        uint32_t delta = 0;
+        if (shape == DS4_ATTN_RAW_ROWS_SHARED) {
+            if (rows > 1) {
+                if (raw_start[1] < raw_start[0]) return 0;
+                delta = raw_start[1] - raw_start[0];
+                if (delta > 1u) return 0;
+            }
+            for (uint32_t i = 0; i < rows; i++)
+                if (raw_start[i] != raw_start[0] + i * delta) return 0;
+        }
+
+        const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
+        const NSUInteger row_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
+        /* BATCH_AXIS gives every row its own ne11-wide copy; SHARED gives the
+         * block one buffer wide enough for the last row to read ne11 from its
+         * own base. That difference is the whole measurement. */
+        const uint32_t stage_keys = shape == DS4_ATTN_RAW_ROWS_SHARED
+            ? (rows - 1u) * delta + ne11
+            : ne11 * rows;
+        const NSUInteger kv_stride = (NSUInteger)ne11 * row_f16;
+        const NSUInteger mask_stride = (NSUInteger)ne11 * sizeof(uint16_t);
+        const NSUInteger nrows = (NSUInteger)n_head * rows;
+        const NSUInteger tmp_bytes = nrows * (NSUInteger)head_dim * nwg * sizeof(float) +
+                                     nrows * (2u * nwg) * sizeof(float);
+
+        if (!ds4_gpu_ensure_scratch_buffer(&g_flash_attn_mask_buffer, &g_flash_attn_mask_bytes,
+                                           mask_stride * rows, "ds4_flash_attn_mask") ||
+            !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_kv_buffer, &g_flash_attn_kv_bytes,
+                                           (NSUInteger)stage_keys * row_f16, "ds4_flash_attn_kv") ||
+            !ds4_gpu_ensure_scratch_buffer(&g_flash_attn_tmp_buffer, &g_flash_attn_tmp_bytes,
+                                           ds4_gpu_flash_attn_tmp_reserve(nrows, head_dim),
+                                           "ds4_flash_attn_tmp")) return 0;
+        (void)tmp_bytes;
+
+        const uint64_t sink_bytes = (uint64_t)n_head * sizeof(float);
+        uint64_t sinks_inner = 0;
+        id<MTLBuffer> sinks_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                                                           sinks_offset, sink_bytes, &sinks_inner);
+        id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
+        id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
+        id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
+        if (!sinks_buf || !qbuf || !rawbuf || !headsbuf) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        if (g_kv_task.pending && !ds4_gpu_kv_norm_task_flush()) return 0;
+
+        /* Everything masked first, then each row's own keys unmasked. */
+        if (!ds4_gpu_encode_fill_f16_1d(cb, g_flash_attn_mask_buffer, 0,
+                                        (uint32_t)(ne11 * rows), -INFINITY)) return 0;
+        for (uint32_t i = 0; i < rows; i++)
+            if (!ds4_gpu_encode_fill_f16_1d(cb, g_flash_attn_mask_buffer,
+                                            (NSUInteger)i * mask_stride, n_raw[i], 0.0f)) return 0;
+
+        /* The padded tail is read by the chunk that straddles it - a fully
+         * masked chunk is skipped, a half masked one is not - and a stale
+         * non-finite half there would survive the multiply by zero. So the
+         * slack is zeroed rather than left as whatever the scratch held. */
+        uint64_t staged = 0;
+        if (shape == DS4_ATTN_RAW_ROWS_SHARED) {
+            const uint32_t have = raw_start[rows - 1] + n_raw[rows - 1] - raw_start[0];
+            if (!ds4_gpu_encode_copy_raw_ring_to_f16(cb, rawbuf,
+                    ds4_gpu_tensor_offset(raw_kv), raw_cap, raw_start[0], have,
+                    head_dim, g_flash_attn_kv_buffer, 0)) return 0;
+            if (stage_keys > have &&
+                !ds4_gpu_encode_fill_f16_1d(cb, g_flash_attn_kv_buffer,
+                        (NSUInteger)have * row_f16,
+                        (uint32_t)((stage_keys - have) * head_dim), 0.0f)) return 0;
+            staged = have;
+        } else {
+            for (uint32_t i = 0; i < rows; i++) {
+                if (!ds4_gpu_encode_copy_raw_ring_to_f16(cb, rawbuf,
+                        ds4_gpu_tensor_offset(raw_kv), raw_cap, raw_start[i], n_raw[i],
+                        head_dim, g_flash_attn_kv_buffer, (NSUInteger)i * kv_stride))
+                    return 0;
+                if (ne11 > n_raw[i] &&
+                    !ds4_gpu_encode_fill_f16_1d(cb, g_flash_attn_kv_buffer,
+                            (NSUInteger)i * kv_stride + (NSUInteger)n_raw[i] * row_f16,
+                            (ne11 - n_raw[i]) * head_dim, 0.0f)) return 0;
+                staged += n_raw[i];
+            }
+        }
+        if (staged_keys) *staged_keys = staged;
+
+        id<MTLComputePipelineState> vec = ds4_gpu_get_flash_attn_vec_pipeline(
+            "kernel_flash_attn_ext_vec_f16_dk512_dv512", true, true, false, false,
+            false, false, (int32_t)head_dim, (int32_t)head_dim, (int32_t)nsg, (int32_t)nwg);
+        id<MTLComputePipelineState> red = ds4_gpu_get_flash_attn_reduce_pipeline(
+            (int32_t)head_dim, (int32_t)nwg);
+        if (!vec || !red) return 0;
+
+        const NSUInteger kv_step = shape == DS4_ATTN_RAW_ROWS_SHARED
+            ? (NSUInteger)delta * row_f16 : kv_stride;
+        ds4_gpu_flash_attn_vec_args vargs = {
+            .ne01 = 1, .ne02 = (int32_t)n_head, .ne03 = (int32_t)rows,
+            .nb01 = (uint64_t)n_head * row_bytes, .nb02 = row_bytes,
+            .nb03 = (uint64_t)n_head * row_bytes,
+            .ne11 = (int32_t)ne11, .ne_12_2 = 1, .ne_12_3 = (int32_t)rows,
+            .ns10 = (int32_t)head_dim, .nb11 = row_f16, .nb12 = kv_step, .nb13 = kv_step,
+            .ns20 = (int32_t)head_dim, .nb21 = row_f16, .nb22 = kv_step, .nb23 = kv_step,
+            .ne31 = 1, .ne32 = 1, .ne33 = (int32_t)rows,
+            .nb31 = mask_stride, .nb32 = mask_stride, .nb33 = mask_stride,
+            .ne1 = (int32_t)n_head, .ne2 = 1, .ne3 = (int32_t)rows,
+            .scale = 1.0f / sqrtf((float)head_dim),
+            .max_bias = 0.0f, .m0 = 0.0f, .m1 = 0.0f,
+            .n_head_log2 = 0, .logit_softcap = 0.0f,
+        };
+        const NSUInteger shared_elems = (ds4_gpu_align_up_ns(head_dim, 128u) + 4u * ncpsg +
+                                         2u * ds4_gpu_align_up_ns(head_dim, 128u)) * nsg;
+        const NSUInteger shared_bytes = ds4_gpu_align_up_ns(shared_elems * (sizeof(float) / 2u), 16u);
+
+        id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:vec];
+        [enc setBytes:&vargs length:sizeof(vargs) atIndex:0];
+        [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:3];
+        [enc setBuffer:g_flash_attn_mask_buffer offset:0 atIndex:4];
+        [enc setBuffer:sinks_buf offset:sinks_inner atIndex:5];
+        [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:6];
+        [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
+        [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
+        ds4_gpu_dispatch(enc, MTLSizeMake(1, n_head, (NSUInteger)rows * nwg),
+                         MTLSizeMake(32, nsg, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        ds4_gpu_flash_attn_reduce_args rargs = { .nrows = (int32_t)nrows };
+        enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:red];
+        [enc setBytes:&rargs length:sizeof(rargs) atIndex:0];
+        [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
+        [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:2];
+        ds4_gpu_dispatch(enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        return ds4_gpu_finish_command_buffer(cb, owned, "raw rows attention heads");
+    }
 }
 
 /* One phase of one row of a block, against that row's own slot of the flash

@@ -1414,10 +1414,17 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
 
     const short iwg = tiisg;
 
+    // The lane axis is the simdgroup width, so a split count below it leaves
+    // lanes with no partial to read. They take the identity of this reduction -
+    // an empty split - which is what a workgroup past the last key chunk would
+    // have written anyway, so a fitted NWG_ combines the same partials in the
+    // same order and agrees bit for bit with NWG_ == N_SIMDWIDTH.
+    const bool live = iwg < NWG_;
+
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
 
-    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    float S = live ? ss[rid*(2*NWG_) + 2*iwg + 0] : 0.0f;
+    float M = live ? ss[rid*(2*NWG_) + 2*iwg + 1] : -FLT_MAX/2;
 
     const float m  = simd_max(M);
     const float ms = exp(M - m);
@@ -1431,7 +1438,7 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG_) {
-        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        const float4 v = simd_sum(live ? htmp4[i*NWG_ + iwg]*ms : (float4) 0.0f);
 
         if (iwg == 0) {
             dst4[i] = v*S;

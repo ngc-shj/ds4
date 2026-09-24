@@ -46325,9 +46325,159 @@ static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
     }
 }
 
+/* The three shapes a K-wide raw attention can take, on the layer 0/1 geometry
+ * where there is no compressed KV to confound them. DS4_V41_ROWTILE_CHECK=7.
+ *
+ * What it separates: BATCH_AXIS against PER_ROW prices folding K dispatches
+ * into one grid, and nothing else - it stages K overlapping copies and each
+ * row reads its own. SHARED against BATCH_AXIS prices scanning the union once.
+ * Reporting one number for "K-wide attention" cannot tell those apart, and the
+ * null that came back from the batch-axis form said only that the first is
+ * worth nothing.
+ *
+ * Two regimes, because they are different problems. Before the sliding window
+ * fills, every row starts at key 0 and differs only in how many keys it has,
+ * so the union is one row's worth. Once it fills, every row has SWA keys and
+ * the starts step by one, so the union is SWA+K-1 against K*SWA staged.
+ *
+ * The arms alternate direction by round parity: run in one order only and the
+ * later arm is always the warm one.
+ */
+static void ds41_attn_raw_arms_check(const ds4_model *m, const ds4_weights *w) {
+    const ds4_layer_weights *l = &w->layer[0];
+    const uint32_t n_head = DS4_N_HEAD, hd = DS4_N_HEAD_DIM, swa = DS4_N_SWA;
+    const uint32_t rows = 8, raw_cap = swa + 2u * rows + 8u;
+    const uint32_t rounds = 6, laps = 20;
+    if (ds4_layer_compress_ratio(0) != 0) {
+        fprintf(stderr, "ds4: layer 0 has a compress ratio, not the raw-only shape\n");
+        return;
+    }
+    /* Two axes, crossed: what gets scanned, and how many split-K workgroups
+     * write partials for the reduce to read. Naming one arm "K-wide" hides
+     * both. */
+#define DS41_ARMS 6
+    const char *names[DS41_ARMS] = {
+        "per-row", "batch-axis", "shared",
+        "per-row/fit", "batch-axis/fit", "shared/fit" };
+    const uint32_t modes[DS41_ARMS] = {
+        DS4_ATTN_RAW_ROWS_PER_ROW,
+        DS4_ATTN_RAW_ROWS_BATCH_AXIS,
+        DS4_ATTN_RAW_ROWS_SHARED,
+        DS4_ATTN_RAW_ROWS_PER_ROW    | DS4_ATTN_RAW_ROWS_FIT_SPLITS,
+        DS4_ATTN_RAW_ROWS_BATCH_AXIS | DS4_ATTN_RAW_ROWS_FIT_SPLITS,
+        DS4_ATTN_RAW_ROWS_SHARED     | DS4_ATTN_RAW_ROWS_FIT_SPLITS };
+
+    const uint64_t qb = (uint64_t)rows * n_head * hd * sizeof(float);
+    const uint64_t rawb = (uint64_t)raw_cap * hd * sizeof(float);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(qb);
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(rawb);
+    ds4_gpu_tensor *heads = ds4_gpu_tensor_alloc(qb);
+    ds4_gpu_tensor *qrow[8] = {0}, *hrow[8] = {0};
+    float *hq = malloc((size_t)qb), *hraw = malloc((size_t)rawb);
+    float *ref = malloc((size_t)qb), *got = malloc((size_t)qb);
+    if (!q || !raw || !heads || !hq || !hraw || !ref || !got) goto done;
+    for (uint64_t i = 0; i < qb / 4; i++)
+        hq[i] = 0.01f * (float)((i * 2654435761u >> 9) % 199 - 99);
+    for (uint64_t i = 0; i < rawb / 4; i++)
+        hraw[i] = 0.01f * (float)((i * 40503u >> 7) % 199 - 99);
+    if (!ds4_gpu_tensor_write(q, 0, hq, qb) || !ds4_gpu_tensor_write(raw, 0, hraw, rawb))
+        goto done;
+    /* Created once, outside every timed region: a view is an allocation, and
+     * an allocation inside the timing is how a sweep once reported 15.6 ms of
+     * host time as memory time. */
+    for (uint32_t i = 0; i < rows; i++) {
+        const uint64_t off = (uint64_t)i * n_head * hd * sizeof(float);
+        qrow[i] = ds4_gpu_tensor_view(q, off, (uint64_t)n_head * hd * sizeof(float));
+        hrow[i] = ds4_gpu_tensor_view(heads, off, (uint64_t)n_head * hd * sizeof(float));
+        if (!qrow[i] || !hrow[i]) goto done;
+    }
+
+    for (uint32_t reg = 0; reg < 2u; reg++) {
+        const uint32_t previous = reg == 0 ? 31u : swa - 1u;
+        uint32_t nr[8], rs[8];
+        for (uint32_t i = 0; i < rows; i++) {
+            const uint32_t avail = previous + i + 1u;
+            nr[i] = avail < swa ? avail : swa;
+            rs[i] = avail - nr[i];
+        }
+        fprintf(stderr, "ds4: raw rows, %s window: %u rows, keys %u..%u, starts %u..%u\n",
+                reg == 0 ? "filling" : "full", rows, nr[0], nr[rows - 1],
+                rs[0], rs[rows - 1]);
+
+        double ms[DS41_ARMS][8];
+        uint64_t staged[DS41_ARMS] = {0};
+        int refused[DS41_ARMS] = {0};
+        for (uint32_t r = 0; r < rounds; r++) {
+            for (uint32_t a = 0; a < (uint32_t)DS41_ARMS; a++) {
+                const uint32_t ai = (r & 1u) ? (uint32_t)DS41_ARMS - 1u - a : a;
+                uint64_t st = 0;
+                for (int warm = 0; warm < 2; warm++) {
+                    if (!ds4_gpu_begin_commands()) goto done;
+                    for (uint32_t lap = 0; lap < laps; lap++)
+                        if (!ds4_gpu_attention_decode_heads_raw_rows_tensor(heads, hrow,
+                                m->map, m->size, l->attn_sinks->abs_offset, q,
+                                (const ds4_gpu_tensor *const *)qrow, raw, raw_cap,
+                                nr, rs, n_head, hd, rows, modes[ai], &st)) {
+                            (void)ds4_gpu_end_commands();
+                            refused[ai] = 1; goto next_arm;
+                        }
+                    const double t0 = now_sec();
+                    if (!ds4_gpu_end_commands()) goto done;
+                    if (warm) ms[ai][r] = (now_sec() - t0) * 1000.0 / laps;
+                }
+                staged[ai] = st;
+                if (r == 0) {
+                    if (!ds4_gpu_tensor_read(heads, 0, ai == 0 ? ref : got, qb)) goto done;
+                    if (ai != 0) {
+                        uint64_t differ = 0, first = UINT64_MAX;
+                        for (uint64_t i = 0; i < qb / 4; i++)
+                            if (memcmp(&ref[i], &got[i], sizeof(float)) != 0) {
+                                differ++; if (first == UINT64_MAX) first = i;
+                            }
+                        fprintf(stderr, "ds4:   %-14s vs per-row at the operator "
+                                "boundary: %s", names[ai],
+                                differ ? "DIVERGED" : "identical");
+                        if (differ)
+                            fprintf(stderr, " (%llu of %llu, first %llu: %.9g vs %.9g)",
+                                    (unsigned long long)differ,
+                                    (unsigned long long)(qb / 4),
+                                    (unsigned long long)first,
+                                    (double)ref[first], (double)got[first]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            next_arm: ;
+            }
+        }
+        /* Forward rounds and reversed rounds separately: a change that only
+         * shows in one order is the order. */
+        for (uint32_t a = 0; a < (uint32_t)DS41_ARMS; a++) {
+            if (refused[a]) { fprintf(stderr, "ds4:   %-14s refused\n", names[a]); continue; }
+            double fwd[3], rev[3];
+            uint32_t nf = 0, nv = 0;
+            for (uint32_t r = 0; r < rounds; r++)
+                ((r & 1u) ? rev : fwd)[(r & 1u) ? nv++ : nf++] = ms[a][r];
+            double mf = 0, mv = 0;
+            for (uint32_t i = 0; i < nf; i++) mf += fwd[i];
+            for (uint32_t i = 0; i < nv; i++) mv += rev[i];
+            fprintf(stderr, "ds4:   %-14s %6.3f ms forward, %6.3f ms reversed, "
+                    "%llu key rows staged\n", names[a], mf / nf, mv / nv,
+                    (unsigned long long)staged[a]);
+        }
+    }
+done:
+    for (uint32_t i = 0; i < rows; i++) {
+        if (qrow[i]) ds4_gpu_tensor_free(qrow[i]);
+        if (hrow[i]) ds4_gpu_tensor_free(hrow[i]);
+    }
+    free(hq); free(hraw); free(ref); free(got);
+    ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(heads);
+}
+
 static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
     const char *env = getenv("DS4_V41_ROWTILE_CHECK");
     if (!env || !env[0] || atoi(env) == 0) return;
+    if (atoi(env) >= 7) { ds41_attn_raw_arms_check(m, w); return; }
     if (atoi(env) >= 6) {
         fprintf(stderr, "ds4: masked padding against the unpadded key count:\n");
         ds41_attn_pad_check(m, w); return;

@@ -2326,6 +2326,53 @@ int ds4_gpu_attention_decode_heads_block_tensor(
         uint32_t              head_dim,
         uint32_t              rows);
 
+/* Raw-only attention for the K rows of a block. The modes are the three shapes
+ * the K-wide question is actually about, and they differ in what gets scanned,
+ * not in how many dispatches it takes:
+ *
+ *   PER_ROW      K stagings, K dispatches. Canonical.
+ *   BATCH_AXIS   K stagings, one dispatch. Each row reads its own copy of a
+ *                key range that overlaps every other row's, so the scan is
+ *                duplicated K times; only the host row loop is gone. This is
+ *                the shape ds4_gpu_attention_decode_heads_block_tensor has.
+ *   SHARED       one staging of the union, one dispatch. The rows read the
+ *                same bytes at their own base, so the staging is scanned once.
+ *
+ * SHARED needs the row bases to be a uniform stride - nb13 is all the kernel
+ * has to say them with - which a block's consecutive positions against a
+ * linear raw_prefill always are; anything else declines. heads_rows and q_rows
+ * are the per-row views and are only read by PER_ROW. staged_keys, when not
+ * NULL, returns the key rows actually materialised, which is the ledger entry
+ * the mode names. */
+#define DS4_ATTN_RAW_ROWS_PER_ROW    0u
+#define DS4_ATTN_RAW_ROWS_BATCH_AXIS 1u
+#define DS4_ATTN_RAW_ROWS_SHARED     2u
+/* OR into the mode: size the split-K workgroup count to the key chunks that
+ * exist instead of the fixed simd width. Bit-identical - the workgroups it
+ * removes wrote empty partials, which are this reduction's identity - and the
+ * partial buffer it removes is the larger part of what the operator costs at
+ * decode key counts. */
+#define DS4_ATTN_RAW_ROWS_FIT_SPLITS 4u
+
+int ds4_gpu_attention_decode_heads_raw_rows_tensor(
+        ds4_gpu_tensor              *heads,
+        ds4_gpu_tensor      *const  *heads_rows,
+        const void                  *model_map,
+        uint64_t                     model_size,
+        uint64_t                     sinks_offset,
+        const ds4_gpu_tensor        *q,
+        const ds4_gpu_tensor *const *q_rows,
+        const ds4_gpu_tensor        *raw_kv,
+        uint32_t                     raw_cap,
+        const uint32_t              *n_raw,
+        const uint32_t              *raw_start,
+        uint32_t                     n_head,
+        uint32_t                     head_dim,
+        uint32_t                     rows,
+        uint32_t                     mode,
+        uint64_t                    *staged_keys);
+
+
 int ds4_gpu_attention_decode_heads_phase_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
