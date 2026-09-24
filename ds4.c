@@ -44947,8 +44947,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         scaffold_env = e && e[0] ? atoi(e) != 0 : 0;
     }
     const bool scaffold = scaffold_env != 0;
-    const bool stage_ms = getenv("DS4_V41_BATCH_STAGE_MS") != NULL;
-    double stage_pre = 0, stage_attn = 0, stage_moe = 0, stage_mark = 0;
+    const char *stage_env = getenv("DS4_V41_BATCH_STAGE_MS");
+    const bool stage_ms = stage_env != NULL;
+    /* =2 splits the per-row attention loop into its core and its output
+     * projection. That costs two more command-buffer boundaries a row, so the
+     * total inflates further and only the split's own ratio is readable. */
+    const bool stage_split_attn = stage_ms && stage_env[0] == '2';
+    /* The per-row attention loop ends in attn_output_b, an 8192x5120 Q8 weight
+     * that every row reads separately - the rows differ in their activations
+     * and not in that weight. Hoisting it out of the loop leaves the attention
+     * core per row and sends one exact-rows matmul for the batch, which is the
+     * same kernel the vocabulary head was moved to in 6c25a41.
+     * DS4_METAL_V41_BATCH_ATTN_OUT=1, default off.
+     * Read on every call and not cached: the selftest's in-process A/B sets and
+     * unsets it between arms, and a static would hand both arms the same one. */
+    const char *attn_out_e = getenv("DS4_METAL_V41_BATCH_ATTN_OUT");
+    const bool batch_attn_out = attn_out_e && attn_out_e[0] && atoi(attn_out_e) != 0 &&
+                                g->tp_world == 1;
+    double stage_pre = 0, stage_attn = 0, stage_attn_out = 0, stage_moe = 0, stage_mark = 0;
     if (stage_ms) {
         ok = ok && ds4_gpu_end_commands() != 0 && ds4_gpu_begin_commands() != 0;
         stage_mark = now_sec();
@@ -45012,10 +45028,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l, false);
+            ok = ds41_attention(&row, model, l, il, true);
+            if (stage_split_attn) DS41_BSTAGE(stage_attn);
+            if (ok) ok = batch_attn_out ? ds41_attention_low(&row, model, l)
+                                        : ds41_attention_output(&row, model, l, false);
+            if (stage_split_attn) DS41_BSTAGE(stage_attn_out);
         }
-        DS41_BSTAGE(stage_attn);
+        if (ok && batch_attn_out) {
+            /* Say so the first time each arm engages: an A/B on a variable the
+             * code did not read is noise wearing a result's clothes. */
+            static bool said;
+            if (!said) { said = true;
+                fprintf(stderr, "ds4: V4.1 batch attn_output_b hoisted out of the "
+                        "per-row loop (%u rows)\n", rows); }
+            ok = ds41_matmul_batch(active.block, model, l->attn_output_b,
+                                   active.low, rows, false);
+        }
+        if (!stage_split_attn) DS41_BSTAGE(stage_attn);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows);
@@ -45159,8 +45188,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     }
     ds4_gpu_tensor_free(batch_logits);
     if (stage_ms)
-        fprintf(stderr, "ds4: V4.1 batch step rows=%u pre %.1f ms, per-row attention %.1f ms, "
-                "moe %.1f ms\n", rows, stage_pre, stage_attn, stage_moe);
+        stage_split_attn ?
+            fprintf(stderr, "ds4: V4.1 batch step rows=%u pre %.1f ms, per-row attention "
+                    "%.1f ms, per-row attention output %.1f ms, moe %.1f ms\n",
+                    rows, stage_pre, stage_attn, stage_attn_out, stage_moe) :
+            fprintf(stderr, "ds4: V4.1 batch step rows=%u pre %.1f ms, per-row attention "
+                    "%.1f ms, moe %.1f ms\n", rows, stage_pre, stage_attn, stage_moe);
 #undef DS41_BSTAGE
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
@@ -45238,7 +45271,9 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     double *single = malloc((size_t)rounds * sizeof(double));
     double *single_b = malloc((size_t)rounds * sizeof(double));
     double *batch = malloc((size_t)rounds * sizeof(double));
-    if (!lg || !rowbuf || !tok || !refgap || !tok2 || !single || !single_b || !batch) goto done;
+    double *batch_b = malloc((size_t)rounds * sizeof(double));
+    if (!lg || !rowbuf || !tok || !refgap || !tok2 || !single || !single_b || !batch ||
+        !batch_b) goto done;
     /* Isolating the rollback: with no batch pass in between, a divergence can
      * only come from the rewind itself. */
     const bool nobatch = getenv("DS4_V41_VERIFY_SELFTEST_NOBATCH") != NULL ||
@@ -45255,6 +45290,12 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
      * a result's clothes. Check the variable's getenv before trusting a number
      * from here, and make the change print something when it takes effect. */
     const char *ab = getenv("DS4_V41_VERIFY_SELFTEST_AB");
+    /* The same alternation against the k-row step instead of the single one.
+     * Every question left about 100 tok/s is a question about the batch step,
+     * and DS4_V41_VERIFY_SELFTEST_AB times ds41_graph_step, which does not see
+     * a batch-only change at all. Same rule applies: the variable has to be
+     * read on every use, or both arms are the same arm. */
+    const char *bab = getenv("DS4_V41_VERIFY_SELFTEST_BATCH_AB");
     /* The same alternation, but the B arm supplies every layer's selected ids
      * from a capture instead of reading them back, so the forty synchronisation
      * points a token disappear and nothing else does. */
@@ -45369,6 +45410,34 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         batch[r] = (now_sec() - t0) * 1000.0 / (double)steps;
         DS41_SELFTEST_REWIND();
 
+        if (bab && !nobatch) {
+            char bab_name[128] = {0};
+            const char *eq = strchr(bab, '=');
+            const size_t nlen = eq ? (size_t)(eq - bab) : strlen(bab);
+            snprintf(bab_name, sizeof(bab_name), "%.*s", (int)nlen, bab);
+            setenv(bab_name, eq ? eq + 1 : "1", 1);
+            t0 = now_sec();
+            for (long b = 0; ok && b < blocks; b++) {
+                ok = ds4_gpu_begin_commands() &&
+                     ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k,
+                                                  m, w, rowbuf);
+                if (ok) ok = ds4_gpu_end_commands() != 0;
+                else { (void)ds4_gpu_synchronize(); break; }
+                for (long j = 0; j < k; j++) {
+                    int arg = 0;
+                    DS41_SELFTEST_ARGMAX(rowbuf + (size_t)j * DS4_N_VOCAB, arg);
+                    checked++;
+                    if (batch_mismatch < 0 && arg != tok[b * k + j + 1]) {
+                        batch_mismatch = b * k + j;
+                        batch_gap = refgap[b * k + j + 1];
+                    }
+                }
+            }
+            batch_b[r] = (now_sec() - t0) * 1000.0 / (double)steps;
+            unsetenv(bab_name);
+            DS41_SELFTEST_REWIND();
+        }
+
         if (ab) {
             /* NAME sets NAME=1 in the B arm; NAME=VALUE sets that value, which
              * is what a sweep of a knob rather than a switch needs. */
@@ -45408,9 +45477,32 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                                  : "odd start, pair carry NOT restored")
                         : "even start, no pair carry",
             rounds);
-    for (long r = 0; !ab && r < rounds; r++)
+    for (long r = 0; !ab && !bab && r < rounds; r++)
         fprintf(stderr, "  round %ld: single %.2f ms/token, batch %.2f ms/step\n",
                 r, single[r], batch[r] * (double)k);
+    /* Printed before anything is sorted: a round's two arms are a pair, and
+     * pairing a sorted array against an unsorted one is not a pair at all. */
+    if (bab) {
+        double *ua = malloc((size_t)rounds * sizeof(double));
+        double *sa = malloc((size_t)rounds * sizeof(double));
+        for (long r = 0; r < rounds; r++) {
+            fprintf(stderr, "  round %ld: %s unset %.2f ms/step, set %.2f ms/step\n",
+                    r, bab, batch[r] * (double)k, batch_b[r] * (double)k);
+            if (ua) ua[r] = batch[r];
+            if (sa) sa[r] = batch_b[r];
+        }
+        if (ua && sa) {
+            qsort(ua, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
+            qsort(sa, (size_t)rounds, sizeof(double), ds41_selftest_cmp);
+            const double um = ua[rounds / 2] * (double)k, sm2 = sa[rounds / 2] * (double)k;
+            fprintf(stderr,
+                    "  %s: median %.2f ms/step unset, %.2f set (%+.1f%%), "
+                    "perfect-draft ceiling %.2f -> %.2f tok/s\n",
+                    bab, um, sm2, 100.0 * (sm2 - um) / um,
+                    1000.0 * (double)k / um, 1000.0 * (double)k / sm2);
+        }
+        free(ua); free(sa);
+    }
     if (ab) {
         for (long r = 0; r < rounds; r++)
             fprintf(stderr, "  round %ld: %s unset %.2f ms/token, set %.2f ms/token\n",
@@ -45477,7 +45569,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
 done:
     g->pos = pos0; g->history = hist0; g->valid = true;
     free(lg); free(rowbuf); free(tok); free(refgap); free(tok2); free(single);
-    free(single_b); free(batch); free(carry);
+    free(single_b); free(batch); free(batch_b); free(carry);
 }
 
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
