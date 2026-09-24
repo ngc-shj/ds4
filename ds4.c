@@ -45958,6 +45958,11 @@ static void ds41_rowtile_sweep(const ds4_model *m, const ds4_weights *w) {
         { "attn_output_b", offsetof(ds4_layer_weights, attn_output_b) },
         { "shexp_gate",    offsetof(ds4_layer_weights, ffn_gate_shexp) },
         { "attn_q_b",      offsetof(ds4_layer_weights, attn_q_b) },
+        { "attn_q_a",      offsetof(ds4_layer_weights, attn_q_a) },
+        { "attn_kv",       offsetof(ds4_layer_weights, attn_kv) },
+        { "attn_output_a", offsetof(ds4_layer_weights, attn_output_a) },
+        { "shexp_up",      offsetof(ds4_layer_weights, ffn_up_shexp) },
+        { "shexp_down",    offsetof(ds4_layer_weights, ffn_down_shexp) },
     };
     /* Every Q8 projection a block touches, in one timed region, with the
      * buffers allocated once outside it - the previous version allocated and
