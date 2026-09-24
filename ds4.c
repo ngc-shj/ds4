@@ -41497,9 +41497,74 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
         ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+/* What a layer looked like where the path already stopped, and nowhere else.
+ *
+ * ds41_moe_partial returns with the router and the shared expert finished and
+ * waited for - the selected ids have been read back - and with the routed
+ * dispatches not yet committed. So everything below is current without a
+ * drain of its own, which is the whole point: a probe that adds a
+ * synchronisation changes the answer, and this branch has now paid for that
+ * twice.
+ *
+ * Both the single-row path and the scaffold-only session batch reach here
+ * through this same function, so one hook compares them. Set
+ * DS4_METAL_V41_MOE_PROBE to how many tokens to print.
+ */
+/* A batch calls this once a row a layer; only the first row is printed, or the
+ * token counter advances twice a token and the two logs stop lining up. */
+static int g_ds41_probe_skip;
+
+static void ds41_moe_probe(ds41_gpu_graph *g, uint32_t il) {
+    if (g_ds41_probe_skip) return;
+    static int want = -2;
+    if (want == -2) {
+        const char *e = getenv("DS4_METAL_V41_MOE_PROBE");
+        want = e && e[0] ? atoi(e) : 0;
+    }
+    if (want <= 0) return;
+    static uint32_t token_seen;
+    if (il == 0) token_seen++;
+    if (token_seen > (uint32_t)want) return;
+    (void)token_seen;
+    static float buf[8192];
+    struct { const char *name; ds4_gpu_tensor *t; uint32_t n; } f[] = {
+        { "residual", g->residual, DS4_N_HC * DS4_N_EMBD },
+        { "pre", g->pre, DS4_N_HC },
+        { "block", g->block, DS4_N_EMBD },
+        { "after_attn", g->after_attn, DS4_N_HC * DS4_N_EMBD },
+        { "ffn_split", g->ffn_split, 24 },
+        { "attn_split", g->attn_split, 24 },
+        { "norm", g->norm, DS4_N_EMBD },
+        { "route_logits", g->route_logits, DS4_N_EXPERT },
+        { "selected", g->selected, DS4_N_EXPERT_USED },
+        { "route_weights", g->route_weights, DS4_N_EXPERT_USED },
+        { "shared", g->shared, DS4_N_EMBD },
+    };
+    /* Keyed on the position, not on how many times this has been called: a
+     * batch's row 0 is not always the same session, and two sessions started
+     * by the same client finish their prefill at different moments. Aligning
+     * two logs by call order compares one session's token 20 against
+     * another's token 1, which is what it did. */
+    fprintf(stderr, "ds4: probe pos %u layer %u:", g->pos, il);
+    for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
+        uint32_t n = f[i].n > 8192u ? 8192u : f[i].n;
+        if (!f[i].t) { fprintf(stderr, " %s=-", f[i].name); continue; }
+        if (!ds4_gpu_tensor_read(f[i].t, 0, buf, (uint64_t)n * sizeof(float))) {
+            fprintf(stderr, " %s=?", f[i].name);
+            continue;
+        }
+        uint64_t h = 1469598103934665603ull;
+        const unsigned char *p8 = (const unsigned char *)buf;
+        for (size_t b = 0; b < (size_t)n * sizeof(float); b++) { h ^= p8[b]; h *= 1099511628211ull; }
+        fprintf(stderr, " %s=%016llx", f[i].name, (unsigned long long)h);
+    }
+    fprintf(stderr, "\n");
+}
+
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     if (!ds41_moe_partial(g, m, l, il, token)) return false;
+    ds41_moe_probe(g, il);
     /* The expert dispatches are encoded here but nothing is submitted until
      * the next layer's selected-id signal, so the GPU has nothing to run for
      * the 0.147 ms a layer the host then spends encoding the next layer's
@@ -44193,8 +44258,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
 #undef DS41_SCAFFOLD_ROW
                 row.q = queries[i];
                 row.heads = heads[i];
+                g_ds41_probe_skip = i != 0;
                 ok = ds4_gpu_routed_moe_set_row_slot((uint32_t)i) != 0 &&
                      ds41_graph_layer(&row, model, l, il, tokens[i]);
+                g_ds41_probe_skip = 0;
                 /* The same per-layer hashes the single-row path prints, so the
                  * two runs can be compared at a layer boundary rather than at
                  * the token that first diverges. Row 0 only: a second row's
