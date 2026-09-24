@@ -45202,8 +45202,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * table, so every row reads each unique expert once instead of once per
      * row. The per-row detour below stays the default until that path has
      * been shown to match it byte for byte on this model's shapes. */
+    /* On by default. It was held back for two reasons and neither survived a
+     * test: generation collapsing after about eighty tokens did not reproduce
+     * at two sessions of four hundred, and the divergence between one session
+     * and two was a harness sending a different prompt. It is byte identical
+     * to the single pass in the selftest's full-logits comparison, and
+     * correct.sh's six prompts - the longest 2048 tokens - hash identically
+     * with it and without it, matching the recorded production hashes.
+     * DS4_METAL_V41_BATCH_STREAM_EXPERTS=0 goes back to the per-row detour. */
+    const char *bse_e = getenv("DS4_METAL_V41_BATCH_STREAM_EXPERTS");
     const bool batch_stream_experts = g->streaming && g->tp_world == 1 &&
-        getenv("DS4_METAL_V41_BATCH_STREAM_EXPERTS") != NULL;
+        (!bse_e || !bse_e[0] || atoi(bse_e) != 0);
     ds41_prefill_row active = {0};
     ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
     uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
