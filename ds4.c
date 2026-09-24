@@ -40528,6 +40528,24 @@ typedef struct {
 
 static ds41_wread g_wread[512];
 static int g_wread_on;
+/* Routed experts are not matrices in the table above: a block selects six of
+ * 384 a row, and what matters is how many of the K*6 selections are distinct. */
+static uint64_t g_wread_routed_sel, g_wread_routed_uniq, g_wread_routed_layers;
+
+static void ds41_wread_note_route(const int32_t *ids, uint32_t rows, uint32_t used) {
+    if (!g_wread_on || !ids) return;
+    bool seen[DS4_MAX_EXPERT] = { false };
+    uint32_t uniq = 0;
+    for (uint32_t r = 0; r < rows; r++)
+        for (uint32_t j = 0; j < used; j++) {
+            const int32_t id = ids[r * DS4_MAX_EXPERT_USED + j];
+            if (id < 0 || (uint32_t)id >= DS4_N_EXPERT) continue;
+            if (!seen[id]) { seen[id] = true; uniq++; }
+        }
+    g_wread_routed_sel += (uint64_t)rows * used;
+    g_wread_routed_uniq += uniq;
+    g_wread_routed_layers++;
+}
 
 /* br is the kernel's batch-row tile. One dispatch is not one read of the
  * weight: the decode-rows kernels put the activation rows on the grid's Y
@@ -40552,6 +40570,7 @@ static void ds41_wread_note(const ds4_tensor *t, uint32_t rows, uint32_t br) {
 
 static void ds41_wread_begin(void) {
     memset(g_wread, 0, sizeof(g_wread));
+    g_wread_routed_sel = g_wread_routed_uniq = g_wread_routed_layers = 0;
     g_wread_on = 1;
 }
 
@@ -40589,6 +40608,25 @@ static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
                 name, (double)e->bytes / 1e6, e->dispatches, e->rows, e->passes,
                 (double)e->bytes * e->passes / 1e6);
     }
+    if (g_wread_routed_layers) {
+        uint64_t grow = 0, drow = 0, per_expert = 0;
+        const ds4_layer_weights *l1 = &w->layer[1];
+        if (tensor_nbytes(l1->ffn_gate_exps->type, DS4_N_EMBD, &grow) &&
+            tensor_nbytes(l1->ffn_down_exps->type, DS4_N_FF_EXP, &drow))
+            per_expert = 2ull * grow * DS4_N_FF_EXP + drow * DS4_N_EMBD;
+        fprintf(stderr,
+                "ds4:   routed: %llu selections over %llu layers, %llu unique "
+                "(%.1f of %.1f a layer, %.0f%% duplicate); %.3f GB selected, "
+                "%.3f GB if the duplicates were shared\n",
+                (unsigned long long)g_wread_routed_sel,
+                (unsigned long long)g_wread_routed_layers,
+                (unsigned long long)g_wread_routed_uniq,
+                (double)g_wread_routed_uniq / (double)g_wread_routed_layers,
+                (double)g_wread_routed_sel / (double)g_wread_routed_layers,
+                100.0 * (1.0 - (double)g_wread_routed_uniq / (double)g_wread_routed_sel),
+                (double)g_wread_routed_sel * per_expert / 1e9,
+                (double)g_wread_routed_uniq * per_expert / 1e9);
+    }
     fprintf(stderr,
             "ds4:   distinct %.3f GB, scanned %.3f GB (%.2fx), floor at one scan %.3f GB, "
             "at ceil(%u/4) scans %.3f GB\n",
@@ -40613,7 +40651,17 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * this between arms, and a static hands both arms the same value and
      * reports no difference. */
     const char *dense_tile_e = getenv("DS4_METAL_V41_DENSE_ROW_TILE");
-    const int dense_tile = dense_tile_e && dense_tile_e[0] ? atoi(dense_tile_e) : 0;
+    /* Per shape, from DS4_V41_ROWTILE_CHECK=2 on this machine: BR=4 is the
+     * best tile everywhere, BR=2 ties it on the vocabulary head, and BR=8 is
+     * the worst of the three on every shape because sumf[8][NR0] and yl[8][NQ]
+     * do not fit. Bit-identical to the exact kernel at every tile, so the
+     * default only changes which kernel runs, never the answer.
+     *
+     * The head keeps its own gate: without EXACT_VOCAB_ROWS it goes to the
+     * generic multi-row path, and turning the tile on for it would change what
+     * the default produces rather than how fast it produces it. */
+    const int dense_tile = dense_tile_e && dense_tile_e[0] ? atoi(dense_tile_e) :
+        (outputs == DS4_N_VOCAB ? 0 : 4);
     if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
         (dense_tile == 2 || dense_tile == 4)) {
         ds41_wread_note(weight, count, (uint32_t)dense_tile);
@@ -45484,6 +45532,23 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                 for (int i = 0; ok && i < count; i++)
                     ok = ds4_gpu_tensor_read(moe_rows[i].selected, 0, row_ids[i],
                                              (uint64_t)DS4_N_EXPERT_USED * sizeof(row_ids[0][0])) != 0;
+                if (ok) ds41_wread_note_route(&row_ids[0][0], rows, DS4_N_EXPERT_USED);
+                /* MEASUREMENT ONLY, and it produces the wrong answer: every
+                 * row is given row 0's experts, so a layer's unique count
+                 * falls from about 26 of 48 to 6. The difference in step time
+                 * is what perfect expert sharing is worth, measured instead of
+                 * derived from a byte count - which is the conversion that
+                 * misled this work once already.
+                 * DS4_METAL_V41_MOE_SAME_EXPERTS=1. */
+                const char *same_e = getenv("DS4_METAL_V41_MOE_SAME_EXPERTS");
+                if (ok && same_e && same_e[0] && atoi(same_e) != 0) {
+                    static bool said_same;
+                    if (!said_same) { said_same = true;
+                        fprintf(stderr, "ds4: V4.1 MoE forced to one row's experts - "
+                                "measurement only, the output is wrong\n"); }
+                    for (int i = 1; i < count; i++)
+                        memcpy(row_ids[i], row_ids[0], sizeof(row_ids[0]));
+                }
                 if (ok) ok = ds4_gpu_begin_commands() != 0;
                 /* What one row's expert miss costs the rows that did not
                  * miss. The rows are done one after another and the load is
