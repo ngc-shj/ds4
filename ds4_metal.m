@@ -27881,7 +27881,9 @@ static int ds4_gpu_attention_output_q8_batch_impl(
         uint64_t                full_low_dim,
         uint64_t                low_offset) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!out || !low || !group_tmp || !low_tmp || !heads || !model_map ||
+    /* out == NULL stops after the low projection: the caller wants output A
+     * for the batch and will send output B itself. */
+    if (!low || !group_tmp || !low_tmp || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0 ||
         group_dim > UINT32_MAX || rank > UINT32_MAX || out_dim > UINT32_MAX) {
         return 0;
@@ -27901,7 +27903,7 @@ static int ds4_gpu_attention_output_q8_batch_impl(
         const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
         const uint64_t out_b_bytes = out_dim * row_b_bytes;
         if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset ||
-            out_b_offset > model_size || out_b_bytes > model_size - out_b_offset) {
+            (out && (out_b_offset > model_size || out_b_bytes > model_size - out_b_offset))) {
             fprintf(stderr, "ds4: Metal attention output batch weights are outside the mapped model\n");
             return 0;
         }
@@ -27911,7 +27913,7 @@ static int ds4_gpu_attention_output_q8_batch_impl(
         const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
         if (ds4_gpu_tensor_bytes(heads) < heads_bytes ||
             ds4_gpu_tensor_bytes(low) < low_bytes ||
-            ds4_gpu_tensor_bytes(out) < out_bytes) {
+            (out && ds4_gpu_tensor_bytes(out) < out_bytes)) {
             fprintf(stderr, "ds4: Metal attention output batch received undersized buffers\n");
             return 0;
         }
@@ -28197,7 +28199,9 @@ static int ds4_gpu_attention_output_q8_batch_impl(
 
         if (ok && round_low_bf16)
             ok = ds4_gpu_dsv41_quantize(low, (uint32_t)low_dim, n_tokens, DS4_V41_BF16);
-        if (ok && full_low_dim != low_dim) {
+        if (ok && !out) {
+            /* Low only: the caller sends output B. */
+        } else if (ok && full_low_dim != low_dim) {
             const uint32_t matrix_rows = ds4_gpu_mpp_available() ? n_tokens / 32u * 32u : 0;
             if (matrix_rows) {
                 ok = ds4_gpu_matmul_q8_0_kslice_rows_impl(out, model_map, model_size,
@@ -28237,6 +28241,20 @@ int ds4_gpu_attention_output_q8_batch_tensor(
     return ds4_gpu_attention_output_q8_batch_impl(out, low, group_tmp, low_tmp,
         model_map, model_size, out_a_offset, out_b_offset, group_dim, rank,
         n_groups, out_dim, heads, n_tokens, false, 0, 0);
+}
+
+/* Output A alone, for n_tokens rows, rounded to BF16 exactly as the per-row
+ * ds41_attention_low does. Output B is left to the caller so a verifier can
+ * keep sending it through the exact-rows kernel already checked byte for byte
+ * against a single row. */
+int ds4_gpu_dsv41_attention_output_low_batch(
+        ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    return ds4_gpu_attention_output_q8_batch_impl(NULL, low, low, low,
+        model_map, model_size, out_a_offset, 0, 4096, 1024,
+        8, 5120, heads, n_tokens, true, 0, 0);
 }
 
 int ds4_gpu_dsv41_attention_output_batch(

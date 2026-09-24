@@ -44927,6 +44927,28 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
     }
+    /* What the K rows of a speculative block actually are: consecutive
+     * positions of ONE session. The executor below was written for K sessions
+     * that happen to share a workspace, and runs attention a row at a time
+     * because independent sessions have independent KV. These rows do not -
+     * they share the whole prefix and differ only in the K new positions,
+     * which is the case ds41_attention_batch() already covers for prefill.
+     *
+     * The condition is the abstraction: same graph, and positions that step by
+     * one. Anything else falls back to the per-row loop. */
+    bool block_attn = ok && count >= 2 && g->tp_world == 1;
+    for (int i = 1; block_attn && i < count; i++)
+        block_attn = graphs[i] == graphs[0] &&
+                     positions[i] == positions[0] + (uint32_t)i;
+    bool block_attn_low = false;
+    if (block_attn) {
+        const char *e = getenv("DS4_METAL_V41_BLOCK_ATTN");
+        const int mode = e && e[0] ? atoi(e) : 0;
+        block_attn = mode != 0;
+        /* =2 keeps output A per row, so a divergence can be attributed to the
+         * attention core or to the batched low projection and not to both. */
+        block_attn_low = mode == 1;
+    }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     /* Which part of a k-row step actually grows with k. Splitting it costs a
      * command buffer boundary per stage, so the totals run high; the shares
@@ -45028,7 +45050,32 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
         DS41_BSTAGE(stage_pre);
-        for (int i = 0; ok && i < count; i++) {
+        if (block_attn) {
+            static bool said_block;
+            if (!said_block) { said_block = true;
+                fprintf(stderr, "ds4: V4.1 contiguous-block attention, one session, "
+                        "%u consecutive positions\n", rows); }
+            /* Attention core for the whole block, then output A for the block,
+             * then output B through the exact-rows kernel the verifier has
+             * already checked byte for byte against a single row. */
+            if (ok) ok = ds41_attention_batch(g, model, l, il, rows);
+            if (ok && block_attn_low)
+                ok = ds4_gpu_dsv41_attention_output_low_batch(active.low,
+                        model->map, model->size, l->attn_output_a->abs_offset,
+                        active.heads, rows) != 0;
+            for (int i = 0; ok && !block_attn_low && i < count; i++) {
+                ds41_gpu_graph row = *graphs[i];
+                row.pos = positions[i];
+#define DS41_BLOCK_ROW(name, width) row.name = g->rows_view[i].name;
+                DS41_PREFILL_ROWS(DS41_BLOCK_ROW)
+#undef DS41_BLOCK_ROW
+                row.heads = heads[i];
+                ok = ds41_attention_low(&row, model, l);
+            }
+            if (ok) ok = ds41_matmul_batch(active.block, model, l->attn_output_b,
+                                           active.low, rows, false);
+        }
+        for (int i = 0; ok && !block_attn && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
 #define DS41_SESSION_ROW(name, width) row.name = g->rows_view[i].name;
@@ -45048,7 +45095,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                         : ds41_attention_output(&row, model, l, false);
             if (stage_split_attn) DS41_BSTAGE(stage_attn_out);
         }
-        if (ok && batch_attn_out) {
+        if (ok && batch_attn_out && !block_attn) {
             /* Say so the first time each arm engages: an A/B on a variable the
              * code did not read is noise wearing a result's clothes. */
             /* Both arms leave a mark. The default is on, so an A/B on this

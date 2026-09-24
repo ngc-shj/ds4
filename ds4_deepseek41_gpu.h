@@ -37,6 +37,14 @@ int ds4_gpu_dsv41_shared_start(
 int ds4_gpu_dsv41_shared_join(void);
 #endif
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
+int ds4_gpu_dsv41_attention_output_low_batch(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens);
+
 int ds4_gpu_dsv41_attention_output_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size,
