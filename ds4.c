@@ -40202,6 +40202,16 @@ typedef struct {
     ds4_engram_table table[2];
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
+    /* A block's new KV rows, per layer, kept out of the ring until the accept
+     * count is known. The ring is the committed prefix and must stay immutable
+     * while the block runs: a partial accept has to leave position A onward as
+     * if the block never happened, and a ring written through cannot - at SWA
+     * 128 the block's own writes overwrite what position A needs, which is what
+     * DS4_V41_VERIFY_SELFTEST_NOBATCH measures at position 1051. So the rows
+     * land here and ds41_block_kv_commit moves the first A of them. */
+    ds4_gpu_tensor *block_kv_delta[40];
+    uint32_t block_kv_delta_rows;
+    uint32_t block_kv_delta_start;
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
@@ -40244,6 +40254,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->engram_k_norm[i]);
     }
     for (uint32_t i = 0; i < 40; i++) ds4_gpu_tensor_free(g->window[i]);
+    for (uint32_t i = 0; i < 40; i++) ds4_gpu_tensor_free(g->block_kv_delta[i]);
     for (uint32_t i = 0; i < 4; i++) {
         ds4_gpu_tensor_free(g->compressed[i]);
         ds4_gpu_tensor_free(g->index_cache[i]);
@@ -40365,6 +40376,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     for (uint32_t i = 0; i < 40; i++) {
         g->window[i] = ds4_gpu_tensor_alloc(128u * 512u * sizeof(float));
         if (!g->window[i]) goto fail;
+        g->block_kv_delta[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_TP_BATCH_MAX_ROWS * 512u * sizeof(float));
+        if (!g->block_kv_delta[i]) goto fail;
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
@@ -45714,6 +45728,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * much of one sliding window they see. One staging of the union serves the
      * block, and each row reads its own keys from its own base.
      * DS4_METAL_V41_BLOCK_ATTN_RAW=1. */
+    /* The block keeps its K new KV rows out of the ring until an accept count
+     * exists. Requires the block-local KV path, which is what puts the rows in a
+     * linear buffer in the first place. DS4_METAL_V41_BLOCK_TXN=1. */
+    const char *btxn_e = getenv("DS4_METAL_V41_BLOCK_TXN");
+    const bool block_txn = btxn_e && btxn_e[0] && atoi(btxn_e) != 0;
     const char *bar_e = getenv("DS4_METAL_V41_BLOCK_ATTN_RAW");
     const bool block_attn_raw = bar_e && bar_e[0] && atoi(bar_e) != 0;
     const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
@@ -46131,8 +46150,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                         (batch_attn_out ? ds41_attention_low(&row, model, l)
                                         : ds41_attention_output(&row, model, l, false));
             }
-            /* Commit, once. */
-            if (ok) {
+            /* Commit, or hold. Writing the ring here commits all K rows before
+             * anything has decided how many are accepted, and then a partial
+             * accept has nowhere to go. With DS4_METAL_V41_BLOCK_TXN the K new
+             * rows are parked in this layer's delta instead and
+             * ds41_block_kv_commit moves the first A once A is known. */
+            if (ok && block_txn) {
+                ok = ds4_gpu_tensor_copy(g->block_kv_delta[il], 0, g->raw_prefill,
+                        (uint64_t)previous * row_bytes,
+                        (uint64_t)rows * row_bytes) != 0;
+                g->block_kv_delta_rows = rows;
+                g->block_kv_delta_start = start;
+            } else if (ok) {
                 const uint32_t n_all = previous + rows;
                 const uint32_t kept = n_all < 128u ? n_all : 128u;
                 const uint32_t slot = (start + rows - kept) % 128u;
@@ -83531,6 +83560,31 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+/* Move the first `accepted` of the block's parked KV rows into the ring, for
+ * every layer, and drop the rest. This is the commit half of the transaction:
+ * until it runs the ring still holds exactly the committed prefix, so a block
+ * that accepts nothing leaves no trace and a block that accepts A leaves A.
+ *
+ * The ring is 128 slots and the rows go at (start + i) % 128. Writing A of them
+ * cannot overwrite a key position A-1 needs - that is the property the
+ * write-through path did not have. */
+static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
+    if (accepted == 0) { g->block_kv_delta_rows = 0; return true; }
+    if (accepted > g->block_kv_delta_rows) return false;
+    const uint64_t row_bytes = 512u * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->block_kv_delta[il]) return false;
+        for (uint32_t i = 0; i < accepted; i++) {
+            const uint32_t slot = (g->block_kv_delta_start + i) % 128u;
+            if (!ds4_gpu_tensor_copy(g->window[il], (uint64_t)slot * row_bytes,
+                                     g->block_kv_delta[il], (uint64_t)i * row_bytes,
+                                     row_bytes)) return false;
+        }
+    }
+    g->block_kv_delta_rows = 0;
+    return true;
+}
+
 /* One K-row verification step for a single session, in production.
  *
  * The K rows of a block are consecutive positions of one session, and the
@@ -83547,15 +83601,18 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
  * position pos+i, so candidates[i+1] is accepted when it equals it, and the
  * prefix ends at the first disagreement.
  *
- * It commits only a full prefix for now, and invalidates the session otherwise.
- * That is not a simplification to be tidied later: rolling back to the accepted
- * position needs the keys the block's own writes overwrote, and with SWA 128 a
- * ring of 128 does not have them - a block of k needs 128+k live. Measured:
- * DS4_V41_VERIFY_SELFTEST_NOBATCH at position 1051 diverges on rollback with no
- * batch pass involved at all, because sixty-four single steps wrap the ring.
- * Until the block-local delta and the accepted-prefix commit are in, a partial
- * accept has nowhere correct to land, and returning a wrong answer quietly is
- * worse than refusing.
+ * With DS4_METAL_V41_BLOCK_TXN it commits the first n of k and the rest never
+ * happened: the block's KV rows are parked in a per-layer delta and only n of
+ * them reach the ring. Without it the ring is written through for all k before
+ * anything knows n, and a partial accept has nowhere correct to land - the keys
+ * position n needs were overwritten by the block's own writes, which
+ * DS4_V41_VERIFY_SELFTEST_NOBATCH shows at position 1051 with no batch involved.
+ * It refuses in that case rather than returning a plausible wrong answer.
+ *
+ * What the transaction does NOT yet park: the compressed KV and its index
+ * visibility, previous_kv/previous_score, Engram, selected_comp, block_mask,
+ * the residual carry, and the publish state. The raw ring is the one measured to
+ * break, so it is first; a partial accept is only correct once the rest follow.
  *
  * So with an oracle - candidates that are known-correct - this commits k tokens
  * a step and the wall over committed tokens is the executor's real rate. With a
@@ -83613,33 +83670,48 @@ int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
     }
 
     /* Row i answers position pos0+i, so it predicts candidates[i+1]. */
-    int n = 1;
+    int n = 1, arg_at_n = -1;
     accepted[0] = candidates[0];
     for (int i = 0; i + 1 < k; i++) {
         const int arg = sample_argmax(rows + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
-        if (arg != candidates[i + 1]) break;
+        if (arg != candidates[i + 1]) { arg_at_n = arg; break; }
         accepted[n++] = candidates[i + 1];
     }
     const int next = sample_argmax(rows + (size_t)(k - 1) * DS4_N_VOCAB, DS4_N_VOCAB);
+    if (n == k) arg_at_n = next;
     free(rows);
 
-    if (n < k) {
-        /* The block ran every row, so the session is k positions ahead with a
-         * ring that no longer holds what position n would need. Refuse rather
-         * than land it somewhere plausible. */
+    /* With the transaction the block's KV rows are parked, not written, so a
+     * partial accept commits the first n of them and the rest never existed.
+     * Without it the ring was written through for all k and there is nowhere for
+     * position n to come from - refuse rather than land somewhere plausible. */
+    if (s->ds41_graph.block_kv_delta_rows == 0 && n < k) {
         ds4_session_invalidate(s);
         if (err && errlen)
-            snprintf(err, errlen, "verify block accepted %d of %d and cannot roll back "
-                     "the rest yet", n, k);
+            snprintf(err, errlen, "verify block accepted %d of %d and the ring was "
+                     "written through, so the rest cannot be undone - needs "
+                     "DS4_METAL_V41_BLOCK_TXN", n, k);
         return -1;
     }
-    for (int i = 0; i < k; i++) token_vec_push(&s->checkpoint, candidates[i]);
-    s->ds41_graph.pos = pos0 + (uint32_t)k;
+    /* The copies need a command scope of their own: the batch step's was closed
+     * above, and a tensor copy outside one does not run. */
+    if (s->ds41_graph.block_kv_delta_rows != 0 &&
+        !(ds4_gpu_begin_commands() &&
+          ds41_block_kv_commit(&s->ds41_graph, (uint32_t)n) &&
+          ds4_gpu_end_commands())) {
+        ds4_session_invalidate(s);
+        if (err && errlen) snprintf(err, errlen, "verify block could not commit %d rows", n);
+        return -1;
+    }
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, candidates[i]);
+    s->ds41_graph.pos = pos0 + (uint32_t)n;
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
-    accepted[k - 1 + 1 - 1] = candidates[k - 1];
+    /* The token after the accepted prefix is the model's own answer there, so a
+     * caller that accepted fewer than k still has somewhere to go. */
+    if (n < k) accepted[n] = arg_at_n;
     (void)next;
-    return k;
+    return n;
 #endif
 }
 
@@ -83755,6 +83827,46 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
         }
         committed += n;
     }
+    /* Every accept count, not just the full one. A is forced by corrupting the
+     * candidate the model would have agreed with, so the block has to stop
+     * there, commit A and leave the session as if the rest never ran - checked
+     * by decoding one more token from it and comparing against the oracle.
+     * A=1 is included: a block that accepts only the token it was given must
+     * leave no trace of the other seven. DS4_V41_ORACLE_ACCEPT_SWEEP=1. */
+    if (getenv("DS4_V41_ORACLE_ACCEPT_SWEEP")) {
+        for (long want = 1; want <= k; want++) {
+            int cand[DS4_TP_BATCH_MAX_ROWS];
+            for (long j = 0; j < k; j++) cand[j] = oracle[j];
+            if (want < k) cand[want] = (oracle[want] + 1) % (int)DS4_N_VOCAB;
+            s->ds41_graph.pos = pos0;
+            s->ds41_graph.history = hist0;
+            s->ds41_graph.valid = true;
+            s->checkpoint.len = (int)pos0;
+            s->checkpoint_valid = true;
+            if (carry && ds4_gpu_synchronize())
+                for (uint32_t ci = 0; ci < 3; ci++) {
+                    (void)ds4_gpu_tensor_write(s->ds41_graph.previous_kv[ci], 0,
+                                               carry + (size_t)ci * 2u * 512u, 512u * 4u);
+                    (void)ds4_gpu_tensor_write(s->ds41_graph.previous_score[ci], 0,
+                                               carry + ((size_t)ci * 2u + 1u) * 512u, 512u * 4u);
+                }
+            const int got = ds4_session_verify_block(s, cand, (int)k, acc, err, sizeof(err));
+            if (got != (int)want) {
+                fprintf(stderr, "ds4:   A sweep: forced %ld, committed %d (%s)\n",
+                        want, got, got < 0 ? err : "wrong count");
+                continue;
+            }
+            if (!ds41_graph_step(&s->ds41_graph, m, w, oracle[want], lg)) {
+                fprintf(stderr, "ds4:   A sweep: forced %ld, committed %d, next step failed\n",
+                        want, got);
+                continue;
+            }
+            const int nxt = sample_argmax(lg, DS4_N_VOCAB);
+            fprintf(stderr, "ds4:   A sweep: forced %ld, committed %d, next token %s\n",
+                    want, got, nxt == oracle[want + 1] ? "matches the oracle" : "DIVERGED");
+        }
+    }
+
     fprintf(stderr, "ds4: oracle block k=%ld from position %u: %ld tokens committed in "
             "%.1f ms = %.2f ms a token, %.2f tok/s\n",
             k, pos0, committed, block_ms, block_ms / (double)committed,
