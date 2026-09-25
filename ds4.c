@@ -41462,6 +41462,81 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
+/* Exact replay ablation of the attention block. DS4_V41_ABLATE=1.
+ *
+ * A capture pass saves, for every layer and every row of one fixed K-row
+ * block, the attention heads as the core left them and the attention block's
+ * contribution to the residual. A later pass over the same block copies one of
+ * those back in and skips the work that produced it.
+ *
+ * Because the saved value goes back in, every later layer sees exactly what
+ * canonical gave it, so the logits come out byte-identical - and that is the
+ * ablation's own check. It is also why the wall difference is a price rather
+ * than an estimate: the skipped work is missing from a real step, in place,
+ * with its neighbours and its memory traffic where they always were.
+ *
+ *   normal   - replay A = row gather + KV staging + attention core
+ *   replay A - replay B = BF16 + inverse RoPE + attn_output_a + attn_output_b
+ *
+ * What it does not price: the indexer that writes selected_comp runs in every
+ * arm, so its cost is in neither figure. A microbenchmark of the core alone
+ * prices neither, which is how one came to read as a ceiling on work it never
+ * touched.
+ */
+#define DS41_ABLATE_OFF       0
+#define DS41_ABLATE_CAPTURE   1
+#define DS41_ABLATE_HEADS     2   /* replay A: heads restored, core skipped */
+#define DS41_ABLATE_BLOCK     3   /* replay B: residual restored, all of it skipped */
+#define DS41_ABLATE_ROPED     4   /* replay C: heads after bf16 and inverse RoPE */
+#define DS41_ABLATE_MAX_LAYER 64
+
+static int g_ds41_ablate_mode;
+/* Which row of the block is in ds41_attention right now. The capture is per
+ * row because bf16 follows each row's core inside the same call, so there is
+ * no point where every row's heads are still as the core left them. */
+static uint32_t g_ds41_ablate_row;
+static ds4_gpu_tensor *g_ds41_ablate_heads[DS41_ABLATE_MAX_LAYER];
+static ds4_gpu_tensor *g_ds41_ablate_block[DS41_ABLATE_MAX_LAYER];
+static ds4_gpu_tensor *g_ds41_ablate_roped[DS41_ABLATE_MAX_LAYER];
+/* An arm that skipped nothing is not an arm. These say the seams fired. */
+static uint64_t g_ds41_ablate_skipped_core, g_ds41_ablate_skipped_block;
+static uint64_t g_ds41_ablate_skipped_rope;
+
+static bool ds41_ablate_live(uint32_t il, bool projected) {
+    return g_ds41_ablate_mode != DS41_ABLATE_OFF && projected &&
+           il < DS41_ABLATE_MAX_LAYER;
+}
+
+/* Allocated once, before any arm is timed, so every arm runs against the same
+ * residency. 336 MB of heads at 40 layers and 8 rows. */
+static bool ds41_ablate_ensure(uint32_t il, uint64_t head_bytes, uint64_t block_bytes) {
+    if (il >= DS41_ABLATE_MAX_LAYER) return false;
+    if (!g_ds41_ablate_heads[il]) {
+        g_ds41_ablate_heads[il] = ds4_gpu_tensor_alloc(head_bytes);
+        if (!g_ds41_ablate_heads[il]) return false;
+    }
+    if (!g_ds41_ablate_roped[il]) {
+        g_ds41_ablate_roped[il] = ds4_gpu_tensor_alloc(head_bytes);
+        if (!g_ds41_ablate_roped[il]) return false;
+    }
+    if (!g_ds41_ablate_block[il]) {
+        g_ds41_ablate_block[il] = ds4_gpu_tensor_alloc(block_bytes);
+        if (!g_ds41_ablate_block[il]) return false;
+    }
+    return true;
+}
+
+static void ds41_ablate_release(void) {
+    for (uint32_t i = 0; i < DS41_ABLATE_MAX_LAYER; i++) {
+        if (g_ds41_ablate_heads[i]) { ds4_gpu_tensor_free(g_ds41_ablate_heads[i]);
+                                      g_ds41_ablate_heads[i] = NULL; }
+        if (g_ds41_ablate_roped[i]) { ds4_gpu_tensor_free(g_ds41_ablate_roped[i]);
+                                      g_ds41_ablate_roped[i] = NULL; }
+        if (g_ds41_ablate_block[i]) { ds4_gpu_tensor_free(g_ds41_ablate_block[i]);
+                                      g_ds41_ablate_block[i] = NULL; }
+    }
+}
+
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -41482,16 +41557,49 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                              g->kv, 0, 512u * 4u) ||
         !ds41_attention_select(g, m, l, il, merged)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                         g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
-            l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
-            g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
-            g->selected_kv, 0, attended, NULL, 0,
-            heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+    const bool ablate = ds41_ablate_live(il, projected) && g_ds41_ablate_heads[il];
+    const uint64_t head_bytes = (uint64_t)heads * DS4_N_HEAD_DIM * sizeof(float);
+    if (ablate && g_ds41_ablate_mode == DS41_ABLATE_BLOCK) {
+        g_ds41_ablate_skipped_core++;
+        /* The whole attention block goes; the caller restores the residual it
+         * would have produced. The prologue above has already run, because the
+         * KV write and the indexer are state the later tokens need and
+         * skipping them would ablate the model rather than the work. */
+        return true;
+    }
+    if (ablate && g_ds41_ablate_mode == DS41_ABLATE_ROPED) {
+        /* bf16 and the inverse RoPE tail go with the core: this restores the
+         * heads as attn_output_a would have received them. */
+        if (!ds4_gpu_tensor_copy(g->heads, 0, g_ds41_ablate_roped[il],
+                (uint64_t)g_ds41_ablate_row * head_bytes, head_bytes)) return false;
+        g_ds41_ablate_skipped_core++;
+        g_ds41_ablate_skipped_rope++;
+        return true;
+    }
+    if (ablate && g_ds41_ablate_mode == DS41_ABLATE_HEADS) {
+        if (!ds4_gpu_tensor_copy(g->heads, 0, g_ds41_ablate_heads[il],
+                (uint64_t)g_ds41_ablate_row * head_bytes, head_bytes)) return false;
+        g_ds41_ablate_skipped_core++;
+    } else {
+        if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                             g->selected_comp, n_comp, attended)) return false;
+        if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+                l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
+                g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
+                g->selected_kv, 0, attended, NULL, 0,
+                heads, DS4_N_HEAD_DIM)) return false;
+        if (ablate && g_ds41_ablate_mode == DS41_ABLATE_CAPTURE &&
+            !ds4_gpu_tensor_copy(g_ds41_ablate_heads[il],
+                (uint64_t)g_ds41_ablate_row * head_bytes, g->heads, 0, head_bytes))
+            return false;
+    }
+    if (!ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+    if (ablate && g_ds41_ablate_mode == DS41_ABLATE_CAPTURE &&
+        !ds4_gpu_tensor_copy(g_ds41_ablate_roped[il],
+            (uint64_t)g_ds41_ablate_row * head_bytes, g->heads, 0, head_bytes))
+        return false;
     if (projected) return true;
     /* With two ranks the sum comes after the projection, so the rounding has
      * to wait for it; alone, the projection is the last writer. */
@@ -45775,6 +45883,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             row.q = queries[i];
             row.heads = heads[i];
             if (row_gather) row.selected_kv = gathers[i];
+            g_ds41_ablate_row = (uint32_t)i;
             ok = ds41_attention(&row, model, l, il, true);
             if (stage_split_attn) DS41_BSTAGE(stage_attn);
             if (ok && !batch_attn_out) {
@@ -45783,8 +45892,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     fprintf(stderr, "ds4: V4.1 batch attn_output_b dispatched per "
                             "row (%u rows)\n", rows); }
             }
-            if (ok) ok = batch_attn_out ? ds41_attention_low(&row, model, l)
-                                        : ds41_attention_output(&row, model, l, false);
+            if (ok && g_ds41_ablate_mode != DS41_ABLATE_BLOCK)
+                ok = batch_attn_out ? ds41_attention_low(&row, model, l)
+                                    : ds41_attention_output(&row, model, l, false);
             if (stage_split_attn) DS41_BSTAGE(stage_attn_out);
         }
         if (ok && batch_attn_out && !block_attn) {
@@ -45798,8 +45908,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             if (!said) { said = true;
                 fprintf(stderr, "ds4: V4.1 batch attn_output_b hoisted out of the "
                         "per-row loop (%u rows)\n", rows); }
-            ok = ds41_matmul_batch(active.block, model, l->attn_output_b,
-                                   active.low, rows, false);
+            /* Seam B: the attention block's contribution to the residual, at
+             * the one point where it is complete and nothing has consumed it. */
+            const bool abl_b = ds41_ablate_live(il, true) && g_ds41_ablate_block[il];
+            const uint64_t abl_bytes = (uint64_t)rows * DS4_N_EMBD * sizeof(float);
+            if (abl_b && g_ds41_ablate_mode == DS41_ABLATE_BLOCK) {
+                ok = ds4_gpu_tensor_copy(active.block, 0, g_ds41_ablate_block[il],
+                                         0, abl_bytes) != 0;
+                g_ds41_ablate_skipped_block++;
+            } else {
+                ok = ds41_matmul_batch(active.block, model, l->attn_output_b,
+                                       active.low, rows, false);
+                if (ok && abl_b && g_ds41_ablate_mode == DS41_ABLATE_CAPTURE)
+                    ok = ds4_gpu_tensor_copy(g_ds41_ablate_block[il], 0,
+                                             active.block, 0, abl_bytes) != 0;
+            }
         }
         if (!stage_split_attn) DS41_BSTAGE(stage_attn);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
@@ -46809,6 +46932,12 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
      * points a token disappear and nothing else does. */
     const bool noreadback = getenv("DS4_V41_VERIFY_SELFTEST_NOREADBACK") != NULL;
     if (noreadback) ab = "selected-id capture";
+    /* Exact replay ablation: one block, three arms, the skipped work missing
+     * from a real step in place. See ds41_ablate_live. DS4_V41_ABLATE=1. */
+    const bool ablate = getenv("DS4_V41_ABLATE") != NULL && !nologits;
+    double abl_ms[4][9];
+    long abl_bad[4] = { -1, -1, -1, -1 };
+    memset(abl_ms, 0, sizeof(abl_ms));
     tok[0] = first_token;
 
 #define DS41_SELFTEST_TOP2(src, dst, gap) do { \
@@ -46883,6 +47012,22 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     DS41_SELFTEST_REWIND();
     if (!ok) { fprintf(stderr, "ds4: verify selftest warm-up failed\n"); goto done; }
 
+    /* Allocated before any arm is timed, and for every layer whether or not
+     * the arm that round will use it, so all three arms run against the same
+     * residency. An allocation inside a timed region is how a sweep once
+     * reported 15.6 ms of host time as memory time. */
+    if (ablate) {
+        const uint32_t heads_n = DS4_N_HEAD / g->tp_world;
+        const uint64_t hb = (uint64_t)k * heads_n * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t bb = (uint64_t)k * DS4_N_EMBD * sizeof(float);
+        for (uint32_t il = 0; il < DS4_N_LAYER && il < DS41_ABLATE_MAX_LAYER; il++)
+            if (!ds41_ablate_ensure(il, hb, bb)) {
+                fprintf(stderr, "ds4: ablation could not hold %u layers of "
+                        "intermediates\n", DS4_N_LAYER);
+                ds41_ablate_release();
+                break;
+            }
+    }
     for (long r = 0; ok && r < rounds; r++) {
         double t0 = now_sec();
         for (long i = 0; ok && i < steps; i++) {
@@ -46948,6 +47093,31 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         DS41_SELFTEST_REWIND(); \
     } while (0)
 
+/* One block, whole step time, and its rows' logits against the reference
+ * element by element. The ablation arms restore a captured intermediate, so a
+ * divergence here means the capture and the replay did not see the same input -
+ * which is the only way this can be wrong, and it is checked rather than
+ * argued. */
+#define DS41_SELFTEST_ONE_BLOCK(dst, badslot) do { \
+        const double _ot0 = now_sec(); \
+        ok = ds4_gpu_begin_commands() && \
+             ds41_graph_step_batch_logits(graphs, &tok[0], (int)k, (uint32_t)k, \
+                                          m, w, rowbuf); \
+        if (ok) ok = ds4_gpu_end_commands() != 0; \
+        else (void)ds4_gpu_synchronize(); \
+        (dst) = (now_sec() - _ot0) * 1000.0; \
+        for (long j = 0; ok && refbuf && j < k; j++) { \
+            const float *_row = rowbuf + (size_t)j * DS4_N_VOCAB; \
+            const float *_ref = refbuf + (size_t)j * DS4_N_VOCAB; \
+            for (uint32_t _v = 0; _v < DS4_N_VOCAB; _v++) \
+                if (memcmp(&_row[_v], &_ref[_v], sizeof(float)) != 0) { \
+                    if ((badslot) < 0) (badslot) = j * DS4_N_VOCAB + _v; \
+                    break; \
+                } \
+        } \
+        DS41_SELFTEST_REWIND(); \
+    } while (0)
+
         if (!bab || nobatch) DS41_SELFTEST_BATCH_PASS(batch[r]);
 
         /* True ABBA, and not A-then-B every round. The rewind restores the
@@ -46972,6 +47142,28 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
             if (set_first) unsetenv(bab_name); else setenv(bab_name, bab_val, 1);
             DS41_SELFTEST_BATCH_PASS(*second);
             unsetenv(bab_name);
+        }
+
+        if (ablate && refbuf) {
+            /* The capture is its own pass and is not timed: it adds a copy of
+             * the heads and of the residual per layer, which the arms it is
+             * feeding must not be charged for. */
+            g_ds41_ablate_mode = DS41_ABLATE_CAPTURE;
+            { double throwaway = 0; long unused = -1;
+              DS41_SELFTEST_ONE_BLOCK(throwaway, unused);
+              if (unused >= 0) abl_bad[0] = unused; }
+            g_ds41_ablate_mode = DS41_ABLATE_OFF;
+            /* Order reversed on odd rounds. Three arms back to back inside one
+             * round are a pair-wise comparison; a fixed order would hand the
+             * warm cache to the same arm every time. */
+            static const int abl_modes[4] = { DS41_ABLATE_OFF, DS41_ABLATE_HEADS,
+                                              DS41_ABLATE_ROPED, DS41_ABLATE_BLOCK };
+            for (int a = 0; ok && a < 4; a++) {
+                const int ai = (r & 1) ? 3 - a : a;
+                g_ds41_ablate_mode = abl_modes[ai];
+                DS41_SELFTEST_ONE_BLOCK(abl_ms[ai][r], abl_bad[ai]);
+                g_ds41_ablate_mode = DS41_ABLATE_OFF;
+            }
         }
 
         if (ab) {
@@ -47050,6 +47242,47 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
                     da[na / 2] > 0 && db[nb / 2] > 0 ? "slower in BOTH orders" :
                     "the two orders DISAGREE - this is the cache, not the change");
         free(da); free(db);
+    }
+    if (ablate) {
+        static const char *const abl_name[4] = { "normal", "replay A (heads)",
+                                                 "replay C (after rope)",
+                                                 "replay B (attention)" };
+        fprintf(stderr, "  ablate engaged: %llu row cores skipped, %llu of those also "
+                "bf16+rope, %llu layer residuals restored\n",
+                (unsigned long long)g_ds41_ablate_skipped_core,
+                (unsigned long long)g_ds41_ablate_skipped_rope,
+                (unsigned long long)g_ds41_ablate_skipped_block);
+        for (int a = 0; a < 4; a++)
+            fprintf(stderr, "  ablate %-22s logits %s\n", abl_name[a],
+                    abl_bad[a] < 0 ? "identical to the reference"
+                                   : "DIVERGED - the capture and the replay saw different input");
+        /* Three nested skips, so three differences, each one a wall time that
+         * a real step did or did not spend. */
+        static const char *const abl_gap[3] = { "gather+staging+core ",
+                                                "bf16 + inverse rope",
+                                                "attn_output_a + _b " };
+        double d[3][2][9]; long n[3][2] = {{0,0},{0,0},{0,0}};
+        for (long r = 0; r < rounds; r++) {
+            const double v0 = abl_ms[0][r], v1 = abl_ms[1][r];
+            const double v2 = abl_ms[2][r], v3 = abl_ms[3][r];
+            fprintf(stderr, "  round %ld (%s first): normal %.2f, A %.2f, C %.2f, "
+                    "B %.2f ms/step; core %+.2f, bf16+rope %+.2f, projections %+.2f\n",
+                    r, (r & 1) ? "replay B" : "normal", v0, v1, v2, v3,
+                    v0 - v1, v1 - v2, v2 - v3);
+            const int o = (r & 1) ? 1 : 0;
+            d[0][o][n[0][o]++] = v0 - v1;
+            d[1][o][n[1][o]++] = v1 - v2;
+            d[2][o][n[2][o]++] = v2 - v3;
+        }
+        for (int i = 0; i < 3; i++) {
+            if (!n[i][0] || !n[i][1]) continue;
+            for (int o = 0; o < 2; o++)
+                qsort(d[i][o], (size_t)n[i][o], sizeof(double), ds41_selftest_cmp);
+            const double a0 = d[i][0][n[i][0] / 2], a1 = d[i][1][n[i][1] / 2];
+            fprintf(stderr, "  %s: %+.2f / %+.2f ms of a step by order%s\n",
+                    abl_gap[i], a0, a1,
+                    (a0 > 0) == (a1 > 0) ? "" : " - ORDERS DISAGREE");
+        }
     }
     if (ab) {
         for (long r = 0; r < rounds; r++)
@@ -47171,6 +47404,8 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
 #undef DS41_SELFTEST_CARRY_BYTES
 #undef DS41_SELFTEST_REWIND
 done:
+    g_ds41_ablate_mode = DS41_ABLATE_OFF;
+    ds41_ablate_release();
     g->pos = pos0; g->history = hist0; g->valid = true;
     free(lg); free(rowbuf); free(tok); free(refgap); free(tok2); free(single);
     free(single_b); free(batch); free(batch_b); free(refbuf); free(carry);
