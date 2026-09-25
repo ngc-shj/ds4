@@ -40815,16 +40815,34 @@ static const char *g_ds41_dense_tile_env;
  * out zero - and a bench that prints tok/s without checking them is reporting
  * the single-row path while claiming to have measured a block one. */
 static uint64_t g_ds41_single_steps;
+/* The wall a decode spends inside the graph, so the split against the wall a
+ * decode takes can be read off one run instead of subtracted across two. The
+ * selftest's median single and a server generation's tok/s are different rulers;
+ * this puts the graph's share on the server's. */
+static double g_ds41_single_ms;
 static uint64_t g_ds41_kblock_steps;
 static uint64_t g_ds41_kblock_rows[DS4_TP_BATCH_MAX_ROWS + 1];
 static uint64_t g_ds41_kblock_positions;
 static uint64_t g_ds41_fuse_sites;
 
 static void ds41_decode_path_report(void) {
-    fprintf(stderr, "ds4:   decode path so far: %llu single-row steps, %llu K-row "
-            "verification steps over %llu positions, %llu batch-fusion sites taken; "
-            "candidate K",
+    /* The graph's share is the window's, not the run's. A cumulative mean is
+     * dragged by the first tokens - a cold 340 GB mapping's first touches - and
+     * the first version of this printed 56.5 ms a step against a 48.3 ms wall,
+     * which is impossible on a serial path and is how the mistake announced
+     * itself. Same watermark pattern as the gate report above. */
+    static uint64_t w_steps;
+    static double w_ms;
+    const uint64_t d_steps = g_ds41_single_steps - w_steps;
+    const double d_ms = g_ds41_single_ms - w_ms;
+    w_steps = g_ds41_single_steps;
+    w_ms = g_ds41_single_ms;
+    fprintf(stderr, "ds4:   decode path so far: %llu single-row steps (%.1f ms each "
+            "inside the graph over the last %llu), %llu K-row verification steps over "
+            "%llu positions, %llu batch-fusion sites taken; candidate K",
             (unsigned long long)g_ds41_single_steps,
+            d_steps ? d_ms / (double)d_steps : 0.0,
+            (unsigned long long)d_steps,
             (unsigned long long)g_ds41_kblock_steps,
             (unsigned long long)g_ds41_kblock_positions,
             (unsigned long long)g_ds41_fuse_sites);
@@ -43528,8 +43546,19 @@ static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp) {
     return 0;
 }
 
+static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_weights *w, int token, float *logits);
+
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
+    const double t0 = now_sec();
+    const bool r = ds41_graph_step_inner(g, m, w, token, logits);
+    g_ds41_single_ms += (now_sec() - t0) * 1000.0;
+    return r;
+}
+
+static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_weights *w, int token, float *logits) {
     ds41_step_config();
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     g_ds41_single_steps++;
