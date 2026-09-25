@@ -220,7 +220,13 @@ kernel void kernel_mul_mv_q8_0_f32(
 // row races another still reading the previous row's total. The condition
 // around the call is uniform across the threadgroup - rb and b are the same
 // for every thread in it - so the barriers inside the helper are not divergent.
-template<short NR0, short BR, typename args_t>
+/* DST_GROUPED changes where the result lands and nothing else. The generic
+ * caller's dst is [im][batch row][ne0]; the attention-output low projection's
+ * is [batch row][group][ne0] with the group on im, so it needs the two outer
+ * indices the other way round. Everything that decides the answer - the K walk,
+ * the i order, the FMA order per (batch row, output row), the reduction tree -
+ * is one copy shared by both, which is what keeps them bit-identical. */
+template<short NR0, short BR, typename args_t, bool DST_GROUPED = false>
 void kernel_mul_mv_q8_0_f32_rows_impl(
         args_t args,
         device const char * src0,
@@ -318,7 +324,9 @@ void kernel_mul_mv_q8_0_f32_rows_impl(
     for (short b = 0; b < BR; ++b) {
         if (rb + b < args.ne1) {
             device float * dst_f32 = (device float *) dst +
-                (uint64_t)im*args.ne0*args.ne1 + (uint64_t)(rb + b)*args.ne0;
+                (DST_GROUPED
+                     ? (uint64_t)(rb + b)*args.ne0*args.ne02 + (uint64_t)im*args.ne0
+                     : (uint64_t)im*args.ne0*args.ne1 + (uint64_t)(rb + b)*args.ne0);
 
             float s[NR0];
             FOR_UNROLL (short row = 0; row < NR0; ++row) {

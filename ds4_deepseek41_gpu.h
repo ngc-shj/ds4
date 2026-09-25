@@ -37,6 +37,15 @@ int ds4_gpu_dsv41_shared_start(
 int ds4_gpu_dsv41_shared_join(void);
 #endif
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
+/* The low projection for a block with each group's weight read once for br
+ * tokens (br is 2 or 4). Bit-identical to the per-token form: same NSG, NR0 and
+ * K walk, one accumulator a token. The caller rounds to BF16. */
+int ds4_gpu_dsv41_attention_output_low_rows(
+        ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t br);
+
 int ds4_gpu_dsv41_attention_output_low_batch(
         ds4_gpu_tensor       *low,
         const void             *model_map,

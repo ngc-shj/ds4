@@ -28359,6 +28359,94 @@ int ds4_gpu_dsv41_attention_output_low_batch(
         8, 5120, heads, n_tokens, round_bf16 != 0, 0, 0);
 }
 
+/* The same low projection for a block, reading each group's weight once for BR
+ * tokens instead of once a token.
+ *
+ * The single-token wrapper puts the token on the grid's z axis beside the
+ * group, so every one of the eight tokens re-reads all 4.5 MB of its group's
+ * weight - 36 MB a layer, eight times over. Here the group stays on z and the
+ * tokens go on y in tiles of BR. The arithmetic is
+ * kernel_mul_mv_q8_0_f32_rows_impl, the same NSG and NR0 and K walk as the
+ * single-token path, with a separate accumulator per token, so it is
+ * bit-identical to it. The caller rounds to BF16, as with the =0 batch form.
+ *
+ * The shape is the model's, as it is for the batch form next door: 8 groups of
+ * 1024 x 4096 Q8, tp_world 1 only, because the weight offset here is the whole
+ * tensor rather than a rank's group slice. */
+int ds4_gpu_dsv41_attention_output_low_rows(
+        ds4_gpu_tensor *low,
+        const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t br) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!low || !heads || !model_map || n_tokens == 0 ||
+        (br != 2u && br != 4u)) return 0;
+
+    @autoreleasepool {
+        const uint32_t group_dim = 4096u, rank = 1024u, n_groups = 8u;
+        const uint64_t row_a_bytes = (group_dim / 32u) * 34u;
+        const uint64_t out_a_bytes = (uint64_t)n_groups * rank * row_a_bytes;
+        if (out_a_offset > model_size || out_a_bytes > model_size - out_a_offset) return 0;
+        const uint64_t heads_bytes = (uint64_t)n_tokens * n_groups * group_dim * sizeof(float);
+        const uint64_t low_bytes = (uint64_t)n_tokens * n_groups * rank * sizeof(float);
+        if (ds4_gpu_tensor_bytes(heads) < heads_bytes ||
+            ds4_gpu_tensor_bytes(low) < low_bytes) return 0;
+
+        uint64_t out_a_inner = 0;
+        id<MTLBuffer> out_a_buf = ds4_gpu_wrap_model_range(model_map, model_size,
+                out_a_offset, out_a_bytes, &out_a_inner);
+        id<MTLBuffer> heads_buf = ds4_gpu_tensor_buffer(heads);
+        id<MTLBuffer> low_buf = ds4_gpu_tensor_buffer(low);
+        if (!out_a_buf || !heads_buf || !low_buf) return 0;
+
+        ds4_gpu_mul_mv_id_args args = {
+            .nei0 = (int32_t)n_groups,
+            .nei1 = (int32_t)n_tokens,
+            .nbi1 = 0,
+            .ne00 = (int32_t)group_dim,
+            .ne01 = (int32_t)rank,
+            .ne02 = (int32_t)n_groups,
+            .nb00 = 34,
+            .nb01 = row_a_bytes,
+            .nb02 = (uint64_t)rank * row_a_bytes,
+            .ne10 = (int32_t)group_dim,
+            .ne11 = (int32_t)n_groups,
+            .ne12 = (int32_t)n_tokens,
+            .ne13 = 1,
+            .nb10 = sizeof(float),
+            .nb11 = (uint64_t)group_dim * sizeof(float),
+            .nb12 = (uint64_t)n_groups * group_dim * sizeof(float),
+            .ne0 = (int32_t)rank,
+            .ne1 = (int32_t)n_groups,
+            .nb1 = (uint64_t)rank * sizeof(float),
+            .nr0 = 2,
+        };
+        const NSUInteger nsg = 4;
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+            br == 2u ? "kernel_dsv4_attn_out_low_q8_0_rows2_f32"
+                     : "kernel_dsv4_attn_out_low_q8_0_rows4_f32", (int32_t)nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        const NSUInteger row_groups = ((NSUInteger)rank + (NSUInteger)args.nr0 - 1u) /
+                                      (NSUInteger)args.nr0;
+        const NSUInteger tiles = ((NSUInteger)n_tokens + br - 1u) / br;
+        id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:out_a_buf offset:(NSUInteger)out_a_inner atIndex:1];
+        [enc setBuffer:heads_buf offset:ds4_gpu_tensor_offset(heads) atIndex:2];
+        [enc setBuffer:low_buf offset:ds4_gpu_tensor_offset(low) atIndex:3];
+        [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
+        ds4_gpu_dispatch(enc, MTLSizeMake(row_groups, tiles, n_groups),
+                         MTLSizeMake(32, nsg, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "attention output low rows");
+    }
+}
+
 int ds4_gpu_dsv41_attention_output_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size,

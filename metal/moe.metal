@@ -3643,6 +3643,84 @@ kernel void kernel_dsv4_attn_out_low_q8_0_f32(
         sgitg);
 }
 
+/* The same low projection over a block of tokens, reading each weight block
+ * once for BR of them.
+ *
+ * The single-token wrapper above puts the token on the grid's z axis next to
+ * the group, so every token re-reads the whole group weight - 4.5 MB a group,
+ * 36 MB a layer, eight times. Here the group stays on z and the tokens go on
+ * y in tiles of BR, which is the arrangement kernel_mul_mv_q8_0_f32_rows_impl
+ * already has; what it does not have is this dst layout, so it takes
+ * DST_GROUPED and the group count arrives as ne02.
+ *
+ * ne12 is set to the group count so the impl's own i12 comes out as the group,
+ * and nb11/nb12 are swapped relative to the id args: the impl's batch-row
+ * stride is the token stride here, and its i12 stride is the group stride.
+ */
+template<short BR>
+static void ds4_attn_out_low_q8_0_rows(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    ds4_metal_args_mul_mv args0 = {
+        /*.ne00 =*/ args.ne00,
+        /*.ne01 =*/ args.ne01,
+        /*.ne02 =*/ args.nei0,
+        /*.nb00 =*/ args.nb00,
+        /*.nb01 =*/ args.nb01,
+        /*.nb02 =*/ args.nb02,
+        /*.nb03 =*/ 0,
+        /*.ne10 =*/ args.ne10,
+        /*.ne11 =*/ 1,
+        /*.ne12 =*/ args.nei0,
+        /*.nb10 =*/ args.nb10,
+        /*.nb11 =*/ args.nb12,
+        /*.nb12 =*/ args.nb11,
+        /*.nb13 =*/ 0,
+        /*.ne0  =*/ args.ne0,
+        /*.ne1  =*/ args.nei1,
+        /*.nr0  =*/ args.nr0,
+        /*.r2   =*/ 1,
+        /*.r3   =*/ 1,
+    };
+
+    kernel_mul_mv_q8_0_f32_rows_impl<N_R0_Q8_0, BR, thread ds4_metal_args_mul_mv &, true>(
+        args0, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_rows2_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    ds4_attn_out_low_q8_0_rows<2>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_dsv4_attn_out_low_q8_0_rows4_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void)tiitg;
+    ds4_attn_out_low_q8_0_rows<4>(args, src0s, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 kernel void kernel_dsv4_attn_out_low_q4_K_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src0s,
