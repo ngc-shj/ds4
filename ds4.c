@@ -40212,6 +40212,34 @@ typedef struct {
     ds4_gpu_tensor *block_kv_delta[40];
     uint32_t block_kv_delta_rows;
     uint32_t block_kv_delta_start;
+    /* The compressor carry is the one piece of committed state a block used to
+     * overwrite in place: pool2 keeps the last even row's projection, and after
+     * K rows that is row K-1's, not row A-1's. There is no wall-clock instant
+     * to snapshot it at, because every owner's carry moves once per block.
+     * Logical coordinates work instead - the carry version for accept count A
+     * is the projection of the last even position below block_start + A, which
+     * is a row of the block's own pool buffer. Park all K rows and let the
+     * commit pick the one the accepted prefix names. */
+    ds4_gpu_tensor *block_carry_kv[4];
+    ds4_gpu_tensor *block_carry_score[4];
+    uint32_t block_carry_rows;
+    uint32_t block_carry_start;
+    uint32_t block_carry_owners;
+    /* The absolute position row 0 of each owner's parked carry belongs to.
+     * Kept per owner rather than once for the block: the compressor path and
+     * the KV path derive their start independently, and a block whose rows do
+     * not all sit on consecutive positions has been a real bug twice. */
+    uint32_t block_carry_origin[4];
+    /* The engram hash tail is committed semantic state that the block advances
+     * once per row. history[i] in the step is already a version per logical
+     * position; parking it is what lets a commit of A take row A-1's rather
+     * than the last row's. */
+    ds4_engram_history block_history[DS4_TP_BATCH_MAX_ROWS];
+    uint32_t block_history_rows;
+    uint32_t block_txn_active;
+    /* Fail-closed: a write into the committed arena while a transaction is
+     * open is a bug, not a slow path. Nothing may make this nonzero. */
+    uint64_t txn_committed_writes;
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
@@ -40258,6 +40286,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     for (uint32_t i = 0; i < 4; i++) {
         ds4_gpu_tensor_free(g->compressed[i]);
         ds4_gpu_tensor_free(g->index_cache[i]);
+        ds4_gpu_tensor_free(g->block_carry_kv[i]);
+        ds4_gpu_tensor_free(g->block_carry_score[i]);
         ds4_gpu_tensor_free(g->previous_kv[i]);
         ds4_gpu_tensor_free(g->previous_score[i]);
     }
@@ -40382,6 +40412,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
+        g->block_carry_kv[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_TP_BATCH_MAX_ROWS * 512u * sizeof(float));
+        g->block_carry_score[i] = ds4_gpu_tensor_alloc(
+            (uint64_t)DS4_TP_BATCH_MAX_ROWS * 512u * sizeof(float));
+        if (!g->block_carry_kv[i] || !g->block_carry_score[i]) goto fail;
         g->compressed[i] = ds4_gpu_tensor_alloc(cap * 512u * sizeof(float));
         g->index_cache[i] = ds4_gpu_tensor_alloc(cap * 128u * sizeof(float));
         g->previous_kv[i] = ds4_gpu_tensor_alloc(512u * sizeof(float));
@@ -40845,6 +40880,13 @@ static double g_ds41_single_ms;
 static uint64_t g_ds41_kblock_steps;
 static uint64_t g_ds41_kblock_rows[DS4_TP_BATCH_MAX_ROWS + 1];
 static uint64_t g_ds41_kblock_positions;
+/* Fail-closed. park is how many owner carries a block held back, publish how
+ * many the accepted prefix named, hold how many kept the committed value
+ * because the frontier landed on an odd position whose pair predates the
+ * block. refuse must stay zero: it counts the times a parked version did not
+ * sit where the block says its rows are, and every one of them refuses. */
+uint64_t g_ds41_txn_carry_park, g_ds41_txn_carry_publish;
+uint64_t g_ds41_txn_carry_hold, g_ds41_txn_refuse;
 static uint64_t g_ds41_fuse_sites;
 
 static void ds41_decode_path_report(void) {
@@ -41348,10 +41390,59 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
         if (!hoisted &&
             !ds41_matmul(g->pool_kv, m, l->attn_compressor_kv, g->norm, ratio == 1)) return false;
         if (ratio == 2) {
-            if ((!hoisted &&
-                 !ds41_matmul(g->pool_score, m, l->attn_compressor_gate, g->norm, false)) ||
-                !ds4_gpu_dsv41_pool2(g->latent, g->pool_kv, g->pool_score,
-                    g->previous_kv[owner], g->previous_score[owner], 512, 1, pos)) return false;
+            /* Inside a block transaction the committed carry is read-only, and
+             * the chain the rows need runs through the block's own versions
+             * instead: row i reads the version row i-1 left, row 0 reads the
+             * committed one. That is what makes a later position in the block
+             * able to see an earlier one without the accepted prefix existing
+             * yet. The version for position p lives at p - block_carry_start,
+             * so a commit of A rows can name one by logical position. */
+            const bool txn = g->block_txn_active != 0;
+            const uint64_t cbytes = 512u * 4u;
+            const uint32_t bi = txn && pos >= g->block_carry_start ?
+                pos - g->block_carry_start : 0u;
+            if (txn && (pos < g->block_carry_start || bi >= DS4_TP_BATCH_MAX_ROWS)) {
+                g_ds41_txn_refuse++;
+                return false;
+            }
+            ds4_gpu_tensor *prev_kv = g->previous_kv[owner];
+            ds4_gpu_tensor *prev_score = g->previous_score[owner];
+            ds4_gpu_tensor *view_kv = NULL, *view_score = NULL;
+            if (txn && bi) {
+                view_kv = ds4_gpu_tensor_view(g->block_carry_kv[owner],
+                                              (uint64_t)(bi - 1u) * cbytes, cbytes);
+                view_score = ds4_gpu_tensor_view(g->block_carry_score[owner],
+                                                 (uint64_t)(bi - 1u) * cbytes, cbytes);
+                if (!view_kv || !view_score) {
+                    ds4_gpu_tensor_free(view_kv); ds4_gpu_tensor_free(view_score);
+                    return false;
+                }
+                prev_kv = view_kv; prev_score = view_score;
+            }
+            bool pooled = (hoisted ||
+                    ds41_matmul(g->pool_score, m, l->attn_compressor_gate, g->norm, false)) &&
+                ds4_gpu_dsv41_pool2_ex(g->latent, g->pool_kv, g->pool_score,
+                    prev_kv, prev_score, 512, 1, pos, txn ? 0 : 1);
+            if (pooled && txn) {
+                /* pool2 keeps the last even position's projection. An even
+                 * position is that projection; an odd one leaves the carry as
+                 * it found it, which here means copying the previous version
+                 * forward so every row has a version of its own. */
+                const uint64_t at = (uint64_t)bi * cbytes;
+                pooled = (pos & 1u) == 0u ?
+                    (ds4_gpu_tensor_copy(g->block_carry_kv[owner], at, g->pool_kv, 0, cbytes) &&
+                     ds4_gpu_tensor_copy(g->block_carry_score[owner], at, g->pool_score, 0, cbytes)) :
+                    (ds4_gpu_tensor_copy(g->block_carry_kv[owner], at,
+                         bi ? g->block_carry_kv[owner] : g->previous_kv[owner],
+                         bi ? at - cbytes : 0, cbytes) &&
+                     ds4_gpu_tensor_copy(g->block_carry_score[owner], at,
+                         bi ? g->block_carry_score[owner] : g->previous_score[owner],
+                         bi ? at - cbytes : 0, cbytes));
+                if (pooled) g_ds41_txn_carry_park++;
+            }
+            ds4_gpu_tensor_free(view_kv);
+            ds4_gpu_tensor_free(view_score);
+            if (!pooled) return false;
         } else if (!ds4_gpu_tensor_copy(g->latent, 0, g->pool_kv, 0, 512u * 4u)) return false;
         if ((pos + 1u) % ratio == 0) {
             const uint32_t rope_pos = pos + 1u - ratio;
@@ -42608,11 +42699,28 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t first = start / ratio, rows = (start + count) / ratio - first;
     if (ratio == 2u) {
+        const bool txn = g->block_txn_active != 0;
         if (!ds41_project_rows(b->pool_kv, m, l->attn_compressor_kv, b->norm, count, false) ||
             !ds41_project_rows(b->pool_score, m, l->attn_compressor_gate, b->norm, count, false) ||
-            !ds4_gpu_dsv41_pool2(b->latent, b->pool_kv, b->pool_score,
-                g->previous_kv[owner], g->previous_score[owner], DS4_N_HEAD_DIM, count, start))
+            !ds4_gpu_dsv41_pool2_ex(b->latent, b->pool_kv, b->pool_score,
+                g->previous_kv[owner], g->previous_score[owner], DS4_N_HEAD_DIM,
+                count, start, txn ? 0 : 1))
             return false;
+        /* pool2 read the committed carry for the first pair and wrote nothing.
+         * The block's own carry versions live here until an accept count says
+         * which one is real; count rows, indexed by position - start. */
+        if (txn) {
+            const uint64_t bytes = (uint64_t)count * DS4_N_HEAD_DIM * sizeof(float);
+            if (count > DS4_TP_BATCH_MAX_ROWS ||
+                !ds4_gpu_tensor_copy(g->block_carry_kv[owner], 0, b->pool_kv, 0, bytes) ||
+                !ds4_gpu_tensor_copy(g->block_carry_score[owner], 0, b->pool_score, 0, bytes))
+                return false;
+            g->block_carry_rows = count;
+            g->block_carry_start = start;
+            g->block_carry_origin[owner] = start;
+            g->block_carry_owners |= 1u << owner;
+            g_ds41_txn_carry_park++;
+        }
     } else if (!ds41_project_rows(b->latent, m, l->attn_compressor_kv, b->norm, count, true))
         return false;
     if (!rows) return true;
@@ -43594,6 +43702,10 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
                                   const ds4_weights *w, int token, float *logits) {
     ds41_step_config();
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    /* A single step is never part of a block transaction. Leaving the flag set
+     * from an earlier block would send its carry into the block's delta and
+     * never publish it. */
+    g->block_txn_active = 0;
     g_ds41_single_steps++;
     const bool v41_prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
     const double v41_t0 = v41_prof ? now_sec() : 0.0;
@@ -44603,6 +44715,9 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
                                   ds4_session_cancel_fn cancel, void *cancel_ud) {
     ds41_gpu_graph row = *g;
     bool ok = true;
+    /* Prefill publishes its carry in place. The flag is per batch call, and
+     * leaving a block's value set here would drop the carry of a whole chunk. */
+    g->block_txn_active = 0;
     const bool batch_publish = publish && batch_attention &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_PUBLISH");
     const uint32_t chunk = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
@@ -45732,7 +45847,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * exists. Requires the block-local KV path, which is what puts the rows in a
      * linear buffer in the first place. DS4_METAL_V41_BLOCK_TXN=1. */
     const char *btxn_e = getenv("DS4_METAL_V41_BLOCK_TXN");
-    const bool block_txn = btxn_e && btxn_e[0] && atoi(btxn_e) != 0;
+    /* The transaction parks rows in the block's linear KV delta, which only the
+     * block-local KV path produces. Asking for it without that path used to be
+     * silent: the ring was written through, the delta stayed empty, and the
+     * refusal at commit blamed the env that was in fact set. Say so here. */
+    const bool block_txn_want = btxn_e && btxn_e[0] && atoi(btxn_e) != 0;
+    const bool block_txn = block_txn_want && block_kv;
+    if (block_txn_want && !block_kv) {
+        static bool said_no_kv;
+        if (!said_no_kv) { said_no_kv = true;
+            fprintf(stderr, "ds4: V4.1 block transaction needs DS4_METAL_V41_BLOCK_KV; "
+                    "running without it\n"); }
+    }
+    g->block_txn_active = block_txn ? 1u : 0u;
+    if (block_txn) g->block_carry_owners = 0;
     const char *bar_e = getenv("DS4_METAL_V41_BLOCK_ATTN_RAW");
     const bool block_attn_raw = bar_e && bar_e[0] && atoi(bar_e) != 0;
     const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
@@ -45911,6 +46039,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             if (!said_kv) { said_kv = true;
                 fprintf(stderr, "ds4: V4.1 block-local KV delta, %u rows over %u "
                         "prefix keys\n", rows, previous); }
+            /* The per-row publish runs on a copy of the graph, so the scalars
+             * that say where the block's carry versions live have to be set
+             * here, where g is the session's own. */
+            if (block_txn) {
+                g->block_carry_start = start;
+                g->block_carry_rows = rows;
+                if (ds41_kv_source(il) && ds4_layer_compress_ratio(il) == 2u) {
+                    const uint32_t co = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+                    g->block_carry_origin[co] = start;
+                    g->block_carry_owners |= 1u << co;
+                }
+            }
             if (ok && first)
                 ok = ds4_gpu_tensor_copy(g->raw_prefill, 0, g->window[il],
                                          (uint64_t)pre_start * row_bytes,
@@ -46453,6 +46593,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             ok = ds4_gpu_tensor_copy(s->tp_logits_half ? s->tp_logits_half : s->logits,
                 0, batch_logits, (uint64_t)i * logits_bytes, logits_bytes);
         if (ok) ds41_logits_dump(s, positions[i], 1);
+        if (ok && block_txn && i < DS4_TP_BATCH_MAX_ROWS) {
+            s->block_history[i] = history[i];
+            s->block_history_rows = (uint32_t)i + 1u;
+        }
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
@@ -83575,7 +83719,48 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
  * The ring is 128 slots and the rows go at (start + i) % 128. Writing A of them
  * cannot overwrite a key position A-1 needs - that is the property the
  * write-through path did not have. */
+/* Publish the carry version named by an accept count of `accepted`.
+ *
+ * pool2 keeps the projection of the last even position at or below the
+ * frontier, so the version for accept count A is the row at
+ * last_even(block_start + A - 1) - block_start. When that is below the block,
+ * the frontier ends on an odd position whose pair came from before the block:
+ * the committed carry is already the right value, and because the transaction
+ * never wrote it, the restore is doing nothing. */
+static bool ds41_block_carry_commit(ds41_gpu_graph *g, uint32_t accepted) {
+    if (!g->block_carry_owners) return true;
+    if (accepted > g->block_carry_rows) { g_ds41_txn_refuse++; return false; }
+    /* The KV delta and the carry delta must describe the same block. They are
+     * produced by different passes over the same positions, so agreeing is a
+     * result, not a definition. */
+    for (uint32_t o = 0; o < 4u; o++)
+        if ((g->block_carry_owners & (1u << o)) &&
+            (g->block_carry_origin[o] != g->block_carry_start ||
+             (g->block_kv_delta_rows &&
+              g->block_carry_start != g->block_kv_delta_start))) {
+            g_ds41_txn_refuse++;
+            return false;
+        }
+    if (accepted == 0) { g_ds41_txn_carry_hold++; return true; }
+    const uint32_t last_even = (g->block_carry_start + accepted - 1u) & ~1u;
+    if (last_even < g->block_carry_start) { g_ds41_txn_carry_hold++; return true; }
+    if (last_even >= g->block_carry_start + accepted) { g_ds41_txn_refuse++; return false; }
+    const uint64_t bytes = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
+    const uint64_t off = (uint64_t)(last_even - g->block_carry_start) * bytes;
+    for (uint32_t o = 0; o < 4u; o++) {
+        if (!(g->block_carry_owners & (1u << o))) continue;
+        if (!ds4_gpu_tensor_copy(g->previous_kv[o], 0, g->block_carry_kv[o], off, bytes) ||
+            !ds4_gpu_tensor_copy(g->previous_score[o], 0, g->block_carry_score[o], off, bytes))
+            return false;
+        g_ds41_txn_carry_publish++;
+    }
+    return true;
+}
+
 static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
+    if (!ds41_block_carry_commit(g, accepted)) return false;
+    g->block_carry_rows = 0;
+    g->block_carry_owners = 0;
     if (accepted == 0) { g->block_kv_delta_rows = 0; return true; }
     if (accepted > g->block_kv_delta_rows) return false;
     const uint64_t row_bytes = 512u * sizeof(float);
@@ -83764,6 +83949,20 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
         if (err && errlen) snprintf(err, errlen, "verify block could not commit %d rows", n);
         return -1;
     }
+    /* The hash tail the accepted prefix names, not the one the last row left.
+     * Row n-1's version is the state after n tokens, which is what a session
+     * that had only ever seen those n would hold. */
+    if (n > 0 && (uint32_t)n <= s->ds41_graph.block_history_rows)
+        s->ds41_graph.history = s->ds41_graph.block_history[n - 1];
+    else if (n > 0 && s->ds41_graph.block_history_rows) {
+        free(carry_before);
+        ds4_session_invalidate(s);
+        g_ds41_txn_refuse++;
+        if (err && errlen) snprintf(err, errlen, "verify block has %u parked hash "
+                 "versions and accepted %d", s->ds41_graph.block_history_rows, n);
+        return -1;
+    }
+    s->ds41_graph.block_history_rows = 0;
     if (n == 0) {
         /* Nothing kept: everything the block touched outside the parked ring has
          * to go back to what it was. */
@@ -83818,6 +84017,20 @@ static uint64_t ds41_state_hash(const void *p, size_t bytes) {
     return h;
 }
 
+static uint64_t ds41_tensor_hash_at(ds4_gpu_tensor *t, uint64_t at, uint64_t bytes) {
+    if (!t) return 0;
+    const uint64_t have = ds4_gpu_tensor_bytes(t);
+    if (at >= have) return 0;
+    if (have - at < bytes) bytes = have - at;
+    if (!bytes) return 0;
+    void *buf = malloc((size_t)bytes);
+    if (!buf) return 0;
+    uint64_t h = 0;
+    if (ds4_gpu_tensor_read(t, at, buf, bytes)) h = ds41_state_hash(buf, (size_t)bytes);
+    free(buf);
+    return h;
+}
+
 static uint64_t ds41_tensor_hash(ds4_gpu_tensor *t, uint64_t bytes) {
     if (!t) return 0;
     const uint64_t have = ds4_gpu_tensor_bytes(t);
@@ -83856,6 +84069,21 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
     ds4_tokens prompt = { .v = seed->checkpoint.v, .len = seed->checkpoint.len,
                           .cap = seed->checkpoint.cap };
     if (prompt.len < 1) return;
+    /* The block starts at the prompt's length, so the prompt is how the test
+     * reaches a boundary. Repeating the seed's tokens up to a chosen length is
+     * degenerate text and an ordinary state - which is all the comparison needs,
+     * and it costs a prefill rather than hundreds of single steps.
+     * DS4_V41_BLOCK_TXN_TEST_START=<absolute position of the block's first row>. */
+    int *padded = NULL;
+    {
+        const char *st_e = getenv("DS4_V41_BLOCK_TXN_TEST_START");
+        const long want = st_e && st_e[0] ? atol(st_e) : 0;
+        if (want > prompt.len && want + k + 24 < ctx &&
+            (padded = malloc((size_t)want * sizeof(int)))) {
+            for (long i = 0; i < want; i++) padded[i] = prompt.v[i % prompt.len];
+            prompt.v = padded; prompt.len = (int)want; prompt.cap = (int)want;
+        }
+    }
 
     float *lg_ref = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     float *lg_blk = malloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -83879,7 +84107,7 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
     ds4_session_free(ref); ref = NULL;
 
     fprintf(stderr, "ds4: block transaction against two independent sessions, "
-            "prompt %d tokens, k=%ld\n", prompt.len, k);
+            "block starts at position %d, k=%ld\n", prompt.len, k);
     for (long a = 0; a <= k; a++) {
         if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "reference") ||
             !ds41_txn_prefill(&blk, e, &prompt, ctx, "block")) goto done;
@@ -83930,11 +84158,40 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
                 hr[2] ^= ds41_tensor_hash(ref->ds41_graph.previous_score[c], 512u * 4u);
                 hb[2] ^= ds41_tensor_hash(blk->ds41_graph.previous_score[c], 512u * 4u);
             }
+            int ring_layer = -1;
+            long ring_slot = -1;
             if (pr == pb && pr <= 128u) {
                 for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                    hr[3] ^= ds41_tensor_hash(ref->ds41_graph.window[il], (uint64_t)pr * 512u * 4u);
-                    hb[3] ^= ds41_tensor_hash(blk->ds41_graph.window[il], (uint64_t)pb * 512u * 4u);
+                    const uint64_t live = (uint64_t)pr * 512u * 4u;
+                    const uint64_t a1 = ds41_tensor_hash(ref->ds41_graph.window[il], live);
+                    const uint64_t b1 = ds41_tensor_hash(blk->ds41_graph.window[il], live);
+                    hr[3] ^= a1; hb[3] ^= b1;
+                    /* Which layer and which slot, not just that the ring moved.
+                     * A hash over forty layers names nothing to fix. */
+                    if (a1 != b1 && ring_layer < 0) {
+                        ring_layer = (int)il;
+                        for (uint32_t sl = 0; sl < pr && ring_slot < 0; sl++) {
+                            const uint64_t at = (uint64_t)sl * 512u * 4u;
+                            if (ds41_tensor_hash_at(ref->ds41_graph.window[il], at, 512u * 4u) !=
+                                ds41_tensor_hash_at(blk->ds41_graph.window[il], at, 512u * 4u))
+                                ring_slot = (long)sl;
+                        }
+                    }
                 }
+            }
+            /* The compressed store and its index, over the rows a session at
+             * this position can see: pos/ratio of them. Left out until now
+             * because hashing the whole allocation reads uninitialised bytes
+             * and calls every session different. */
+            uint64_t hc[2] = {0}, hd[2] = {0};
+            for (uint32_t c = 0; c < 4; c++) {
+                const uint32_t ratio = c < 3 ? 2u : 1u;
+                const uint64_t nc = (uint64_t)pr / ratio;
+                if (pr != pb || !nc) continue;
+                hc[0] ^= ds41_tensor_hash(ref->ds41_graph.compressed[c], nc * 512u * 4u);
+                hd[0] ^= ds41_tensor_hash(blk->ds41_graph.compressed[c], nc * 512u * 4u);
+                hc[1] ^= ds41_tensor_hash(ref->ds41_graph.index_cache[c], nc * 128u * 4u);
+                hd[1] ^= ds41_tensor_hash(blk->ds41_graph.index_cache[c], nc * 128u * 4u);
             }
             fprintf(stderr, "ds4:   A=%ld state (pos %u/%u, txn %llu/%llu/%llu rows "
                     "verified/committed/discarded):", a, pr, pb,
@@ -83943,7 +84200,16 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
                     (unsigned long long)g_ds41_txn_discard_rows);
             for (int z = 0; z < 4; z++)
                 fprintf(stderr, " %s=%s", names[z], hr[z] == hb[z] ? "same" : "DIFF");
-            fprintf(stderr, "\n");
+            fprintf(stderr, " compressed=%s index=%s",
+                    hc[0] == hd[0] ? "same" : "DIFF", hc[1] == hd[1] ? "same" : "DIFF");
+            if (ring_layer >= 0)
+                fprintf(stderr, " (ring first differs at layer %d slot %ld of %u)",
+                        ring_layer, ring_slot, pr);
+            fprintf(stderr, " carry park/publish/hold/refuse %llu/%llu/%llu/%llu\n",
+                    (unsigned long long)g_ds41_txn_carry_park,
+                    (unsigned long long)g_ds41_txn_carry_publish,
+                    (unsigned long long)g_ds41_txn_carry_hold,
+                    (unsigned long long)g_ds41_txn_refuse);
         }
         uint64_t differ = 0, first = UINT64_MAX;
         for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
@@ -83987,7 +84253,7 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
 done:
     if (ref) ds4_session_free(ref);
     if (blk) ds4_session_free(blk);
-    free(lg_ref); free(lg_blk); free(oracle);
+    free(lg_ref); free(lg_blk); free(oracle); free(padded);
 }
 
 /* Does the executor actually commit k tokens a step, and at what rate?

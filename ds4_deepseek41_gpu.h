@@ -86,6 +86,15 @@ int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
                       const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
                       ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,
                        uint32_t width, uint32_t rows, uint32_t start);
+/* As above, but publish_carry == 0 leaves previous_* untouched: the caller is a
+ * block transaction and keeps its own version of the carry per accepted count.
+ * previous_* are still read, because the first pair of an odd start needs the
+ * committed carry, which is exactly the value a transaction may not overwrite. */
+int ds4_gpu_dsv41_pool2_ex(ds4_gpu_tensor *out,
+                      const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
+                      ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,
+                       uint32_t width, uint32_t rows, uint32_t start,
+                       int publish_carry);
 /* Candidate blocks contain eight compressed positions. Produce causal block
  * maxima, pinning the newest block; filter consumes a 0/-inf block mask. */
 int ds4_gpu_dsv41_candidate_blocks(ds4_gpu_tensor *blocks,

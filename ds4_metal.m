@@ -51740,6 +51740,15 @@ int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
                       const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
                       ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,
                       uint32_t width, uint32_t rows, uint32_t start) {
+    return ds4_gpu_dsv41_pool2_ex(out, kv, scores, previous_kv, previous_scores,
+                                  width, rows, start, 1);
+}
+
+int ds4_gpu_dsv41_pool2_ex(ds4_gpu_tensor *out,
+                      const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
+                      ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,
+                      uint32_t width, uint32_t rows, uint32_t start,
+                      int publish_carry) {
     const uint64_t count = (uint64_t)width * rows;
     const uint32_t pairs = (uint32_t)(((uint64_t)rows + (start & 1u)) / 2u);
     if (!width || !rows || rows > UINT32_MAX - start ||
@@ -51777,7 +51786,7 @@ int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
          * It is live only for an odd frontier, but matching it also makes
          * snapshots independent of how the prefix was partitioned. */
         const uint32_t last_even = (start + rows - 1u) & ~1u;
-        if (last_even >= start) {
+        if (publish_carry && last_even >= start) {
             const uint64_t bytes = (uint64_t)width * sizeof(float);
             const uint64_t offset = (last_even - start) * bytes;
             if (!ds4_gpu_tensor_copy(previous_kv, 0, kv, offset, bytes) ||
