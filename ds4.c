@@ -46156,6 +46156,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
              * rows are parked in this layer's delta instead and
              * ds41_block_kv_commit moves the first A once A is known. */
             if (ok && block_txn) {
+                static bool said_txn;
+                if (!said_txn) { said_txn = true;
+                    fprintf(stderr, "ds4: V4.1 block transaction: %u KV rows parked a "
+                            "layer, ring holds the committed prefix\n", rows); }
                 ok = ds4_gpu_tensor_copy(g->block_kv_delta[il], 0, g->raw_prefill,
                         (uint64_t)previous * row_bytes,
                         (uint64_t)rows * row_bytes) != 0;
@@ -83630,9 +83634,27 @@ static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
  * real candidate source it will refuse whenever the drafter is wrong, which is
  * why the oracle comes first: it separates the executor's speed from the
  * candidates' quality instead of measuring their product. */
+/* Counters the audit reads. verified counts rows the block ran, committed and
+ * discarded split by what the accept decision did with them, and base_writes is
+ * the one that has to be zero between verify and commit: a semantic write that
+ * reaches the committed state before the commit is the bug this is looking for. */
+uint64_t g_ds41_txn_begin, g_ds41_txn_verify_rows, g_ds41_txn_commit_rows;
+uint64_t g_ds41_txn_discard_rows;
+
 int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
                              int *accepted, char *err, size_t errlen) {
-    if (!s || !candidates || !accepted || k < 2 || k > DS4_TP_BATCH_MAX_ROWS) {
+    return ds4_session_verify_block_ex(s, candidates, k, k, accepted, err, errlen);
+}
+
+/* max_commit caps what the accept decision may commit. At 0 the block runs every
+ * row and commits nothing, which is both the atomic-abandonment path a failure
+ * needs and the first case a transaction has to pass: a session that verified a
+ * block and kept none of it must be indistinguishable from one that never saw
+ * it. That case cannot be posed at all by a bench that rewinds. */
+int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
+                                int max_commit, int *accepted, char *err, size_t errlen) {
+    if (!s || !candidates || !accepted || k < 2 || k > DS4_TP_BATCH_MAX_ROWS ||
+        max_commit < 0 || max_commit > k) {
         if (err && errlen) snprintf(err, errlen, "invalid verify block");
         return -1;
     }
@@ -83664,6 +83686,8 @@ int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
         return -1;
     }
     const uint32_t pos0 = s->ds41_graph.pos;
+    g_ds41_txn_begin++;
+    g_ds41_txn_verify_rows += (uint64_t)k;
     const bool ok = ds4_gpu_begin_commands() != 0 &&
         /* prefill_rows = k, not 0. The batch step sets positions[i] = pos +
          * (i > 0 && i < prefill_rows ? i : 0), so at 0 every row lands on the
@@ -83683,7 +83707,8 @@ int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
     /* Row i answers position pos0+i, so it predicts candidates[i+1]. */
     int n = 1, arg_at_n = -1;
     accepted[0] = candidates[0];
-    for (int i = 0; i + 1 < k; i++) {
+    if (max_commit == 0) n = 0;
+    for (int i = 0; n > 0 && n < max_commit && i + 1 < k; i++) {
         const int arg = sample_argmax(rows + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
         if (arg != candidates[i + 1]) { arg_at_n = arg; break; }
         accepted[n++] = candidates[i + 1];
@@ -83706,6 +83731,12 @@ int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
     }
     /* The copies need a command scope of their own: the batch step's was closed
      * above, and a tensor copy outside one does not run. */
+    {
+        static bool said_vb;
+        if (!said_vb) { said_vb = true;
+            fprintf(stderr, "ds4: verify_block: %u rows parked at commit time\n",
+                    s->ds41_graph.block_kv_delta_rows); }
+    }
     if (s->ds41_graph.block_kv_delta_rows != 0 &&
         !(ds4_gpu_begin_commands() &&
           ds41_block_kv_commit(&s->ds41_graph, (uint32_t)n) &&
@@ -83714,6 +83745,8 @@ int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
         if (err && errlen) snprintf(err, errlen, "verify block could not commit %d rows", n);
         return -1;
     }
+    g_ds41_txn_commit_rows += (uint64_t)n;
+    g_ds41_txn_discard_rows += (uint64_t)(k - n);
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, candidates[i]);
     s->ds41_graph.pos = pos0 + (uint32_t)n;
     s->checkpoint_valid = true;
@@ -83744,6 +83777,28 @@ int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
  * A = 0 is the case that matters most and is the one a rewind-based bench
  * cannot pose at all: the block runs K rows and commits nothing, and the
  * session has to be indistinguishable from one that never saw it. */
+/* FNV-1a over bytes, and the same over a tensor's first `bytes`. Only ever
+ * compared against another hash taken the same way in the same run. */
+static uint64_t ds41_state_hash(const void *p, size_t bytes) {
+    const unsigned char *b = (const unsigned char *)p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < bytes; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+static uint64_t ds41_tensor_hash(ds4_gpu_tensor *t, uint64_t bytes) {
+    if (!t) return 0;
+    const uint64_t have = ds4_gpu_tensor_bytes(t);
+    if (have < bytes) bytes = have;
+    if (!bytes) return 0;
+    void *buf = malloc((size_t)bytes);
+    if (!buf) return 0;
+    uint64_t h = 0;
+    if (ds4_gpu_tensor_read(t, 0, buf, bytes)) h = ds41_state_hash(buf, (size_t)bytes);
+    free(buf);
+    return h;
+}
+
 static bool ds41_txn_prefill(ds4_session **out, ds4_engine *e, const ds4_tokens *prompt,
                              int ctx, const char *what) {
     char err[192];
@@ -83803,9 +83858,11 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
         /* Block: k candidates, the first a of them right. a = 0 corrupts the
          * one the caller fed, which is how a block commits nothing. */
         for (long j = 0; j < k; j++) cand[j] = oracle[j];
-        if (a < k) cand[a] = (oracle[a] + 1) % (int)DS4_N_VOCAB;
-        const int got = ok ? ds4_session_verify_block(blk, cand, (int)k, acc,
-                                                      err, sizeof(err)) : -1;
+        /* A=0 runs every row and keeps none: the base must be untouched, which is
+         * the write-set assertion stated end to end. Above 0 the accept
+         * decision caps itself at a. */
+        const int got = ok ? ds4_session_verify_block_ex(blk, cand, (int)k, (int)a, acc,
+                                                         err, sizeof(err)) : -1;
         if (!ok || got != (int)a) {
             fprintf(stderr, "ds4:   A=%ld: committed %d (%s)\n", a, got,
                     got < 0 ? err : "wrong count");
@@ -83816,6 +83873,45 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
             !ds41_graph_step(&blk->ds41_graph, m, w, oracle[a], lg_blk)) {
             fprintf(stderr, "ds4:   A=%ld: the follow-up step failed\n", a);
             goto next;
+        }
+        /* Which state is different, not just that the answer is. Each is hashed
+         * on both sessions and named when it disagrees, so the next thing to
+         * park is read off the run instead of guessed at. */
+        /* A=8 is the control: its logits are identical, so every hash here has
+         * to read `same` there. Without that the DIFFs below are the
+         * instrument's word and not the transaction's. */
+        {
+            /* Live bytes only. Hashing a whole 128-slot ring or a megabyte of
+             * compressed store takes in whatever the allocation held, which
+             * differs per session and made every one of these read DIFF - the
+             * instrument's answer, not the transaction's. The ring holds pos
+             * slots here because both sessions are under 128. */
+            const uint32_t pr = ref->ds41_graph.pos, pb = blk->ds41_graph.pos;
+            const char *names[4] = { "history", "previous_kv", "previous_score",
+                                     "window(raw ring)" };
+            uint64_t hr[4] = {0}, hb[4] = {0};
+            hr[0] = ds41_state_hash(&ref->ds41_graph.history, sizeof(ds4_engram_history));
+            hb[0] = ds41_state_hash(&blk->ds41_graph.history, sizeof(ds4_engram_history));
+            for (uint32_t c = 0; c < 4; c++) {
+                hr[1] ^= ds41_tensor_hash(ref->ds41_graph.previous_kv[c], 512u * 4u);
+                hb[1] ^= ds41_tensor_hash(blk->ds41_graph.previous_kv[c], 512u * 4u);
+                hr[2] ^= ds41_tensor_hash(ref->ds41_graph.previous_score[c], 512u * 4u);
+                hb[2] ^= ds41_tensor_hash(blk->ds41_graph.previous_score[c], 512u * 4u);
+            }
+            if (pr == pb && pr <= 128u) {
+                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                    hr[3] ^= ds41_tensor_hash(ref->ds41_graph.window[il], (uint64_t)pr * 512u * 4u);
+                    hb[3] ^= ds41_tensor_hash(blk->ds41_graph.window[il], (uint64_t)pb * 512u * 4u);
+                }
+            }
+            fprintf(stderr, "ds4:   A=%ld state (pos %u/%u, txn %llu/%llu/%llu rows "
+                    "verified/committed/discarded):", a, pr, pb,
+                    (unsigned long long)g_ds41_txn_verify_rows,
+                    (unsigned long long)g_ds41_txn_commit_rows,
+                    (unsigned long long)g_ds41_txn_discard_rows);
+            for (int z = 0; z < 4; z++)
+                fprintf(stderr, " %s=%s", names[z], hr[z] == hb[z] ? "same" : "DIFF");
+            fprintf(stderr, "\n");
         }
         uint64_t differ = 0, first = UINT64_MAX;
         for (uint32_t v = 0; v < DS4_N_VOCAB; v++)

@@ -583,6 +583,12 @@ void ds4_session_invalidate(ds4_session *s);
 int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
                              int *accepted, char *err, size_t errlen);
 
+/* As above, with a cap on what may be committed. max_commit = 0 runs the block
+ * and keeps none of it, which is the atomic-abandonment path and the first case
+ * a transaction has to pass. */
+int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
+                                int max_commit, int *accepted, char *err, size_t errlen);
+
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
