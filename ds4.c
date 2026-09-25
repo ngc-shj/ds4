@@ -46973,6 +46973,140 @@ done:
     ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(raw); ds4_gpu_tensor_free(heads);
 }
 
+/* What the routed experts cost as a function of K, on one ruler.
+ * DS4_V41_ROWTILE_CHECK=9.
+ *
+ * 53 ms at K=8 does not say which of three things it is:
+ *
+ *   T(K) = F + K*S - reuse(K)
+ *
+ * F is fixed cost a block already amortises, S is what every extra row repeats,
+ * and reuse is what sharing a weight across rows could still take back. A
+ * number at one K cannot separate them, and the one that matters most for a
+ * single token is F + S at K=1.
+ *
+ * Two selections bracket the reuse term at each K: every row on its own expert
+ * set - no sharing available - and every row on row 0's - the most sharing
+ * there could ever be. The gap between them at each K is the ceiling on
+ * expert-major, measured rather than derived from a duplication count.
+ *
+ * Same entry point the layer uses, same expert state, same process.
+ *
+ * NOT VALID YET. It reports 0.002 ms for six experts of 5120x2304 IQ2, which is
+ * 13.8 MB of weight in 2 microseconds - 6.9 TB/s against a 614 GB/s machine, so
+ * the operator returns success without doing the work. The ids here are
+ * synthetic and the streaming cache has no entry for them, so nothing binds.
+ *
+ * What it needs before a number from it means anything: a check that the work
+ * happened. Either route through ids the cache actually holds - capture them
+ * from a live decode, as DS4_METAL_V41_GATE_ROUTE_LOG does - or read the output
+ * back and require it to differ from what it held before. An arm that did no
+ * work reporting a time is the failure this file keeps writing comments about,
+ * and this harness was written without the check it exists to enforce. */
+static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
+    const ds4_layer_weights *l = &w->layer[20];
+    const uint32_t used = DS4_N_EXPERT_USED, ff = DS4_N_FF_EXP, embd = DS4_N_EMBD;
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    const uint32_t maxk = 8;
+    const uint64_t xb = (uint64_t)maxk * embd * sizeof(float);
+    const uint64_t ob = (uint64_t)maxk * embd * sizeof(float);
+    const uint64_t gb = (uint64_t)maxk * used * ff * sizeof(float);
+    const uint64_t eb = (uint64_t)maxk * used * embd * sizeof(float);
+    const uint64_t sb = (uint64_t)maxk * used * sizeof(int32_t);
+    const uint64_t wb = (uint64_t)maxk * used * sizeof(float);
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(xb);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(ob);
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(gb), *up = ds4_gpu_tensor_alloc(gb);
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(gb);
+    ds4_gpu_tensor *experts = ds4_gpu_tensor_alloc(eb);
+    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc(sb);
+    ds4_gpu_tensor *rw = ds4_gpu_tensor_alloc(wb);
+    float *hx = malloc((size_t)xb), *hw = malloc((size_t)wb);
+    int32_t *hs = malloc((size_t)sb);
+    if (!x || !out || !gate || !up || !mid || !experts || !sel || !rw || !hx || !hw || !hs)
+        goto done;
+    for (uint64_t i = 0; i < (uint64_t)maxk * embd; i++)
+        hx[i] = 0.01f * (float)((i * 2654435761u >> 9) % 199 - 99);
+    for (uint32_t i = 0; i < maxk * used; i++) hw[i] = 1.0f / (float)used;
+    if (!ds4_gpu_tensor_write(x, 0, hx, xb) || !ds4_gpu_tensor_write(rw, 0, hw, wb))
+        goto done;
+
+    fprintf(stderr, "ds4: routed experts by K, layer 20, %u used of %u, ff %u\n",
+            used, DS4_N_EXPERT, ff);
+    for (int share = 0; share < 2; share++) {
+        double t[9] = {0};
+        for (uint32_t k = 1; k <= maxk; k *= 2u) {
+            /* share=0: every row its own experts. share=1: every row row 0's. */
+            for (uint32_t r = 0; r < k; r++)
+                for (uint32_t j = 0; j < used; j++)
+                    hs[r * used + j] = (int32_t)(((share ? 0u : r) * used + j) *
+                                                 7u % DS4_N_EXPERT);
+            if (!ds4_gpu_tensor_write(sel, 0, hs, (uint64_t)k * used * sizeof(int32_t)))
+                goto done;
+            const int laps = 10;
+            double best = 0;
+            for (int warm = 0; warm < 3; warm++) {
+                bool mf = false;
+                if (!ds4_gpu_begin_commands()) goto done;
+                for (int q = 0; q < laps; q++)
+                    if (!ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, experts,
+                            m->map, m->size, l->ffn_gate_exps->abs_offset,
+                            l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                            l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                            gate_row * ff, gate_row, down_row * embd, down_row,
+                            embd, ff, embd, sel, rw, DS4_N_EXPERT, used,
+                            DS4_SWIGLU_CLAMP_EXP, x, 20u, k, &mf, false)) {
+                        (void)ds4_gpu_end_commands();
+                        fprintf(stderr, "ds4:   K=%u refused (gate_row=%llu down_row=%llu "
+                                "in=%u mid=%u out=%u used=%u)\n", k,
+                                (unsigned long long)gate_row, (unsigned long long)down_row,
+                                embd, ff, embd, used);
+                        /* One K refusing is not the arm refusing: the entry has
+                         * its own 1-token pipelines and they are not always
+                         * built, which is itself worth seeing next to the
+                         * sweep rather than instead of it. */
+                        best = 0; goto next_k;
+                    }
+                const double t0 = now_sec();
+                if (!ds4_gpu_end_commands()) goto done;
+                const double ms = (now_sec() - t0) * 1000.0 / laps;
+                /* The fastest lap of three: this is a cost model's coefficient,
+                 * and the arm's best case is what the fit wants. */
+                if (warm && (best == 0 || ms < best)) best = ms;
+            }
+        next_k:
+            t[k] = best;
+            if (best == 0) continue;
+            fprintf(stderr, "ds4:   %s K=%u: %6.3f ms", share ? "shared " : "distinct", k, best);
+            if (k > 1 && t[1] > 0)
+                fprintf(stderr, "  (%.2fx K=1, %+.3f ms a row over K=1)",
+                        best / t[1], (best - t[1]) / (double)(k - 1));
+            fprintf(stderr, "\n");
+        }
+        /* F and S from the two ends, which is all a two-point fit can claim. */
+        /* Two points, so two coefficients and no more. K=1 when the entry
+         * gives it, K=2 otherwise, and the intercept is then extrapolated
+         * rather than measured - which the line says. */
+        const uint32_t lo = t[1] > 0 ? 1u : 2u;
+        if (t[lo] > 0 && t[8] > 0) {
+            const double S = (t[8] - t[lo]) / (double)(8u - lo);
+            const double F = t[lo] - (double)lo * S;
+            fprintf(stderr, "ds4:   %s fit over K=%u..8: marginal row %.3f ms, fixed %.3f ms "
+                    "(%.0f%% of K=8); K=1 %s %.3f ms\n",
+                    share ? "shared " : "distinct", lo, S, F, 100.0 * F / t[8],
+                    t[1] > 0 ? "measured" : "extrapolated", t[1] > 0 ? t[1] : F + S);
+        }
+    next_share: ;
+    }
+done:
+    free(hx); free(hw); free(hs);
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(experts);
+    ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(rw);
+}
+
 /* The three shapes a K-wide raw attention can take, on the layer 0/1 geometry
  * where there is no compressed KV to confound them. DS4_V41_ROWTILE_CHECK=7.
  *
@@ -47125,6 +47259,7 @@ done:
 static void ds41_rowtile_check(const ds4_model *m, const ds4_weights *w) {
     const char *env = getenv("DS4_V41_ROWTILE_CHECK");
     if (!env || !env[0] || atoi(env) == 0) return;
+    if (atoi(env) >= 9) { ds41_routed_k_sweep(m, w); return; }
     if (atoi(env) >= 8) { ds41_attn_share_check(m, w); return; }
     if (atoi(env) >= 7) { ds41_attn_raw_arms_check(m, w); return; }
     if (atoi(env) >= 6) {
