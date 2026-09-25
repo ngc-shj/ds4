@@ -45523,6 +45523,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const char *attn_out_e = getenv("DS4_METAL_V41_BATCH_ATTN_OUT");
     const bool batch_attn_out = (!attn_out_e || !attn_out_e[0] || atoi(attn_out_e) != 0) &&
                                 g->tp_world == 1;
+    /* attn_output_a is 1024 rows of 4096 Q8 per output group, and every row of
+     * the block reads all of it. The default path still dispatches it per row
+     * while the block path has had a batch entry point since BLOCK_LOW_BATCH,
+     * and the exact replay ablation puts the two projections at the larger
+     * half of the attention block. DS4_METAL_V41_LOW_BATCH=1. */
+    const char *lowb_e = getenv("DS4_METAL_V41_LOW_BATCH");
+    const bool low_batch_default = lowb_e && lowb_e[0] && atoi(lowb_e) != 0 &&
+                                   batch_attn_out && g->tp_world == 1;
     double stage_pre = 0, stage_attn = 0, stage_attn_out = 0, stage_moe = 0,
            stage_head = 0, stage_tail = 0, stage_setup = 0, stage_mark = 0;
     /* Everything before the first layer: the row views, the Engram hash and
@@ -45892,10 +45900,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     fprintf(stderr, "ds4: V4.1 batch attn_output_b dispatched per "
                             "row (%u rows)\n", rows); }
             }
-            if (ok && g_ds41_ablate_mode != DS41_ABLATE_BLOCK)
+            if (ok && g_ds41_ablate_mode != DS41_ABLATE_BLOCK && !low_batch_default)
                 ok = batch_attn_out ? ds41_attention_low(&row, model, l)
                                     : ds41_attention_output(&row, model, l, false);
             if (stage_split_attn) DS41_BSTAGE(stage_attn_out);
+        }
+        if (ok && low_batch_default && !block_attn && !block_kv &&
+            g_ds41_ablate_mode != DS41_ABLATE_BLOCK) {
+            static bool said_lowb;
+            if (!said_lowb) { said_lowb = true;
+                fprintf(stderr, "ds4: V4.1 attn_output_a batched out of the per-row "
+                        "loop (%u rows)\n", rows); }
+            ds41_wread_note_full(l->attn_output_a, rows, rows, 7, true);
+            ok = ds4_gpu_dsv41_attention_output_low_batch(active.low,
+                    model->map, model->size, l->attn_output_a->abs_offset,
+                    active.heads, rows, 0) != 0;
+            if (ok) ok = ds41_bf16(active.low, rows * DS4_N_OUT_GROUP * DS4_N_LORA_O);
         }
         if (ok && batch_attn_out && !block_attn) {
             /* Say so the first time each arm engages: an A/B on a variable the
