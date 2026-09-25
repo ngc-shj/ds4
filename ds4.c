@@ -40929,6 +40929,13 @@ uint64_t g_ds41_txn_carry_hold, g_ds41_txn_refuse;
  * that has drifted below the block shows up here instead of overwriting history.
  * Must stay zero, and a nonzero one refuses the publish. */
 uint64_t g_ds41_txn_base_write;
+/* Where a K-row step's wall time goes, so a number below the recorded one says
+ * which part grew. verify is the block step, accept is the decision over the K
+ * rows - forced by the oracle, so it is not what a real candidate source will
+ * cost - commit is the delta publish, and entry is the debug tag check on the
+ * next step, which is not part of a production step at all. */
+double g_ds41_txn_ms_verify, g_ds41_txn_ms_accept;
+double g_ds41_txn_ms_commit, g_ds41_txn_ms_entry;
 /* Process-cumulative by default, which is the wrong scope for proving that one
  * chain engaged the contract the expected number of times: a sweep run earlier
  * in the same process lands in the same totals, and choosing which runs to add
@@ -40940,6 +40947,8 @@ static void ds41_txn_counters_reset(void) {
     g_ds41_txn_carry_park = g_ds41_txn_carry_publish = 0;
     g_ds41_txn_carry_hold = g_ds41_txn_refuse = 0;
     g_ds41_txn_base_write = 0;
+    g_ds41_txn_ms_verify = g_ds41_txn_ms_accept = 0.0;
+    g_ds41_txn_ms_commit = g_ds41_txn_ms_entry = 0.0;
 }
 /* One bit per parked row per owner. The publish runs on a copy of the graph, so
  * this cannot live there. A commit wants all K bits: eight rows on eight
@@ -41494,6 +41503,7 @@ static void ds41_tag_write_index(ds41_gpu_graph *g, uint32_t owner, uint32_t row
  * position completed. A row it will write itself is not checked here. */
 static bool ds41_tag_verify(ds41_gpu_graph *g, const char *when) {
     bool ok = true;
+    const double t_enter = now_sec();
     for (uint32_t o = 0; o < 4u; o++) {
         if (!g->tag_pos[o]) continue;
         const uint32_t ratio = o < 3u ? 2u : 1u;
@@ -41517,6 +41527,7 @@ static bool ds41_tag_verify(ds41_gpu_graph *g, const char *when) {
             break;      /* the first violation is the one that locates the bug */
         }
     }
+    g_ds41_txn_ms_entry += (now_sec() - t_enter) * 1000.0;
     return ok;
 }
 
@@ -84132,6 +84143,7 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     }
     g_ds41_txn_begin++;
     g_ds41_txn_verify_rows += (uint64_t)k;
+    const double t_verify = now_sec();
     const bool ok = ds4_gpu_begin_commands() != 0 &&
         /* prefill_rows = k, not 0. The batch step sets positions[i] = pos +
          * (i > 0 && i < prefill_rows ? i : 0), so at 0 every row lands on the
@@ -84141,6 +84153,7 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
         ds41_graph_step_batch_logits(graphs, candidates, k, (uint32_t)k,
                                      &e->model, &e->weights, rows);
     const bool done = ds4_gpu_end_commands() != 0;
+    g_ds41_txn_ms_verify += (now_sec() - t_verify) * 1000.0;
     if (!ok || !done) {
         free(rows); free(carry_before);
         ds4_session_invalidate(s);
@@ -84149,6 +84162,7 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     }
 
     /* Row i answers position pos0+i, so it predicts candidates[i+1]. */
+    const double t_accept = now_sec();
     int n = 1, arg_at_n = -1;
     accepted[0] = candidates[0];
     if (max_commit == 0) n = 0;
@@ -84160,6 +84174,8 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     const int next = sample_argmax(rows + (size_t)(k - 1) * DS4_N_VOCAB, DS4_N_VOCAB);
     if (n == k) arg_at_n = next;
     free(rows);
+    g_ds41_txn_ms_accept += (now_sec() - t_accept) * 1000.0;
+    const double t_commit = now_sec();
 
     /* With the transaction the block's KV rows are parked, not written, so a
      * partial accept commits the first n of them and the rest never existed.
@@ -84238,6 +84254,7 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
      * caller that accepted fewer than k still has somewhere to go. */
     if (n < k) accepted[n] = arg_at_n;
     (void)next;
+    g_ds41_txn_ms_commit += (now_sec() - t_commit) * 1000.0;
     return n;
 #endif
 }
@@ -84915,6 +84932,7 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
     long committed = 0;
     double block_ms = 0;
     for (long i = 0; i + k <= m_tokens; i += k) {
+        if (i == 0) ds41_txn_counters_reset();
         const double t0 = now_sec();
         const int n = ds4_session_verify_block(s, oracle + i, (int)k, acc, err, sizeof(err));
         block_ms += (now_sec() - t0) * 1000.0;
@@ -84973,6 +84991,20 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
             "the block is %.2fx\n", single_ms / (double)m_tokens,
             1000.0 * (double)m_tokens / single_ms,
             (single_ms / (double)m_tokens) / (block_ms / (double)committed));
+    /* Where the block's wall time went. accept is forced here - the oracle hands
+     * the executor its own earlier output, so this is the cost of comparing
+     * against a known answer and not the cost of a candidate source deciding.
+     * entry is the debug tag check, which no production step runs. */
+    {
+        const double acc_ms = g_ds41_txn_ms_accept, ver = g_ds41_txn_ms_verify;
+        const double com = g_ds41_txn_ms_commit, ent = g_ds41_txn_ms_entry;
+        fprintf(stderr, "ds4:   of that: verify %.1f ms (%.1f%%), forced accept "
+                "%.1f ms (%.1f%%), publish/commit %.1f ms (%.1f%%), next-step entry "
+                "check %.1f ms (%.1f%%), unaccounted %.1f ms\n",
+                ver, 100.0 * ver / block_ms, acc_ms, 100.0 * acc_ms / block_ms,
+                com, 100.0 * com / block_ms, ent, 100.0 * ent / block_ms,
+                block_ms - ver - acc_ms - com);
+    }
 done:
     free(oracle); free(acc); free(lg); free(carry);
 }
