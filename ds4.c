@@ -83686,6 +83686,23 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
         return -1;
     }
     const uint32_t pos0 = s->ds41_graph.pos;
+    /* The states the block advances that the raw-ring parking does not cover.
+     * Saved before the rows run and put back after, so a block that commits
+     * nothing leaves them as it found them. This is the A=0 case only: for A>0
+     * the right value is the one after A rows, which a single pre-block snapshot
+     * cannot give - that needs the per-row capture the next step adds. */
+    const ds4_engram_history hist_before = s->ds41_graph.history;
+    float *carry_before = NULL;
+    if (ds4_gpu_synchronize()) {
+        carry_before = malloc((size_t)4u * 2u * 512u * sizeof(float));
+        for (uint32_t c = 0; carry_before && c < 4u; c++)
+            if (!ds4_gpu_tensor_read(s->ds41_graph.previous_kv[c], 0,
+                                     carry_before + (size_t)c * 2u * 512u, 512u * 4u) ||
+                !ds4_gpu_tensor_read(s->ds41_graph.previous_score[c], 0,
+                                     carry_before + ((size_t)c * 2u + 1u) * 512u, 512u * 4u)) {
+                free(carry_before); carry_before = NULL;
+            }
+    }
     g_ds41_txn_begin++;
     g_ds41_txn_verify_rows += (uint64_t)k;
     const bool ok = ds4_gpu_begin_commands() != 0 &&
@@ -83698,7 +83715,7 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
                                      &e->model, &e->weights, rows);
     const bool done = ds4_gpu_end_commands() != 0;
     if (!ok || !done) {
-        free(rows);
+        free(rows); free(carry_before);
         ds4_session_invalidate(s);
         if (err && errlen) snprintf(err, errlen, "verify block step failed");
         return -1;
@@ -83722,6 +83739,7 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
      * Without it the ring was written through for all k and there is nowhere for
      * position n to come from - refuse rather than land somewhere plausible. */
     if (s->ds41_graph.block_kv_delta_rows == 0 && n < k) {
+        free(carry_before);
         ds4_session_invalidate(s);
         if (err && errlen)
             snprintf(err, errlen, "verify block accepted %d of %d and the ring was "
@@ -83741,10 +83759,24 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
         !(ds4_gpu_begin_commands() &&
           ds41_block_kv_commit(&s->ds41_graph, (uint32_t)n) &&
           ds4_gpu_end_commands())) {
+        free(carry_before);
         ds4_session_invalidate(s);
         if (err && errlen) snprintf(err, errlen, "verify block could not commit %d rows", n);
         return -1;
     }
+    if (n == 0) {
+        /* Nothing kept: everything the block touched outside the parked ring has
+         * to go back to what it was. */
+        s->ds41_graph.history = hist_before;
+        if (carry_before && ds4_gpu_synchronize())
+            for (uint32_t c = 0; c < 4u; c++) {
+                (void)ds4_gpu_tensor_write(s->ds41_graph.previous_kv[c], 0,
+                        carry_before + (size_t)c * 2u * 512u, 512u * 4u);
+                (void)ds4_gpu_tensor_write(s->ds41_graph.previous_score[c], 0,
+                        carry_before + ((size_t)c * 2u + 1u) * 512u, 512u * 4u);
+            }
+    }
+    free(carry_before);
     g_ds41_txn_commit_rows += (uint64_t)n;
     g_ds41_txn_discard_rows += (uint64_t)(k - n);
     for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, candidates[i]);
