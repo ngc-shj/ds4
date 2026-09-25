@@ -923,6 +923,19 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         uint32_t              n_rows,
         uint32_t              row_tile);
 
+/* The row tile with the BF16 rounding folded into its store. */
+int ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        uint32_t              row_tile,
+        int                   round_bf16);
+
 int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -1287,6 +1300,16 @@ int ds4_gpu_add_bf16_tensor(
         const ds4_gpu_tensor *a,
         const ds4_gpu_tensor *b,
         uint32_t              n);
+int ds4_gpu_rms_norm_weight_rows_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
 int ds4_gpu_rms_norm_weight_bf16_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

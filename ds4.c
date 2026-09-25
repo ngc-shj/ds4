@@ -40800,6 +40800,20 @@ static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
             (double)distinct * ((k + 3u) / 4u) / 1e9);
 }
 
+/* The batch path writes a stage's result and then reads all of it back to round
+ * to BF16, where the single-row path has had the rounding folded into the
+ * producer's store for a while. Forty layers of that is several hundred
+ * dispatches and a re-read of every activation they wrote. The fused forms all
+ * existed; nothing called them with a row count.
+ *
+ * DS4_METAL_V41_BATCH_FUSE=0 puts the separate passes back, which is how the
+ * A/B has to be written now that the default is on. Read on every call, not
+ * cached in a static, or both arms are the same arm. */
+static bool ds41_batch_fuse(void) {
+    const char *e = getenv("DS4_METAL_V41_BATCH_FUSE");
+    return !e || !e[0] || atoi(e) != 0;
+}
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
@@ -40843,14 +40857,19 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
     if (count >= 2 && weight->type == DS4_TENSOR_Q8_0 &&
         (dense_tile == 2 || dense_tile == 4)) {
         ds41_wread_note_full(weight, count, (uint32_t)dense_tile, 1, round);
-        ok = ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(out, m->map, m->size,
-            weight->abs_offset, width, outputs, in, count, (uint32_t)dense_tile);
+        /* The tile's reduction helper rounds on store when asked, so the pass
+         * that used to read every output row back is not needed. */
+        const bool fuse = round && ds41_batch_fuse();
+        ok = ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(out, m->map, m->size,
+            weight->abs_offset, width, outputs, in, count, (uint32_t)dense_tile,
+            fuse ? 1 : 0);
         if (!ok) {
             fprintf(stderr, "ds4: dense row tile %d refused for %u x %u rows=%u\n",
                     dense_tile, width, outputs, count);
             return false;
         }
-        return !round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16);
+        return fuse || !round ||
+            ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16);
     }
     /* Small decode batches retain scalar reductions before BF16 and sparse
      * routing boundaries. Preserve Metal's separate vocabulary-head dispatch.
@@ -42382,9 +42401,13 @@ static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_norm_batch(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                             const ds4_model *m, const ds4_tensor *weight, uint32_t count) {
+    const uint32_t n = (uint32_t)weight->dim[0];
+    if (ds41_batch_fuse())
+        return ds4_gpu_rms_norm_weight_rows_bf16_tensor(out, in, m->map, m->size,
+            weight->abs_offset, n, count, DS4_RMS_EPS);
     return ds4_gpu_rms_norm_weight_rows_tensor(out, in, m->map, m->size,
-        weight->abs_offset, (uint32_t)weight->dim[0], count, DS4_RMS_EPS) &&
-        ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[0], count, DS4_V41_BF16);
+        weight->abs_offset, n, count, DS4_RMS_EPS) &&
+        ds4_gpu_dsv41_quantize(out, n, count, DS4_V41_BF16);
 }
 
 static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
@@ -42422,21 +42445,36 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
     }
     if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
+    const bool fuse = ds41_batch_fuse();
     const bool mixed = il ?
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
-        ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC);
-    return mixed && ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        (fuse ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(b->x, b->residual, b->ffn_split,
+                                                          DS4_N_EMBD, DS4_N_HC)
+              : ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split,
+                                                     DS4_N_EMBD, DS4_N_HC)) :
+        (fuse ? ds4_gpu_hc_weighted_sum_bf16_tensor(b->x, b->residual, b->pre,
+                                                    DS4_N_EMBD, DS4_N_HC)
+              : ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre,
+                                               DS4_N_EMBD, DS4_N_HC));
+    return mixed &&
+        (fuse || ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16)) &&
         ds41_norm_batch(b->norm, b->x, m, l->attn_norm, count);
 }
 
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t count) {
-    return ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
-        b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16) &&
+    const bool fuse = ds41_batch_fuse();
+    return (fuse ? ds4_gpu_hc_expand_split_bf16_tensor(b->after_attn, b->block, b->residual,
+                       b->attn_split, DS4_N_EMBD, DS4_N_HC)
+                 : (ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
+                        b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+                    ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count,
+                        DS4_V41_BF16))) &&
         ds41_hc_mix_batch(b, m, l, true, count) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        (fuse ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(b->x, b->after_attn, b->attn_split,
+                    DS4_N_EMBD, DS4_N_HC)
+              : (ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split,
+                     DS4_N_EMBD, DS4_N_HC) &&
+                 ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16))) &&
         ds41_norm_batch(b->norm, b->x, m, l->ffn_norm, count);
 }
 

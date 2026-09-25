@@ -21773,6 +21773,24 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows,
         uint32_t              row_tile) {
+    return ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(out, model_map, model_size,
+        weight_offset, in_dim, out_dim, x, n_rows, row_tile, 0);
+}
+
+/* The row tile's reduction helper already takes round_bf16; nothing on the host
+ * passed it, so every batched Q8 projection wrote its rows and then a second
+ * pass read all of them back to round. */
+int ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        uint32_t              row_tile,
+        int                   round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (row_tile != 2u && row_tile != 4u && row_tile != 8u) return 0;
     if (!out || !x || !model_map || n_rows == 0 ||
@@ -21809,6 +21827,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_tensor(
         args.nb13 = args.nb12;
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
+        args.round_bf16 = round_bf16 ? 1 : 0;
 
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
                 row_tile == 2u ? "kernel_mul_mv_q8_0_f32_rows2" :
@@ -24523,6 +24542,23 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         float                   eps) {
     return ds4_gpu_rms_norm_weight_rows_round(out, x, model_map, model_size,
                                               weight_offset, n, rows, eps, 0);
+}
+
+/* Rows with the rounding folded in. The batch path had the rows form and the
+ * single-row path had the rounding form, and nothing had both, so every batched
+ * norm was a norm followed by a pass that read the whole output back to round
+ * it. The stored value is the one that pass would have written. */
+int ds4_gpu_rms_norm_weight_rows_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps) {
+    return ds4_gpu_rms_norm_weight_rows_round(out, x, model_map, model_size,
+                                              weight_offset, n, rows, eps, 1);
 }
 
 int ds4_gpu_rms_norm_weight_bf16_tensor(
