@@ -47024,15 +47024,19 @@ static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
     ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc(sb);
     ds4_gpu_tensor *rw = ds4_gpu_tensor_alloc(wb);
     float *hx = malloc((size_t)xb), *hw = malloc((size_t)wb);
+    float *ho = malloc((size_t)ob);
     int32_t *hs = malloc((size_t)sb);
-    if (!x || !out || !gate || !up || !mid || !experts || !sel || !rw || !hx || !hw || !hs)
-        goto done;
+    if (!x || !out || !gate || !up || !mid || !experts || !sel || !rw || !hx || !hw ||
+        !hs || !ho) goto done;
     for (uint64_t i = 0; i < (uint64_t)maxk * embd; i++)
         hx[i] = 0.01f * (float)((i * 2654435761u >> 9) % 199 - 99);
     for (uint32_t i = 0; i < maxk * used; i++) hw[i] = 1.0f / (float)used;
     if (!ds4_gpu_tensor_write(x, 0, hx, xb) || !ds4_gpu_tensor_write(rw, 0, hw, wb))
         goto done;
 
+    float *ref8 = malloc((size_t)maxk * embd * sizeof(float));
+    bool sel_ignored = false;
+    if (!ref8) goto done;
     fprintf(stderr, "ds4: routed experts by K, layer 20, %u used of %u, ff %u\n",
             used, DS4_N_EXPERT, ff);
     for (int share = 0; share < 2; share++) {
@@ -47045,10 +47049,81 @@ static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
                                                  7u % DS4_N_EXPERT);
             if (!ds4_gpu_tensor_write(sel, 0, hs, (uint64_t)k * used * sizeof(int32_t)))
                 goto done;
-            const int laps = 10;
             double best = 0;
+            /* An arm that did no work must not report a time. Zero the output,
+             * run once, and require it to have changed - the check this file
+             * keeps demanding of other people's arms. */
+            bool zero_ok = false;
+            if (!ds4_gpu_tensor_fill_f32(out, 0, (uint64_t)k * embd)) goto done;
+            if (ds4_gpu_tensor_read(out, 0, ho, (uint64_t)k * embd * sizeof(float))) {
+                zero_ok = true;
+                for (uint64_t i = 0; i < (uint64_t)k * embd; i++)
+                    if (ho[i] != 0.0f) { zero_ok = false; break; }
+            }
+            {
+                bool mf = false;
+                const bool ran = ds4_gpu_begin_commands() &&
+                    ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, experts,
+                        m->map, m->size, l->ffn_gate_exps->abs_offset,
+                        l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                        l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                        gate_row * ff, gate_row, down_row * embd, down_row,
+                        embd, ff, embd, sel, rw, DS4_N_EXPERT, used,
+                        DS4_SWIGLU_CLAMP_EXP, x, 20u, k, &mf, false) != 0;
+                if (!ds4_gpu_end_commands() || !ran ||
+                    !ds4_gpu_tensor_read(out, 0, ho, (uint64_t)k * embd * sizeof(float))) {
+                    fprintf(stderr, "ds4:   %s K=%u refused\n", share ? "shared " : "distinct", k);
+                    best = 0; goto next_k;
+                }
+                /* Non-zero is not proof: a freshly allocated buffer is
+                 * non-zero too, and the fill that was meant to clear it can
+                 * itself do nothing. Two tests that a buffer cannot pass by
+                 * accident - the fill really zeroed, and changing which experts
+                 * are selected really changes the answer. */
+                uint64_t nz = 0;
+                for (uint64_t i = 0; i < (uint64_t)k * embd; i++) if (ho[i] != 0.0f) nz++;
+                if (!nz) {
+                    fprintf(stderr, "ds4:   %s K=%u: output unchanged, so nothing ran - "
+                            "not timed\n", share ? "shared " : "distinct", k);
+                    best = 0; goto next_k;
+                }
+                if (!zero_ok) {
+                    fprintf(stderr, "ds4:   %s K=%u: the fill did not zero the output, so "
+                            "non-zero proves nothing - not timed\n",
+                            share ? "shared " : "distinct", k);
+                    best = 0; goto next_k;
+                }
+                if (k == maxk) {
+                    if (share == 0) memcpy(ref8, ho, (size_t)maxk * embd * sizeof(float));
+                    else {
+                        uint64_t differ = 0;
+                        for (uint64_t i = 0; i < (uint64_t)maxk * embd; i++)
+                            if (memcmp(&ref8[i], &ho[i], sizeof(float)) != 0) differ++;
+                        if (!differ) {
+                            fprintf(stderr, "ds4:   K=8: distinct and shared selections give "
+                                    "the same output, so the selection is not being read - "
+                                    "the sweep is not measuring the experts\n");
+                            sel_ignored = true;
+                        } else {
+                            fprintf(stderr, "ds4:   K=8: %llu of %llu outputs differ between "
+                                    "the two selections, so the experts are being read\n",
+                                    (unsigned long long)differ,
+                                    (unsigned long long)((uint64_t)maxk * embd));
+                        }
+                    }
+                }
+            }
+            const int laps = 10;
             for (int warm = 0; warm < 3; warm++) {
                 bool mf = false;
+                /* The region starts before begin_commands, not after the encode.
+                 * This operator commits and waits inside itself - the streaming
+                 * cache's host round trip - so by end_commands the work is
+                 * already done and timing only that reported 0.002 ms for 13.8
+                 * MB of IQ2, below the floor of a single command buffer. The
+                 * engagement check said the experts were being read, so it was
+                 * the region and not the work. */
+                const double t0 = now_sec();
                 if (!ds4_gpu_begin_commands()) goto done;
                 for (int q = 0; q < laps; q++)
                     if (!ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, experts,
@@ -47069,7 +47144,6 @@ static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
                          * sweep rather than instead of it. */
                         best = 0; goto next_k;
                     }
-                const double t0 = now_sec();
                 if (!ds4_gpu_end_commands()) goto done;
                 const double ms = (now_sec() - t0) * 1000.0 / laps;
                 /* The fastest lap of three: this is a cost model's coefficient,
@@ -47101,7 +47175,9 @@ static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
     next_share: ;
     }
 done:
-    free(hx); free(hw); free(hs);
+    free(hx); free(hw); free(hs); free(ho);
+    if (sel_ignored) fprintf(stderr, "ds4:   the times above are not the experts' - "
+                             "the selection was ignored\n");
     ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(gate);
     ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid); ds4_gpu_tensor_free(experts);
     ds4_gpu_tensor_free(sel); ds4_gpu_tensor_free(rw);
