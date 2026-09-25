@@ -45555,8 +45555,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     /* =1 takes the batch entry point, which puts the token on a grid axis and
      * still re-reads the group weight a token. =2 or =4 takes the row tile,
      * which reads each weight block once for BR tokens; DS4_V41_ROWTILE_CHECK=4
-     * has it identical to single rows and 1.43x the batch at eight rows. */
-    const uint32_t low_br = lowb_e && lowb_e[0] ? (uint32_t)atoi(lowb_e) : 0u;
+     * has it identical to single rows and 1.43x the batch at eight rows.
+     *
+     * BR=4 is the default: byte-exact, and faster in both ABBA orders on a
+     * quiet machine (unset-first -6.8%, set-first -2.7%), which is the standard
+     * the row tile and the routed MoE batch were defaulted on. So an A/B has to
+     * be written DS4_METAL_V41_LOW_BATCH=0 - unsetting it selects the tile, and
+     * two arms that both say "row tile BR=4" are one arm. */
+    const uint32_t low_br = lowb_e && lowb_e[0] ? (uint32_t)atoi(lowb_e) : 4u;
     const bool low_batch_default = (low_br == 1u || low_br == 2u || low_br == 4u) &&
                                    batch_attn_out && g->tp_world == 1;
     double stage_pre = 0, stage_attn = 0, stage_attn_out = 0, stage_moe = 0,
