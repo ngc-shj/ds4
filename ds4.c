@@ -40800,6 +40800,18 @@ static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
             (double)distinct * ((k + 3u) / 4u) / 1e9);
 }
 
+/* Read once a step rather than once a matmul. ds41_step_config() refreshes
+ * them at both step entry points; they keep the env's value before the first
+ * step so the prefill paths see what they always did. */
+static int g_ds41_exact_vocab = -1;
+static const char *g_ds41_dense_tile_env;
+
+static void ds41_step_config(void) {
+    const char *ev = getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS");
+    g_ds41_exact_vocab = ev && ev[0] ? atoi(ev) != 0 : 0;
+    g_ds41_dense_tile_env = getenv("DS4_METAL_V41_DENSE_ROW_TILE");
+}
+
 /* The batch path writes a stage's result and then reads all of it back to round
  * to BF16, where the single-row path has had the rounding folded into the
  * producer's store for a while. Forty layers of that is several hundred
@@ -40825,15 +40837,14 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
      * which leaves the verifier on the single-token bandwidth floor.  Reuse
      * the byte-exact row-tile primitive for every Q8 projection when asked,
      * not only for the vocabulary head. */
-    /* Not cached in a static: the selftest's in-process A/B sets and unsets
-     * this between arms, and a static hands both arms the same value and
-     * reports no difference. */
-    static int exact_vocab = -1;
-    if (exact_vocab < 0) {
-        const char *ev = getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS");
-        exact_vocab = ev && ev[0] ? atoi(ev) != 0 : 0;
-    }
-    const char *dense_tile_e = getenv("DS4_METAL_V41_DENSE_ROW_TILE");
+    /* The comment that used to be here said this was not cached in a static,
+     * directly above a static. Both knobs are now refreshed once at each step
+     * entry instead: the A/B alternates them between passes and sees the
+     * change, and this function - which every projection calls - is not doing a
+     * getenv a matmul. */
+    if (g_ds41_exact_vocab < 0) ds41_step_config();
+    const int exact_vocab = g_ds41_exact_vocab;
+    const char *dense_tile_e = g_ds41_dense_tile_env;
     /* Per shape, from DS4_V41_ROWTILE_CHECK=2 on this machine: BR=4 is the
      * best tile everywhere, BR=2 ties it on the vocabulary head, and BR=8 is
      * the worst of the three on every shape because sumf[8][NR0] and yl[8][NQ]
@@ -43484,6 +43495,7 @@ static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp) {
 
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
                                              const ds4_weights *w, int token, float *logits) {
+    ds41_step_config();
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     const bool v41_prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
     const double v41_t0 = v41_prof ? now_sec() : 0.0;
@@ -45475,6 +45487,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights,
                                    float *row_logits) {
+    ds41_step_config();
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
     /* Sparse block masks scale with context, even when prefill caps match.
@@ -45561,10 +45574,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
         for (unsigned table = 0; ok && table < 2; table++)
             ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
-        if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
-            ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
-                weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
+        if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre));
+        if (ok && !ds41_batch_fuse())
+            ok = ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
+                weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i],
+                DS4_N_EMBD, DS4_N_HC);
     }
+    /* One embed for the block. ds4_gpu_embed_tokens_hc_tensor has been here all
+     * along and the token ids are already on the GPU - prefill_tokens is
+     * written above - so this was K dispatches for want of a call. */
+    if (ok && ds41_batch_fuse())
+        ok = ds4_gpu_embed_tokens_hc_tensor(active.residual, g->prefill_tokens,
+                model->map, model->size, weights->token_embd->abs_offset,
+                DS4_N_VOCAB, rows, DS4_N_EMBD, DS4_N_HC) != 0;
     /* What the K rows of a speculative block actually are: consecutive
      * positions of ONE session. The executor below was written for K sessions
      * that happen to share a workspace, and runs attention a row at a time
@@ -46247,7 +46269,29 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     /* Pure prefill publishes only its final row; the caller computes the head
      * once at the complete prompt frontier. */
     const int first_output = prefill_only ? count - 1 : 0;
-    for (int i = first_output; ok && i < count; i++) {
+    /* When the rows are one session's, the loop below is K copies into the same
+     * two session tensors - only the last survives - wrapped around a weighted
+     * sum, a rounding, a norm and a copy back whose only purpose is to fill
+     * active.norm one row at a time. active.residual and active.ffn_split are
+     * already K rows contiguous, and the split weighted sum reads the first
+     * n_hc of each row, which is what the per-row form was handed a copy of.
+     * So it is two dispatches for the block instead of six a row. */
+    bool one_session = count >= 2;
+    for (int i = 1; one_session && i < count; i++)
+        if (graphs[i] != graphs[0]) one_session = false;
+    const bool fuse_head = one_session && !prefill_only && batch_logits != NULL &&
+                           ds41_batch_fuse();
+    if (ok && fuse_head) {
+        ds41_gpu_graph *s = graphs[count - 1];
+        ok = ds4_gpu_tensor_copy(s->residual, 0, g->rows_view[count - 1].residual, 0,
+                (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
+            ds4_gpu_tensor_copy(s->pre, 0, g->rows_view[count - 1].ffn_split, 0,
+                DS4_N_HC * sizeof(float)) &&
+            ds4_gpu_hc_weighted_sum_split_bf16_tensor(active.x, active.residual,
+                active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+            ds41_norm_batch(active.norm, active.x, model, weights->output_norm, rows);
+    }
+    for (int i = first_output; ok && !fuse_head && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         ok = ds4_gpu_tensor_copy(s->residual, 0, g->rows_view[i].residual, 0,
                                  (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float)) &&
@@ -46274,9 +46318,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                      logits_bytes) != 0;
         if (ok) ok = ds4_gpu_begin_commands() != 0;
     }
+    /* One session's rows all publish into the same logits tensor, so every copy
+     * but the last is overwritten before anything reads it - 4.1 MB of which
+     * 3.6 MB is dead at k=8. The dump does read a row at a time, so it keeps
+     * them. */
+    const bool dump_rows = getenv("DS4_METAL_V41_LOGITS_DUMP") != NULL;
     for (int i = first_output; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        if (batch_logits)
+        const bool live_row = !one_session || dump_rows || !ds41_batch_fuse() ||
+                              i == count - 1;
+        if (batch_logits && live_row)
             ok = ds4_gpu_tensor_copy(s->tp_logits_half ? s->tp_logits_half : s->logits,
                 0, batch_logits, (uint64_t)i * logits_bytes, logits_bytes);
         if (ok) ds41_logits_dump(s, positions[i], 1);
