@@ -47016,13 +47016,34 @@ done:
  * layer and no single value from it should be quoted. The gap between the arms
  * at K=8 is 6.7%, twice, which is expert-major's ceiling.
  *
- * And a scope note the warnings make plain: under --ssd-streaming the expert
- * weights are not reachable by model offset, so "Metal model range ... is not
- * covered by mapped model views" prints on every call and what gets read is
- * whatever the streaming cache holds, not the ids named here. The shape of the
- * work - six experts by K rows - is right, so the cost model stands; the
- * identity of the weights does not, which is why varying `used` refuses
- * outright. */
+ * NOT ESTABLISHED. Every number above is withdrawn, including the ones that
+ * reproduced, and the reason is that the harness is not fail-closed.
+ *
+ * "Metal model range ... is not covered by mapped model views" does not mean the
+ * call read a different expert. ds4_gpu_stream_expert_cache_bind has no path
+ * that substitutes one: a unique id with no cache entry falls back to a
+ * whole-tensor view, and when that view cannot be made it sets ok = 0 and the
+ * call refuses. So the calls that printed the warning are not the calls that
+ * reported a time - they are different calls - and nothing here can be
+ * attributed. A number that reproduces across runs can still be a number about
+ * the wrong thing.
+ *
+ * What this needs before it measures anything:
+ *
+ *  - real ids for this layer captured from a production route, enough of them
+ *    for K=8 at six a row
+ *  - those ids loaded into the cache through the loader, then verified entry by
+ *    entry: expert id, layer, offsets, generation, and a non-nil address
+ *  - every entry pinned, so nothing is evicted and no address generation
+ *    changes while the arm runs
+ *  - the address table build and the cache lookup outside the timed region
+ *  - a count of the assignments actually executed for gate, up and down, each
+ *    required to be exactly 6*K
+ *  - one warning, one nil address, one fallback or one missing assignment
+ *    refuses the whole arm
+ *
+ * Until then the only routed figure that stands is the 53.4 ms from the
+ * production exact-replay ablation, which measures the layer in place. */
 static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
     const ds4_layer_weights *l = &w->layer[20];
     const uint32_t used = DS4_N_EXPERT_USED, ff = DS4_N_FF_EXP, embd = DS4_N_EMBD;
