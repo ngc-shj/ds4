@@ -46997,12 +46997,32 @@ done:
  * the operator returns success without doing the work. The ids here are
  * synthetic and the streaming cache has no entry for them, so nothing binds.
  *
- * What it needs before a number from it means anything: a check that the work
- * happened. Either route through ids the cache actually holds - capture them
- * from a live decode, as DS4_METAL_V41_GATE_ROUTE_LOG does - or read the output
- * back and require it to differ from what it held before. An arm that did no
- * work reporting a time is the failure this file keeps writing comments about,
- * and this harness was written without the check it exists to enforce. */
+ * The checks it now carries, and what each one caught:
+ *
+ *  - the fill really zeroed the output, because a freshly allocated buffer is
+ *    non-zero too and "non-zero means it ran" proves nothing
+ *  - two different selections give different outputs - 35,840 of 40,960 - so
+ *    the experts are read rather than the call returning success over nothing
+ *  - the timed region starts before begin_commands, because this operator
+ *    commits and waits inside itself for the streaming cache. Timing only
+ *    end_commands reported 0.002 ms for 13.8 MB of IQ2, which is 6.9 TB/s on a
+ *    614 GB/s machine and below the floor of one command buffer
+ *
+ * What is established, and what is not. K=8 at 1.35 ms a layer reproduces across
+ * runs and agrees with the stage instrument's 1.351 ms by a different route. The
+ * marginal row is 0.12 ms a layer in the shared arm, twice. The distinct arm's
+ * intercept is not stable - 0.43 and 0.85 ms a layer on consecutive runs, with
+ * K=4 below K=2 in the second - so the intercept is between 0.25 and 0.85 ms a
+ * layer and no single value from it should be quoted. The gap between the arms
+ * at K=8 is 6.7%, twice, which is expert-major's ceiling.
+ *
+ * And a scope note the warnings make plain: under --ssd-streaming the expert
+ * weights are not reachable by model offset, so "Metal model range ... is not
+ * covered by mapped model views" prints on every call and what gets read is
+ * whatever the streaming cache holds, not the ids named here. The shape of the
+ * work - six experts by K rows - is right, so the cost model stands; the
+ * identity of the weights does not, which is why varying `used` refuses
+ * outright. */
 static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
     const ds4_layer_weights *l = &w->layer[20];
     const uint32_t used = DS4_N_EXPERT_USED, ff = DS4_N_FF_EXP, embd = DS4_N_EMBD;
@@ -47039,6 +47059,64 @@ static void ds41_routed_k_sweep(const ds4_model *m, const ds4_weights *w) {
     if (!ref8) goto done;
     fprintf(stderr, "ds4: routed experts by K, layer 20, %u used of %u, ff %u\n",
             used, DS4_N_EXPERT, ff);
+    /* Is the intercept per-layer setup, or per-expert binding? Setup does not
+     * move when the number of selected experts does; binding and the weight
+     * scan both do. Same operator, same K, only `used` changes. */
+    for (uint32_t u = 1; u <= used; u *= 2u) {
+        const uint32_t uu = u > used ? used : u;
+        double tu[9] = {0};
+        for (uint32_t k = 2; k <= maxk; k *= 2u) {
+            for (uint32_t r = 0; r < k; r++)
+                for (uint32_t j = 0; j < uu; j++)
+                    hs[r * uu + j] = (int32_t)((r * uu + j) * 7u % DS4_N_EXPERT);
+            for (uint32_t i = 0; i < k * uu; i++) hw[i] = 1.0f / (float)uu;
+            if (!ds4_gpu_tensor_write(sel, 0, hs, (uint64_t)k * uu * sizeof(int32_t)) ||
+                !ds4_gpu_tensor_write(rw, 0, hw, (uint64_t)k * uu * sizeof(float))) {
+                fprintf(stderr, "ds4:   used=%u K=%u: the id/weight write failed\n", uu, k);
+                goto done;
+            }
+            const int laps = 10;
+            double best = 0;
+            for (int warm = 0; warm < 3; warm++) {
+                bool mf = false;
+                const double t0 = now_sec();
+                if (!ds4_gpu_begin_commands()) {
+                    fprintf(stderr, "ds4:   used=%u K=%u: begin_commands failed\n", uu, k);
+                    goto done;
+                }
+                bool lap_ok = true;
+                for (int q = 0; q < laps && lap_ok; q++)
+                    lap_ok = ds4_gpu_routed_moe_batch_tensor(out, gate, up, mid, experts,
+                            m->map, m->size, l->ffn_gate_exps->abs_offset,
+                            l->ffn_up_exps->abs_offset, l->ffn_down_exps->abs_offset,
+                            l->ffn_gate_exps->type, l->ffn_down_exps->type,
+                            gate_row * ff, gate_row, down_row * embd, down_row,
+                            embd, ff, embd, sel, rw, DS4_N_EXPERT, uu,
+                            DS4_SWIGLU_CLAMP_EXP, x, 20u, k, &mf, false) != 0;
+                if (!ds4_gpu_end_commands()) {
+                    fprintf(stderr, "ds4:   used=%u K=%u: end_commands failed\n", uu, k);
+                    goto done;
+                }
+                if (!lap_ok) { best = 0; break; }
+                const double ms = (now_sec() - t0) * 1000.0 / laps;
+                if (warm && best != 0 && ms < best) best = ms;
+                else if (warm && best == 0) best = ms;
+            }
+            tu[k] = best;
+        }
+        if (tu[2] > 0 && tu[8] > 0) {
+            const double S = (tu[8] - tu[2]) / 6.0;
+            fprintf(stderr, "ds4:   used=%u: K=2 %.3f K=4 %.3f K=8 %.3f ms; marginal row "
+                    "%.3f, fixed %.3f ms\n", uu, tu[2], tu[4], tu[8], S, tu[2] - 2.0 * S);
+        } else {
+            fprintf(stderr, "ds4:   used=%u: refused\n", uu);
+        }
+        if (uu == used) break;
+    }
+    /* Restore the full-width weights for the arms below. */
+    for (uint32_t i = 0; i < maxk * used; i++) hw[i] = 1.0f / (float)used;
+    if (!ds4_gpu_tensor_write(rw, 0, hw, wb)) goto done;
+
     for (int share = 0; share < 2; share++) {
         double t[9] = {0};
         for (uint32_t k = 1; k <= maxk; k *= 2u) {
