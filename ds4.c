@@ -40814,6 +40814,14 @@ static const char *g_ds41_dense_tile_env;
  * (server_slot::decode_accepted[2]), so outside ds41_verify_selftest these come
  * out zero - and a bench that prints tok/s without checking them is reporting
  * the single-row path while claiming to have measured a block one. */
+/* Why a gathered batch ends up decoded a row at a time. One session failing any
+ * of these declines the batch for all of them, so the counters are per reason
+ * and not per session, and the report prints them with the decode path. */
+static uint64_t g_ds41_decline[8];
+enum { DS41_DECLINE_SHAPE = 0, DS41_DECLINE_BACKEND, DS41_DECLINE_SESSION,
+       DS41_DECLINE_STREAMING, DS41_DECLINE_GRAPH, DS41_DECLINE_POS,
+       DS41_DECLINE_TP, DS41_DECLINE_WORKSPACE };
+
 static uint64_t g_ds41_single_steps;
 /* The wall a decode spends inside the graph, so the split against the wall a
  * decode takes can be read off one run instead of subtracted across two. The
@@ -40851,6 +40859,17 @@ static void ds41_decode_path_report(void) {
             fprintf(stderr, " %u:%llu", i, (unsigned long long)g_ds41_kblock_rows[i]);
     if (!g_ds41_kblock_steps) fprintf(stderr, " none");
     fprintf(stderr, "\n");
+    static const char *const why[8] = { "shape", "backend", "session", "streaming",
+                                        "graph", "pos!=checkpoint", "tp", "workspace" };
+    uint64_t total = 0;
+    for (int i = 0; i < 8; i++) total += g_ds41_decline[i];
+    if (total) {
+        fprintf(stderr, "ds4:   batch declined %llu times:", (unsigned long long)total);
+        for (int i = 0; i < 8; i++)
+            if (g_ds41_decline[i])
+                fprintf(stderr, " %s=%llu", why[i], (unsigned long long)g_ds41_decline[i]);
+        fprintf(stderr, "\n");
+    }
 }
 
 static void ds41_step_config(void) {
@@ -83841,28 +83860,43 @@ static bool glm53_graph_encode_native_session_batch(
 static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
                                           const ds4_engine *e) {
     if (!items || count < 2 || count > DS4_TP_BATCH_MAX_ROWS || !e ||
-        e->support_kind != DS4_SUPPORT_NONE)
+        e->support_kind != DS4_SUPPORT_NONE) {
+        g_ds41_decline[DS41_DECLINE_SHAPE]++;
         return false;
+    }
     const bool cuda = e->backend == DS4_BACKEND_CUDA;
     if (cuda ? !metal_graph_tp_env_flag("DS4_CUDA_SESSION_BATCH_MOE", true) :
-        (e->backend != DS4_BACKEND_METAL || getenv("DS4_METAL_DISABLE_V41_SESSION_BATCH")))
+        (e->backend != DS4_BACKEND_METAL || getenv("DS4_METAL_DISABLE_V41_SESSION_BATCH"))) {
+        g_ds41_decline[DS41_DECLINE_BACKEND]++;
         return false;
+    }
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
-        if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid || s->distributed ||
-            (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) :
+        if (!s || s->engine != e || !s->ds41_graph_ready || !s->checkpoint_valid ||
+            s->distributed) { g_ds41_decline[DS41_DECLINE_SESSION]++; return false; }
+        if (cuda ? !ds41_cuda_row_batch_supported(&s->ds41_graph, &e->weights) :
                 (s->ds41_graph.streaming &&
-                 !getenv("DS4_METAL_ENABLE_V41_STREAMING_SESSION_BATCH"))) ||
-            s->ds41_graph.imatrix || s->ds41_graph.quality ||
-            !s->ds41_graph.valid || s->ds41_graph.image_count ||
-            s->ds41_graph.pos != (uint32_t)s->checkpoint.len) return false;
+                 !getenv("DS4_METAL_ENABLE_V41_STREAMING_SESSION_BATCH"))) {
+            g_ds41_decline[DS41_DECLINE_STREAMING]++; return false;
+        }
+        if (s->ds41_graph.imatrix || s->ds41_graph.quality ||
+            !s->ds41_graph.valid || s->ds41_graph.image_count) {
+            g_ds41_decline[DS41_DECLINE_GRAPH]++; return false;
+        }
+        if (s->ds41_graph.pos != (uint32_t)s->checkpoint.len) {
+            g_ds41_decline[DS41_DECLINE_POS]++; return false;
+        }
         /* Smaller TP batches lose to ordered decode. Single-host execution
          * starts at two; the network crossover is backend-specific. */
-        if (s->ds41_graph.tp_world == 2 && count < (cuda ? 5 : 3)) return false;
+        if (s->ds41_graph.tp_world == 2 && count < (cuda ? 5 : 3)) {
+            g_ds41_decline[DS41_DECLINE_TP]++; return false;
+        }
         graphs[i] = &s->ds41_graph;
     }
-    return ds41_batch_workspace(graphs, count) != NULL;
+    if (ds41_batch_workspace(graphs, count) != NULL) return true;
+    g_ds41_decline[DS41_DECLINE_WORKSPACE]++;
+    return false;
 }
 
 #endif
