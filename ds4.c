@@ -40236,6 +40236,24 @@ typedef struct {
      * than the last row's. */
     ds4_engram_history block_history[DS4_TP_BATCH_MAX_ROWS];
     uint32_t block_history_rows;
+    /* Debug only, DS4_V41_TXN_TAGS=1. Per compressed row: which absolute
+     * position produced it, which transaction wrote it, and whether that write
+     * has been committed. A read counter over n_comp alone is tautological - the
+     * reader derives n_comp from its own position - but the tags are not: they
+     * catch a ring alias, a row an accepted position failed to rewrite, and a
+     * rejected row the visible window walks over later.
+     *
+     * The epoch is recorded but does not decide. Marking whole epochs committed
+     * would pass every rejected row of a block that committed anything, which is
+     * the same mistake as treating an epoch tag as a transaction. What decides is
+     * per row: a commit of A marks only the rows whose covered positions are all
+     * inside the accepted prefix. */
+    uint32_t *tag_pos[4];
+    uint64_t *tag_epoch[4];
+    uint8_t *tag_committed[4];
+    uint32_t tag_rows[4];
+    uint64_t txn_epoch;
+    uint64_t tag_reads, tag_bad;
     uint32_t block_txn_active;
     /* Fail-closed: a write into the committed arena while a transaction is
      * open is a bug, not a slow path. Nothing may make this nonzero. */
@@ -40288,6 +40306,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->index_cache[i]);
         ds4_gpu_tensor_free(g->block_carry_kv[i]);
         ds4_gpu_tensor_free(g->block_carry_score[i]);
+        free(g->tag_pos[i]); free(g->tag_epoch[i]); free(g->tag_committed[i]);
         ds4_gpu_tensor_free(g->previous_kv[i]);
         ds4_gpu_tensor_free(g->previous_score[i]);
     }
@@ -40412,6 +40431,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
+        if (getenv("DS4_V41_TXN_TAGS")) {
+            g->tag_rows[i] = (uint32_t)cap;
+            g->tag_pos[i] = malloc(cap * sizeof(*g->tag_pos[i]));
+            g->tag_epoch[i] = calloc(cap, sizeof(*g->tag_epoch[i]));
+            g->tag_committed[i] = calloc(cap, sizeof(*g->tag_committed[i]));
+            if (!g->tag_pos[i] || !g->tag_epoch[i] || !g->tag_committed[i]) goto fail;
+            for (uint64_t r = 0; r < cap; r++) g->tag_pos[i][r] = UINT32_MAX;
+        }
         g->block_carry_kv[i] = ds4_gpu_tensor_alloc(
             (uint64_t)DS4_TP_BATCH_MAX_ROWS * 512u * sizeof(float));
         g->block_carry_score[i] = ds4_gpu_tensor_alloc(
@@ -40887,6 +40914,26 @@ static uint64_t g_ds41_kblock_positions;
  * sit where the block says its rows are, and every one of them refuses. */
 uint64_t g_ds41_txn_carry_park, g_ds41_txn_carry_publish;
 uint64_t g_ds41_txn_carry_hold, g_ds41_txn_refuse;
+/* One bit per parked row per owner. The publish runs on a copy of the graph, so
+ * this cannot live there. A commit wants all K bits: eight rows on eight
+ * consecutive positions is the premise everything else rests on, and the one
+ * time it was false - every row on the same position, from prefill_rows = 0 -
+ * it showed up as an oracle accepting five of eight and nothing said why. */
+static uint32_t g_ds41_txn_rows_seen[4];
+static uint32_t g_ds41_txn_rows_writes[4];
+static uint32_t g_ds41_txn_row_lo[4], g_ds41_txn_row_hi[4];
+
+/* What a block transaction is made of. Every one of these has to be present
+ * before the block's first dispatch: a transaction missing one of them writes
+ * through and then discovers it at commit, which is the wrong end. */
+enum {
+    DS41_TXN_CAP_BLOCK_KV       = 1u << 0,  /* the K rows land in a linear delta */
+    DS41_TXN_CAP_CARRY_DELTA    = 1u << 1,  /* one carry version per row per owner */
+    DS41_TXN_CAP_ENGRAM_DELTA   = 1u << 2,  /* one hash-tail version per row */
+    DS41_TXN_CAP_POSITION_CHECK = 1u << 3,  /* the rows are K consecutive positions */
+    DS41_TXN_CAPS_REQUIRED = DS41_TXN_CAP_BLOCK_KV | DS41_TXN_CAP_CARRY_DELTA |
+                             DS41_TXN_CAP_ENGRAM_DELTA | DS41_TXN_CAP_POSITION_CHECK,
+};
 static uint64_t g_ds41_fuse_sites;
 
 static void ds41_decode_path_report(void) {
@@ -40915,6 +40962,16 @@ static void ds41_decode_path_report(void) {
             fprintf(stderr, " %u:%llu", i, (unsigned long long)g_ds41_kblock_rows[i]);
     if (!g_ds41_kblock_steps) fprintf(stderr, " none");
     fprintf(stderr, "\n");
+    /* refuse is the one that has to stay at zero: every count is a block whose
+     * parked versions did not describe the positions the block says it ran, and
+     * each of them refused rather than committing something plausible. */
+    if (g_ds41_txn_carry_park || g_ds41_txn_refuse)
+        fprintf(stderr, "ds4:   block transaction: %llu carry versions parked, "
+                "%llu published, %llu held at the committed value, %llu refused\n",
+                (unsigned long long)g_ds41_txn_carry_park,
+                (unsigned long long)g_ds41_txn_carry_publish,
+                (unsigned long long)g_ds41_txn_carry_hold,
+                (unsigned long long)g_ds41_txn_refuse);
     static const char *const why[8] = { "shape", "backend", "session", "streaming",
                                         "graph", "pos!=checkpoint", "tp", "workspace" };
     uint64_t total = 0;
@@ -41378,6 +41435,41 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
         ds41_matmul(g->block, m, l->attn_output_b, g->low, round);
 }
 
+/* Record who produced a compressed row. `upto` is the last absolute position
+ * pooled into it, which is what a reader recomputes from the row index. */
+static void ds41_tag_write(ds41_gpu_graph *g, uint32_t owner, uint32_t row,
+                           uint32_t upto, bool committed) {
+    if (!g->tag_pos[owner] || row >= g->tag_rows[owner]) return;
+    g->tag_pos[owner][row] = upto;
+    g->tag_epoch[owner][row] = g->txn_epoch;
+    g->tag_committed[owner][row] = committed ? 1u : 0u;
+}
+
+/* Every compressed row this position can read, which is every row a previous
+ * position completed. A row it will write itself is not checked here. */
+static bool ds41_tag_verify(ds41_gpu_graph *g, const char *when) {
+    bool ok = true;
+    for (uint32_t o = 0; o < 4u; o++) {
+        if (!g->tag_pos[o]) continue;
+        const uint32_t ratio = o < 3u ? 2u : 1u;
+        const uint32_t visible = g->pos / ratio;
+        for (uint32_t r = 0; r < visible && r < g->tag_rows[o]; r++) {
+            const uint32_t want = r * ratio + ratio - 1u;
+            g->tag_reads++;
+            if (g->tag_pos[o][r] == want && g->tag_committed[o][r]) continue;
+            g->tag_bad++;
+            if (ok)
+                fprintf(stderr, "ds4: V4.1 compressed row %u of owner %u is visible at "
+                        "position %u %s but was produced by position %u in epoch %llu, "
+                        "committed %u - wanted position %u\n", r, o, g->pos, when,
+                        g->tag_pos[o][r], (unsigned long long)g->tag_epoch[o][r],
+                        g->tag_committed[o][r], want);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 /* `hoisted`: the compressor projections have already gone out, merged with
  * the rest of the layer's narrow matvecs (ds41_narrow_merged_project). */
 static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
@@ -41438,7 +41530,15 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                      ds4_gpu_tensor_copy(g->block_carry_score[owner], at,
                          bi ? g->block_carry_score[owner] : g->previous_score[owner],
                          bi ? at - cbytes : 0, cbytes));
-                if (pooled) g_ds41_txn_carry_park++;
+                if (pooled) {
+                    if (!g_ds41_txn_rows_writes[owner] || bi < g_ds41_txn_row_lo[owner])
+                        g_ds41_txn_row_lo[owner] = bi;
+                    if (!g_ds41_txn_rows_writes[owner] || bi > g_ds41_txn_row_hi[owner])
+                        g_ds41_txn_row_hi[owner] = bi;
+                    g_ds41_txn_rows_seen[owner] |= 1u << bi;
+                    g_ds41_txn_rows_writes[owner]++;
+                    g_ds41_txn_carry_park++;
+                }
             }
             ds4_gpu_tensor_free(view_kv);
             ds4_gpu_tensor_free(view_score);
@@ -41457,6 +41557,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                 !ds4_gpu_dsv41_quantize(g->latent, 512, 1, DS4_V41_FP4_E4M3) ||
                 !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
                                      g->latent, 0, 512u * 4u)) return false;
+            ds41_tag_write(g, owner, n_comp - 1u, pos, g->block_txn_active == 0);
         }
     }
     return true;
@@ -42692,6 +42793,13 @@ static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
     return ds41_matmul_batch(out, m, weight, in, count, bf16);
 }
 
+static void ds41_tag_batch(ds41_gpu_graph *g, uint32_t owner, uint32_t first,
+                           uint32_t rows, uint32_t ratio) {
+    for (uint32_t r = 0; r < rows; r++)
+        ds41_tag_write(g, owner, first + r, (first + r) * ratio + ratio - 1u,
+                       g->block_txn_active == 0);
+}
+
 static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
                                          uint32_t il, uint32_t start, uint32_t count) {
@@ -42738,7 +42846,8 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                   first * ratio, ratio, true, false) &&
         ds4_gpu_dsv41_quantize(b->latent, DS4_N_HEAD_DIM, rows, DS4_V41_FP4_E4M3) &&
         ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)first * DS4_N_HEAD_DIM * sizeof(float),
-            b->latent, 0, (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float));
+            b->latent, 0, (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float)) &&
+        (ds41_tag_batch(g, owner, first, rows, ratio), true);
 }
 
 static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
@@ -43706,6 +43815,7 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
      * from an earlier block would send its carry into the block's delta and
      * never publish it. */
     g->block_txn_active = 0;
+    if (g->tag_pos[0] && !ds41_tag_verify(g, "entering a single step")) return false;
     g_ds41_single_steps++;
     const bool v41_prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
     const double v41_t0 = v41_prof ? now_sec() : 0.0;
@@ -45847,20 +45957,37 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * exists. Requires the block-local KV path, which is what puts the rows in a
      * linear buffer in the first place. DS4_METAL_V41_BLOCK_TXN=1. */
     const char *btxn_e = getenv("DS4_METAL_V41_BLOCK_TXN");
-    /* The transaction parks rows in the block's linear KV delta, which only the
-     * block-local KV path produces. Asking for it without that path used to be
-     * silent: the ring was written through, the delta stayed empty, and the
-     * refusal at commit blamed the env that was in fact set. Say so here. */
+    /* A transaction is not one switch but four capabilities, and running with
+     * three of them is worse than refusing: the ring gets written through, the
+     * deltas stay empty, and the refusal arrives at commit time naming the
+     * variable that was in fact set. So the mask is built from what is actually
+     * there and checked before the first dispatch. */
     const bool block_txn_want = btxn_e && btxn_e[0] && atoi(btxn_e) != 0;
-    const bool block_txn = block_txn_want && block_kv;
-    if (block_txn_want && !block_kv) {
-        static bool said_no_kv;
-        if (!said_no_kv) { said_no_kv = true;
-            fprintf(stderr, "ds4: V4.1 block transaction needs DS4_METAL_V41_BLOCK_KV; "
-                    "running without it\n"); }
+    uint32_t txn_caps = 0;
+    if (block_kv) txn_caps |= DS41_TXN_CAP_BLOCK_KV;
+    if (g->block_carry_kv[0] && g->block_carry_kv[1] && g->block_carry_kv[2] &&
+        g->block_carry_score[0] && g->block_carry_score[1] && g->block_carry_score[2])
+        txn_caps |= DS41_TXN_CAP_CARRY_DELTA;
+    if (rows <= DS4_TP_BATCH_MAX_ROWS) txn_caps |= DS41_TXN_CAP_ENGRAM_DELTA;
+    /* block_ok is positions[i] == positions[0] + i over the whole block, which
+     * is the premise the version coordinates are read against. */
+    if (block_ok) txn_caps |= DS41_TXN_CAP_POSITION_CHECK;
+    if (block_txn_want && txn_caps != DS41_TXN_CAPS_REQUIRED) {
+        static const char *const cap_name[4] = { "BLOCK_KV", "CARRY_DELTA",
+                                                 "ENGRAM_DELTA", "POSITION_CHECK" };
+        fprintf(stderr, "ds4: V4.1 block transaction REFUSED before dispatch, missing");
+        for (int c = 0; c < 4; c++)
+            if (!(txn_caps & (1u << c))) fprintf(stderr, " %s", cap_name[c]);
+        fprintf(stderr, "\n");
+        g_ds41_txn_refuse++;
+        /* Clearing ok is the refusal: every dispatch below is guarded by it, so
+         * nothing is encoded, and the function's own cleanup still runs. */
+        ok = false;
     }
+    const bool block_txn = block_txn_want;
     g->block_txn_active = block_txn ? 1u : 0u;
-    if (block_txn) g->block_carry_owners = 0;
+    if (block_txn) { g->block_carry_owners = 0; g->txn_epoch++; }
+    if (ok && g->tag_pos[0] && !ds41_tag_verify(g, "entering a block")) ok = false;
     const char *bar_e = getenv("DS4_METAL_V41_BLOCK_ATTN_RAW");
     const bool block_attn_raw = bar_e && bar_e[0] && atoi(bar_e) != 0;
     const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
@@ -46049,6 +46176,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     const uint32_t co = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
                     g->block_carry_origin[co] = start;
                     g->block_carry_owners |= 1u << co;
+                    g_ds41_txn_rows_seen[co] = 0;
+                    g_ds41_txn_rows_writes[co] = 0;
+                    g_ds41_txn_row_lo[co] = g_ds41_txn_row_hi[co] = 0;
                 }
             }
             if (ok && first)
@@ -79774,6 +79904,8 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
                                     const ds4_weights *w);
 static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w);
+static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
+                                      const ds4_weights *w);
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen);
@@ -83508,6 +83640,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             selftest_done = 1;
             ds41_rowtile_check(&e->model, &e->weights);
             ds41_block_txn_test(s, &e->model, &e->weights);
+            ds41_block_txn_chain_test(s, &e->model, &e->weights);
             ds41_oracle_block_bench(s, &e->model, &e->weights);
             ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
         }
@@ -83721,12 +83854,17 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
  * write-through path did not have. */
 /* Publish the carry version named by an accept count of `accepted`.
  *
+ *     A = 0:                      keep the committed carry
+ *     A > 0: p = last_even(start + A - 1)
+ *            p < start:           keep the committed carry
+ *            otherwise:           publish txn row[p - start]
+ *
  * pool2 keeps the projection of the last even position at or below the
- * frontier, so the version for accept count A is the row at
- * last_even(block_start + A - 1) - block_start. When that is below the block,
- * the frontier ends on an odd position whose pair came from before the block:
- * the committed carry is already the right value, and because the transaction
- * never wrote it, the restore is doing nothing. */
+ * frontier, so that row is the state a session which had only ever seen those A
+ * positions would hold. When p is below the block the frontier ends on an odd
+ * position whose pair came from before the block, and the committed carry is
+ * already that value - which the transaction never overwrote, so keeping it is
+ * a no-op rather than a restore. */
 static bool ds41_block_carry_commit(ds41_gpu_graph *g, uint32_t accepted) {
     if (!g->block_carry_owners) return true;
     if (accepted > g->block_carry_rows) { g_ds41_txn_refuse++; return false; }
@@ -83741,6 +83879,28 @@ static bool ds41_block_carry_commit(ds41_gpu_graph *g, uint32_t accepted) {
             g_ds41_txn_refuse++;
             return false;
         }
+    /* Every row of the block, once each, on the positions the block claims.
+     *
+     * The bit index is pos - block_carry_start, so a complete mask plus a write
+     * count equal to the row count is a bijection between the versions and the
+     * positions start .. start+K-1: no hole, no repeat, nothing outside. The
+     * low and high bits pin the ends, which is what says the block did not
+     * quietly slide. Every row on one position - prefill_rows = 0 - leaves the
+     * mask at 1 and the count at K, and either one of those refuses. */
+    const uint32_t k = g->block_carry_rows;
+    const uint32_t want = k >= 32u ? UINT32_MAX : (1u << k) - 1u;
+    for (uint32_t o = 0; o < 4u; o++) {
+        if (!(g->block_carry_owners & (1u << o))) continue;
+        if (g_ds41_txn_rows_seen[o] != want || g_ds41_txn_rows_writes[o] != k ||
+            g_ds41_txn_row_lo[o] != 0u || g_ds41_txn_row_hi[o] != k - 1u) {
+            fprintf(stderr, "ds4: V4.1 block transaction REFUSED at commit: owner %u "
+                    "parked mask %#x writes %u rows %u..%u, wanted mask %#x writes %u "
+                    "rows 0..%u\n", o, g_ds41_txn_rows_seen[o], g_ds41_txn_rows_writes[o],
+                    g_ds41_txn_row_lo[o], g_ds41_txn_row_hi[o], want, k, k - 1u);
+            g_ds41_txn_refuse++;
+            return false;
+        }
+    }
     if (accepted == 0) { g_ds41_txn_carry_hold++; return true; }
     const uint32_t last_even = (g->block_carry_start + accepted - 1u) & ~1u;
     if (last_even < g->block_carry_start) { g_ds41_txn_carry_hold++; return true; }
@@ -83757,7 +83917,24 @@ static bool ds41_block_carry_commit(ds41_gpu_graph *g, uint32_t accepted) {
     return true;
 }
 
+/* A commit of A marks the compressed rows the accepted prefix owns, and only
+ * those. A row that also covers a rejected position stays uncommitted: it is
+ * physically there and out of view, and the position that rewrites it later is
+ * what makes it visible. */
+static void ds41_block_tags_commit(ds41_gpu_graph *g, uint32_t start,
+                                   uint32_t rows, uint32_t accepted) {
+    for (uint32_t o = 0; o < 4u; o++) {
+        if (!g->tag_committed[o]) continue;
+        const uint32_t ratio = o < 3u ? 2u : 1u;
+        const uint32_t last = (start + rows) / ratio;
+        for (uint32_t r = start / ratio; r < last && r < g->tag_rows[o]; r++)
+            if (r * ratio + ratio - 1u < start + accepted)
+                g->tag_committed[o][r] = 1u;
+    }
+}
+
 static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
+    ds41_block_tags_commit(g, g->block_kv_delta_start, g->block_kv_delta_rows, accepted);
     if (!ds41_block_carry_commit(g, accepted)) return false;
     g->block_carry_rows = 0;
     g->block_carry_owners = 0;
@@ -84059,9 +84236,70 @@ static bool ds41_txn_prefill(ds4_session **out, ds4_engine *e, const ds4_tokens 
     return true;
 }
 
-static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
-                                const ds4_weights *w) {
-    if (!getenv("DS4_V41_BLOCK_TXN_TEST")) return;
+/* The committed state a block advances, hashed over the live range of each
+ * piece. The ranges are the whole point and they belong in one place: hashing a
+ * full 128-slot ring or a megabyte of compressed store reads whatever the
+ * allocation held and calls every session different, which is how the first
+ * version of this reported DIFF everywhere.
+ *
+ * Below 128 the ring holds one key per position at slot == position. At or
+ * above it every slot is live, and two sessions at the same position carry the
+ * same rotation, so a linear hash still compares like for like. */
+enum { DS41_TXN_STATES = 6 };
+static const char *const ds41_txn_state_name[DS41_TXN_STATES] = {
+    "history", "previous_kv", "previous_score", "window(raw ring)",
+    "compressed", "index"
+};
+
+static uint32_t ds41_txn_state_hashes(ds41_gpu_graph *g, uint64_t h[DS41_TXN_STATES]) {
+    const uint32_t pos = g->pos;
+    const uint32_t slots = pos < 128u ? pos : 128u;
+    for (int i = 0; i < DS41_TXN_STATES; i++) h[i] = 0;
+    h[0] = ds41_state_hash(&g->history, sizeof(ds4_engram_history));
+    for (uint32_t c = 0; c < 4u; c++) {
+        h[1] ^= ds41_tensor_hash(g->previous_kv[c], 512u * 4u);
+        h[2] ^= ds41_tensor_hash(g->previous_score[c], 512u * 4u);
+        const uint32_t ratio = c < 3u ? 2u : 1u;
+        const uint64_t nc = (uint64_t)pos / ratio;
+        if (!nc) continue;
+        h[4] ^= ds41_tensor_hash(g->compressed[c], nc * 512u * 4u);
+        h[5] ^= ds41_tensor_hash(g->index_cache[c], nc * 128u * 4u);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        h[3] ^= ds41_tensor_hash(g->window[il], (uint64_t)slots * 512u * 4u);
+    return slots;
+}
+
+/* Which states differ, as a bitmask, plus the first ring layer and slot that
+ * does - a hash over forty layers names nothing to fix. */
+static uint32_t ds41_txn_state_diff(ds41_gpu_graph *a, ds41_gpu_graph *b,
+                                    int *ring_layer, long *ring_slot) {
+    uint64_t ha[DS41_TXN_STATES], hb[DS41_TXN_STATES];
+    uint32_t bad = 0;
+    const uint32_t slots = ds41_txn_state_hashes(a, ha);
+    if (ds41_txn_state_hashes(b, hb) != slots) bad |= 1u << 3;
+    for (int i = 0; i < DS41_TXN_STATES; i++)
+        if (ha[i] != hb[i]) bad |= 1u << i;
+    if (ring_layer) *ring_layer = -1;
+    if (ring_slot) *ring_slot = -1;
+    if ((bad & (1u << 3)) && ring_layer)
+        for (uint32_t il = 0; il < DS4_N_LAYER && *ring_layer < 0; il++) {
+            const uint64_t live = (uint64_t)slots * 512u * 4u;
+            if (ds41_tensor_hash(a->window[il], live) == ds41_tensor_hash(b->window[il], live))
+                continue;
+            *ring_layer = (int)il;
+            for (uint32_t sl = 0; ring_slot && sl < slots && *ring_slot < 0; sl++) {
+                const uint64_t at = (uint64_t)sl * 512u * 4u;
+                if (ds41_tensor_hash_at(a->window[il], at, 512u * 4u) !=
+                    ds41_tensor_hash_at(b->window[il], at, 512u * 4u))
+                    *ring_slot = (long)sl;
+            }
+        }
+    return bad;
+}
+
+static void ds41_block_txn_test_at(ds4_session *seed, const ds4_model *m,
+                                   const ds4_weights *w, long want, uint32_t a_mask) {
     const long k = 8;
     ds4_engine *e = seed->engine;
     const int ctx = seed->ctx_size;
@@ -84075,14 +84313,13 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
      * and it costs a prefill rather than hundreds of single steps.
      * DS4_V41_BLOCK_TXN_TEST_START=<absolute position of the block's first row>. */
     int *padded = NULL;
-    {
-        const char *st_e = getenv("DS4_V41_BLOCK_TXN_TEST_START");
-        const long want = st_e && st_e[0] ? atol(st_e) : 0;
-        if (want > prompt.len && want + k + 24 < ctx &&
-            (padded = malloc((size_t)want * sizeof(int)))) {
-            for (long i = 0; i < want; i++) padded[i] = prompt.v[i % prompt.len];
-            prompt.v = padded; prompt.len = (int)want; prompt.cap = (int)want;
-        }
+    if (want > 0 && want != prompt.len && want + k + 24 < ctx &&
+        (padded = malloc((size_t)want * sizeof(int)))) {
+        for (long i = 0; i < want; i++) padded[i] = prompt.v[i % prompt.len];
+        prompt.v = padded; prompt.len = (int)want; prompt.cap = (int)want;
+    } else if (want > 0 && want != prompt.len) {
+        fprintf(stderr, "ds4:   txn test: cannot start at %ld\n", want);
+        return;
     }
 
     float *lg_ref = malloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -84109,6 +84346,7 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
     fprintf(stderr, "ds4: block transaction against two independent sessions, "
             "block starts at position %d, k=%ld\n", prompt.len, k);
     for (long a = 0; a <= k; a++) {
+        if (!(a_mask & (1u << a))) continue;
         if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "reference") ||
             !ds41_txn_prefill(&blk, e, &prompt, ctx, "block")) goto done;
         /* Reference: a exact single steps. */
@@ -84141,70 +84379,23 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
          * to read `same` there. Without that the DIFFs below are the
          * instrument's word and not the transaction's. */
         {
-            /* Live bytes only. Hashing a whole 128-slot ring or a megabyte of
-             * compressed store takes in whatever the allocation held, which
-             * differs per session and made every one of these read DIFF - the
-             * instrument's answer, not the transaction's. The ring holds pos
-             * slots here because both sessions are under 128. */
             const uint32_t pr = ref->ds41_graph.pos, pb = blk->ds41_graph.pos;
-            const char *names[4] = { "history", "previous_kv", "previous_score",
-                                     "window(raw ring)" };
-            uint64_t hr[4] = {0}, hb[4] = {0};
-            hr[0] = ds41_state_hash(&ref->ds41_graph.history, sizeof(ds4_engram_history));
-            hb[0] = ds41_state_hash(&blk->ds41_graph.history, sizeof(ds4_engram_history));
-            for (uint32_t c = 0; c < 4; c++) {
-                hr[1] ^= ds41_tensor_hash(ref->ds41_graph.previous_kv[c], 512u * 4u);
-                hb[1] ^= ds41_tensor_hash(blk->ds41_graph.previous_kv[c], 512u * 4u);
-                hr[2] ^= ds41_tensor_hash(ref->ds41_graph.previous_score[c], 512u * 4u);
-                hb[2] ^= ds41_tensor_hash(blk->ds41_graph.previous_score[c], 512u * 4u);
-            }
             int ring_layer = -1;
             long ring_slot = -1;
-            if (pr == pb && pr <= 128u) {
-                for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-                    const uint64_t live = (uint64_t)pr * 512u * 4u;
-                    const uint64_t a1 = ds41_tensor_hash(ref->ds41_graph.window[il], live);
-                    const uint64_t b1 = ds41_tensor_hash(blk->ds41_graph.window[il], live);
-                    hr[3] ^= a1; hb[3] ^= b1;
-                    /* Which layer and which slot, not just that the ring moved.
-                     * A hash over forty layers names nothing to fix. */
-                    if (a1 != b1 && ring_layer < 0) {
-                        ring_layer = (int)il;
-                        for (uint32_t sl = 0; sl < pr && ring_slot < 0; sl++) {
-                            const uint64_t at = (uint64_t)sl * 512u * 4u;
-                            if (ds41_tensor_hash_at(ref->ds41_graph.window[il], at, 512u * 4u) !=
-                                ds41_tensor_hash_at(blk->ds41_graph.window[il], at, 512u * 4u))
-                                ring_slot = (long)sl;
-                        }
-                    }
-                }
-            }
-            /* The compressed store and its index, over the rows a session at
-             * this position can see: pos/ratio of them. Left out until now
-             * because hashing the whole allocation reads uninitialised bytes
-             * and calls every session different. */
-            uint64_t hc[2] = {0}, hd[2] = {0};
-            for (uint32_t c = 0; c < 4; c++) {
-                const uint32_t ratio = c < 3 ? 2u : 1u;
-                const uint64_t nc = (uint64_t)pr / ratio;
-                if (pr != pb || !nc) continue;
-                hc[0] ^= ds41_tensor_hash(ref->ds41_graph.compressed[c], nc * 512u * 4u);
-                hd[0] ^= ds41_tensor_hash(blk->ds41_graph.compressed[c], nc * 512u * 4u);
-                hc[1] ^= ds41_tensor_hash(ref->ds41_graph.index_cache[c], nc * 128u * 4u);
-                hd[1] ^= ds41_tensor_hash(blk->ds41_graph.index_cache[c], nc * 128u * 4u);
-            }
+            const uint32_t bad = pr != pb ? UINT32_MAX :
+                ds41_txn_state_diff(&ref->ds41_graph, &blk->ds41_graph,
+                                    &ring_layer, &ring_slot);
             fprintf(stderr, "ds4:   A=%ld state (pos %u/%u, txn %llu/%llu/%llu rows "
                     "verified/committed/discarded):", a, pr, pb,
                     (unsigned long long)g_ds41_txn_verify_rows,
                     (unsigned long long)g_ds41_txn_commit_rows,
                     (unsigned long long)g_ds41_txn_discard_rows);
-            for (int z = 0; z < 4; z++)
-                fprintf(stderr, " %s=%s", names[z], hr[z] == hb[z] ? "same" : "DIFF");
-            fprintf(stderr, " compressed=%s index=%s",
-                    hc[0] == hd[0] ? "same" : "DIFF", hc[1] == hd[1] ? "same" : "DIFF");
+            for (int z = 0; z < DS41_TXN_STATES; z++)
+                fprintf(stderr, " %s=%s", ds41_txn_state_name[z],
+                        bad & (1u << z) ? "DIFF" : "same");
             if (ring_layer >= 0)
-                fprintf(stderr, " (ring first differs at layer %d slot %ld of %u)",
-                        ring_layer, ring_slot, pr);
+                fprintf(stderr, " (ring first differs at layer %d slot %ld)",
+                        ring_layer, ring_slot);
             fprintf(stderr, " carry park/publish/hold/refuse %llu/%llu/%llu/%llu\n",
                     (unsigned long long)g_ds41_txn_carry_park,
                     (unsigned long long)g_ds41_txn_carry_publish,
@@ -84254,6 +84445,247 @@ done:
     if (ref) ds4_session_free(ref);
     if (blk) ds4_session_free(blk);
     free(lg_ref); free(lg_blk); free(oracle); free(padded);
+}
+
+/* Consecutive transactions. One block returning the right answer says nothing
+ * about the next one: the delta arenas are reused, the carry chain restarts from
+ * whatever the last commit published, and a rejected row written by block n
+ * becomes visible somewhere inside block n+1. So the chains below run block
+ * after block with no single step between them, and the comparison is against a
+ * reference that only ever took single steps.
+ *
+ * DS4_V41_BLOCK_TXN_CHAIN=1. */
+static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
+                                      const ds4_weights *w) {
+    if (!getenv("DS4_V41_BLOCK_TXN_CHAIN")) return;
+    /* (k, accept) per block. The pairs that matter are the ones where a block's
+     * accept count changes what the next block starts on: nothing then
+     * everything, everything then nothing, and either end of the range. */
+    struct step { int k, a; };
+    static const struct step c1[] = {{8,0},{8,8},{0,0}};
+    static const struct step c2[] = {{8,8},{8,0},{0,0}};
+    static const struct step c3[] = {{8,1},{8,7},{0,0}};
+    static const struct step c4[] = {{8,7},{8,1},{0,0}};
+    static const struct step c5[] = {{8,3},{8,3},{8,3},{8,3},{0,0}};
+    static const struct step c6[] = {{8,3},{4,4},{2,1},{6,5},{0,0}};
+    static const struct step c7[] = {{8,0},{8,0},{8,8},{0,0}};
+    static const struct { const char *name; const struct step *s; } chains[] = {
+        {"0 then 8", c1}, {"8 then 0", c2}, {"1 then 7", c3}, {"7 then 1", c4},
+        {"3 four times", c5}, {"k 8,4,2,6", c6}, {"0,0 then 8", c7},
+    };
+    const int ahead = 16;   /* past the last block's own rows either way */
+    ds4_engine *e = seed->engine;
+    const int ctx = seed->ctx_size;
+    ds4_tokens prompt = { .v = seed->checkpoint.v, .len = seed->checkpoint.len,
+                          .cap = seed->checkpoint.cap };
+    if (prompt.len < 1) return;
+
+    enum { ORACLE = 96 };
+    float *lg_ref = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *lg_blk = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int *oracle = malloc((size_t)(ORACLE + 1) * sizeof(int));
+    int cand[DS4_TP_BATCH_MAX_ROWS], acc[DS4_TP_BATCH_MAX_ROWS];
+    char err[192];
+    ds4_session *ref = NULL, *blk = NULL;
+    if (!lg_ref || !lg_blk || !oracle) goto done;
+
+    if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "oracle")) goto done;
+    oracle[0] = prompt.v[prompt.len - 1];
+    for (int i = 0; i < ORACLE; i++) {
+        if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg_ref)) {
+            fprintf(stderr, "ds4:   chain test: the oracle stopped at %d\n", i);
+            goto done;
+        }
+        oracle[i + 1] = sample_argmax(lg_ref, DS4_N_VOCAB);
+    }
+    ds4_session_free(ref); ref = NULL;
+
+    fprintf(stderr, "ds4: consecutive block transactions from position %d\n", prompt.len);
+    for (size_t ci = 0; ci < sizeof(chains) / sizeof(chains[0]); ci++) {
+        const struct step *chain = chains[ci].s;
+        if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "reference") ||
+            !ds41_txn_prefill(&blk, e, &prompt, ctx, "block")) goto done;
+        int o = 0;
+        bool ok = true;
+        const char *why = NULL;
+        for (int b = 0; ok && chain[b].k; b++) {
+            const int k = chain[b].k, a = chain[b].a;
+            if (o + k > ORACLE) { why = "the oracle is too short"; ok = false; break; }
+            for (int j = 0; j < k; j++) cand[j] = oracle[o + j];
+            const int got = ds4_session_verify_block_ex(blk, cand, k, a, acc,
+                                                       err, sizeof(err));
+            if (got != a) {
+                fprintf(stderr, "ds4:   chain %s: block %d wanted %d, got %d (%s)\n",
+                        chains[ci].name, b, a, got, got < 0 ? err : "wrong count");
+                ok = false; break;
+            }
+            for (int i = 0; ok && i < a; i++)
+                ok = ds41_graph_step(&ref->ds41_graph, m, w, oracle[o + i], lg_ref);
+            if (!ok) { why = "the reference stopped"; break; }
+            o += a;
+            /* State after this block, before the next one runs on it. */
+            int rl = -1; long rs = -1;
+            const uint32_t bad = ref->ds41_graph.pos != blk->ds41_graph.pos ? UINT32_MAX :
+                ds41_txn_state_diff(&ref->ds41_graph, &blk->ds41_graph, &rl, &rs);
+            if (bad) {
+                fprintf(stderr, "ds4:   chain %s: after block %d (a=%d, pos %u/%u)",
+                        chains[ci].name, b, a, ref->ds41_graph.pos, blk->ds41_graph.pos);
+                for (int z = 0; z < DS41_TXN_STATES; z++)
+                    if (bad & (1u << z)) fprintf(stderr, " %s=DIFF", ds41_txn_state_name[z]);
+                if (rl >= 0) fprintf(stderr, " (ring layer %d slot %ld)", rl, rs);
+                fprintf(stderr, "\n");
+                ok = false; break;
+            }
+        }
+        /* Every position from here to past the last block's own rows, compared
+         * whole. A state hash that matches now is not the same as the rejected
+         * rows staying invisible as the visible window walks over them. */
+        int bad_at = -1;
+        uint64_t differ = 0;
+        for (int t = 0; ok && t < ahead && bad_at < 0; t++) {
+            if (o >= ORACLE) break;
+            if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[o], lg_ref) ||
+                !ds41_graph_step(&blk->ds41_graph, m, w, oracle[o], lg_blk)) {
+                bad_at = t; why = "a follow-up step failed"; break;
+            }
+            o++;
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                if (memcmp(&lg_ref[v], &lg_blk[v], sizeof(float)) != 0) differ++;
+            if (differ) bad_at = t;
+        }
+        if (ok && bad_at < 0)
+            fprintf(stderr, "ds4:   chain %s: %d positions committed, all %u logits "
+                    "identical at every position to %u\n", chains[ci].name, o,
+                    DS4_N_VOCAB, blk->ds41_graph.pos);
+        else if (ok)
+            fprintf(stderr, "ds4:   chain %s: position %u of the follow-up differs, "
+                    "%llu of %u logits%s%s\n", chains[ci].name, blk->ds41_graph.pos,
+                    (unsigned long long)differ, DS4_N_VOCAB, why ? ": " : "",
+                    why ? why : "");
+        else if (why)
+            fprintf(stderr, "ds4:   chain %s: %s\n", chains[ci].name, why);
+        ds4_session_free(ref); ref = NULL;
+        ds4_session_free(blk); blk = NULL;
+    }
+
+    /* A block that never ran must leave the session usable. An out-of-range
+     * candidate is refused before any state moves, so the singles after it have
+     * to match a reference that only ever took singles. */
+    if (ds41_txn_prefill(&ref, e, &prompt, ctx, "reference") &&
+        ds41_txn_prefill(&blk, e, &prompt, ctx, "block")) {
+        for (int j = 0; j < 8; j++) cand[j] = oracle[j];
+        cand[3] = DS4_N_VOCAB + 7;
+        const int got = ds4_session_verify_block_ex(blk, cand, 8, 8, acc, err, sizeof(err));
+        int bad_at = -1;
+        uint64_t differ = 0;
+        for (int t = 0; got < 0 && t < ahead && bad_at < 0; t++) {
+            if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[t], lg_ref) ||
+                !ds41_graph_step(&blk->ds41_graph, m, w, oracle[t], lg_blk)) { bad_at = t; break; }
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                if (memcmp(&lg_ref[v], &lg_blk[v], sizeof(float)) != 0) differ++;
+            if (differ) bad_at = t;
+        }
+        fprintf(stderr, got >= 0 ?
+                "ds4:   chain refused-block: an out-of-range candidate committed %d\n" :
+                (bad_at < 0 ?
+                 "ds4:   chain refused-block: refused, then %d single positions all "
+                 "%u logits identical\n" :
+                 "ds4:   chain refused-block: refused, then position %d differs\n"),
+                got >= 0 ? got : (bad_at < 0 ? ahead : bad_at),
+                DS4_N_VOCAB);
+    }
+
+done:
+    if (ref) ds4_session_free(ref);
+    if (blk) ds4_session_free(blk);
+    free(lg_ref); free(lg_blk); free(oracle);
+}
+
+/* Every position where something in the decode path changes size, wraps, or
+ * switches algorithm. Written as the expressions the code uses rather than as
+ * numbers, so a shape change moves the test with it - a hand-written list of
+ * positions is a list of the boundaries someone remembered.
+ *
+ * Reachability is part of the answer: a boundary past the context cannot be
+ * tested at this context and saying so is better than leaving it off the list. */
+static void ds41_block_txn_bounds(ds4_session *seed, const ds4_model *m,
+                                  const ds4_weights *w, long k, long cap) {
+    const long ctx = seed->ctx_size;
+    const long swa = DS4_N_SWA;
+    const long top = DS4_N_INDEXER_TOP_K;
+    const long tail = DS4_ENGRAM_NGRAM - 1;
+    /* The literals these come from, each named where it lives:
+     *   ds41_attention / the block KV path: avail < DS4_N_SWA ? avail : DS4_N_SWA
+     *   ds41_attention_pick:                att = min(n_comp, DS4_N_INDEXER_TOP_K)
+     *   ds41_index_batch:                   batch_topk at n_comp >= 1024
+     *   ds41_attention_candidates:          block top capped at 2048 blocks of 8
+     *   ds4_engram_history:                 DS4_ENGRAM_NGRAM - 1 hash tail slots
+     *   ds41_decoder_prepare:               prefill chunk of 2048
+     *   graph alloc:                        compressed cap = ctx / ratio + 1 */
+    const struct { const char *what; long at; } bounds[] = {
+        { "engram hash tail full",            tail },
+        { "raw KV ring first wrap",           swa },
+        { "raw KV ring second wrap",          2 * swa },
+        { "indexer top-k reached, ratio 1",   top },
+        { "indexer top-k reached, ratio 2",   2 * top },
+        { "batch top-k switch, ratio 1",      1024 },
+        { "batch top-k switch, ratio 2",      2048 },
+        { "prefill chunk",                    2048 },
+        { "candidate block cap",              2048 * 8 * 2 },
+        { "compressed capacity, ratio 2",     2 * (ctx / 2 + 1) },
+        { "compressed capacity, ratio 1",     ctx },
+    };
+    /* A = 0 and A = k are the ends, 1 and k-1 the first partial either way, and
+     * the one that lands the frontier exactly on the boundary is the reason this
+     * sweep exists. The full 0..k sweep is what DS4_V41_BLOCK_TXN_TEST_START
+     * does; running it at 17 starts a boundary costs more than it adds. */
+    for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
+        const long b = bounds[i].at;
+        if (b <= k || b + k + 24 >= ctx) {
+            fprintf(stderr, "ds4:   boundary %s at %ld: out of reach at ctx %ld\n",
+                    bounds[i].what, b, ctx);
+            continue;
+        }
+        if (cap && b > cap) {
+            fprintf(stderr, "ds4:   boundary %s at %ld: above the cap %ld\n",
+                    bounds[i].what, b, cap);
+            continue;
+        }
+        fprintf(stderr, "ds4: boundary %s at %ld, starts %ld..%ld\n",
+                bounds[i].what, b, b - k, b + k);
+        for (long start = b - k; start <= b + k; start++) {
+            uint32_t a_mask = (1u << 0) | (1u << 1) | (1u << (k - 1)) | (1u << k);
+            if (b >= start && b - start <= k) a_mask |= 1u << (b - start);
+            ds41_block_txn_test_at(seed, m, w, start, a_mask);
+        }
+    }
+}
+
+/* DS4_V41_BLOCK_TXN_TEST=1 runs the sweep where the prompt ends.
+ * DS4_V41_BLOCK_TXN_TEST_START=a,b,c runs it at each of those positions in one
+ * process - loading the model again per boundary costs more than the test.
+ * DS4_V41_BLOCK_TXN_TEST_BOUNDS=1 generates the starts instead, from the
+ * moduli and capacities the code actually has, optionally capped by
+ * DS4_V41_BLOCK_TXN_TEST_BOUNDS_MAX so the cheap ones can run on their own. */
+static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
+                                const ds4_weights *w) {
+    if (!getenv("DS4_V41_BLOCK_TXN_TEST")) return;
+    const uint32_t all = (1u << 9) - 1u;
+    const char *bounds = getenv("DS4_V41_BLOCK_TXN_TEST_BOUNDS");
+    if (bounds && bounds[0] && atoi(bounds) != 0) {
+        const char *cap_e = getenv("DS4_V41_BLOCK_TXN_TEST_BOUNDS_MAX");
+        ds41_block_txn_bounds(seed, m, w, 8, cap_e && cap_e[0] ? atol(cap_e) : 0);
+        return;
+    }
+    const char *list = getenv("DS4_V41_BLOCK_TXN_TEST_START");
+    if (!list || !list[0]) { ds41_block_txn_test_at(seed, m, w, 0, all); return; }
+    for (const char *p = list; *p; ) {
+        char *end = NULL;
+        const long want = strtol(p, &end, 10);
+        if (end == p) break;
+        ds41_block_txn_test_at(seed, m, w, want, all);
+        p = *end == ',' ? end + 1 : end;
+    }
 }
 
 /* Does the executor actually commit k tokens a step, and at what rate?
