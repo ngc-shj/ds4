@@ -79624,6 +79624,8 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
  * called from ds4_session_eval_internal, which comes before it. */
 static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
                                     const ds4_weights *w);
+static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
+                                const ds4_weights *w);
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen);
@@ -83357,6 +83359,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             s->ds41_graph.pos == (uint32_t)s->checkpoint.len) {
             selftest_done = 1;
             ds41_rowtile_check(&e->model, &e->weights);
+            ds41_block_txn_test(s, &e->model, &e->weights);
             ds41_oracle_block_bench(s, &e->model, &e->weights);
             ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
         }
@@ -83602,17 +83605,25 @@ static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
  * prefix ends at the first disagreement.
  *
  * With DS4_METAL_V41_BLOCK_TXN it commits the first n of k and the rest never
- * happened: the block's KV rows are parked in a per-layer delta and only n of
- * them reach the ring. Without it the ring is written through for all k before
+ * happened FOR THE RAW KV RING ONLY, which is not enough to be correct.
+ * Measured against two independent sessions: at n = 8 the follow-up logits are
+ * identical, and at every n from 1 to 7 all 129,280 of them differ. The
+ * rewind-based sweep that passed at every n was checking the transaction with
+ * the transaction - both halves made the same mistake and agreed.
+ *
+ * So a partial accept is not yet usable. What still has to be parked and
+ * committed with the prefix: the compressed KV and its index visibility,
+ * previous_kv/previous_score, Engram, selected_comp, block_mask, the residual
+ * carry and the publish state. A block's KV rows are parked in a per-layer
+ * delta and only n of them reach the ring; Without it the ring is written through for all k before
  * anything knows n, and a partial accept has nowhere correct to land - the keys
  * position n needs were overwritten by the block's own writes, which
  * DS4_V41_VERIFY_SELFTEST_NOBATCH shows at position 1051 with no batch involved.
  * It refuses in that case rather than returning a plausible wrong answer.
  *
- * What the transaction does NOT yet park: the compressed KV and its index
- * visibility, previous_kv/previous_score, Engram, selected_comp, block_mask,
- * the residual carry, and the publish state. The raw ring is the one measured to
- * break, so it is first; a partial accept is only correct once the rest follow.
+ * A=0 - the block commits nothing at all - is not expressible here yet either:
+ * candidates[0] is the caller's already-decided token and is always committed.
+ * Atomic abandonment needs its own path.
  *
  * So with an oracle - candidates that are known-correct - this commits k tokens
  * a step and the wall over committed tokens is the executor's real rate. With a
@@ -83713,6 +83724,120 @@ int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
     (void)next;
     return n;
 #endif
+}
+
+/* Does a block that commits A leave the session exactly where A single steps
+ * would? DS4_V41_BLOCK_TXN_TEST=1.
+ *
+ * Two sessions, prefilled separately from the same prompt, and neither is
+ * rewound. The reference takes A exact single steps; the block verifies K
+ * candidates of which A are right and commits its accepted prefix. Then both
+ * decode the same next token and their full 129,280 logits are compared byte
+ * for byte.
+ *
+ * Not a rewind, on purpose. A bench that rolled one session back through the
+ * transaction would be checking the transaction with the transaction: the same
+ * mistake in both halves passes. Two sessions that never share state cannot do
+ * that. And not an argmax either - argmax has reported "identical" over a
+ * difference in every position three times in this work.
+ *
+ * A = 0 is the case that matters most and is the one a rewind-based bench
+ * cannot pose at all: the block runs K rows and commits nothing, and the
+ * session has to be indistinguishable from one that never saw it. */
+static bool ds41_txn_prefill(ds4_session **out, ds4_engine *e, const ds4_tokens *prompt,
+                             int ctx, const char *what) {
+    char err[192];
+    if (ds4_session_create(out, e, ctx) != 0 || !*out) {
+        fprintf(stderr, "ds4:   txn test: could not create the %s session\n", what);
+        return false;
+    }
+    if (ds4_session_sync(*out, prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4:   txn test: %s prefill failed: %s\n", what, err);
+        ds4_session_free(*out); *out = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
+                                const ds4_weights *w) {
+    if (!getenv("DS4_V41_BLOCK_TXN_TEST")) return;
+    const long k = 8;
+    ds4_engine *e = seed->engine;
+    const int ctx = seed->ctx_size;
+    /* The prompt both sessions start from: whatever the seed has committed. */
+    ds4_tokens prompt = { .v = seed->checkpoint.v, .len = seed->checkpoint.len,
+                          .cap = seed->checkpoint.cap };
+    if (prompt.len < 1) return;
+
+    float *lg_ref = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *lg_blk = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int *oracle = malloc((size_t)(k + 2) * sizeof(int));
+    int cand[DS4_TP_BATCH_MAX_ROWS], acc[DS4_TP_BATCH_MAX_ROWS];
+    char err[192];
+    ds4_session *ref = NULL, *blk = NULL;
+    if (!lg_ref || !lg_blk || !oracle) goto done;
+
+    /* The oracle: what exact single decode says follows the prompt. Taken on its
+     * own session so neither test session is touched. */
+    if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "oracle")) goto done;
+    oracle[0] = prompt.v[prompt.len - 1];
+    for (long i = 0; i <= k; i++) {
+        if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg_ref)) {
+            fprintf(stderr, "ds4:   txn test: the oracle stopped at %ld\n", i);
+            goto done;
+        }
+        oracle[i + 1] = sample_argmax(lg_ref, DS4_N_VOCAB);
+    }
+    ds4_session_free(ref); ref = NULL;
+
+    fprintf(stderr, "ds4: block transaction against two independent sessions, "
+            "prompt %d tokens, k=%ld\n", prompt.len, k);
+    for (long a = 0; a <= k; a++) {
+        if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "reference") ||
+            !ds41_txn_prefill(&blk, e, &prompt, ctx, "block")) goto done;
+        /* Reference: a exact single steps. */
+        bool ok = true;
+        for (long i = 0; ok && i < a; i++)
+            ok = ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg_ref);
+        /* Block: k candidates, the first a of them right. a = 0 corrupts the
+         * one the caller fed, which is how a block commits nothing. */
+        for (long j = 0; j < k; j++) cand[j] = oracle[j];
+        if (a < k) cand[a] = (oracle[a] + 1) % (int)DS4_N_VOCAB;
+        const int got = ok ? ds4_session_verify_block(blk, cand, (int)k, acc,
+                                                      err, sizeof(err)) : -1;
+        if (!ok || got != (int)a) {
+            fprintf(stderr, "ds4:   A=%ld: committed %d (%s)\n", a, got,
+                    got < 0 ? err : "wrong count");
+            goto next;
+        }
+        /* Both decode the same next token from their own state. */
+        if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[a], lg_ref) ||
+            !ds41_graph_step(&blk->ds41_graph, m, w, oracle[a], lg_blk)) {
+            fprintf(stderr, "ds4:   A=%ld: the follow-up step failed\n", a);
+            goto next;
+        }
+        uint64_t differ = 0, first = UINT64_MAX;
+        for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+            if (memcmp(&lg_ref[v], &lg_blk[v], sizeof(float)) != 0) {
+                differ++; if (first == UINT64_MAX) first = v;
+            }
+        if (!differ)
+            fprintf(stderr, "ds4:   A=%ld: committed %d, all %u logits identical\n",
+                    a, got, DS4_N_VOCAB);
+        else
+            fprintf(stderr, "ds4:   A=%ld: committed %d, %llu of %u logits DIFFER "
+                    "(first %llu: %.9g vs %.9g)\n", a, got,
+                    (unsigned long long)differ, DS4_N_VOCAB,
+                    (unsigned long long)first, (double)lg_ref[first], (double)lg_blk[first]);
+    next:
+        if (ref) { ds4_session_free(ref); ref = NULL; }
+        if (blk) { ds4_session_free(blk); blk = NULL; }
+    }
+done:
+    if (ref) ds4_session_free(ref);
+    if (blk) ds4_session_free(blk);
+    free(lg_ref); free(lg_blk); free(oracle);
 }
 
 /* Does the executor actually commit k tokens a step, and at what rate?
