@@ -83950,10 +83950,32 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
             if (memcmp(&lg_ref[v], &lg_blk[v], sizeof(float)) != 0) {
                 differ++; if (first == UINT64_MAX) first = v;
             }
-        if (!differ)
-            fprintf(stderr, "ds4:   A=%ld: committed %d, all %u logits identical\n",
-                    a, got, DS4_N_VOCAB);
-        else
+        /* One position agreeing says the rejected rows are invisible now, not
+         * that they stay invisible. The compressed store and its index still
+         * hold what the discarded rows wrote, hidden only by nc = (pos+1)/ratio,
+         * and every position from here walks that boundary forward until those
+         * slots are inside it. So both sessions run on and every position is
+         * compared, which is the difference between "not observable yet" and
+         * "never observable". */
+        if (!differ) {
+            const long ahead = 16;
+            long bad = -1;
+            for (long t = 0; t < ahead && bad < 0; t++) {
+                const int fed = oracle[(a + 1 + t) % (k + 1)];
+                if (!ds41_graph_step(&ref->ds41_graph, m, w, fed, lg_ref) ||
+                    !ds41_graph_step(&blk->ds41_graph, m, w, fed, lg_blk)) { bad = t; break; }
+                for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                    if (memcmp(&lg_ref[v], &lg_blk[v], sizeof(float)) != 0) { bad = t; break; }
+            }
+            if (bad < 0)
+                fprintf(stderr, "ds4:   A=%ld: committed %d, all %u logits identical, and "
+                        "for %ld positions after\n", a, got, DS4_N_VOCAB, ahead);
+            else
+                fprintf(stderr, "ds4:   A=%ld: committed %d, identical here but DIVERGED "
+                        "%ld positions later - a rejected row became visible\n",
+                        a, got, bad + 1);
+        }
+        if (differ)
             fprintf(stderr, "ds4:   A=%ld: committed %d, %llu of %u logits DIFFER "
                     "(first %llu: %.9g vs %.9g)\n", a, got,
                     (unsigned long long)differ, DS4_N_VOCAB,
