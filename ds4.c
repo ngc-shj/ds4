@@ -40185,6 +40185,55 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(engram_prefetch, (g->carry_cap ? g->carry_cap : g->prefill_cap) * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM) \
     X(engram_kv, (DS4_N_HC + 1u) * DS4_N_EMBD) X(logits, DS4_N_VOCAB)
 
+/* The arithmetic a decode step commits to.
+ *
+ * On DeepSeek 4.1 there is one contract: ds4_session_eval calls ds41_graph_step,
+ * which is the same function the batch path is compared against byte for byte,
+ * so production single and exact single are the same code. The greedy split-KV
+ * approximation belongs to the older GPU graph - ds4_session_eval_argmax takes
+ * the ds41 branch before reaching any of it - and an earlier note in this file
+ * blaming it for an oracle accepting five of eight was a misattribution of
+ * prefill_rows = 0.
+ *
+ * So EXACT is unreachable today and the enum is here to make that visible if it
+ * stops being true, rather than to check anything. What does need checking is
+ * the knobs that change the answer rather than the speed: the vocabulary head
+ * takes a different path with and without EXACT_VOCAB_ROWS, and the split count
+ * changes the order a split-K attention reduces in. A block whose knobs differ
+ * from the singles the session has already committed is comparing two
+ * arithmetics, and it refuses before dispatch. */
+enum ds41_decode_contract {
+    DS41_DECODE_PRODUCTION = 0,   /* ds41_graph_step, what every ds41 single runs */
+    DS41_DECODE_EXACT = 1,        /* a separate explicit mode; nothing selects it */
+};
+
+typedef struct {
+    uint32_t contract;      /* enum ds41_decode_contract */
+    uint32_t exact_vocab;   /* DS4_METAL_V41_EXACT_VOCAB_ROWS: a different head */
+    int32_t flash_nwg;      /* DS4_METAL_FLASH_NWG: the reduction's split count */
+    uint32_t fit_splits;    /* DS4_METAL_V41_FIT_SPLITS: ditto, fitted per row */
+    uint32_t valid;
+} ds41_decode_contract_id;
+
+static ds41_decode_contract_id ds41_decode_contract_now(void) {
+    const char *nwg = getenv("DS4_METAL_FLASH_NWG");
+    ds41_decode_contract_id id = {
+        .contract = DS41_DECODE_PRODUCTION,
+        .exact_vocab = getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS") &&
+                       atoi(getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS")) != 0,
+        .flash_nwg = nwg && nwg[0] ? atoi(nwg) : 0,
+        .fit_splits = getenv("DS4_METAL_V41_FIT_SPLITS") != NULL,
+        .valid = 1,
+    };
+    return id;
+}
+
+static bool ds41_decode_contract_same(const ds41_decode_contract_id *a,
+                                      const ds41_decode_contract_id *b) {
+    return a->contract == b->contract && a->exact_vocab == b->exact_vocab &&
+           a->flash_nwg == b->flash_nwg && a->fit_splits == b->fit_splits;
+}
+
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
@@ -40257,6 +40306,8 @@ typedef struct {
     uint64_t tag_reads, tag_bad;
     uint32_t block_txn_active;
     uint32_t txn_base_pos;
+    /* The contract the session's committed positions were produced under. */
+    ds41_decode_contract_id contract;
     /* Fail-closed: a write into the committed arena while a transaction is
      * open is a bug, not a slow path. Nothing may make this nonzero. */
     uint64_t txn_committed_writes;
@@ -40955,7 +41006,7 @@ static void ds41_txn_counters_reset(void) {
  * consecutive positions is the premise everything else rests on, and the one
  * time it was false - every row on the same position, from prefill_rows = 0 -
  * it showed up as an oracle accepting five of eight and nothing said why. */
-static uint32_t g_ds41_txn_rows_seen[4];
+static uint64_t g_ds41_txn_rows_seen[4];
 static uint32_t g_ds41_txn_rows_writes[4];
 static uint32_t g_ds41_txn_row_lo[4], g_ds41_txn_row_hi[4];
 
@@ -40971,10 +41022,16 @@ enum {
                              DS41_TXN_CAP_ENGRAM_DELTA | DS41_TXN_CAP_POSITION_CHECK,
 };
 
-/* The parked-version mask is one uint32_t. A cap above that has to widen the
- * mask first, so this fails the build rather than the run. */
-_Static_assert(DS4_TP_BATCH_MAX_ROWS <= 32,
-               "the parked-version bitmask in ds41_block_carry_commit is 32 bits wide");
+/* The parked-version mask is one uint64_t, so K = 32 needs no special case and
+ * K = 64 is the next wall - at which point the shift itself needs handling, not
+ * just a wider word. A cap above that has to widen the mask first, so this fails
+ * the build rather than the run.
+ *
+ * A candidate tree will want two masks rather than a wider one: depth K and the
+ * number of verified nodes N are different counts, and one mask cannot say both
+ * which positions were parked and which nodes were. */
+_Static_assert(DS4_TP_BATCH_MAX_ROWS <= 64,
+               "the parked-version bitmask in ds41_block_carry_commit is 64 bits wide");
 static uint64_t g_ds41_fuse_sites;
 
 static void ds41_decode_path_report(void) {
@@ -41558,7 +41615,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
              * version coordinate to check against and is refused rather than
              * shifted past the end of the word. Raising DS4_TP_BATCH_MAX_ROWS
              * above 32 needs a wider mask here first, not a wider cap there. */
-            if (txn && (pos < g->block_carry_start || bi >= 32u ||
+            if (txn && (pos < g->block_carry_start || bi >= 64u ||
                         bi >= DS4_TP_BATCH_MAX_ROWS)) {
                 g_ds41_txn_refuse++;
                 return false;
@@ -41601,7 +41658,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                         g_ds41_txn_row_lo[owner] = bi;
                     if (!g_ds41_txn_rows_writes[owner] || bi > g_ds41_txn_row_hi[owner])
                         g_ds41_txn_row_hi[owner] = bi;
-                    g_ds41_txn_rows_seen[owner] |= 1u << bi;
+                    g_ds41_txn_rows_seen[owner] |= 1ull << bi;
                     g_ds41_txn_rows_writes[owner]++;
                     g_ds41_txn_carry_park++;
                 }
@@ -43892,6 +43949,15 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
      * from an earlier block would send its carry into the block's delta and
      * never publish it. */
     g->block_txn_active = 0;
+    {
+        const ds41_decode_contract_id now = ds41_decode_contract_now();
+        if (g->contract.valid && !ds41_decode_contract_same(&g->contract, &now))
+            fprintf(stderr, "ds4: V4.1 decode contract changed mid-session: "
+                    "exact_vocab %u->%u, flash_nwg %d->%d, fit_splits %u->%u\n",
+                    g->contract.exact_vocab, now.exact_vocab, g->contract.flash_nwg,
+                    now.flash_nwg, g->contract.fit_splits, now.fit_splits);
+        g->contract = now;
+    }
     if (g->tag_pos[0] && !ds41_tag_verify(g, "entering a single step")) return false;
     g_ds41_single_steps++;
     const bool v41_prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
@@ -46064,6 +46130,22 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const bool block_txn = block_txn_want;
     g->block_txn_active = block_txn ? 1u : 0u;
     if (block_txn) { g->block_carry_owners = 0; g->txn_epoch++; }
+    /* The block is about to be compared against, and committed alongside, the
+     * positions the singles produced. Two arithmetics cannot share a prefix. */
+    {
+        const ds41_decode_contract_id now = ds41_decode_contract_now();
+        if (ok && g->contract.valid && !ds41_decode_contract_same(&g->contract, &now)) {
+            fprintf(stderr, "ds4: V4.1 block REFUSED before dispatch: the session's "
+                    "committed positions were produced under exact_vocab %u, "
+                    "flash_nwg %d, fit_splits %u, and this block would run under "
+                    "%u, %d, %u\n", g->contract.exact_vocab, g->contract.flash_nwg,
+                    g->contract.fit_splits, now.exact_vocab, now.flash_nwg,
+                    now.fit_splits);
+            g_ds41_txn_refuse++;
+            ok = false;
+        }
+        if (ok && !g->contract.valid) g->contract = now;
+    }
     if (ok && g->tag_pos[0] && !ds41_tag_verify(g, "entering a block")) ok = false;
     const char *bar_e = getenv("DS4_METAL_V41_BLOCK_ATTN_RAW");
     const bool block_attn_raw = bar_e && bar_e[0] && atoi(bar_e) != 0;
@@ -83966,16 +84048,17 @@ static bool ds41_block_carry_commit(ds41_gpu_graph *g, uint32_t accepted) {
      * quietly slide. Every row on one position - prefill_rows = 0 - leaves the
      * mask at 1 and the count at K, and either one of those refuses. */
     const uint32_t k = g->block_carry_rows;
-    if (k > 32u) { g_ds41_txn_refuse++; return false; }
-    const uint32_t want = k == 32u ? UINT32_MAX : (1u << k) - 1u;
+    if (k > 64u) { g_ds41_txn_refuse++; return false; }
+    const uint64_t want = k == 64u ? UINT64_MAX : (1ull << k) - 1ull;
     for (uint32_t o = 0; o < 4u; o++) {
         if (!(g->block_carry_owners & (1u << o))) continue;
         if (g_ds41_txn_rows_seen[o] != want || g_ds41_txn_rows_writes[o] != k ||
             g_ds41_txn_row_lo[o] != 0u || g_ds41_txn_row_hi[o] != k - 1u) {
             fprintf(stderr, "ds4: V4.1 block transaction REFUSED at commit: owner %u "
-                    "parked mask %#x writes %u rows %u..%u, wanted mask %#x writes %u "
-                    "rows 0..%u\n", o, g_ds41_txn_rows_seen[o], g_ds41_txn_rows_writes[o],
-                    g_ds41_txn_row_lo[o], g_ds41_txn_row_hi[o], want, k, k - 1u);
+                    "parked mask %#llx writes %u rows %u..%u, wanted mask %#llx writes %u "
+                    "rows 0..%u\n", o, (unsigned long long)g_ds41_txn_rows_seen[o],
+                    g_ds41_txn_rows_writes[o], g_ds41_txn_row_lo[o], g_ds41_txn_row_hi[o],
+                    (unsigned long long)want, k, k - 1u);
             g_ds41_txn_refuse++;
             return false;
         }
@@ -84781,11 +84864,21 @@ static void ds41_block_txn_bounds(ds4_session *seed, const ds4_model *m,
      * the one that lands the frontier exactly on the boundary is the reason this
      * sweep exists. The full 0..k sweep is what DS4_V41_BLOCK_TXN_TEST_START
      * does; running it at 17 starts a boundary costs more than it adds. */
+    /* A block needs at least one prompt token before it, so the low end is
+     * clamped rather than the boundary dropped: position 3 is a real boundary
+     * and B - K being negative is a property of the sweep, not of the code under
+     * test. The two reasons a boundary can be skipped are different and say so. */
+    const long first_start = 1;
     for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
         const long b = bounds[i].at;
-        if (b <= k || b + k + 24 >= ctx) {
-            fprintf(stderr, "ds4:   boundary %s at %ld: out of reach at ctx %ld\n",
-                    bounds[i].what, b, ctx);
+        if (b + k + 24 >= ctx) {
+            fprintf(stderr, "ds4:   boundary %s at %ld: past ctx %ld, not reachable "
+                    "at this context\n", bounds[i].what, b, ctx);
+            continue;
+        }
+        if (b < first_start) {
+            fprintf(stderr, "ds4:   boundary %s at %ld: below the first testable "
+                    "start\n", bounds[i].what, b);
             continue;
         }
         if (cap && b > cap) {
@@ -84793,9 +84886,10 @@ static void ds41_block_txn_bounds(ds4_session *seed, const ds4_model *m,
                     bounds[i].what, b, cap);
             continue;
         }
+        const long lo = b - k < first_start ? first_start : b - k;
         fprintf(stderr, "ds4: boundary %s at %ld, starts %ld..%ld\n",
-                bounds[i].what, b, b - k, b + k);
-        for (long start = b - k; start <= b + k; start++) {
+                bounds[i].what, b, lo, b + k);
+        for (long start = lo; start <= b + k; start++) {
             uint32_t a_mask = (1u << 0) | (1u << 1) | (1u << (k - 1)) | (1u << k);
             if (b >= start && b - start <= k) a_mask |= 1u << (b - start);
             ds41_block_txn_test_at(seed, m, w, start, a_mask);
