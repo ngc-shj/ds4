@@ -572,6 +572,17 @@ void ds4_session_invalidate(ds4_session *s);
 /* Keep the token prefix, restoring recurrent state where possible. Otherwise
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
+/* One K-row verification step for a single session. candidates[0] is the token
+ * already decided and candidates[1..k-1] are guesses at what follows; the step
+ * runs k consecutive positions in one batch and returns how many tokens were
+ * committed, writing them to accepted[]. Commits only a full prefix: a partial
+ * accept needs a rollback the sliding-window ring cannot serve yet, so it
+ * invalidates the session and returns -1 instead of landing somewhere
+ * plausible. With known-correct candidates it commits k a step, which is what
+ * separates the executor's rate from a drafter's accuracy. */
+int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
+                             int *accepted, char *err, size_t errlen);
+
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);

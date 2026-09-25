@@ -79591,6 +79591,11 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #endif
 }
 
+/* Defined next to ds4_session_verify_block, which needs the session struct;
+ * called from ds4_session_eval_internal, which comes before it. */
+static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
+                                    const ds4_weights *w);
+
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen);
 
@@ -83323,6 +83328,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             s->ds41_graph.pos == (uint32_t)s->checkpoint.len) {
             selftest_done = 1;
             ds41_rowtile_check(&e->model, &e->weights);
+            ds41_oracle_block_bench(s, &e->model, &e->weights);
             ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
         }
         if (!s->ds41_graph_ready ||
@@ -83523,6 +83529,242 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         }
     }
     return rc;
+}
+
+/* One K-row verification step for a single session, in production.
+ *
+ * The K rows of a block are consecutive positions of one session, and the
+ * hardware already does the work: eight concurrent sessions reach 40 tok/s
+ * aggregate through the same batch operator, and one K=8 step is 181 ms for
+ * eight positions. What has been missing is not arithmetic but an executor that
+ * supplies a single session with eight rows of useful work and commits the
+ * result as consecutive tokens.
+ *
+ * This is that step and nothing more. Given k candidate tokens - candidates[0]
+ * is the token already decided, candidates[1..k-1] are guesses at what follows -
+ * it runs one k-row batch over positions pos..pos+k-1 and reports how many of
+ * the guesses the model agrees with. Row i's argmax is the model's answer for
+ * position pos+i, so candidates[i+1] is accepted when it equals it, and the
+ * prefix ends at the first disagreement.
+ *
+ * It commits only a full prefix for now, and invalidates the session otherwise.
+ * That is not a simplification to be tidied later: rolling back to the accepted
+ * position needs the keys the block's own writes overwrote, and with SWA 128 a
+ * ring of 128 does not have them - a block of k needs 128+k live. Measured:
+ * DS4_V41_VERIFY_SELFTEST_NOBATCH at position 1051 diverges on rollback with no
+ * batch pass involved at all, because sixty-four single steps wrap the ring.
+ * Until the block-local delta and the accepted-prefix commit are in, a partial
+ * accept has nowhere correct to land, and returning a wrong answer quietly is
+ * worse than refusing.
+ *
+ * So with an oracle - candidates that are known-correct - this commits k tokens
+ * a step and the wall over committed tokens is the executor's real rate. With a
+ * real candidate source it will refuse whenever the drafter is wrong, which is
+ * why the oracle comes first: it separates the executor's speed from the
+ * candidates' quality instead of measuring their product. */
+int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
+                             int *accepted, char *err, size_t errlen) {
+    if (!s || !candidates || !accepted || k < 2 || k > DS4_TP_BATCH_MAX_ROWS) {
+        if (err && errlen) snprintf(err, errlen, "invalid verify block");
+        return -1;
+    }
+#if defined(DS4_NO_GPU) || !defined(DS4_HAS_DEEPSEEK41_GPU)
+    if (err && errlen) snprintf(err, errlen, "verify block needs the DeepSeek 4.1 GPU path");
+    return -1;
+#else
+    if (!ds4_session_is_ds41(s) || !s->ds41_graph_ready || !s->checkpoint_valid ||
+        s->ds41_graph.pos != (uint32_t)s->checkpoint.len) {
+        if (err && errlen) snprintf(err, errlen, "verify block needs a synchronised ds41 session");
+        return -1;
+    }
+    if (s->checkpoint.len + (uint32_t)k > s->ctx_size) {
+        if (err && errlen) snprintf(err, errlen, "verify block would pass the context limit");
+        return -1;
+    }
+    for (int i = 0; i < k; i++)
+        if (candidates[i] < 0 || candidates[i] >= (int)DS4_N_VOCAB) {
+            if (err && errlen) snprintf(err, errlen, "verify block candidate %d is out of range", i);
+            return -1;
+        }
+
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    for (int i = 0; i < k; i++) graphs[i] = &s->ds41_graph;
+    float *rows = malloc((size_t)k * DS4_N_VOCAB * sizeof(float));
+    if (!rows) {
+        if (err && errlen) snprintf(err, errlen, "verify block is out of memory");
+        return -1;
+    }
+    const uint32_t pos0 = s->ds41_graph.pos;
+    const bool ok = ds4_gpu_begin_commands() != 0 &&
+        /* prefill_rows = k, not 0. The batch step sets positions[i] = pos +
+         * (i > 0 && i < prefill_rows ? i : 0), so at 0 every row lands on the
+         * same position and the block is eight copies of one step rather than
+         * eight consecutive ones. That showed up as an oracle accepting five of
+         * eight, which is how a wrong position looks from outside. */
+        ds41_graph_step_batch_logits(graphs, candidates, k, (uint32_t)k,
+                                     &e->model, &e->weights, rows);
+    const bool done = ds4_gpu_end_commands() != 0;
+    if (!ok || !done) {
+        free(rows);
+        ds4_session_invalidate(s);
+        if (err && errlen) snprintf(err, errlen, "verify block step failed");
+        return -1;
+    }
+
+    /* Row i answers position pos0+i, so it predicts candidates[i+1]. */
+    int n = 1;
+    accepted[0] = candidates[0];
+    for (int i = 0; i + 1 < k; i++) {
+        const int arg = sample_argmax(rows + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
+        if (arg != candidates[i + 1]) break;
+        accepted[n++] = candidates[i + 1];
+    }
+    const int next = sample_argmax(rows + (size_t)(k - 1) * DS4_N_VOCAB, DS4_N_VOCAB);
+    free(rows);
+
+    if (n < k) {
+        /* The block ran every row, so the session is k positions ahead with a
+         * ring that no longer holds what position n would need. Refuse rather
+         * than land it somewhere plausible. */
+        ds4_session_invalidate(s);
+        if (err && errlen)
+            snprintf(err, errlen, "verify block accepted %d of %d and cannot roll back "
+                     "the rest yet", n, k);
+        return -1;
+    }
+    for (int i = 0; i < k; i++) token_vec_push(&s->checkpoint, candidates[i]);
+    s->ds41_graph.pos = pos0 + (uint32_t)k;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    accepted[k - 1 + 1 - 1] = candidates[k - 1];
+    (void)next;
+    return k;
+#endif
+}
+
+/* Does the executor actually commit k tokens a step, and at what rate?
+ * DS4_V41_ORACLE_BLOCK=<k>.
+ *
+ * Two phases over the same positions. First the session decodes M tokens one at
+ * a time and they are recorded - that is the oracle, and it is not timed.
+ * Then the session is rewound and the same M tokens are fed back as candidates,
+ * k at a time, through ds4_session_verify_block. Every block accepts all k
+ * because the candidates are what the model already said, so the wall over
+ * committed tokens is the executor's rate with a perfect drafter and no
+ * rollback - the number that says whether the machine can reach 40 tok/s on one
+ * session before any question about candidate quality is asked.
+ *
+ * M stays inside the sliding window on purpose. The rewind at the end of phase
+ * one has to put the session back, and sixty-four steps from position 1051 do
+ * not come back - they wrap the ring, which is measured. Under 128 positions
+ * from a low start they do.
+ *
+ * It refuses loudly rather than reporting a rate it cannot stand behind: a block
+ * that accepts fewer than k, or a session that will not rewind, ends the run. */
+static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
+                                    const ds4_weights *w) {
+    const char *env = getenv("DS4_V41_ORACLE_BLOCK");
+    const long k = env && env[0] ? strtol(env, NULL, 10) : 0;
+    if (k < 2 || k > DS4_TP_BATCH_MAX_ROWS) return;
+    (void)m; (void)w;
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+    long m_tokens = 64;
+    while (m_tokens % k) m_tokens--;
+    if (pos0 + (uint32_t)m_tokens >= 128u) {
+        /* Beyond the window the rewind cannot restore what phase one
+         * overwrote, and the oracle would be compared against a session that
+         * is not the one it came from. */
+        fprintf(stderr, "ds4: oracle block: start %u plus %ld tokens leaves the %u-key "
+                "window, so the rewind would not restore it - skipped\n",
+                pos0, m_tokens, 128u);
+        return;
+    }
+    int *oracle = malloc((size_t)(m_tokens + 1) * sizeof(int));
+    int *acc = malloc((size_t)k * sizeof(int));
+    float *lg = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *carry = NULL;
+    const ds4_engram_history hist0 = s->ds41_graph.history;
+    char err[192];
+    if (!oracle || !acc || !lg) goto done;
+    /* The half-finished ratio-2 compression pair is carried from step to step
+     * rather than indexed by position, so pos alone does not describe the state
+     * at an odd start. Same thing ds41_verify_selftest keeps. */
+    if ((pos0 & 1u) && ds4_gpu_synchronize()) {
+        carry = malloc((size_t)3u * 2u * 512u * sizeof(float));
+        for (uint32_t ci = 0; carry && ci < 3; ci++)
+            if (!ds4_gpu_tensor_read(s->ds41_graph.previous_kv[ci], 0,
+                                     carry + (size_t)ci * 2u * 512u, 512u * 4u) ||
+                !ds4_gpu_tensor_read(s->ds41_graph.previous_score[ci], 0,
+                                     carry + ((size_t)ci * 2u + 1u) * 512u, 512u * 4u)) {
+                free(carry); carry = NULL;
+            }
+    }
+
+    /* Phase one: the truth, one token at a time, untimed. */
+    oracle[0] = s->checkpoint.len ? s->checkpoint.v[s->checkpoint.len - 1] : 0;
+    double single_ms = 0;
+    /* The oracle has to be the exact decode's answer, not the session API's.
+     * ds4_session_eval_argmax can take the greedy split-KV approximation, and
+     * then the block legitimately disagrees with it - measured: eight candidates
+     * from that path, five accepted. This is ds41_verify_selftest's reference
+     * pass, which is the thing the batch is byte-identical to. */
+    for (long i = 0; i < m_tokens; i++) {
+        const double t0 = now_sec();
+        const bool ok1 = ds41_graph_step(&s->ds41_graph, m, w, oracle[i], lg);
+        single_ms += (now_sec() - t0) * 1000.0;
+        if (!ok1) {
+            fprintf(stderr, "ds4: oracle block: phase one failed at %ld\n", i);
+            goto done;
+        }
+        oracle[i + 1] = sample_argmax(lg, DS4_N_VOCAB);
+        token_vec_push(&s->checkpoint, oracle[i]);
+    }
+    s->checkpoint_valid = true;
+    /* ds4_session_rewind has no ds41 branch: state_ok stays false, so it
+     * truncates the checkpoint and clears checkpoint_valid, which means a
+     * re-prefill. There is no session-level rollback for this model - only the
+     * graph-level one the selftest does by hand - so the bench does the same
+     * thing here, and the fact that it has to is the gap the block transaction
+     * has to close. Valid inside the sliding window, which is why M is capped. */
+    s->ds41_graph.pos = pos0;
+    s->ds41_graph.history = hist0;
+    s->ds41_graph.valid = true;
+    s->checkpoint.len = (int)pos0;
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    if (carry && ds4_gpu_synchronize())
+        for (uint32_t ci = 0; ci < 3; ci++) {
+            (void)ds4_gpu_tensor_write(s->ds41_graph.previous_kv[ci], 0,
+                                       carry + (size_t)ci * 2u * 512u, 512u * 4u);
+            (void)ds4_gpu_tensor_write(s->ds41_graph.previous_score[ci], 0,
+                                       carry + ((size_t)ci * 2u + 1u) * 512u, 512u * 4u);
+        }
+
+    /* Phase two: the same tokens as candidates, k at a time, timed. */
+    long committed = 0;
+    double block_ms = 0;
+    for (long i = 0; i + k <= m_tokens; i += k) {
+        const double t0 = now_sec();
+        const int n = ds4_session_verify_block(s, oracle + i, (int)k, acc, err, sizeof(err));
+        block_ms += (now_sec() - t0) * 1000.0;
+        if (n != (int)k) {
+            fprintf(stderr, "ds4: oracle block: block at %ld committed %d of %ld: %s\n",
+                    i, n, k, err);
+            goto done;
+        }
+        committed += n;
+    }
+    fprintf(stderr, "ds4: oracle block k=%ld from position %u: %ld tokens committed in "
+            "%.1f ms = %.2f ms a token, %.2f tok/s\n",
+            k, pos0, committed, block_ms, block_ms / (double)committed,
+            1000.0 * (double)committed / block_ms);
+    fprintf(stderr, "ds4:   the same tokens one at a time: %.2f ms each, %.2f tok/s; "
+            "the block is %.2fx\n", single_ms / (double)m_tokens,
+            1000.0 * (double)m_tokens / single_ms,
+            (single_ms / (double)m_tokens) / (block_ms / (double)committed));
+done:
+    free(oracle); free(acc); free(lg); free(carry);
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
