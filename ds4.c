@@ -40249,12 +40249,14 @@ typedef struct {
      * per row: a commit of A marks only the rows whose covered positions are all
      * inside the accepted prefix. */
     uint32_t *tag_pos[4];
+    uint32_t *tag_ipos[4];
     uint64_t *tag_epoch[4];
     uint8_t *tag_committed[4];
     uint32_t tag_rows[4];
     uint64_t txn_epoch;
     uint64_t tag_reads, tag_bad;
     uint32_t block_txn_active;
+    uint32_t txn_base_pos;
     /* Fail-closed: a write into the committed arena while a transaction is
      * open is a bug, not a slow path. Nothing may make this nonzero. */
     uint64_t txn_committed_writes;
@@ -40306,7 +40308,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->index_cache[i]);
         ds4_gpu_tensor_free(g->block_carry_kv[i]);
         ds4_gpu_tensor_free(g->block_carry_score[i]);
-        free(g->tag_pos[i]); free(g->tag_epoch[i]); free(g->tag_committed[i]);
+        free(g->tag_pos[i]); free(g->tag_ipos[i]);
+        free(g->tag_epoch[i]); free(g->tag_committed[i]);
         ds4_gpu_tensor_free(g->previous_kv[i]);
         ds4_gpu_tensor_free(g->previous_score[i]);
     }
@@ -40434,10 +40437,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         if (getenv("DS4_V41_TXN_TAGS")) {
             g->tag_rows[i] = (uint32_t)cap;
             g->tag_pos[i] = malloc(cap * sizeof(*g->tag_pos[i]));
+            g->tag_ipos[i] = malloc(cap * sizeof(*g->tag_ipos[i]));
             g->tag_epoch[i] = calloc(cap, sizeof(*g->tag_epoch[i]));
             g->tag_committed[i] = calloc(cap, sizeof(*g->tag_committed[i]));
-            if (!g->tag_pos[i] || !g->tag_epoch[i] || !g->tag_committed[i]) goto fail;
-            for (uint64_t r = 0; r < cap; r++) g->tag_pos[i][r] = UINT32_MAX;
+            if (!g->tag_pos[i] || !g->tag_ipos[i] || !g->tag_epoch[i] ||
+                !g->tag_committed[i]) goto fail;
+            for (uint64_t r = 0; r < cap; r++)
+                g->tag_pos[i][r] = g->tag_ipos[i][r] = UINT32_MAX;
         }
         g->block_carry_kv[i] = ds4_gpu_tensor_alloc(
             (uint64_t)DS4_TP_BATCH_MAX_ROWS * 512u * sizeof(float));
@@ -40912,8 +40918,29 @@ static uint64_t g_ds41_kblock_positions;
  * because the frontier landed on an odd position whose pair predates the
  * block. refuse must stay zero: it counts the times a parked version did not
  * sit where the block says its rows are, and every one of them refuses. */
+uint64_t g_ds41_txn_begin, g_ds41_txn_verify_rows, g_ds41_txn_commit_rows;
+uint64_t g_ds41_txn_discard_rows;
 uint64_t g_ds41_txn_carry_park, g_ds41_txn_carry_publish;
 uint64_t g_ds41_txn_carry_hold, g_ds41_txn_refuse;
+/* A compressed or index row a transaction wrote that a committed position had
+ * already written. The watermark comes from the block's first position, captured
+ * on the session's own graph at block entry, while the row number comes from the
+ * publishing row's own position on a copy of it - two sources, so a row copy
+ * that has drifted below the block shows up here instead of overwriting history.
+ * Must stay zero, and a nonzero one refuses the publish. */
+uint64_t g_ds41_txn_base_write;
+/* Process-cumulative by default, which is the wrong scope for proving that one
+ * chain engaged the contract the expected number of times: a sweep run earlier
+ * in the same process lands in the same totals, and choosing which runs to add
+ * up until the numbers agree proves nothing. A harness resets these around the
+ * unit it wants to make a claim about. */
+static void ds41_txn_counters_reset(void) {
+    g_ds41_txn_begin = g_ds41_txn_verify_rows = g_ds41_txn_commit_rows = 0;
+    g_ds41_txn_discard_rows = 0;
+    g_ds41_txn_carry_park = g_ds41_txn_carry_publish = 0;
+    g_ds41_txn_carry_hold = g_ds41_txn_refuse = 0;
+    g_ds41_txn_base_write = 0;
+}
 /* One bit per parked row per owner. The publish runs on a copy of the graph, so
  * this cannot live there. A commit wants all K bits: eight rows on eight
  * consecutive positions is the premise everything else rests on, and the one
@@ -40934,6 +40961,11 @@ enum {
     DS41_TXN_CAPS_REQUIRED = DS41_TXN_CAP_BLOCK_KV | DS41_TXN_CAP_CARRY_DELTA |
                              DS41_TXN_CAP_ENGRAM_DELTA | DS41_TXN_CAP_POSITION_CHECK,
 };
+
+/* The parked-version mask is one uint32_t. A cap above that has to widen the
+ * mask first, so this fails the build rather than the run. */
+_Static_assert(DS4_TP_BATCH_MAX_ROWS <= 32,
+               "the parked-version bitmask in ds41_block_carry_commit is 32 bits wide");
 static uint64_t g_ds41_fuse_sites;
 
 static void ds41_decode_path_report(void) {
@@ -41437,12 +41469,25 @@ static bool ds41_attention_output(ds41_gpu_graph *g, const ds4_model *m,
 
 /* Record who produced a compressed row. `upto` is the last absolute position
  * pooled into it, which is what a reader recomputes from the row index. */
+/* The compressed row and the index row are recorded separately. Today both
+ * publish sites derive the two row numbers from one variable, so the two tags
+ * cannot disagree and this half of the check is tautological - saying so is
+ * better than presenting it as evidence. It is here as a regression guard: the
+ * moment either store gets a row basis of its own, the tags diverge and the
+ * reader's check fires instead of the store quietly answering for a different
+ * position. */
 static void ds41_tag_write(ds41_gpu_graph *g, uint32_t owner, uint32_t row,
                            uint32_t upto, bool committed) {
     if (!g->tag_pos[owner] || row >= g->tag_rows[owner]) return;
     g->tag_pos[owner][row] = upto;
     g->tag_epoch[owner][row] = g->txn_epoch;
     g->tag_committed[owner][row] = committed ? 1u : 0u;
+}
+
+static void ds41_tag_write_index(ds41_gpu_graph *g, uint32_t owner, uint32_t row,
+                                 uint32_t upto) {
+    if (!g->tag_ipos[owner] || row >= g->tag_rows[owner]) return;
+    g->tag_ipos[owner][row] = upto;
 }
 
 /* Every compressed row this position can read, which is every row a previous
@@ -41456,15 +41501,20 @@ static bool ds41_tag_verify(ds41_gpu_graph *g, const char *when) {
         for (uint32_t r = 0; r < visible && r < g->tag_rows[o]; r++) {
             const uint32_t want = r * ratio + ratio - 1u;
             g->tag_reads++;
-            if (g->tag_pos[o][r] == want && g->tag_committed[o][r]) continue;
+            if (g->tag_pos[o][r] == want && g->tag_ipos[o][r] == want &&
+                g->tag_committed[o][r]) continue;
             g->tag_bad++;
-            if (ok)
-                fprintf(stderr, "ds4: V4.1 compressed row %u of owner %u is visible at "
-                        "position %u %s but was produced by position %u in epoch %llu, "
-                        "committed %u - wanted position %u\n", r, o, g->pos, when,
-                        g->tag_pos[o][r], (unsigned long long)g->tag_epoch[o][r],
-                        g->tag_committed[o][r], want);
+            /* One line with everything needed to place it: which boundary state
+             * it is, whose row, and what it should have been. */
+            fprintf(stderr, "ds4: TAG VIOLATION %s state=%s owner=%u slot=%u "
+                    "pos=%u expected-producer=%u actual-producer=%u "
+                    "actual-index-producer=%u epoch=%llu commit-bit=%u\n",
+                    when, g->tag_pos[o][r] != want ? "compressed" :
+                          g->tag_ipos[o][r] != want ? "index_cache" : "commit-bit",
+                    o, r, g->pos, want, g->tag_pos[o][r], g->tag_ipos[o][r],
+                    (unsigned long long)g->tag_epoch[o][r], g->tag_committed[o][r]);
             ok = false;
+            break;      /* the first violation is the one that locates the bug */
         }
     }
     return ok;
@@ -41493,7 +41543,12 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
             const uint64_t cbytes = 512u * 4u;
             const uint32_t bi = txn && pos >= g->block_carry_start ?
                 pos - g->block_carry_start : 0u;
-            if (txn && (pos < g->block_carry_start || bi >= DS4_TP_BATCH_MAX_ROWS)) {
+            /* One bit per row in a uint32_t, so a block wider than 32 has no
+             * version coordinate to check against and is refused rather than
+             * shifted past the end of the word. Raising DS4_TP_BATCH_MAX_ROWS
+             * above 32 needs a wider mask here first, not a wider cap there. */
+            if (txn && (pos < g->block_carry_start || bi >= 32u ||
+                        bi >= DS4_TP_BATCH_MAX_ROWS)) {
                 g_ds41_txn_refuse++;
                 return false;
             }
@@ -41545,6 +41600,14 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
             if (!pooled) return false;
         } else if (!ds4_gpu_tensor_copy(g->latent, 0, g->pool_kv, 0, 512u * 4u)) return false;
         if ((pos + 1u) % ratio == 0) {
+            if (g->block_txn_active && n_comp - 1u < g->txn_base_pos / ratio) {
+                fprintf(stderr, "ds4: V4.1 block transaction REFUSED: row %u of owner %u "
+                        "is below the committed watermark %u (position %u, block from "
+                        "%u)\n", n_comp - 1u, owner, g->txn_base_pos / ratio, pos,
+                        g->txn_base_pos);
+                g_ds41_txn_base_write++;
+                return false;
+            }
             const uint32_t rope_pos = pos + 1u - ratio;
             if (!ds41_norm(g->latent, g->latent, m, l->attn_compressor_norm) ||
                 !ds41_matmul(g->index_k, m, l->indexer_attn_k, g->latent, true) ||
@@ -41558,6 +41621,7 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
                 !ds4_gpu_tensor_copy(g->compressed[owner], (uint64_t)(n_comp - 1u) * 512u * 4u,
                                      g->latent, 0, 512u * 4u)) return false;
             ds41_tag_write(g, owner, n_comp - 1u, pos, g->block_txn_active == 0);
+            ds41_tag_write_index(g, owner, n_comp - 1u, pos);
         }
     }
     return true;
@@ -42795,9 +42859,11 @@ static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
 
 static void ds41_tag_batch(ds41_gpu_graph *g, uint32_t owner, uint32_t first,
                            uint32_t rows, uint32_t ratio) {
-    for (uint32_t r = 0; r < rows; r++)
-        ds41_tag_write(g, owner, first + r, (first + r) * ratio + ratio - 1u,
-                       g->block_txn_active == 0);
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint32_t upto = (first + r) * ratio + ratio - 1u;
+        ds41_tag_write(g, owner, first + r, upto, g->block_txn_active == 0);
+        ds41_tag_write_index(g, owner, first + r, upto);
+    }
 }
 
 static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
@@ -46172,6 +46238,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             if (block_txn) {
                 g->block_carry_start = start;
                 g->block_carry_rows = rows;
+                g->txn_base_pos = start;
                 if (ds41_kv_source(il) && ds4_layer_compress_ratio(il) == 2u) {
                     const uint32_t co = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
                     g->block_carry_origin[co] = start;
@@ -83888,7 +83955,8 @@ static bool ds41_block_carry_commit(ds41_gpu_graph *g, uint32_t accepted) {
      * quietly slide. Every row on one position - prefill_rows = 0 - leaves the
      * mask at 1 and the count at K, and either one of those refuses. */
     const uint32_t k = g->block_carry_rows;
-    const uint32_t want = k >= 32u ? UINT32_MAX : (1u << k) - 1u;
+    if (k > 32u) { g_ds41_txn_refuse++; return false; }
+    const uint32_t want = k == 32u ? UINT32_MAX : (1u << k) - 1u;
     for (uint32_t o = 0; o < 4u; o++) {
         if (!(g->block_carry_owners & (1u << o))) continue;
         if (g_ds41_txn_rows_seen[o] != want || g_ds41_txn_rows_writes[o] != k ||
@@ -83934,7 +84002,6 @@ static void ds41_block_tags_commit(ds41_gpu_graph *g, uint32_t start,
 }
 
 static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
-    ds41_block_tags_commit(g, g->block_kv_delta_start, g->block_kv_delta_rows, accepted);
     if (!ds41_block_carry_commit(g, accepted)) return false;
     g->block_carry_rows = 0;
     g->block_carry_owners = 0;
@@ -84000,8 +84067,6 @@ static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
  * discarded split by what the accept decision did with them, and base_writes is
  * the one that has to be zero between verify and commit: a semantic write that
  * reaches the committed state before the commit is the bug this is looking for. */
-uint64_t g_ds41_txn_begin, g_ds41_txn_verify_rows, g_ds41_txn_commit_rows;
-uint64_t g_ds41_txn_discard_rows;
 
 int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
                              int *accepted, char *err, size_t errlen) {
@@ -84117,7 +84182,11 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
             fprintf(stderr, "ds4: verify_block: %u rows parked at commit time\n",
                     s->ds41_graph.block_kv_delta_rows); }
     }
-    if (s->ds41_graph.block_kv_delta_rows != 0 &&
+    /* Kept because the commit clears them, and the tags are published against
+     * them once the copies have actually landed. */
+    const uint32_t txn_start = s->ds41_graph.block_kv_delta_start;
+    const uint32_t txn_rows = s->ds41_graph.block_kv_delta_rows;
+    if (txn_rows != 0 &&
         !(ds4_gpu_begin_commands() &&
           ds41_block_kv_commit(&s->ds41_graph, (uint32_t)n) &&
           ds4_gpu_end_commands())) {
@@ -84126,6 +84195,12 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
         if (err && errlen) snprintf(err, errlen, "verify block could not commit %d rows", n);
         return -1;
     }
+    /* Only now. ds4_gpu_end_commands returned, so the copies have completed, and
+     * a tag that said committed before them would let the next step's entry
+     * check pass over a row whose bytes were never written. Data first, then the
+     * completion ticket, then the tag, then the read is allowed. */
+    if (txn_rows != 0)
+        ds41_block_tags_commit(&s->ds41_graph, txn_start, txn_rows, (uint32_t)n);
     /* The hash tail the accepted prefix names, not the one the last row left.
      * Row n-1's version is the state after n tokens, which is what a session
      * that had only ever seen those n would hold. */
@@ -84508,6 +84583,27 @@ static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
         int o = 0;
         bool ok = true;
         const char *why = NULL;
+        /* What this chain should engage, added up from its own (k, a) list and
+         * from nothing else. Reading the expectation out of the same code that
+         * produces the counters would agree with it bug for bug, and totals
+         * taken over a whole process agree with whatever set of runs is chosen
+         * to add up - which is how the first version of this reported a match
+         * that included an unrelated sweep. */
+        long want_blocks = 0, want_k = 0, want_a = 0, want_pub = 0, want_hold = 0;
+        {
+            long at = prompt.len;
+            for (int b = 0; chain[b].k; b++) {
+                const long a = chain[b].a;
+                want_blocks++; want_k += chain[b].k; want_a += a;
+                /* Three owners carry, and each block either publishes all three
+                 * or holds all three - see ds41_block_carry_commit. */
+                if (a == 0 || ((at + a - 1) & ~1L) < at) want_hold++;
+                else want_pub += 3;
+                at += a;
+            }
+        }
+        const uint64_t single_before = g_ds41_single_steps;
+        ds41_txn_counters_reset();
         for (int b = 0; ok && chain[b].k; b++) {
             const int k = chain[b].k, a = chain[b].a;
             if (o + k > ORACLE) { why = "the oracle is too short"; ok = false; break; }
@@ -84553,6 +84649,35 @@ static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
                 if (memcmp(&lg_ref[v], &lg_blk[v], sizeof(float)) != 0) differ++;
             if (differ) bad_at = t;
         }
+        /* The contract's own accounting for this chain alone. The single steps
+         * are the reference session and the follow-up positions; they are in a
+         * separate counter so they cannot be mistaken for block engagement. */
+        fprintf(stderr, "ds4:   chain %s blocks=%lld sumK=%lld sumA=%lld\n"
+                "ds4:     parked      expected %lld actual %llu%s\n"
+                "ds4:     commit_rows expected %lld actual %llu%s\n"
+                "ds4:     published   expected %lld actual %llu%s\n"
+                "ds4:     held        expected %lld actual %llu%s\n"
+                "ds4:     blocks      expected %lld actual %llu%s, refused %llu, "
+                "single steps %llu\n"
+                "ds4:     base-write-before-commit %llu, tag reads %llu, "
+                "tag violations %llu\n",
+                chains[ci].name, (long long)want_blocks, (long long)want_k,
+                (long long)want_a,
+                (long long)(3 * want_k), (unsigned long long)g_ds41_txn_carry_park,
+                (uint64_t)(3 * want_k) == g_ds41_txn_carry_park ? "" : "  MISMATCH",
+                (long long)want_a, (unsigned long long)g_ds41_txn_commit_rows,
+                (uint64_t)want_a == g_ds41_txn_commit_rows ? "" : "  MISMATCH",
+                (long long)want_pub, (unsigned long long)g_ds41_txn_carry_publish,
+                (uint64_t)want_pub == g_ds41_txn_carry_publish ? "" : "  MISMATCH",
+                (long long)want_hold, (unsigned long long)g_ds41_txn_carry_hold,
+                (uint64_t)want_hold == g_ds41_txn_carry_hold ? "" : "  MISMATCH",
+                (long long)want_blocks, (unsigned long long)g_ds41_txn_begin,
+                (uint64_t)want_blocks == g_ds41_txn_begin ? "" : "  MISMATCH",
+                (unsigned long long)g_ds41_txn_refuse,
+                (unsigned long long)(g_ds41_single_steps - single_before),
+                (unsigned long long)g_ds41_txn_base_write,
+                (unsigned long long)blk->ds41_graph.tag_reads,
+                (unsigned long long)blk->ds41_graph.tag_bad);
         if (ok && bad_at < 0)
             fprintf(stderr, "ds4:   chain %s: %d positions committed, all %u logits "
                     "identical at every position to %u\n", chains[ci].name, o,
