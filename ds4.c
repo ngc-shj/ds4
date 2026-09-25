@@ -40806,6 +40806,35 @@ static void ds41_wread_report(const ds4_weights *w, uint32_t k) {
 static int g_ds41_exact_vocab = -1;
 static const char *g_ds41_dense_tile_env;
 
+/* What the production decode path actually did, so a benchmark can refuse a
+ * measurement in which the thing being measured never ran.
+ *
+ * The K-row verifier is ds41_graph_step_batch_logits. The server's ordinary
+ * generation path advances at most two tokens a decode through the MTP
+ * (server_slot::decode_accepted[2]), so outside ds41_verify_selftest these come
+ * out zero - and a bench that prints tok/s without checking them is reporting
+ * the single-row path while claiming to have measured a block one. */
+static uint64_t g_ds41_single_steps;
+static uint64_t g_ds41_kblock_steps;
+static uint64_t g_ds41_kblock_rows[DS4_TP_BATCH_MAX_ROWS + 1];
+static uint64_t g_ds41_kblock_positions;
+static uint64_t g_ds41_fuse_sites;
+
+static void ds41_decode_path_report(void) {
+    fprintf(stderr, "ds4:   decode path so far: %llu single-row steps, %llu K-row "
+            "verification steps over %llu positions, %llu batch-fusion sites taken; "
+            "candidate K",
+            (unsigned long long)g_ds41_single_steps,
+            (unsigned long long)g_ds41_kblock_steps,
+            (unsigned long long)g_ds41_kblock_positions,
+            (unsigned long long)g_ds41_fuse_sites);
+    for (uint32_t i = 2; i <= DS4_TP_BATCH_MAX_ROWS; i++)
+        if (g_ds41_kblock_rows[i])
+            fprintf(stderr, " %u:%llu", i, (unsigned long long)g_ds41_kblock_rows[i]);
+    if (!g_ds41_kblock_steps) fprintf(stderr, " none");
+    fprintf(stderr, "\n");
+}
+
 static void ds41_step_config(void) {
     const char *ev = getenv("DS4_METAL_V41_EXACT_VOCAB_ROWS");
     g_ds41_exact_vocab = ev && ev[0] ? atoi(ev) != 0 : 0;
@@ -40823,7 +40852,13 @@ static void ds41_step_config(void) {
  * cached in a static, or both arms are the same arm. */
 static bool ds41_batch_fuse(void) {
     const char *e = getenv("DS4_METAL_V41_BATCH_FUSE");
-    return !e || !e[0] || atoi(e) != 0;
+    /* Off by default. Byte-exactness is half of an adoption case; the other
+     * half is a paired ABBA and a production path that takes it, and neither
+     * has landed for this flag. Defaulting it on before that is claiming a gate
+     * it has not passed. */
+    const bool on = e && e[0] && atoi(e) != 0;
+    if (on) g_ds41_fuse_sites++;
+    return on;
 }
 
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
@@ -43497,6 +43532,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                              const ds4_weights *w, int token, float *logits) {
     ds41_step_config();
     if (!g || !g->valid || g->pos >= g->ctx || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    g_ds41_single_steps++;
     const bool v41_prof = getenv("DS4_V41_DECODE_PROFILE") != NULL;
     const double v41_t0 = v41_prof ? now_sec() : 0.0;
 #ifdef __APPLE__
@@ -44171,6 +44207,7 @@ spec_done:;
                                       &spec_far, &spec_saved);
             static double w_encode, w_wait, w_entry, w_repair, w_account,
                           w_tail, w_wall, w_gpu;
+            ds41_decode_path_report();
             fprintf(stderr,
                 "ds4: gate over tokens %llu-%llu: %.2f command buffers, %.2f aborts, "
                 "%.1f expert ids accounted, %.2f MiB loaded a token; "
@@ -45490,6 +45527,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     ds41_step_config();
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
+    g_ds41_kblock_steps++;
+    g_ds41_kblock_rows[count]++;
+    g_ds41_kblock_positions += (uint64_t)count;
     /* Sparse block masks scale with context, even when prefill caps match.
      * Attention and Engram history remain private to each session. */
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
@@ -45687,12 +45727,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * which reads each weight block once for BR tokens; DS4_V41_ROWTILE_CHECK=4
      * has it identical to single rows and 1.43x the batch at eight rows.
      *
-     * BR=4 is the default: byte-exact, and faster in both ABBA orders on a
-     * quiet machine (unset-first -6.8%, set-first -2.7%), which is the standard
-     * the row tile and the routed MoE batch were defaulted on. So an A/B has to
-     * be written DS4_METAL_V41_LOW_BATCH=0 - unsetting it selects the tile, and
-     * two arms that both say "row tile BR=4" are one arm. */
-    const uint32_t low_br = lowb_e && lowb_e[0] ? (uint32_t)atoi(lowb_e) : 4u;
+     * BR=4 measured byte-exact and faster in both ABBA orders on a quiet machine
+     * (unset-first -6.8%, set-first -2.7%). It is still off by default: those
+     * are the K-row verifier's numbers, and the verifier is not what the
+     * server's generation path calls, so nothing here has been shown to move a
+     * token of production throughput yet. Re-defaulting it is this one literal
+     * once a K-row step runs in production and is faster there too. */
+    const uint32_t low_br = lowb_e && lowb_e[0] ? (uint32_t)atoi(lowb_e) : 0u;
     const bool low_batch_default = (low_br == 1u || low_br == 2u || low_br == 4u) &&
                                    batch_attn_out && g->tp_world == 1;
     double stage_pre = 0, stage_attn = 0, stage_attn_out = 0, stage_moe = 0,
