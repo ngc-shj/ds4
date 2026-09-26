@@ -41047,6 +41047,8 @@ uint64_t g_ds41_txn_base_write;
  * back. readback counts rows that crossed the bus, gpu counts blocks that took
  * their decision on the device. */
 uint64_t g_ds41_accept_gpu, g_ds41_accept_readback;
+/* Nodes attended to one at a time from the host. Zero is the goal. */
+uint64_t g_ds41_zc_attn_row_loop;
 /* encode, close, read, reopen. */
 double g_ds41_acc_ms[4];
 /* -1 takes the environment. A harness forces an arm so the two passes can be
@@ -41165,6 +41167,9 @@ static void ds41_decode_path_report(void) {
      * each of them refused rather than committing something plausible. */
     /* The invariants, not percentages. Every one of these has to read zero on the
      * performance path; a nonzero readback means the vocabulary crossed the bus. */
+    if (g_ds41_zc_attn_row_loop)
+        fprintf(stderr, "ds4:   host row loop: %llu nodes attended one at a time\n",
+                (unsigned long long)g_ds41_zc_attn_row_loop);
     if (g_ds41_accept_gpu || g_ds41_accept_readback)
         fprintf(stderr, "ds4:   accept: %llu blocks decided on the device, "
                 "%llu logit rows read back; device accept encode %.2f, close "
@@ -46814,6 +46819,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                 }
                 levelled = ok;
             }
+            /* The per-node attention loop. Counted where it happens, because
+             * "host row loop 0" is a claim about an executed block and not about
+             * which branches exist: the levelled path skips this, the raw-rows path
+             * skips it for the layers with no compressed KV, and whatever is left
+             * shows up here. */
+            if (ok && !levelled) g_ds41_zc_attn_row_loop += (uint64_t)count;
             for (int i = 0; ok && !levelled && i < count; i++) {
                 const uint32_t nc = ratio_l ? (positions[i] + 1u) / ratio_l : 0u;
                 const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;

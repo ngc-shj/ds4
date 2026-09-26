@@ -33542,6 +33542,31 @@ int ds4_gpu_attention_decode_heads_block_tensor(
         uint32_t              n_head,
         uint32_t              head_dim,
         uint32_t              rows) {
+    return ds4_gpu_attention_decode_heads_block_dag_tensor(heads, model_map,
+        model_size, sinks_offset, q, raw_kv, raw_cap, n_raw, raw_start, comp_kv,
+        comp_stride, n_comp, n_head, head_dim, rows, NULL);
+}
+
+int ds4_gpu_attention_decode_heads_block_dag_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t              raw_cap,
+        const uint32_t       *n_raw,
+        const uint32_t       *raw_start,
+        const ds4_gpu_tensor *comp_kv,
+        uint64_t              comp_stride,
+        const uint32_t       *n_comp,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              rows,
+        const void           *dag_opaque) {
+    /* The descriptor type belongs to this file; the header carries it as void so
+     * the graph side does not have to know its shape. */
+    const ds4_gpu_kv_source_dag *dag = (const ds4_gpu_kv_source_dag *)dag_opaque;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !q || !raw_kv || !comp_kv || !n_raw || !raw_start || !n_comp ||
         !model_map || rows == 0 || rows > 64u || n_head == 0 || head_dim != 512) return 0;
@@ -33606,7 +33631,7 @@ int ds4_gpu_attention_decode_heads_block_tensor(
                     g_flash_attn_mask_buffer, (NSUInteger)i * mask_stride,
                     g_flash_attn_pad_buffer, (NSUInteger)i * pad_bytes,
                     false, false, &fused,
-                                                             NULL)) return 0;
+                    dag ? &dag[i] : NULL)) return 0;
         }
 
         id<MTLComputePipelineState> vec = ds4_gpu_get_flash_attn_vec_pipeline(

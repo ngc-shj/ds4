@@ -2341,6 +2341,17 @@ int ds4_gpu_attention_decode_heads_tensor(
  *
  * Encodes an ordered chain - mask, stage, attend, reduce - so it must not be
  * called inside a concurrent section. */
+/* The block form with one key source a row: a row's keys may come from the ring and
+ * its own ancestor path rather than one contiguous window. Pass NULL for the linear
+ * form. The mask, pad, FlashAttention pass and reduce are the same code either way.
+ * The descriptor type is private to the Metal backend; callers there use it. */
+int ds4_gpu_attention_decode_heads_block_dag_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        uint32_t raw_cap, const uint32_t *n_raw, const uint32_t *raw_start,
+        const ds4_gpu_tensor *comp_kv, uint64_t comp_stride, const uint32_t *n_comp,
+        uint32_t n_head, uint32_t head_dim, uint32_t rows, const void *dag);
+
 int ds4_gpu_attention_decode_heads_block_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
