@@ -162,13 +162,11 @@ struct ds4_metal_args_flash_kv_stage_f16 {
  * the FlashAttention pass that consumes this does not change and cannot answer
  * differently. */
 struct ds4_metal_args_flash_kv_stage_dag_f16 {
-    uint raw_cap;
-    uint raw_start;
-    uint n_raw;
+    uint ring_cap;         /* the sliding window's slot count */
+    uint visible_start;    /* the first absolute key this node can see */
+    uint visible_count;    /* how many it can see */
+    uint committed_rows;   /* absolute keys below this live in the ring */
     uint n_comp;
-    uint pad_rows;
-    uint shared_pad;
-    uint prefix_rows;      /* logical keys below this come from the ring */
     uint delta_row_vecs;   /* float4 per delta row; 128 for a 512-wide key */
 };
 
@@ -181,22 +179,27 @@ kernel void kernel_dsv4_flash_kv_stage_dag_f16(
         device       char * dst,
         uint gid [[thread_position_in_grid]]) {
     constexpr uint row_vecs = 128;
-    const uint raw_vecs = args.n_raw * row_vecs;
-    const uint n_keys = args.n_raw + args.n_comp;
+    const uint raw_vecs = args.visible_count * row_vecs;
+    const uint n_keys = args.visible_count + args.n_comp;
     const uint total_vecs = n_keys * row_vecs;
 
     if (gid < raw_vecs) {
         const uint logical_row = gid >> 7;
         const uint col = gid & 127u;
         device packed_half4 *dst_half = (device packed_half4 *)dst;
+        /* The window is the node's, not the block's. A deeper node's sliding
+         * window has moved on, so the oldest committed keys and the earliest
+         * ancestors have fallen out of it; deciding ring against delta on a single
+         * prefix for the whole block passes a wrap test and then shows a deep node
+         * keys it should no longer see. */
+        const uint absolute = args.visible_start + logical_row;
         float4 value;
-        if (logical_row < args.prefix_rows) {
-            uint physical_row = args.raw_start + logical_row;
-            if (physical_row >= args.raw_cap) physical_row -= args.raw_cap;
+        if (absolute < args.committed_rows) {
+            /* A committed key at absolute position a sits in slot a % cap. */
             device const packed_float4 *ring = (device const packed_float4 *)ring_src;
-            value = float4(ring[physical_row * row_vecs + col]);
+            value = float4(ring[(absolute % args.ring_cap) * row_vecs + col]);
         } else {
-            const uint node = path[logical_row - args.prefix_rows];
+            const uint node = path[absolute - args.committed_rows];
             device const packed_float4 *delta = (device const packed_float4 *)delta_src;
             value = float4(delta[(ulong)node * args.delta_row_vecs + col]);
         }

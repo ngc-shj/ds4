@@ -52069,17 +52069,25 @@ int ds4_gpu_dsv41_block_accept_warm(void) {
  * The prefix is shared logically - every node names the same committed keys - but
  * each query still rescans the ring, so this removes the materialisation and not
  * the scan. Sharing the scan physically is a later step inside the query tile. */
-int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring,
-                                     uint32_t ring_start, uint32_t ring_cap,
+int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring, uint32_t ring_cap,
                                      const ds4_gpu_tensor *delta,
                                      uint32_t delta_row_floats,
                                      const ds4_gpu_tensor *path,
                                      uint32_t path_offset, uint32_t path_length,
                                      const ds4_gpu_tensor *comp, uint32_t n_comp,
-                                     ds4_gpu_tensor *dst, uint32_t prefix_rows) {
-    if (!ring || !dst || !ring_cap || (path_length && (!delta || !path))) return 0;
-    if (prefix_rows > ring_cap) return 0;
+                                     ds4_gpu_tensor *dst,
+                                     uint32_t sequence_rows, uint32_t committed_rows) {
+    if (!ring || !dst || !ring_cap) return 0;
+    if (committed_rows > sequence_rows) return 0;
+    if (sequence_rows - committed_rows != path_length) return 0;
+    if (path_length && (!delta || !path)) return 0;
     if (delta_row_floats % 4u) return 0;
+    /* The node's own window: the oldest key it can still see is sequence_rows -
+     * ring_cap, so a deeper node has lost the earliest committed keys and may have
+     * lost its earliest ancestors too. */
+    const uint32_t visible_start =
+        sequence_rows > ring_cap ? sequence_rows - ring_cap : 0u;
+    const uint32_t visible_count = sequence_rows - visible_start;
     /* A path index the delta does not hold would be read as whatever occupies that
      * address, so the bound is checked here rather than trusted. The delta's row
      * count comes from its own size, not from the caller. */
@@ -52090,18 +52098,18 @@ int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring,
         const uint64_t need = ((uint64_t)path_offset + path_length) * sizeof(uint32_t);
         if (ds4_gpu_tensor_bytes(path) < need) return 0;
     }
+    if (visible_start > committed_rows + path_length) return 0;
     {
-        const uint64_t keys = (uint64_t)prefix_rows + path_length + n_comp;
+        const uint64_t keys = (uint64_t)visible_count + n_comp;
         if (ds4_gpu_tensor_bytes(dst) < keys * 512u * sizeof(uint16_t)) return 0;
     }
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    const uint32_t n_raw = prefix_rows + path_length;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_flash_kv_stage_dag_f16");
         if (!pipeline) return 0;
-        const uint32_t args[8] = { ring_cap, ring_start, n_raw, n_comp, 0u, 0u,
-                                   prefix_rows, delta_row_floats / 4u };
+        const uint32_t args[6] = { ring_cap, visible_start, visible_count,
+                                   committed_rows, n_comp, delta_row_floats / 4u };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<DS4Encoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
@@ -52120,7 +52128,7 @@ int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring,
                 offset:comp ? ds4_gpu_tensor_offset(comp) : ds4_gpu_tensor_offset(ring)
                atIndex:4];
         [enc setBuffer:ds4_gpu_tensor_buffer(dst) offset:ds4_gpu_tensor_offset(dst) atIndex:5];
-        const uint32_t vecs = (n_raw + n_comp) * 128u;
+        const uint32_t vecs = (visible_count + n_comp) * 128u;
         const NSUInteger tw = 256;
         ds4_gpu_dispatch(enc, MTLSizeMake((vecs + tw - 1u) / tw, 1, 1), MTLSizeMake(tw, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);

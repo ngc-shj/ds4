@@ -86176,49 +86176,57 @@ static void ds41_dag_stage_check(void) {
     if (!ds4_gpu_synchronize()) goto done;
 
     int bad = 0, cases = 0;
-    /* Starts either side of the wrap, and prefixes that reach it. */
-    const uint32_t starts[] = { 0u, 100u, 120u, 127u };
-    const uint32_t prefixes[] = { 8u, 64u, 120u, 127u };
-    for (uint32_t si = 0; si < 4; si++)
-        for (uint32_t pi = 0; pi < 4; pi++)
-            for (uint32_t d = 1; d <= 4; d++) {
-                const uint32_t start = starts[si], prefix = prefixes[pi];
-                /* The ancestor order the linear form would have produced. */
-                for (uint32_t j = 0; j < d; j++) hpath[j] = j;
-                if (!ds4_gpu_tensor_write(path, 0, hpath, d * sizeof(uint32_t))) goto done;
-                /* The copies and the two stages need a command scope; without one
-                 * a tensor copy does not run and the check fell out of its own
-                 * goto without printing. */
-                if (!ds4_gpu_begin_commands()) goto done;
-                /* The linear reference: the same keys, copied into one buffer. */
-                for (uint32_t j = 0; j < prefix; j++) {
-                    const uint32_t phys = (start + j) % CAP;
+    /* The window is what varies, not a start offset: absolute key j lives in slot
+     * j % cap, so the wrap is reached by letting the sequence outgrow the cap. At
+     * sequence 200 with cap 128 the first 72 committed keys are gone, and at a
+     * sequence whose committed part is itself below visible_start the earliest
+     * ancestors have gone too - which is the case a single block-wide prefix got
+     * wrong. */
+    const uint32_t sequences[] = { 8u, 64u, 127u, 128u, 129u, 200u, 255u, 256u };
+    for (uint32_t si = 0; si < 8; si++)
+        for (uint32_t d = 1; d <= 4; d++) {
+            const uint32_t seq = sequences[si];
+            if (d >= seq) continue;
+            const uint32_t committed = seq - d;
+            if (committed > CAP) continue;      /* the ring only holds CAP of them */
+            const uint32_t vstart = seq > CAP ? seq - CAP : 0u;
+            const uint32_t vcount = seq - vstart;
+            for (uint32_t j = 0; j < d; j++) hpath[j] = j;
+            if (!ds4_gpu_begin_commands()) goto done;
+            if (!ds4_gpu_tensor_write(path, 0, hpath, d * sizeof(uint32_t))) goto done;
+            /* The reference: the node's window, key by key, from where each lives. */
+            for (uint32_t j = 0; j < vcount; j++) {
+                const uint32_t absolute = vstart + j;
+                if (absolute < committed) {
                     if (!ds4_gpu_tensor_copy(linear, (uint64_t)j * ROW * 4u, ring,
-                                             (uint64_t)phys * ROW * 4u, ROW * 4u)) goto done;
-                }
-                for (uint32_t j = 0; j < d; j++)
-                    if (!ds4_gpu_tensor_copy(linear, (uint64_t)(prefix + j) * ROW * 4u,
-                                             delta, (uint64_t)hpath[j] * ROW * 4u,
+                                             (uint64_t)(absolute % CAP) * ROW * 4u,
                                              ROW * 4u)) goto done;
-                const uint32_t n_raw = prefix + d;
-                if (!ds4_gpu_dsv41_flash_kv_stage_dag(linear, 0, CAP + DELTA_ROWS, NULL, 4u,
-                                                      NULL, 0, 0, NULL, 0, a, n_raw) ||
-                    !ds4_gpu_dsv41_flash_kv_stage_dag(ring, start, CAP, delta, ROW,
-                                                      path, 0, d, NULL, 0, b, prefix) ||
-                    !ds4_gpu_end_commands() || !ds4_gpu_synchronize()) goto done;
-                const uint64_t bytes = (uint64_t)n_raw * ROW * sizeof(uint16_t);
-                if (!ds4_gpu_tensor_read(a, 0, ha, bytes) ||
-                    !ds4_gpu_tensor_read(b, 0, hb, bytes)) goto done;
-                cases++;
-                if (memcmp(ha, hb, (size_t)bytes) != 0) {
-                    uint64_t first = 0;
-                    while (first < bytes / 2u && ha[first] == hb[first]) first++;
-                    fprintf(stderr, "ds4: DAG stage differs at start %u prefix %u depth "
-                            "%u, first half at %llu\n", start, prefix, d,
-                            (unsigned long long)first);
-                    bad++;
+                } else {
+                    const uint32_t node = hpath[absolute - committed];
+                    if (!ds4_gpu_tensor_copy(linear, (uint64_t)j * ROW * 4u, delta,
+                                             (uint64_t)node * ROW * 4u,
+                                             ROW * 4u)) goto done;
                 }
             }
+            if (!ds4_gpu_dsv41_flash_kv_stage_dag(linear, CAP + DELTA_ROWS, NULL, 4u,
+                                                  NULL, 0, 0, NULL, 0, a,
+                                                  vcount, vcount) ||
+                !ds4_gpu_dsv41_flash_kv_stage_dag(ring, CAP, delta, ROW, path, 0, d,
+                                                  NULL, 0, b, seq, committed) ||
+                !ds4_gpu_end_commands() || !ds4_gpu_synchronize()) goto done;
+            const uint64_t bytes = (uint64_t)vcount * ROW * sizeof(uint16_t);
+            if (!ds4_gpu_tensor_read(a, 0, ha, bytes) ||
+                !ds4_gpu_tensor_read(b, 0, hb, bytes)) goto done;
+            cases++;
+            if (memcmp(ha, hb, (size_t)bytes) != 0) {
+                uint64_t first = 0;
+                while (first < bytes / 2u && ha[first] == hb[first]) first++;
+                fprintf(stderr, "ds4: DAG stage differs at sequence %u committed %u "
+                        "depth %u window %u..%u, first half at %llu\n", seq, committed,
+                        d, vstart, vstart + vcount, (unsigned long long)first);
+                bad++;
+            }
+        }
     fprintf(stderr, "ds4: DAG KV stage against the linear form: %d cases, %d differ\n",
             cases, bad);
 
@@ -86230,23 +86238,24 @@ static void ds41_dag_stage_check(void) {
         if (!ds4_gpu_begin_commands()) goto done;
         if (!ds4_gpu_tensor_write(path, 0, hpath, DELTA_ROWS * sizeof(uint32_t))) rbad++;
         /* Longer than the delta has rows. */
-        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0,
-                                             DELTA_ROWS + 1u, NULL, 0, b, 8u)) rbad++;
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, CAP, delta, ROW, path, 0,
+                                             DELTA_ROWS + 1u, NULL, 0, b,
+                                             8u + DELTA_ROWS + 1u, 8u)) rbad++;
         /* An offset that runs the path array off its end. */
-        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path,
-                                             DELTA_ROWS, 4u, NULL, 0, b, 8u)) rbad++;
-        /* A prefix wider than the ring. */
-        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0, 2u,
-                                             NULL, 0, b, CAP + 1u)) rbad++;
-        /* A destination too small for the keys asked for. */
-        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0, 4u,
-                                             NULL, 0, path, 8u)) rbad++;
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, CAP, delta, ROW, path,
+                                             DELTA_ROWS, 4u, NULL, 0, b, 12u, 8u)) rbad++;
+        /* A sequence that does not account for its own path. */
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, CAP, delta, ROW, path, 0, 2u,
+                                             NULL, 0, b, 8u, 8u)) rbad++;
+        /* A destination too small for the window asked for. */
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, CAP, delta, ROW, path, 0, 4u,
+                                             NULL, 0, path, 12u, 8u)) rbad++;
         /* A path with no delta behind it. */
-        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, NULL, ROW, path, 0, 2u,
-                                             NULL, 0, b, 8u)) rbad++;
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, CAP, NULL, ROW, path, 0, 2u,
+                                             NULL, 0, b, 10u, 8u)) rbad++;
         /* And the shape that must still be accepted. */
-        if (!ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0, 4u,
-                                              NULL, 0, b, 8u)) rbad++;
+        if (!ds4_gpu_dsv41_flash_kv_stage_dag(ring, CAP, delta, ROW, path, 0, 4u,
+                                              NULL, 0, b, 12u, 8u)) rbad++;
         (void)ds4_gpu_end_commands();
         fprintf(stderr, "ds4: DAG KV stage bounds: 6 cases, %d wrong\n", rbad);
     }
