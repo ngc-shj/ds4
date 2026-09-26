@@ -41462,21 +41462,6 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
         ds41_wread_note_full(weight, count, 1, 3, round);
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
-    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
-        /* The router's weight is F32 and this loop is 320 single-row dispatches
-         * a verify block - the largest remaining host row loop on the path. It
-         * stays until there is a batch F32 matvec that reduces the way the
-         * single-row one does: sending these rows to the generic multi-row path
-         * instead changed every logit from A=1 on, exactly as the vocabulary
-         * head did before DS4_METAL_V41_EXACT_VOCAB_ROWS existed. */
-        ok = true;
-        for (uint32_t i = 0; ok && i < count; i++) {
-            ds4_gpu_tensor *x = ds41_view((ds4_gpu_tensor *)in,
-                (uint64_t)i * width * sizeof(float), (uint64_t)width * sizeof(float));
-            ds4_gpu_tensor *y = ds41_view(out,
-                (uint64_t)i * outputs * sizeof(float), (uint64_t)outputs * sizeof(float));
-            ok = x && y && ds41_matmul(y, m, weight, x, false);
-        }
     } else {
         ds41_wread_note_full(weight, count, 1, 5, round);
         ok = metal_graph_matmul_plain_tensor(out, m, weight, width, outputs, in, count);

@@ -24255,8 +24255,20 @@ static int ds4_gpu_matmul_f32_round_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1) {
-            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
+        /* The same matvec with the batch row on the grid's Y axis. In the kernel
+         * r1 = tgpig.y moves only which input row is read and which output row
+         * is written; the K walk, the simdgroup count and the reduction tree are
+         * the single row's. That is what the router needs: sending its rows to
+         * the generic multi-row path instead left A=0 identical and every logit
+         * from A=1 different, which is the same trap the vocabulary head was in
+         * before EXACT_VOCAB_ROWS. It also replaces a host loop of n_tok
+         * single-row dispatches - 320 a verify block at forty layers.
+         * DS4_METAL_DISABLE_V41_F32_EXACT_ROWS=1 goes back to that loop. */
+        const bool f32_exact_rows =
+            n_tok >= 2u && n_tok <= 32u &&
+            getenv("DS4_METAL_DISABLE_V41_F32_EXACT_ROWS") == NULL;
+        if (n_tok == 1 || f32_exact_rows) {
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
             if (ds4_gpu_plain_mv_single_row(out_dim)) {
                 mv_dispatch.nr0 = 1;
@@ -24278,7 +24290,11 @@ static int ds4_gpu_matmul_f32_round_tensor(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
+            ds4_gpu_dispatch(enc,
+                MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                                (NSUInteger)mv_dispatch.nr0,
+                            (NSUInteger)n_tok, 1),
+                MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "F32 tensor matvec")) return 0;
@@ -48234,7 +48250,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                 fprintf(stderr, "ds4: Metal Q4 batch expert table residency set is not available\n");
                 return 0;
             }
-        } else if (use_cached_batch || use_iq2_batch_full_addr) {
+        } else if (use_cached_batch || use_iq2_batch_full_addr ||
+                   use_iq2_batch_resident_addr) {
             if (n_expert > 1 && (!expertsbuf ||
                 ds4_gpu_tensor_bytes(experts) < down_scratch_bytes)) {
                 if (!ds4_gpu_ensure_scratch_buffer(&g_moe_down_scratch_buffer,
@@ -48246,6 +48263,24 @@ int ds4_gpu_routed_moe_batch_tensor(
                 }
             }
         } else {
+            /* Whole-tensor addressing. With the device-residency path on, a
+             * layer arriving here is a layer whose experts were never admitted
+             * to the cache, so name it rather than let it fail three ranges
+             * later inside the wrap. */
+            if (ds4_gpu_stream_block_residency_requested()) {
+                static uint32_t said_plain;
+                if (said_plain < 4u) { said_plain++;
+                    fprintf(stderr,
+                            "ds4: V4.1 routed batch layer=%u took the whole-tensor path: "
+                            "tokens=%u n_expert=%u force_resident=%d gate=%s down=%s "
+                            "sel=%d cached=%d resident=%d\n",
+                            layer_index, n_tokens, n_expert, force_resident ? 1 : 0,
+                            ds4_gpu_metal_tensor_type_name(gate_type),
+                            ds4_gpu_metal_tensor_type_name(down_type),
+                            use_iq2_batch_selected_addr ? 1 : 0,
+                            use_cached_batch ? 1 : 0,
+                            use_iq2_batch_resident_addr ? 1 : 0); }
+            }
             if (n_expert > 1 && (!expertsbuf ||
                 ds4_gpu_tensor_bytes(experts) < down_scratch_bytes)) {
                 if (!ds4_gpu_ensure_scratch_buffer(&g_moe_down_scratch_buffer,
