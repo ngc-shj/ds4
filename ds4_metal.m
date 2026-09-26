@@ -51953,6 +51953,7 @@ int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
         if (ds4_gpu_tensor_bytes(argmax) < need) return 0;
         const NSUInteger part_off = ds4_gpu_tensor_offset(argmax) +
                                     (NSUInteger)rows * sizeof(uint32_t);
+        (void)ds4_gpu_concurrent_section_barrier();
         const uint32_t a1[] = { n_vocab, rows, row_floats };
         [enc setComputePipelineState:pick];
         [enc setBytes:a1 length:sizeof(a1) atIndex:0];
@@ -51960,6 +51961,11 @@ int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
         [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:part_off atIndex:2];
         ds4_gpu_dispatch(enc, MTLSizeMake(chunks, rows, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
+        /* Inside an open batch buffer these three dispatches share one encoder,
+         * and a concurrent encoder does not order them: the head's output, the
+         * partials and the per-row answers are each read by the next step, so the
+         * dependency has to be stated. It held by luck before this. */
+        (void)ds4_gpu_concurrent_section_barrier();
         enc = ds4_gpu_compute_encoder(cb);
         if (!enc) return 0;
         [enc setComputePipelineState:fold];
@@ -51968,6 +51974,7 @@ int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
         [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:ds4_gpu_tensor_offset(argmax) atIndex:2];
         ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
+        (void)ds4_gpu_concurrent_section_barrier();
         enc = ds4_gpu_compute_encoder(cb);
         if (!enc) return 0;
         const uint32_t a2[] = { rows, max_commit };
