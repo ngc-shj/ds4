@@ -86221,6 +86221,35 @@ static void ds41_dag_stage_check(void) {
             }
     fprintf(stderr, "ds4: DAG KV stage against the linear form: %d cases, %d differ\n",
             cases, bad);
+
+    /* A path the delta cannot satisfy has to be refused, not read. Each of these
+     * would otherwise fetch whatever occupies the address. */
+    {
+        int rbad = 0;
+        for (uint32_t j = 0; j < DELTA_ROWS; j++) hpath[j] = j;
+        if (!ds4_gpu_begin_commands()) goto done;
+        if (!ds4_gpu_tensor_write(path, 0, hpath, DELTA_ROWS * sizeof(uint32_t))) rbad++;
+        /* Longer than the delta has rows. */
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0,
+                                             DELTA_ROWS + 1u, NULL, 0, b, 8u)) rbad++;
+        /* An offset that runs the path array off its end. */
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path,
+                                             DELTA_ROWS, 4u, NULL, 0, b, 8u)) rbad++;
+        /* A prefix wider than the ring. */
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0, 2u,
+                                             NULL, 0, b, CAP + 1u)) rbad++;
+        /* A destination too small for the keys asked for. */
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0, 4u,
+                                             NULL, 0, path, 8u)) rbad++;
+        /* A path with no delta behind it. */
+        if (ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, NULL, ROW, path, 0, 2u,
+                                             NULL, 0, b, 8u)) rbad++;
+        /* And the shape that must still be accepted. */
+        if (!ds4_gpu_dsv41_flash_kv_stage_dag(ring, 0, CAP, delta, ROW, path, 0, 4u,
+                                              NULL, 0, b, 8u)) rbad++;
+        (void)ds4_gpu_end_commands();
+        fprintf(stderr, "ds4: DAG KV stage bounds: 6 cases, %d wrong\n", rbad);
+    }
 done:
     ds4_gpu_tensor_free(ring); ds4_gpu_tensor_free(delta); ds4_gpu_tensor_free(linear);
     ds4_gpu_tensor_free(path); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b);

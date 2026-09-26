@@ -52080,6 +52080,20 @@ int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring,
     if (!ring || !dst || !ring_cap || (path_length && (!delta || !path))) return 0;
     if (prefix_rows > ring_cap) return 0;
     if (delta_row_floats % 4u) return 0;
+    /* A path index the delta does not hold would be read as whatever occupies that
+     * address, so the bound is checked here rather than trusted. The delta's row
+     * count comes from its own size, not from the caller. */
+    if (path_length) {
+        const uint64_t rows = ds4_gpu_tensor_bytes(delta) /
+                              ((uint64_t)delta_row_floats * sizeof(float));
+        if (!rows || path_length > rows) return 0;
+        const uint64_t need = ((uint64_t)path_offset + path_length) * sizeof(uint32_t);
+        if (ds4_gpu_tensor_bytes(path) < need) return 0;
+    }
+    {
+        const uint64_t keys = (uint64_t)prefix_rows + path_length + n_comp;
+        if (ds4_gpu_tensor_bytes(dst) < keys * 512u * sizeof(uint16_t)) return 0;
+    }
     if (!g_initialized && !ds4_gpu_init()) return 0;
     const uint32_t n_raw = prefix_rows + path_length;
     @autoreleasepool {
