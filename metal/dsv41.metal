@@ -146,6 +146,122 @@ kernel void kernel_dsv41_pool2(
     out[(ulong)index.y * args.width + index.x] = dsv41_bf16((ka * ea + kv[b] * eb) / (ea + eb));
 }
 
+/* The accept decision, on the GPU.
+ *
+ * A verifier does not need the vocabulary on the host. The performance path
+ * wants the accepted length and the one token that replaces the first wrong
+ * candidate, which is tens of bytes; reading K x 129280 floats back and taking
+ * the argmax there costs 16.5 MiB and a queue drain at K = 32, and the full
+ * logits are only needed by the correctness pass that compares them.
+ *
+ * The tie-break is sample_argmax's: a strict greater-than keeps the earliest
+ * index, so ties resolve to the lowest one. NaN is skipped here and cannot be
+ * selected there either, because every comparison against it is false. */
+struct ds4_metal_args_dsv41_block_argmax {
+    uint32_t n_vocab;
+    uint32_t rows;
+    uint32_t row_floats;   /* stride between rows, in floats */
+};
+
+/* Two passes, because one threadgroup a row leaves the machine idle.
+ *
+ * The first version put 256 threads on each of K rows - eight threadgroups for a
+ * million floats - and measured 5.78 ms a token worse than reading the logits
+ * back and taking the argmax on the host, which costs 1.5 ms for all K rows. The
+ * bytes were never the problem on unified memory; the parallelism was. So the
+ * grid is chunk x row here, 32 chunks a row at 4096 values, and a second pass
+ * folds the partials. */
+kernel void kernel_dsv41_block_argmax(
+        constant ds4_metal_args_dsv41_block_argmax &args,
+        device const float *logits,
+        device uint2 *partials,          /* [rows][chunks] as (bits, index) */
+        uint2  gid  [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]]) {
+    /* The dispatch below uses 256; taking it from threads_per_threadgroup would
+     * have to match the grid position's dimensionality, which is not worth an
+     * attribute here. */
+    const ushort nthr = 256;
+    const uint row = gid.y;
+    if (row >= args.rows) return;
+    const uint chunks = (args.n_vocab + 4095u) / 4096u;
+    if (gid.x >= chunks) return;
+    device const float *y = logits + (ulong)row * args.row_floats;
+    const uint begin = gid.x * 4096u;
+    const uint end = min(begin + 4096u, args.n_vocab);
+    float best = -INFINITY;
+    uint index = 0xffffffffu;
+    for (uint i = begin + tid; i < end; i += nthr) {
+        const float v = y[i];
+        if (v != v) continue;
+        if (index == 0xffffffffu || v > best) { best = v; index = i; }
+    }
+    const float top = simd_max(best);
+    const uint winner = simd_min(best == top ? index : 0xffffffffu);
+    threadgroup float scores[8];    /* 256 threads is eight simdgroups */
+    threadgroup uint indices[8];
+    const ushort lane = tid % 32u;
+    const ushort sg = tid / 32u;
+    if (lane == 0) { scores[sg] = top; indices[sg] = winner; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        const ushort groups = (nthr + 31u) / 32u;
+        float b = scores[0];
+        uint ix = indices[0];
+        for (ushort g = 1; g < groups; g++)
+            if (indices[g] != 0xffffffffu &&
+                (ix == 0xffffffffu || scores[g] > b || (scores[g] == b && indices[g] < ix))) {
+                b = scores[g]; ix = indices[g];
+            }
+        partials[(ulong)row * chunks + gid.x] = uint2(as_type<uint>(b), ix);
+    }
+}
+
+/* Fold one row's partials, keeping the earliest index on a tie so the answer is
+ * sample_argmax's. One threadgroup a row, 32 partials at K = 32 vocabularies. */
+kernel void kernel_dsv41_block_argmax_fold(
+        constant ds4_metal_args_dsv41_block_argmax &args,
+        device const uint2 *partials,
+        device uint32_t *out_index,
+        uint row [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    if (row >= args.rows || tid != 0) return;
+    const uint chunks = (args.n_vocab + 4095u) / 4096u;
+    float best = -INFINITY;
+    uint index = 0xffffffffu;
+    for (uint c = 0; c < chunks; c++) {
+        const uint2 p = partials[(ulong)row * chunks + c];
+        if (p.y == 0xffffffffu) continue;
+        const float v = as_type<float>(p.x);
+        if (index == 0xffffffffu || v > best || (v == best && p.y < index)) { best = v; index = p.y; }
+    }
+    out_index[row] = index == 0xffffffffu ? 0u : index;
+}
+
+/* Row i answers the position candidate i sits on, so it predicts candidate
+ * i + 1. The accepted length is one plus the number of leading rows whose argmax
+ * matches, capped by max_commit, and the replacement token is the argmax of the
+ * row that stopped it - the same walk the host loop did. */
+struct ds4_metal_args_dsv41_block_accept {
+    uint32_t rows;
+    uint32_t max_commit;
+};
+
+kernel void kernel_dsv41_block_accept(
+        constant ds4_metal_args_dsv41_block_accept &args,
+        device const uint32_t *argmax,
+        device const int32_t *candidates,
+        device uint32_t *out,          /* [0] accepted, [1] token after the prefix */
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0) return;
+    uint n = args.max_commit == 0u ? 0u : 1u;
+    for (uint i = 0; n > 0u && n < args.max_commit && i + 1u < args.rows; i++) {
+        if (argmax[i] != (uint32_t)candidates[i + 1u]) break;
+        n++;
+    }
+    out[0] = n;
+    out[1] = n == 0u ? argmax[0] : argmax[n - 1u];
+}
+
 struct ds4_metal_args_dsv41_candidates {
     uint width;
     uint rows;

@@ -87,6 +87,16 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
 void ds4_gpu_moe_expert_major_override(int mode);
 uint64_t ds4_gpu_moe_expert_major_dispatches(void);
 int ds4_gpu_moe_expert_major_enabled_host(void);
+/* Compile the accept pipelines, so first use does not land inside a timed arm. */
+int ds4_gpu_dsv41_block_accept_warm(void);
+/* Encode the accept decision so the performance path never reads the vocabulary:
+ * the result is two words in a caller-owned tensor, read after the queue closes. */
+int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
+                                      const ds4_gpu_tensor *tokens,
+                                      ds4_gpu_tensor *argmax,
+                                      ds4_gpu_tensor *result,
+                                      uint32_t rows, uint32_t n_vocab,
+                                      uint32_t row_floats, uint32_t max_commit);
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
                       const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
                       ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,

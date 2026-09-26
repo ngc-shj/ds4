@@ -51903,6 +51903,86 @@ int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_offset,
     }
 }
 
+/* Build the accept pipelines before anything is timed.
+ *
+ * ds4_gpu_get_pipeline compiles on first use, and tens of milliseconds of that
+ * landed entirely in whichever arm ran the first block: the device accept
+ * measured 5.78 then 7.39 ms a token worse than the host path, and making the
+ * argmax two-pass did not move it, which is what pointed here. */
+int ds4_gpu_dsv41_block_accept_warm(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    return ds4_gpu_get_pipeline("kernel_dsv41_block_argmax") != nil &&
+           ds4_gpu_get_pipeline("kernel_dsv41_block_argmax_fold") != nil &&
+           ds4_gpu_get_pipeline("kernel_dsv41_block_accept") != nil;
+}
+
+/* Encode the accept decision. The vocabulary never crosses the bus.
+ *
+ * Only the encode: the caller already has to close the queue once before it can
+ * act on the answer, and that drain is not what this removes - what it removes
+ * is the K x 129280 floats that used to come with it, 16.5 MiB at K = 32. The
+ * result lands in two words of a caller-owned tensor, read after the close.
+ *
+ * `argmax` and `result` belong to the caller so nothing here is a process
+ * global: several blocks may be in flight and a global would tie them together. */
+int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
+                                      const ds4_gpu_tensor *tokens,
+                                      ds4_gpu_tensor *argmax,
+                                      ds4_gpu_tensor *result,
+                                      uint32_t rows, uint32_t n_vocab,
+                                      uint32_t row_floats, uint32_t max_commit) {
+    if (!logits || !tokens || !argmax || !result || !rows || !n_vocab) return 0;
+    if (!dsv41_tensor_has_floats(logits, (uint64_t)(rows - 1u) * row_floats + n_vocab)) return 0;
+
+    if (ds4_gpu_tensor_bytes(result) < 2u * sizeof(uint32_t)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pick = ds4_gpu_get_pipeline("kernel_dsv41_block_argmax");
+        id<MTLComputePipelineState> acc = ds4_gpu_get_pipeline("kernel_dsv41_block_accept");
+        if (!pick || !acc) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<DS4Encoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        id<MTLComputePipelineState> fold = ds4_gpu_get_pipeline("kernel_dsv41_block_argmax_fold");
+        if (!fold) return 0;
+        const uint32_t chunks = (n_vocab + 4095u) / 4096u;
+        /* The partials ride in the argmax tensor past the per-row answers. */
+        const uint64_t need = (uint64_t)rows * sizeof(uint32_t) +
+                              (uint64_t)rows * chunks * 2u * sizeof(uint32_t);
+        if (ds4_gpu_tensor_bytes(argmax) < need) return 0;
+        const NSUInteger part_off = ds4_gpu_tensor_offset(argmax) +
+                                    (NSUInteger)rows * sizeof(uint32_t);
+        const uint32_t a1[] = { n_vocab, rows, row_floats };
+        [enc setComputePipelineState:pick];
+        [enc setBytes:a1 length:sizeof(a1) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:part_off atIndex:2];
+        ds4_gpu_dispatch(enc, MTLSizeMake(chunks, rows, 1), MTLSizeMake(256, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:fold];
+        [enc setBytes:a1 length:sizeof(a1) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:part_off atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:ds4_gpu_tensor_offset(argmax) atIndex:2];
+        ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(32, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        const uint32_t a2[] = { rows, max_commit };
+        [enc setComputePipelineState:acc];
+        [enc setBytes:a2 length:sizeof(a2) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:ds4_gpu_tensor_offset(argmax) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tokens) offset:ds4_gpu_tensor_offset(tokens) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(result) offset:ds4_gpu_tensor_offset(result) atIndex:3];
+        ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (owned && !ds4_gpu_finish_command_buffer(cb, owned, "V4.1 block accept")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
                       const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
                       ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,

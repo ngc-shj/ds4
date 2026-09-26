@@ -40312,6 +40312,11 @@ typedef struct {
     uint64_t tag_reads, tag_bad;
     uint32_t block_txn_active;
     uint32_t txn_base_pos;
+    /* The accept decision's scratch, owned here rather than by a process global
+     * so blocks in flight do not share it. Two words of result and one argmax a
+     * row - the whole of what the performance path brings back. */
+    ds4_gpu_tensor *block_argmax;
+    ds4_gpu_tensor *block_accept;
     /* The contract the session's committed positions were produced under. */
     ds41_decode_contract_id contract;
     /* Fail-closed: a write into the committed arena while a transaction is
@@ -40365,7 +40370,11 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->index_cache[i]);
         ds4_gpu_tensor_free(g->block_carry_kv[i]);
         ds4_gpu_tensor_free(g->block_carry_score[i]);
-        if (i == 0) free(g->block_history);
+        if (i == 0) {
+            free(g->block_history);
+            ds4_gpu_tensor_free(g->block_argmax);
+            ds4_gpu_tensor_free(g->block_accept);
+        }
         free(g->tag_pos[i]); free(g->tag_ipos[i]);
         free(g->tag_epoch[i]); free(g->tag_committed[i]);
         ds4_gpu_tensor_free(g->previous_kv[i]);
@@ -40494,6 +40503,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
         if (i == 0 && !(g->block_history = calloc(DS4_TP_BATCH_MAX_ROWS,
                                                   sizeof(*g->block_history)))) goto fail;
+        if (i == 0) {
+            /* The per-row answers, then the two-pass partials behind them. */
+            g->block_argmax = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_TP_BATCH_MAX_ROWS * sizeof(uint32_t) +
+                (uint64_t)DS4_TP_BATCH_MAX_ROWS * ((DS4_N_VOCAB + 4095u) / 4096u) *
+                    2u * sizeof(uint32_t));
+            g->block_accept = ds4_gpu_tensor_alloc(2u * sizeof(uint32_t));
+            if (!g->block_argmax || !g->block_accept) goto fail;
+        }
         if (getenv("DS4_V41_TXN_TAGS")) {
             g->tag_rows[i] = (uint32_t)cap;
             g->tag_pos[i] = malloc(cap * sizeof(*g->tag_pos[i]));
@@ -40989,6 +41007,14 @@ uint64_t g_ds41_txn_carry_hold, g_ds41_txn_refuse;
  * that has drifted below the block shows up here instead of overwriting history.
  * Must stay zero, and a nonzero one refuses the publish. */
 uint64_t g_ds41_txn_base_write;
+/* The invariant the performance path has to hold: no row of the vocabulary read
+ * back. readback counts rows that crossed the bus, gpu counts blocks that took
+ * their decision on the device. */
+uint64_t g_ds41_accept_gpu, g_ds41_accept_readback;
+/* -1 takes the environment. A harness forces an arm so the two passes can be
+ * alternated inside one process, which is the only comparison this machine
+ * supports: run to run the same single step has measured 37.6 to 69.0 ms. */
+static int g_ds41_full_logits_force = -1;
 /* Where a K-row step's wall time goes, so a number below the recorded one says
  * which part grew. verify is the block step, accept is the decision over the K
  * rows - forced by the oracle, so it is not what a real candidate source will
@@ -41018,6 +41044,17 @@ static void ds41_txn_counters_reset(void) {
 static uint64_t g_ds41_txn_rows_seen[4];
 static uint32_t g_ds41_txn_rows_writes[4];
 static uint32_t g_ds41_txn_row_lo[4], g_ds41_txn_row_hi[4];
+
+/* The performance path's result. A verifier commits on the accepted length and
+ * the token that replaces the first wrong candidate; the vocabulary stays on the
+ * device. row_logits and this are alternatives, not companions: asking for both
+ * is the correctness pass, which is allowed to be slow. */
+typedef struct {
+    uint32_t max_commit;
+    uint32_t accepted;
+    int next_token;
+    int done;
+} ds41_block_accept;
 
 /* What a block transaction is made of. Every one of these has to be present
  * before the block's first dispatch: a transaction missing one of them writes
@@ -41074,6 +41111,13 @@ static void ds41_decode_path_report(void) {
     /* refuse is the one that has to stay at zero: every count is a block whose
      * parked versions did not describe the positions the block says it ran, and
      * each of them refused rather than committing something plausible. */
+    /* The invariants, not percentages. Every one of these has to read zero on the
+     * performance path; a nonzero readback means the vocabulary crossed the bus. */
+    if (g_ds41_accept_gpu || g_ds41_accept_readback)
+        fprintf(stderr, "ds4:   accept: %llu blocks decided on the device, "
+                "%llu logit rows read back\n",
+                (unsigned long long)g_ds41_accept_gpu,
+                (unsigned long long)g_ds41_accept_readback);
     if (g_ds41_union_layers)
         fprintf(stderr, "ds4:   routed expert union over %llu layer-blocks: %llu pairs, "
                 "%llu distinct, %.2fx duplicate reads an expert-major operator would "
@@ -46005,7 +46049,8 @@ static DS4_MAYBE_UNUSED int ds41_graph_step_wave(ds41_gpu_graph *const *graphs,
 static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights,
-                                   float *row_logits) {
+                                   float *row_logits,
+                                                         ds41_block_accept *acc) {
     ds41_step_config();
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
@@ -46019,7 +46064,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const uint32_t rows = (uint32_t)count;
     /* Consecutive positions in one session and publishing only the frontier
      * row are separate things; a verifier wants the first and not the second. */
-    const bool prefill_only = prefill_rows == rows && !row_logits;
+    /* An accept request wants a head for every row just as row_logits does - it
+     * is the same question asked with the answer left on the device. Without it
+     * here the block was taken for a pure prefill, the head was skipped, and the
+     * device accept had nothing to read. */
+    const bool prefill_only = prefill_rows == rows && !row_logits && !acc;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* The streaming expert cache can serve a whole batch from one address
@@ -46942,16 +46991,36 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     if (ok && batch_logits)
         ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
     DS41_BSTAGE(stage_head);
+    if (ok && acc && batch_logits) {
+        /* The performance path. The queue has to close once before the host can
+         * act on the answer either way; what does not come with it is the
+         * vocabulary. Two words. */
+        uint32_t out[2] = { 0, 0 };
+        ok = ds4_gpu_dsv41_block_accept_encode(batch_logits, g->prefill_tokens,
+                                               g->block_argmax, g->block_accept,
+                                               rows, DS4_N_VOCAB,
+                                               (uint32_t)(logits_bytes / 4u),
+                                               acc->max_commit) != 0 &&
+             ds4_gpu_end_commands() != 0 &&
+             ds4_gpu_tensor_read(g->block_accept, 0, out, sizeof(out)) != 0 &&
+             ds4_gpu_begin_commands() != 0;
+        acc->accepted = out[0];
+        acc->next_token = (int)out[1];
+        acc->done = ok ? 1 : 0;
+        g_ds41_accept_gpu += ok ? 1u : 0u;
+    }
     if (ok && row_logits) {
-        /* All rows share one session's tensors, so the tail below would leave
-         * only the last row's logits behind. Take them from the batch buffer
-         * while they are all still there. */
+        /* The correctness path. All rows share one session's tensors, so the
+         * tail below would leave only the last row's logits behind; take them
+         * from the batch buffer while they are all still there. This is 16.5 MiB
+         * and a drain at K = 32, which is why it is not on the other path. */
         ok = batch_logits != NULL && ds4_gpu_end_commands() != 0;
         for (uint32_t i = 0; ok && i < rows; i++)
             ok = ds4_gpu_tensor_read(batch_logits, (uint64_t)i * logits_bytes,
                                      row_logits + (size_t)i * DS4_N_VOCAB,
                                      logits_bytes) != 0;
         if (ok) ok = ds4_gpu_begin_commands() != 0;
+        g_ds41_accept_readback += rows;
     }
     /* One session's rows all publish into the same logits tensor, so every copy
      * but the last is overwritten before anything reads it - 4.1 MB of which
@@ -47003,7 +47072,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                                    int count, uint32_t prefill_rows,
                                    const ds4_model *model, const ds4_weights *weights) {
     return ds41_graph_step_batch_logits(graphs, tokens, count, prefill_rows,
-                                        model, weights, NULL);
+                                        model, weights, NULL, NULL);
 }
 
 /* Speculative decoding rests on three things that are not safe to assume here:
@@ -48263,7 +48332,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     for (long b = 0; ok && !nobatch && b < blocks; b++) {
         ok = ds4_gpu_begin_commands() &&
              ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k,
-                                          m, w, rowbuf);
+                                          m, w, rowbuf, NULL);
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
     }
@@ -48314,7 +48383,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         for (long b = 0; ok && !nobatch && b < blocks; b++) { \
             ok = ds4_gpu_begin_commands() && \
                  ds41_graph_step_batch_logits(graphs, &tok[b * k], (int)k, (uint32_t)k, \
-                                              m, w, nologits ? NULL : rowbuf); \
+                                              m, w, nologits ? NULL : rowbuf, NULL); \
             if (ok) ok = ds4_gpu_end_commands() != 0; \
             else { (void)ds4_gpu_synchronize(); break; } \
             for (long j = 0; !nologits && j < k; j++) { \
@@ -48358,7 +48427,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
         const double _ot0 = now_sec(); \
         ok = ds4_gpu_begin_commands() && \
              ds41_graph_step_batch_logits(graphs, &tok[0], (int)k, (uint32_t)k, \
-                                          m, w, rowbuf); \
+                                          m, w, rowbuf, NULL); \
         if (ok) ok = ds4_gpu_end_commands() != 0; \
         else (void)ds4_gpu_synchronize(); \
         (dst) = (now_sec() - _ot0) * 1000.0; \
@@ -48611,7 +48680,7 @@ static void ds41_verify_selftest(ds41_gpu_graph *g, const ds4_model *m,
     if (getenv("DS4_V41_WEIGHT_READS")) {
         ds41_wread_begin();
         if (ds4_gpu_begin_commands() &&
-            ds41_graph_step_batch_logits(graphs, &tok[0], (int)k, (uint32_t)k, m, w, rowbuf))
+            ds41_graph_step_batch_logits(graphs, &tok[0], (int)k, (uint32_t)k, m, w, rowbuf, NULL))
             (void)ds4_gpu_end_commands();
         ds41_wread_report(w, (uint32_t)k);
         if (atoi(getenv("DS4_V41_WEIGHT_READS")) >= 2) ds41_contract_check(m);
@@ -84287,11 +84356,36 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     ds4_engine *e = s->engine;
     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
     for (int i = 0; i < k; i++) graphs[i] = &s->ds41_graph;
-    float *rows = malloc((size_t)k * DS4_N_VOCAB * sizeof(float));
-    if (!rows) {
+    /* Two passes, and they are alternatives. The performance pass takes the
+     * decision on the device and reads two words back; the correctness pass
+     * reads all K rows of the vocabulary so they can be compared against single
+     * steps, which is 16.5 MiB and a queue drain at K = 32.
+     * DS4_V41_VERIFY_FULL_LOGITS=1 asks for the correctness pass. */
+    /* The host path is the default because it is faster, not because it is the
+     * shape we want. Paired inside one process, block against block, taking the
+     * decision on the device cost 3.87 ms a token more than reading all K rows
+     * back and running sample_argmax over them - 31 ms a block for a million
+     * floats, which is neither bandwidth (7 us of it), nor the argmax's
+     * parallelism (two-pass did not move it), nor pipeline compilation (warming
+     * them recovered 3.5 of the original 7.39). What is left is this command
+     * layer's per-encoder cost: the accept adds three encoder boundaries inside
+     * the block's buffer, and the gate's bookkeeping runs on each.
+     *
+     * So the vocabulary crossing the bus is not what the performance path has to
+     * stop doing - it is the host deciding at all, which fixes a synchronisation
+     * point a candidate tree cannot work around. That belongs in an executor
+     * where the accept is encoded with the head and adds no boundary, not in a
+     * kernel bolted onto this one. DS4_V41_VERIFY_GPU_ACCEPT=1 runs it. */
+    const char *ga_e = getenv("DS4_V41_VERIFY_GPU_ACCEPT");
+    const bool full_logits = g_ds41_full_logits_force >= 0 ?
+        g_ds41_full_logits_force != 0 : !(ga_e && ga_e[0] && atoi(ga_e) != 0);
+    float *rows = full_logits ?
+        malloc((size_t)k * DS4_N_VOCAB * sizeof(float)) : NULL;
+    if (full_logits && !rows) {
         if (err && errlen) snprintf(err, errlen, "verify block is out of memory");
         return -1;
     }
+    ds41_block_accept accept_req = { .max_commit = (uint32_t)max_commit };
     const uint32_t pos0 = s->ds41_graph.pos;
     /* The states the block advances that the raw-ring parking does not cover.
      * Saved before the rows run and put back after, so a block that commits
@@ -84320,7 +84414,8 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
          * eight consecutive ones. That showed up as an oracle accepting five of
          * eight, which is how a wrong position looks from outside. */
         ds41_graph_step_batch_logits(graphs, candidates, k, (uint32_t)k,
-                                     &e->model, &e->weights, rows);
+                                     &e->model, &e->weights, rows,
+                                     full_logits ? NULL : &accept_req);
     const bool done = ds4_gpu_end_commands() != 0;
     g_ds41_txn_ms_verify += (now_sec() - t_verify) * 1000.0;
     if (!ok || !done) {
@@ -84335,13 +84430,33 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     int n = 1, arg_at_n = -1;
     accepted[0] = candidates[0];
     if (max_commit == 0) n = 0;
-    for (int i = 0; n > 0 && n < max_commit && i + 1 < k; i++) {
-        const int arg = sample_argmax(rows + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
-        if (arg != candidates[i + 1]) { arg_at_n = arg; break; }
-        accepted[n++] = candidates[i + 1];
+    if (!full_logits) {
+        if (!accept_req.done) {
+            free(rows);
+            ds4_session_invalidate(s);
+            if (err && errlen) snprintf(err, errlen, "verify block: the device accept did not run");
+            return -1;
+        }
+        n = (int)accept_req.accepted;
+        if (n < 0 || n > k) {
+            free(rows);
+            ds4_session_invalidate(s);
+            if (err && errlen) snprintf(err, errlen, "verify block: the device accepted %d of %d",
+                                        n, k);
+            return -1;
+        }
+        for (int i = 1; i < n; i++) accepted[i] = candidates[i];
+        arg_at_n = accept_req.next_token;
+    } else {
+        for (int i = 0; n > 0 && n < max_commit && i + 1 < k; i++) {
+            const int arg = sample_argmax(rows + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB);
+            if (arg != candidates[i + 1]) { arg_at_n = arg; break; }
+            accepted[n++] = candidates[i + 1];
+        }
+        const int next = sample_argmax(rows + (size_t)(k - 1) * DS4_N_VOCAB, DS4_N_VOCAB);
+        if (n == k) arg_at_n = next;
     }
-    const int next = sample_argmax(rows + (size_t)(k - 1) * DS4_N_VOCAB, DS4_N_VOCAB);
-    if (n == k) arg_at_n = next;
+    const int next = arg_at_n;
     free(rows);
     g_ds41_txn_ms_accept += (now_sec() - t_accept) * 1000.0;
     const double t_commit = now_sec();
@@ -85140,7 +85255,7 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                     for (long i = 0; i < k; i++) cand[i] = oracle[i];
                     const bool bok = ds4_gpu_begin_commands() != 0 &&
                         ds41_graph_step_batch_logits(graphs, cand, (int)k, (uint32_t)k,
-                                                     m, w, rowbuf) &&
+                                                     m, w, rowbuf, NULL) &&
                         ds4_gpu_end_commands() != 0;
                     ds4_session_free(s); s = NULL;
                     uint64_t differ = 0;
@@ -85321,6 +85436,10 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
     if (k < 2 || k > DS4_TP_BATCH_MAX_ROWS) return;
     (void)m; (void)w;
     const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+    /* Before anything is timed: the accept pipelines compile on first use. */
+    (void)ds4_gpu_dsv41_block_accept_warm();
+    double arm_ms[2] = { 0.0, 0.0 };
+    long arm_tok[2] = { 0, 0 };
     long m_tokens = 64;
     while (m_tokens % k) m_tokens--;
     if (pos0 + (uint32_t)m_tokens >= 128u) {
@@ -85398,9 +85517,17 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
     double block_ms = 0;
     for (long i = 0; i + k <= m_tokens; i += k) {
         if (i == 0) ds41_txn_counters_reset();
+        /* DS4_V41_ORACLE_READBACK_AB=1 alternates the two passes block by block,
+         * so the vocabulary readback is priced against its own neighbours rather
+         * than against another run. */
+        const bool rb_ab = getenv("DS4_V41_ORACLE_READBACK_AB") != NULL;
+        const int arm = rb_ab ? (int)((i / k) & 1) : -1;
+        if (rb_ab) g_ds41_full_logits_force = arm;
         const double t0 = now_sec();
         const int n = ds4_session_verify_block(s, oracle + i, (int)k, acc, err, sizeof(err));
-        block_ms += (now_sec() - t0) * 1000.0;
+        const double lap = (now_sec() - t0) * 1000.0;
+        block_ms += lap;
+        if (rb_ab) { arm_ms[arm] += lap; arm_tok[arm] += n > 0 ? n : 0; }
         if (n != (int)k) {
             fprintf(stderr, "ds4: oracle block: block at %ld committed %d of %ld: %s\n",
                     i, n, k, err);
@@ -85448,6 +85575,14 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
         }
     }
 
+    g_ds41_full_logits_force = -1;
+    if (arm_tok[0] && arm_tok[1])
+        fprintf(stderr, "ds4:   readback arms, paired in process: device accept "
+                "%.2f ms a token over %ld, full logits %.2f ms a token over %ld, "
+                "difference %+.2f\n",
+                arm_ms[0] / (double)arm_tok[0], arm_tok[0],
+                arm_ms[1] / (double)arm_tok[1], arm_tok[1],
+                arm_ms[1] / (double)arm_tok[1] - arm_ms[0] / (double)arm_tok[0]);
     fprintf(stderr, "ds4: oracle block k=%ld from position %u: %ld tokens committed in "
             "%.1f ms = %.2f ms a token, %.2f tok/s\n",
             k, pos0, committed, block_ms, block_ms / (double)committed,
