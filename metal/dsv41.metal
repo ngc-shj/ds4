@@ -291,6 +291,13 @@ struct ds4_metal_args_dsv41_candidates {
     uint rows;
     uint start;
     uint ratio;
+    /* Row strides of the output and of the block mask, in floats. Zero keeps
+     * the packed layout these kernels always assumed - a row is exactly as wide
+     * as the visible window - which is only true when the caller allocated for
+     * this width. A block's per-row buffers are allocated for the context, so
+     * batching the rows needs the real stride rather than a derived one. */
+    uint out_stride;
+    uint mask_stride;
 };
 
 kernel void kernel_dsv41_candidate_blocks(
@@ -307,7 +314,8 @@ kernel void kernel_dsv41_candidate_blocks(
     for (uint i = index.x * 8u; i < min(visible, (index.x + 1u) * 8u); i++)
         best = max(best, scores[(ulong)index.y * args.width + i]);
     if (visible && index.x == (visible - 1u) / 8u) best = INFINITY;
-    blocks[(ulong)index.y * count + index.x] = best;
+    const uint out_stride = args.out_stride ? args.out_stride : count;
+    blocks[(ulong)index.y * out_stride + index.x] = best;
 }
 
 kernel void kernel_dsv41_candidate_filter(
@@ -319,9 +327,10 @@ kernel void kernel_dsv41_candidate_filter(
     if (index.x >= args.width || index.y >= args.rows) return;
     const ulong offset = (ulong)index.y * args.width + index.x;
     const uint blocks = (args.width + 7u) / 8u;
+    const uint mask_stride = args.mask_stride ? args.mask_stride : blocks;
     const uint visible = min(args.width, (args.start + index.y + 1u) / args.ratio);
     out[offset] = index.x < visible &&
-        block_mask[(ulong)index.y * blocks + index.x / 8u] == 0.0f
+        block_mask[(ulong)index.y * mask_stride + index.x / 8u] == 0.0f
         ? scores[offset] : -INFINITY;
 }
 

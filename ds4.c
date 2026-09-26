@@ -19046,6 +19046,73 @@ static uint64_t metal_graph_q8_0_row_bytes(uint64_t in_dim) {
  * Single-tier (g_n_gpus <= 1) is byte-equivalent regardless of placement,
  * because metal_graph_alloc_kv_cache_tensor_on short-circuits to the
  * legacy 1-arg helpers when g_n_gpus <= 1. */
+/* Which line asked for a view, not just how many were made. "view 0" is a claim
+ * about every site on the path, and the first attempt at it converted the sites
+ * that were easy to find and moved the count by 16 of 767 - the ones that
+ * mattered were somewhere else entirely. Tallying by line is how that stops
+ * being a guess. The table is tiny and the tally is two increments, so it stays
+ * on: a site that reappears has to show up in the report, not in a hunt. */
+enum { DS41_VIEW_SITES = 64 };
+static struct ds41_view_site {
+    int      line;
+    uint64_t calls;      /* the whole process */
+    uint64_t block;      /* inside a verify block only */
+} g_ds41_view_sites[DS41_VIEW_SITES];
+static uint64_t g_ds41_view_site_overflow;
+/* Session setup allocates 32 row views a row and dwarfs everything else in a
+ * cumulative count - 311,296 of 311,334 in the first reading, which said nothing
+ * about the block. Only what a block does is a zero condition. */
+static int g_ds41_view_block_scope;
+
+static ds4_gpu_tensor *ds41_view_at(int line, const ds4_gpu_tensor *base,
+                                    uint64_t off, uint64_t bytes) {
+    uint32_t i = 0;
+    for (; i < DS41_VIEW_SITES && g_ds41_view_sites[i].line; i++)
+        if (g_ds41_view_sites[i].line == line) break;
+    if (i < DS41_VIEW_SITES) {
+        g_ds41_view_sites[i].line = line;
+        g_ds41_view_sites[i].calls++;
+        if (g_ds41_view_block_scope) g_ds41_view_sites[i].block++;
+    } else {
+        g_ds41_view_site_overflow++;
+    }
+    return ds4_gpu_tensor_view(base, off, bytes);
+}
+#define ds4_gpu_tensor_view(base, off, bytes) \
+    ds41_view_at(__LINE__, (base), (off), (bytes))
+
+static void ds41_view_site_report(void) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < DS41_VIEW_SITES && g_ds41_view_sites[i].line; i++)
+        total += g_ds41_view_sites[i].block;
+    uint64_t metal_first[2] = {0};
+    ds4_gpu_view_sites_metal(metal_first);
+    if (!total && !metal_first[0] && !metal_first[1]) return;
+    fprintf(stderr, "ds4:   views by ds4.c line inside verify blocks (%llu total, "
+            "%llu sites over the table):",
+            (unsigned long long)total, (unsigned long long)g_ds41_view_site_overflow);
+    /* Descending by count, printed in place: at most 64 entries, so a selection
+     * sort here is cheaper than anything that needs a second array. */
+    for (uint32_t shown = 0; shown < 8; shown++) {
+        uint32_t best = DS41_VIEW_SITES;
+        uint64_t best_calls = 0;
+        for (uint32_t i = 0; i < DS41_VIEW_SITES && g_ds41_view_sites[i].line; i++)
+            if (g_ds41_view_sites[i].block > best_calls) {
+                best_calls = g_ds41_view_sites[i].block;
+                best = i;
+            }
+        if (best == DS41_VIEW_SITES) break;
+        fprintf(stderr, " %d:%llu", g_ds41_view_sites[best].line,
+                (unsigned long long)best_calls);
+        g_ds41_view_sites[best].block = 0;
+    }
+    uint64_t metal_sites[2] = {0};
+    ds4_gpu_view_sites_metal(metal_sites);
+    fprintf(stderr, " | ds4_metal.m comp_row:%llu kslice_row:%llu (whole process)",
+            (unsigned long long)metal_sites[0], (unsigned long long)metal_sites[1]);
+    fprintf(stderr, "\n");
+}
+
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
         const ds4_weights     *weights,
@@ -40174,7 +40241,8 @@ static uint32_t ds41_carry_cap(uint32_t ctx) {
     X(selected_kv, DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
     X(block_selected_kv, (uint64_t)DS4_TP_BATCH_MAX_ROWS * \
                          DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM) \
-    X(block_scores, (g->ctx + 7u) / 8u) X(block_selected, 2048) \
+    X(block_scores, (uint64_t)DS4_TP_BATCH_MAX_ROWS * ((g->ctx + 7u) / 8u)) \
+    X(block_selected, (uint64_t)DS4_TP_BATCH_MAX_ROWS * 2048u) \
     X(block_mask, (g->ctx + 7u) / 8u) \
     X(heads, DS4_N_HEAD * DS4_N_HEAD_DIM) X(low, DS4_N_OUT_GROUP * DS4_N_LORA_O) \
     X(route_logits, DS4_N_EXPERT) X(route_probs, DS4_N_EXPERT) \
@@ -40391,67 +40459,6 @@ static ds4_gpu_tensor *ds41_view(const ds4_gpu_tensor *base, uint64_t off, uint6
     if (!v) return NULL;
     g_ds41_views[g_ds41_view_count++] = (struct ds41_view_entry){ base, off, bytes, v };
     return v;
-}
-
-/* Which line asked for a view, not just how many were made. "view 0" is a claim
- * about every site on the path, and the first attempt at it converted the sites
- * that were easy to find and moved the count by 16 of 767 - the ones that
- * mattered were somewhere else entirely. Tallying by line is how that stops
- * being a guess. The table is tiny and the tally is two increments, so it stays
- * on: a site that reappears has to show up in the report, not in a hunt. */
-enum { DS41_VIEW_SITES = 64 };
-static struct ds41_view_site {
-    int      line;
-    uint64_t calls;      /* the whole process */
-    uint64_t block;      /* inside a verify block only */
-} g_ds41_view_sites[DS41_VIEW_SITES];
-static uint64_t g_ds41_view_site_overflow;
-/* Session setup allocates 32 row views a row and dwarfs everything else in a
- * cumulative count - 311,296 of 311,334 in the first reading, which said nothing
- * about the block. Only what a block does is a zero condition. */
-static int g_ds41_view_block_scope;
-
-static ds4_gpu_tensor *ds41_view_at(int line, const ds4_gpu_tensor *base,
-                                    uint64_t off, uint64_t bytes) {
-    uint32_t i = 0;
-    for (; i < DS41_VIEW_SITES && g_ds41_view_sites[i].line; i++)
-        if (g_ds41_view_sites[i].line == line) break;
-    if (i < DS41_VIEW_SITES) {
-        g_ds41_view_sites[i].line = line;
-        g_ds41_view_sites[i].calls++;
-        if (g_ds41_view_block_scope) g_ds41_view_sites[i].block++;
-    } else {
-        g_ds41_view_site_overflow++;
-    }
-    return ds4_gpu_tensor_view(base, off, bytes);
-}
-#define ds4_gpu_tensor_view(base, off, bytes) \
-    ds41_view_at(__LINE__, (base), (off), (bytes))
-
-static void ds41_view_site_report(void) {
-    uint64_t total = 0;
-    for (uint32_t i = 0; i < DS41_VIEW_SITES && g_ds41_view_sites[i].line; i++)
-        total += g_ds41_view_sites[i].block;
-    if (!total) return;
-    fprintf(stderr, "ds4:   views by ds4.c line inside verify blocks (%llu total, "
-            "%llu sites over the table):",
-            (unsigned long long)total, (unsigned long long)g_ds41_view_site_overflow);
-    /* Descending by count, printed in place: at most 64 entries, so a selection
-     * sort here is cheaper than anything that needs a second array. */
-    for (uint32_t shown = 0; shown < 8; shown++) {
-        uint32_t best = DS41_VIEW_SITES;
-        uint64_t best_calls = 0;
-        for (uint32_t i = 0; i < DS41_VIEW_SITES && g_ds41_view_sites[i].line; i++)
-            if (g_ds41_view_sites[i].block > best_calls) {
-                best_calls = g_ds41_view_sites[i].block;
-                best = i;
-            }
-        if (best == DS41_VIEW_SITES) break;
-        fprintf(stderr, " %d:%llu", g_ds41_view_sites[best].line,
-                (unsigned long long)best_calls);
-        g_ds41_view_sites[best].block = 0;
-    }
-    fprintf(stderr, "\n");
 }
 
 /* The bases belong to a graph, so a graph going away takes every view of it.
@@ -43307,7 +43314,6 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                    count * DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
                !ds41_project_rows(b->index_weights, m, l->indexer_proj, b->norm, count, true))
         return false;
-    ds41_gpu_graph row = *g;
     /* Only 32 score rows are live. Batched sorting retains the original
      * per-row causal width, including padding and tie order. */
     const bool packed = count >= 8u && ds4_gpu_dsv41_tensor_ops_available() &&
@@ -43325,23 +43331,42 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                 g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
             ds4_gpu_dsv41_indexer_scores_batch(g->index_scores,
                 q, weights, g->index_cache[owner], n_comp, rows, start + off, ratio));
-        const bool batch_topk = (start + off + 1u) / ratio >= 1024u &&
-            !getenv("DS4_METAL_DISABLE_V41_BATCH_TOPK");
-        for (uint32_t t = 0; ok && (!batch_topk || il >= 20u) && t < rows; t++) {
-            row.pos = start + off + t;
-            row.selected_comp = g->rows_view[off + t].selected_comp;
-            row.block_mask = g->rows_view[off + t].block_mask;
-            row.index_scores = ds4_gpu_tensor_view(g->index_scores,
-                (uint64_t)t * n_comp * sizeof(float), (uint64_t)n_comp * sizeof(float));
-            ok = row.index_scores && (batch_topk ? ds41_attention_candidates(&row, il) :
-                                                  ds41_attention_pick(&row, il));
-            ds4_gpu_tensor_free(row.index_scores);
-        }
-        if (ok && batch_topk) {
-            const uint64_t id_bytes = DS4_N_INDEXER_TOP_K * sizeof(int32_t);
-            ds4_gpu_tensor *ids = ds41_view(b->selected_comp, off * id_bytes, rows * id_bytes);
-            ok = ids && ds4_gpu_dsv41_indexer_topk_batch(ids, g->index_scores,
-                                                       n_comp, rows, start + off, ratio);
+        /* Still a row at a time, and no longer a view a row. The kernels here
+         * take both the destination's row stride and an element offset into the
+         * scores, so naming row t costs an argument rather than a tensor object:
+         * the dispatch, its arguments and its arithmetic are the ones the per-row
+         * call always made.
+         *
+         * One dispatch for the whole chunk is the next step and a separate one.
+         * It needs the causal argsort, which refuses when the first row's
+         * visible window is no wider than half a sort block - 16 keys against a
+         * block of 32 at start=31 - so it holds at long context and not here,
+         * and swapping kernels is a change that has to be verified on its own. */
+        const uint32_t mask_row = (g->ctx + 7u) / 8u;
+        for (uint32_t t = 0; ok && t < rows; t++) {
+            const uint32_t pos = start + off + t;
+            const uint32_t row_comp = ratio ? (pos + 1u) / ratio : 0u;
+            if (!row_comp || !ds41_index_source(il)) continue;
+            const uint32_t row_blocks = (row_comp + 7u) / 8u;
+            const uint32_t row_top = row_comp < DS4_N_INDEXER_TOP_K ?
+                                     row_comp : DS4_N_INDEXER_TOP_K;
+            const uint64_t score_off = (uint64_t)t * n_comp;
+            if (il == 20u) {
+                const uint32_t btop = row_blocks < 2048u ? row_blocks : 2048u;
+                ok = ds4_gpu_dsv41_candidate_blocks_rows(g->block_scores, g->index_scores,
+                         row_comp, 1, pos, ratio, mask_row, score_off) &&
+                     ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores,
+                         row_blocks, 1, btop) &&
+                     ds4_gpu_dsv4_topk_mask_rows(g->rows_view[off + t].block_mask,
+                         g->block_selected, row_blocks, 1, btop, 0, 0);
+            } else if (il > 20u) {
+                ok = ds4_gpu_dsv41_candidate_filter_rows(g->index_scores,
+                         g->rows_view[off + t].block_mask, row_comp, 1, pos, ratio, 0,
+                         score_off);
+            }
+            if (ok)
+                ok = ds4_gpu_dsv41_indexer_topk_rows(g->rows_view[off + t].selected_comp,
+                         g->index_scores, row_comp, 1, row_top, 0, 0, 0, score_off);
         }
         if (!ok) return false;
     }

@@ -14,6 +14,12 @@ struct ds4_metal_args_argsort {
     int32_t  top_k;
     uint32_t causal_start;
     uint32_t causal_ratio;
+    /* Row stride of the destination, in indices. Zero keeps the stride the
+     * result's own width implies, which is what every caller that owns a
+     * tightly packed output wants. A caller writing into a row of a buffer
+     * allocated for the largest top-k has a wider stride than this result, and
+     * deriving it would put row 1 inside row 0. */
+    uint32_t dst_stride;
 };
 
 struct ds4_metal_args_argsort_merge {
@@ -35,6 +41,9 @@ struct ds4_metal_args_argsort_merge {
     uint32_t causal_ratio;
     uint32_t block_width;
     uint32_t block_top_k;
+    /* As above, and set only on the merge that writes the final result: the
+     * intermediate passes address the scratch by its own work width. */
+    uint32_t dst_stride;
 };
 
 typedef void (argsort_t)(
@@ -140,7 +149,8 @@ kernel void kernel_argsort_f32_i32(
 
     // copy the result to dst without the padding
     if (i0 + col < work_width && col < args.top_k) {
-        dst += i0 + args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
+        const int dst_row = args.dst_stride ? int(args.dst_stride) : args.ne0;
+        dst += i0 + dst_row*i01 + dst_row*args.ne1*i02 + dst_row*args.ne1*args.ne2*i03;
 
         dst[col] = shuffle ? reg_idx : shmem_i32[col];
     }
@@ -198,10 +208,11 @@ kernel void kernel_argsort_merge_f32_i32(
 
     device const int32_t * tmp1 = tmp0 + args.len;
 
+    const int dst_row = args.dst_stride ? int(args.dst_stride) : args.top_k;
     dst += start
-        + i01*args.top_k
-        + i02*args.top_k*args.ne01
-        + i03*args.top_k*args.ne01*args.ne02;
+        + i01*dst_row
+        + i02*dst_row*int(args.ne01)
+        + i03*dst_row*int(args.ne01)*int(args.ne02);
 
     device const float * src0_row = (device const float *)(src0
         + args.nb01*i01

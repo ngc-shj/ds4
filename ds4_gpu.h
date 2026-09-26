@@ -524,7 +524,10 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                k_cnt,
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t                x_elem_off);
+        uint64_t                x_elem_off,
+        /* Element offset of the destination row, so a caller writing one row of
+         * a wider buffer needs no tensor view for it. */
+        uint64_t                out_elem_off);
 /* CUDA input rows contain only the owned contiguous K slice. Metal input
  * rows span full_in_dim and the kernel reads the slice at k_off within them.
  * Both backends produce full-width output rows. */

@@ -112,6 +112,35 @@ void ds4_gpu_moe_block_miss_reset(void);
  * parked makes progress on the readback path instead of parking again. */
 void ds4_gpu_stream_block_residency_suspend(void);
 uint64_t ds4_gpu_resident_addr_batch_layers(void);
+/* [0] the compressor pool's row view, [1] the attention output k-slice tail. */
+void ds4_gpu_view_sites_metal(uint64_t out[2]);
+
+/* Block forms of the candidate and top-k selection: the row strides of the
+ * outputs are named instead of derived from this call's widths, which is what
+ * lets a block's rows share one dispatch when their buffers are allocated for
+ * the context rather than for the visible window. */
+int ds4_gpu_dsv41_candidate_blocks_rows(ds4_gpu_tensor *blocks,
+                                        const ds4_gpu_tensor *scores,
+                                        uint32_t width, uint32_t rows,
+                                        uint32_t start, uint32_t ratio,
+                                        uint32_t blocks_row_stride,
+                                        uint64_t scores_elem_off);
+int ds4_gpu_dsv41_candidate_filter_rows(ds4_gpu_tensor *scores,
+                                        const ds4_gpu_tensor *block_mask,
+                                        uint32_t width, uint32_t rows,
+                                        uint32_t start, uint32_t ratio,
+                                        uint32_t mask_row_stride,
+                                        uint64_t scores_elem_off);
+int ds4_gpu_dsv4_topk_mask_rows(ds4_gpu_tensor *mask,
+                                const ds4_gpu_tensor *topk,
+                                uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
+                                uint32_t topk_row_stride, uint32_t mask_row_stride);
+int ds4_gpu_dsv41_indexer_topk_rows(ds4_gpu_tensor *selected,
+                                    const ds4_gpu_tensor *scores,
+                                    uint32_t width, uint32_t rows, uint32_t top_k,
+                                    uint32_t start, uint32_t ratio,
+                                    uint32_t selected_row_stride,
+                                    uint64_t scores_elem_off);
 int ds4_gpu_moe_block_miss_read(uint32_t *records,
                                 uint32_t  capacity,
                                 uint32_t *count,
