@@ -40444,6 +40444,18 @@ typedef struct {
     /* Set when the device published the accepted prefix, so the host commit
      * knows there is nothing left to copy. */
     uint32_t device_published;
+    /* Pass control for a block that stops at one layer's routed phase and is
+     * resumed from there. Layers are stored plus one, so zero is off.
+     *   stop_before_routed  end the pass once layer L's router and shared expert
+     *                       have run, before any routed expert does
+     *   resume_routed       start the pass at layer L's routed experts
+     *   resume_row0         the first block row this pass runs
+     *   resume_accept_rows  rows the accept spans; 0 stores argmax answers only */
+    uint32_t stop_before_routed;
+    uint32_t resume_routed;
+    uint32_t resume_row0;
+    uint32_t resume_accept_rows;
+    uint32_t pass_stopped;
 } ds41_gpu_graph;
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
@@ -41363,6 +41375,8 @@ static uint32_t g_ds41_park_last_first_layer_misses;
 /* Set by the block step when it refuses for a missing expert, so the caller can
  * tell a park from a step that broke. Read and cleared in one place. */
 static bool g_ds41_park_refused;
+/* Blocks that ran as more than one pass, resumed at a layer's routed phase. */
+static uint64_t g_ds41_resume_passes;
 /* How many leading rows of the parked block ran on the model's own state. The
  * caller commits that many and discards the rest. */
 static uint32_t g_ds41_park_last_prefix;
@@ -41423,6 +41437,10 @@ static void ds41_decode_path_report(void) {
                 (unsigned long long)ds4_gpu_resident_addr_batch_layers());
         fprintf(stderr, "\n");
         ds41_view_site_report();
+        if (g_ds41_resume_passes)
+            fprintf(stderr, "ds4:   resumed: %llu blocks ran as two passes, the second "
+                    "starting at a layer's routed experts\n",
+                    (unsigned long long)g_ds41_resume_passes);
         if (g_ds41_park_blocks)
             fprintf(stderr, "ds4:   parked: %llu blocks, %llu of them with the "
                     "accepted prefix cut short, over %llu missing "
@@ -41440,6 +41458,15 @@ static void ds41_decode_path_report(void) {
                 (unsigned long long)g_ds41_accept_gpu,
                 (unsigned long long)g_ds41_accept_readback,
                 g_ds41_acc_ms[0], g_ds41_acc_ms[1], g_ds41_acc_ms[2], g_ds41_acc_ms[3]);
+    /* The price of the block boundary, in the same run: the commit section is
+     * the carry commit's own command scope plus the host bookkeeping after the
+     * accept is read, which is everything the second close costs. */
+    if (g_ds41_accept_gpu)
+        fprintf(stderr, "ds4:   block boundary: verify %.2f, accept %.2f, commit %.2f ms "
+                "total over %llu blocks (%.3f ms a block in commit)\n",
+                g_ds41_txn_ms_verify, g_ds41_txn_ms_accept, g_ds41_txn_ms_commit,
+                (unsigned long long)g_ds41_accept_gpu,
+                g_ds41_txn_ms_commit / (double)g_ds41_accept_gpu);
     if (g_ds41_union_layers)
         fprintf(stderr, "ds4:   routed expert union over %llu layer-blocks: %llu pairs, "
                 "%llu distinct, %.2fx duplicate reads an expert-major operator would "
@@ -43725,9 +43752,26 @@ static bool ds41_moe_union_note(ds41_prefill_row *b, uint32_t il, uint32_t count
     return true;
 }
 
+/* The two halves of a layer's MoE, so a pass can stop between them and another
+ * can start there. FRONT is the router and the shared expert - everything whose
+ * inputs a missing routed expert cannot poison - and ROUTED is the routed
+ * experts and what consumes them. */
+enum { DS41_MOE_FRONT = 1, DS41_MOE_ROUTED = 2, DS41_MOE_ALL = 3 };
+
+static bool ds41_moe_batch_phase(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t il, uint32_t count,
+                                 bool shared_owner, bool force_resident, int phase);
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner, bool force_resident) {
+    return ds41_moe_batch_phase(g, m, l, il, count, shared_owner, force_resident,
+                                DS41_MOE_ALL);
+}
+
+static bool ds41_moe_batch_phase(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t il, uint32_t count,
+                                 bool shared_owner, bool force_resident, int phase) {
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
@@ -43747,6 +43791,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
      * short-circuiting is the same. */
     const uint64_t abl_eb = (uint64_t)count * DS4_N_EMBD * sizeof(float);
     const bool shared_here_abl = !(shared_owner && g->tp_rank != (il & 1u));
+    if (phase & DS41_MOE_FRONT) {
     if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
         !ds41_route_batch(g, m, l, count) ||
         !ds41_moe_union_note(b, il, count) ||
@@ -43773,6 +43818,8 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         }
     }
     if (!ds41_moe_split_note(split_ms, &split_t0, il, count, "shared")) return false;
+    }
+    if (!(phase & DS41_MOE_ROUTED)) return true;
     /* Seam ROUTED: the routed experts. The streaming cache's accounting goes
      * with them, so in a regime that misses this figure would carry the load
      * too; the runs it is quoted from report 0 misses and 0 evictions a token. */
@@ -46441,6 +46488,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     /* Cleared here as well as where it is read: a caller that does not check it
      * would otherwise leave it set for whoever fails next. */
     g_ds41_park_refused = false;
+    if (zc_scope) ds4_gpu_enc_trace_mark("verify-block-begin");
     const int view_scope_was = g_ds41_view_block_scope;
     if (zc_scope) g_ds41_view_block_scope = 1;
     const bool shared_owner = g->tp_world == 2 &&
@@ -46514,13 +46562,27 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         ok = queries[i] && heads[i] && (!row_gather || gathers[i]);
     }
     const float initial_pre[] = {1, 0, 0, 0};
+    /* A resumed pass starts part-way into the block: its rows' state is already
+     * in the batch buffers at (layer, routed), put there by the pass that
+     * stopped. Only what the host computes for itself - positions and the
+     * Engram hash chain the commit parks - is rebuilt; nothing is uploaded or
+     * embedded again. */
+    const uint32_t resume_layer = g->resume_routed;
+    const bool resuming = resume_layer != 0;
+    const uint32_t resume_row0 = resuming ? g->resume_row0 : 0u;
+    if (resuming && (resume_row0 != 0 || row_logits || !batch_stream_experts)) {
+        /* Row-offset passes and host logit readback come in a later step. */
+        ok = false;
+    }
+    g->pass_stopped = 0;
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         uint32_t ids[2][DS4_ENGRAM_COLS];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
-        positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
+        positions[i] = s->pos + resume_row0 + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
+        if (resuming) continue;
         float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
             engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
         for (unsigned table = 0; ok && table < 2; table++)
@@ -46534,7 +46596,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     /* One embed for the block. ds4_gpu_embed_tokens_hc_tensor has been here all
      * along and the token ids are already on the GPU - prefill_tokens is
      * written above - so this was K dispatches for want of a call. */
-    if (ok && ds41_batch_fuse())
+    if (ok && ds41_batch_fuse() && !resuming)
         ok = ds4_gpu_embed_tokens_hc_tensor(active.residual, g->prefill_tokens,
                 model->map, model->size, weights->token_embd->abs_offset,
                 DS4_N_VOCAB, rows, DS4_N_EMBD, DS4_N_HC) != 0;
@@ -46610,7 +46672,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     }
     const bool block_txn = block_txn_want;
     g->block_txn_active = block_txn ? 1u : 0u;
-    if (block_txn) { g->block_carry_owners = 0; g->txn_epoch++; }
+    /* A resumed pass belongs to the transaction the first pass opened: the
+     * carry versions it parked and the epoch its tags carry are still live. */
+    if (block_txn && !resuming) { g->block_carry_owners = 0; g->txn_epoch++; }
     /* The block is about to be compared against, and committed alongside, the
      * positions the singles produced. Two arithmetics cannot share a prefix. */
     {
@@ -46633,7 +46697,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const char *low_b_e = getenv("DS4_METAL_V41_BLOCK_LOW_BATCH");
     const bool low_batch = block_levels && g->tp_world == 1 &&
                            (block_all || (low_b_e && low_b_e[0] && atoi(low_b_e) != 0));
-    if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
+    if (ok && !resuming) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens,
+                                                   rows * sizeof(int));
     /* Which part of a k-row step actually grows with k. Splitting it costs a
      * command buffer boundary per stage, so the totals run high; the shares
      * between them are the point. */
@@ -46745,6 +46810,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
+        /* Layers behind the resume point ran in the pass that stopped; their KV,
+         * compressed rows and carry versions are in the transaction already. */
+        if (resuming && il + 1u < resume_layer) continue;
+        const bool resume_here = resuming && il + 1u == resume_layer;
+        const bool stop_here = g->stop_before_routed && il + 1u == g->stop_before_routed;
+        if (zc_scope) { char mk[24]; snprintf(mk, sizeof(mk), "layer %u", il);
+                        ds4_gpu_enc_trace_mark(mk); }
+        if (resume_here) goto resume_routed_entry;
         if (ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
             for (int i = 0; ok && i < count; i++) {
@@ -47244,13 +47317,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows);
+resume_routed_entry:
         if (ok) {
             /* The batched routed kernels bind resident expert tensors. The
              * streaming expert cache is wired into the single-row path, so the
              * rows run through that, still inside this command buffer: one host
              * round trip per step instead of one per token. */
-            if (batch_stream_experts) {
-                ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, false);
+            if ((resume_here || stop_here) && !batch_stream_experts) {
+                ok = false;
+            } else if (batch_stream_experts) {
+                ok = ds41_moe_batch_phase(g, model, l, il, rows, shared_owner, false,
+                                          resume_here ? DS41_MOE_ROUTED :
+                                          stop_here ? DS41_MOE_FRONT : DS41_MOE_ALL);
+                if (ok && stop_here) { g->pass_stopped = il + 1u; break; }
             } else if (g->streaming) {
                 if (!moe_rows && !(moe_rows = malloc((size_t)count * sizeof(*moe_rows))))
                     ok = false;
@@ -47363,6 +47442,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     }
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
+    /* A pass that stopped at a layer's routed phase has no head to run: its rows
+     * are mid-layer, and the pass that resumes them runs the rest. */
+    if (ok && g->pass_stopped) goto pass_done;
     /* The final FFN intermediates are dead. Reuse that storage for the head
      * rather than allocating another vocabulary-sized buffer per session. */
     ds4_gpu_tensor *batch_logits = NULL;
@@ -47420,12 +47502,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
          * ds4_gpu_compute_encoder reuses the one encoder and
          * ds4_gpu_end_compute_encoder is a no-op, so this path adds none. */
         const double e0 = now_sec();
-        ok = ds4_gpu_dsv41_block_accept_encode(batch_logits, g->prefill_tokens,
-                                               g->block_argmax, g->block_accept,
-                                               rows, DS4_N_VOCAB,
-                                               (uint32_t)(logits_bytes / 4u),
-                                               acc->max_commit) != 0;
+        /* A pass that is not the last stores its rows' answers where the block's
+         * rows sit and accepts nothing: the storage its logits are in is the next
+         * pass's MoE scratch, and the accept needs every row's answer. */
+        const uint32_t accept_rows = resuming ? g->resume_accept_rows : rows;
+        ok = ds4_gpu_dsv41_block_accept_encode_ex(batch_logits, g->prefill_tokens,
+                                                  g->block_argmax, g->block_accept,
+                                                  rows, DS4_N_VOCAB,
+                                                  (uint32_t)(logits_bytes / 4u),
+                                                  acc->max_commit, resume_row0,
+                                                  accept_rows) != 0;
         const double e1 = now_sec();
+        if (!accept_rows) goto accept_done;
         /* The publish rides in the same buffer as the accept that decided it, so
          * the rows land without the host learning the count first. That is what
          * makes the read after this a bookkeeping read rather than a dependency,
@@ -47459,6 +47547,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         acc->done = ok ? 1 : 0;
         g_ds41_accept_gpu += ok ? 1u : 0u;
     }
+accept_done:
     if (ok && row_logits) {
         /* The correctness path. All rows share one session's tensors, so the
          * tail below would leave only the last row's logits behind; take them
@@ -47505,6 +47594,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     stage_tail);
 #undef DS41_BSTAGE
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
+pass_done:
     /* active.*, queries, heads and gathers are cached views owned by the graph:
      * nothing to release at the end of a block. */
     free(engram);
@@ -47582,6 +47672,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         }
     }
     g_ds41_view_block_scope = view_scope_was;
+    if (zc_scope) ds4_gpu_enc_trace_mark("verify-block-end");
     if (zc_scope) {
         uint64_t zc_after[8];
         ds4_gpu_zero_conditions(zc_after);
@@ -85466,7 +85557,19 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     g_ds41_txn_begin++;
     g_ds41_txn_verify_rows += (uint64_t)k;
     const double t_verify = now_sec();
-    const bool ok = ds4_gpu_begin_commands() != 0 &&
+    /* DS4_V41_RESUME_TEST=<layer> runs the block as two passes with no miss
+     * involved: the first stops once that layer's router and shared expert have
+     * run, the second starts there with the routed experts. The answer has to be
+     * the uninterrupted block's, bit for bit, before a miss is allowed anywhere
+     * near the seam. */
+    static int resume_test = -2;
+    if (resume_test == -2) {
+        const char *rt = getenv("DS4_V41_RESUME_TEST");
+        resume_test = rt && rt[0] ? atoi(rt) : -1;
+        if (resume_test >= (int)DS4_N_LAYER) resume_test = -1;
+    }
+    if (resume_test >= 0) s->ds41_graph.stop_before_routed = (uint32_t)resume_test + 1u;
+    bool ok = ds4_gpu_begin_commands() != 0 &&
         /* prefill_rows = k, not 0. The batch step sets positions[i] = pos +
          * (i > 0 && i < prefill_rows ? i : 0), so at 0 every row lands on the
          * same position and the block is eight copies of one step rather than
@@ -85477,6 +85580,26 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
                                      full_logits ? NULL : &accept_req,
                                      full_logits ? DS41_STEP_VERIFY_CORRECTNESS :
                                                    DS41_STEP_VERIFY_PRODUCTION);
+    s->ds41_graph.stop_before_routed = 0;
+    if (ok && resume_test >= 0) {
+        if (s->ds41_graph.pass_stopped != (uint32_t)resume_test + 1u) {
+            if (err && errlen) snprintf(err, errlen, "resume test: the first pass did not "
+                                        "stop at layer %d", resume_test);
+            ok = false;
+        } else {
+            g_ds41_resume_passes++;
+            s->ds41_graph.resume_routed = (uint32_t)resume_test + 1u;
+            s->ds41_graph.resume_row0 = 0;
+            s->ds41_graph.resume_accept_rows = (uint32_t)k;
+            ok = ds41_graph_step_batch_logits(graphs, candidates, k, (uint32_t)k,
+                                              &e->model, &e->weights, rows,
+                                              full_logits ? NULL : &accept_req,
+                                              full_logits ? DS41_STEP_VERIFY_CORRECTNESS :
+                                                            DS41_STEP_VERIFY_PRODUCTION);
+            s->ds41_graph.resume_routed = 0;
+            s->ds41_graph.resume_accept_rows = 0;
+        }
+    }
     const bool done = ds4_gpu_end_commands() != 0;
     g_ds41_txn_ms_verify += (now_sec() - t_verify) * 1000.0;
     if (!ok || !done) {

@@ -100,6 +100,7 @@ void ds4_gpu_zero_conditions(uint64_t out[8]);
 /* Layer-blocks whose routed MoE took the full per-layer expert address table:
  * no selected readback and no cache pin, so no queue boundary either. */
 uint64_t ds4_gpu_full_addr_batch_layers(void);
+void ds4_gpu_enc_trace_mark(const char *what);
 
 /* The verify block's expert miss list, decided on the device. Reset before the
  * block, appended to by every routed layer without a queue boundary, and read
@@ -181,6 +182,15 @@ int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
                                      uint32_t depth, uint32_t row_floats,
                                      uint32_t ring_cap, uint32_t delta_start,
                                      uint32_t cap);
+/* Argmax of `rows` logits rows into answers argmax_base.., then, when
+ * accept_rows is non-zero, the accept over answers 0..accept_rows. */
+int ds4_gpu_dsv41_block_accept_encode_ex(const ds4_gpu_tensor *logits,
+                                         const ds4_gpu_tensor *tokens,
+                                         ds4_gpu_tensor *argmax,
+                                         ds4_gpu_tensor *result,
+                                         uint32_t rows, uint32_t n_vocab,
+                                         uint32_t row_floats, uint32_t max_commit,
+                                         uint32_t argmax_base, uint32_t accept_rows);
 int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
                                       const ds4_gpu_tensor *tokens,
                                       ds4_gpu_tensor *argmax,

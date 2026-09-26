@@ -32,9 +32,15 @@ static FILE *ds4_enc_trace_file(void) {
 }
 
 static void ds4_enc_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* DS4_METAL_V41_ENC_TRACE_FROM_MARK=1 drops everything before the first mark,
+ * so a trace of one verify block is not spent on the prefill that precedes it. */
+static int g_enc_trace_armed;
+
 static void ds4_enc_trace(const char *fmt, ...) {
     FILE *f = ds4_enc_trace_file();
     if (!f) return;
+    if (!g_enc_trace_armed && getenv("DS4_METAL_V41_ENC_TRACE_FROM_MARK") &&
+        strncmp(fmt, "mark ", 5) != 0) return;
     if (++g_enc_trace_lines > DS4_ENC_TRACE_MAX) {
         if (g_enc_trace_fp) { fclose(g_enc_trace_fp); g_enc_trace_fp = nil; }
         return;

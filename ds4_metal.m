@@ -16223,6 +16223,13 @@ void ds4_gpu_view_sites_metal(uint64_t out[2]) {
     out[1] = g_ds41_view_site_kslice_row;
 }
 
+/* A line in the encode trace, so a block's dispatches can be cut out of a run
+ * that also contains prefill and single-row decode. */
+void ds4_gpu_enc_trace_mark(const char *what) {
+    g_enc_trace_armed = 1;
+    ds4_enc_trace("mark %s\n", what ? what : "?");
+}
+
 uint64_t ds4_gpu_full_addr_batch_layers(void) {
     return g_ds41_full_addr_batch_layers;
 }
@@ -52815,14 +52822,25 @@ int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
     }
 }
 
-int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
-                                      const ds4_gpu_tensor *tokens,
-                                      ds4_gpu_tensor *argmax,
-                                      ds4_gpu_tensor *result,
-                                      uint32_t rows, uint32_t n_vocab,
-                                      uint32_t row_floats, uint32_t max_commit) {
-    if (!logits || !tokens || !argmax || !result || !rows || !n_vocab) return 0;
-    if (!dsv41_tensor_has_floats(logits, (uint64_t)(rows - 1u) * row_floats + n_vocab)) return 0;
+/* The argmax of `rows` logits rows, stored as answers argmax_base.. of the
+ * block, and then - when accept_rows is non-zero - the accept over answers
+ * 0..accept_rows. A block that runs as one pass does both at once; a block
+ * resumed in passes stores each pass's answers as its rows finish, because the
+ * storage its logits sit in is the next pass's MoE scratch, and accepts once at
+ * the end over answers alone. The partials sit behind room for the largest
+ * block, so a pass's partials never overlap another pass's answers. */
+int ds4_gpu_dsv41_block_accept_encode_ex(const ds4_gpu_tensor *logits,
+                                         const ds4_gpu_tensor *tokens,
+                                         ds4_gpu_tensor *argmax,
+                                         ds4_gpu_tensor *result,
+                                         uint32_t rows, uint32_t n_vocab,
+                                         uint32_t row_floats, uint32_t max_commit,
+                                         uint32_t argmax_base, uint32_t accept_rows) {
+    if (!tokens || !argmax || !result || !n_vocab) return 0;
+    if (rows && (!logits ||
+        !dsv41_tensor_has_floats(logits, (uint64_t)(rows - 1u) * row_floats + n_vocab)))
+        return 0;
+    if (argmax_base + rows > 32u || accept_rows > 32u) return 0;
 
     if (ds4_gpu_tensor_bytes(result) < 2u * sizeof(uint32_t)) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
@@ -52837,37 +52855,46 @@ int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
         id<MTLComputePipelineState> fold = ds4_gpu_get_pipeline("kernel_dsv41_block_argmax_fold");
         if (!fold) return 0;
         const uint32_t chunks = (n_vocab + 4095u) / 4096u;
-        /* The partials ride in the argmax tensor past the per-row answers. */
-        const uint64_t need = (uint64_t)rows * sizeof(uint32_t) +
-                              (uint64_t)rows * chunks * 2u * sizeof(uint32_t);
+        /* Answers first, room for the largest block, then the partials. */
+        const uint64_t need = 32u * sizeof(uint32_t) +
+                              (uint64_t)32u * chunks * 2u * sizeof(uint32_t);
         if (ds4_gpu_tensor_bytes(argmax) < need) return 0;
+        const NSUInteger ans_off = ds4_gpu_tensor_offset(argmax) +
+                                   (NSUInteger)argmax_base * sizeof(uint32_t);
         const NSUInteger part_off = ds4_gpu_tensor_offset(argmax) +
-                                    (NSUInteger)rows * sizeof(uint32_t);
-        (void)ds4_gpu_concurrent_section_barrier();
-        const uint32_t a1[] = { n_vocab, rows, row_floats };
-        [enc setComputePipelineState:pick];
-        [enc setBytes:a1 length:sizeof(a1) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:1];
-        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:part_off atIndex:2];
-        ds4_gpu_dispatch(enc, MTLSizeMake(chunks, rows, 1), MTLSizeMake(256, 1, 1));
-        ds4_gpu_end_compute_encoder(cb, enc);
-        /* Inside an open batch buffer these three dispatches share one encoder,
-         * and a concurrent encoder does not order them: the head's output, the
-         * partials and the per-row answers are each read by the next step, so the
-         * dependency has to be stated. It held by luck before this. */
+                                    32u * sizeof(uint32_t) +
+                                    (NSUInteger)argmax_base * chunks * 2u * sizeof(uint32_t);
+        if (rows) {
+            (void)ds4_gpu_concurrent_section_barrier();
+            const uint32_t a1[] = { n_vocab, rows, row_floats };
+            [enc setComputePipelineState:pick];
+            [enc setBytes:a1 length:sizeof(a1) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(logits) offset:ds4_gpu_tensor_offset(logits) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:part_off atIndex:2];
+            ds4_gpu_dispatch(enc, MTLSizeMake(chunks, rows, 1), MTLSizeMake(256, 1, 1));
+            ds4_gpu_end_compute_encoder(cb, enc);
+            /* Inside an open batch buffer these three dispatches share one
+             * encoder, and a concurrent encoder does not order them: the head's
+             * output, the partials and the per-row answers are each read by the
+             * next step, so the dependency has to be stated. */
+            (void)ds4_gpu_concurrent_section_barrier();
+            enc = ds4_gpu_compute_encoder(cb);
+            if (!enc) return 0;
+            [enc setComputePipelineState:fold];
+            [enc setBytes:a1 length:sizeof(a1) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:part_off atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:ans_off atIndex:2];
+            ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(32, 1, 1));
+            ds4_gpu_end_compute_encoder(cb, enc);
+        }
+        if (!accept_rows) {
+            if (owned && !ds4_gpu_finish_command_buffer(cb, owned, "V4.1 block argmax")) return 0;
+            return 1;
+        }
         (void)ds4_gpu_concurrent_section_barrier();
         enc = ds4_gpu_compute_encoder(cb);
         if (!enc) return 0;
-        [enc setComputePipelineState:fold];
-        [enc setBytes:a1 length:sizeof(a1) atIndex:0];
-        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:part_off atIndex:1];
-        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:ds4_gpu_tensor_offset(argmax) atIndex:2];
-        ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(32, 1, 1));
-        ds4_gpu_end_compute_encoder(cb, enc);
-        (void)ds4_gpu_concurrent_section_barrier();
-        enc = ds4_gpu_compute_encoder(cb);
-        if (!enc) return 0;
-        const uint32_t a2[] = { rows, max_commit };
+        const uint32_t a2[] = { accept_rows, max_commit };
         [enc setComputePipelineState:acc];
         [enc setBytes:a2 length:sizeof(a2) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:ds4_gpu_tensor_offset(argmax) atIndex:1];
@@ -52878,6 +52905,17 @@ int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
         if (owned && !ds4_gpu_finish_command_buffer(cb, owned, "V4.1 block accept")) return 0;
     }
     return 1;
+}
+
+int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
+                                      const ds4_gpu_tensor *tokens,
+                                      ds4_gpu_tensor *argmax,
+                                      ds4_gpu_tensor *result,
+                                      uint32_t rows, uint32_t n_vocab,
+                                      uint32_t row_floats, uint32_t max_commit) {
+    if (!rows) return 0;
+    return ds4_gpu_dsv41_block_accept_encode_ex(logits, tokens, argmax, result, rows,
+                                                n_vocab, row_floats, max_commit, 0, rows);
 }
 
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
