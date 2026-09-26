@@ -43106,7 +43106,16 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
             g->block_carry_start = start;
             g->block_carry_origin[owner] = start;
             g->block_carry_owners |= 1u << owner;
-            g_ds41_txn_carry_park++;
+            /* The same accounting the per-row form keeps. Parking every row in one
+             * copy still has to say which positions it covered, or the commit's
+             * bijection check reads an empty mask and refuses - which is what it did
+             * the first time this path replaced the other. */
+            g_ds41_txn_rows_seen[owner] = count >= 64u ? UINT64_MAX :
+                                          (1ull << count) - 1ull;
+            g_ds41_txn_rows_writes[owner] = count;
+            g_ds41_txn_row_lo[owner] = 0u;
+            g_ds41_txn_row_hi[owner] = count ? count - 1u : 0u;
+            g_ds41_txn_carry_park += count;
         }
     } else if (!ds41_project_rows(b->latent, m, l->attn_compressor_kv, b->norm, count, true))
         return false;
@@ -46559,7 +46568,46 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                 ok = ds4_gpu_tensor_copy(g->raw_prefill, (uint64_t)first * row_bytes,
                                          g->window[il], 0,
                                          (uint64_t)(previous - first) * row_bytes) != 0;
-            /* Writes. */
+            /* Writes. DS4_METAL_V41_BLOCK_WRITE_BATCH=1 replaces the loop over the
+             * nodes with one pass a stage: the rotations take their positions from
+             * the node descriptors, the quantise and the write cover the block, and
+             * the compressor and the indexer go through the batch entries the
+             * prefill path already uses. The descriptors and the results are the
+             * same - this is the implementation changing under the oracle, not the
+             * semantics. The per-row form stays as that oracle. */
+            const char *wb_e = getenv("DS4_METAL_V41_BLOCK_WRITE_BATCH");
+            const bool write_batch = wb_e && wb_e[0] && atoi(wb_e) != 0;
+            if (ok && write_batch) {
+                uint32_t hp[DS4_TP_BATCH_MAX_ROWS];
+                for (int i = 0; i < count; i++) hp[i] = positions[i];
+                ok = ds4_gpu_tensor_write(g->block_positions, 0, hp,
+                                          (uint64_t)count * sizeof(uint32_t)) != 0;
+                /* The rotations and the key write, one dispatch a stage. The keys
+                 * land in raw_prefill here because the reads below still take a
+                 * contiguous window; moving them into the delta is the step that
+                 * needs the descriptor attention wired in. */
+                if (ok) {
+                    const uint32_t heads_all = DS4_N_HEAD / g->tp_world;
+                    const bool comp = ds4_layer_compress_ratio(il) != 0;
+                    ok = ds4_gpu_dsv41_rope_nodes(active.q, DS4_N_HEAD_DIM, heads_all,
+                            rows, g->block_positions, 0, comp, false) &&
+                         ds4_gpu_dsv41_rope_nodes(active.kv, DS4_N_HEAD_DIM, 1, rows,
+                            g->block_positions, 0, comp, false) &&
+                         ds4_gpu_dsv41_quantize(active.kv, DS4_N_HEAD_DIM, rows,
+                            DS4_V41_FP8_E8M0) &&
+                         ds4_gpu_tensor_copy(g->raw_prefill,
+                            (uint64_t)previous * row_bytes, active.kv, 0,
+                            (uint64_t)rows * row_bytes) != 0;
+                }
+                /* The compressor and the indexer exist on their own layers only -
+                 * the projections are null everywhere else, which the per-row form
+                 * guards and this did not: a null weight dereferenced at 0x58. */
+                if (ok && ds41_kv_source(il))
+                    ok = ds41_attention_publish_batch(g, &active, model, l, il,
+                                                      positions[0], rows);
+                if (ok && ds41_index_source(il))
+                    ok = ds41_index_batch(g, model, l, il, rows);
+            } else
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph row = *graphs[i];
                 row.pos = positions[i];
