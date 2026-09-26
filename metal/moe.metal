@@ -4911,7 +4911,8 @@ kernel void kernel_stream_expert_cache_validate(
  *   [1] parked row mask
  *   [2] invalid id count
  *   [3] records dropped because the list was full
- *   [4 + 4*i .. ] {layer, row, slot, expert} a record
+ *   [4 + row]      the layer a row parked at, plus one; 0 while it is running
+ *   [36 + 4*i .. ] {layer, row, slot, expert} a record
  *
  * A dropped record must not read as "all resident", which is why [3] exists and
  * why the host treats it as a refusal rather than as a smaller miss list. */
@@ -4934,20 +4935,46 @@ kernel void kernel_dsv41_moe_block_residency(
     if (expert < 0 || (uint32_t)expert >= args.n_total_expert || (uint32_t)expert >= 384) {
         atomic_fetch_add_explicit(&out[2], 1u, memory_order_relaxed);
         atomic_fetch_or_explicit(&out[1], 1u << min(row, 31u), memory_order_relaxed);
+        uint32_t unset = 0u;
+        (void)atomic_compare_exchange_weak_explicit(&out[4 + min(row, 31u)], &unset,
+                                                    args.layer + 1u,
+                                                    memory_order_relaxed,
+                                                    memory_order_relaxed);
         return;
     }
 
     const uint32_t e = (uint32_t)expert;
     if (gate_addrs[e] != 0 && up_addrs[e] != 0 && down_addrs[e] != 0) return;
 
-    atomic_fetch_or_explicit(&out[1], 1u << min(row, 31u), memory_order_relaxed);
+    /* A row that has already parked contributes nothing the model would, so the
+     * layers after it route on a hidden state that is not the model's and select
+     * experts nobody asked for. Recording those as misses is what turned one
+     * eviction at layer 17 into 90 assignments over 22 layers. The row stops
+     * being counted at its first miss; the rows beside it carry on. */
+    const uint32_t row_bit = 1u << min(row, 31u);
+    atomic_fetch_or_explicit(&out[1], row_bit, memory_order_relaxed);
+
+    /* The layer this row parks at, claimed once. Every slot of that layer still
+     * records - six slots shared by eight rows have to be released together -
+     * and the layers after it record nothing, because a row that contributes
+     * zero routes the rest of the stack on a hidden state that is not the
+     * model's and would otherwise report experts nobody asked for. */
+    const uint32_t mine = args.layer + 1u;
+    uint32_t seen = 0u;
+    if (!atomic_compare_exchange_weak_explicit(&out[4 + min(row, 31u)], &seen, mine,
+                                               memory_order_relaxed,
+                                               memory_order_relaxed) &&
+        seen != mine) {
+        return;
+    }
+
     const uint32_t slot_index =
         atomic_fetch_add_explicit(&out[0], 1u, memory_order_relaxed);
     if (slot_index >= args.max_records) {
         atomic_fetch_add_explicit(&out[3], 1u, memory_order_relaxed);
         return;
     }
-    device atomic_uint *rec = &out[4 + 4u * slot_index];
+    device atomic_uint *rec = &out[36 + 4u * slot_index];
     atomic_store_explicit(&rec[0], args.layer, memory_order_relaxed);
     atomic_store_explicit(&rec[1], row, memory_order_relaxed);
     atomic_store_explicit(&rec[2], slot, memory_order_relaxed);

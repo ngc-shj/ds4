@@ -148,7 +148,11 @@ int ds4_gpu_moe_block_miss_read(uint32_t *records,
                                 uint32_t *count,
                                 uint32_t *parked_rows,
                                 uint32_t *invalid,
-                                uint32_t *dropped);
+                                uint32_t *dropped,
+                                /* The layer each row parked at, plus one; 0 if it
+                                 * ran to the end. */
+                                uint32_t *park_layers,
+                                uint32_t  park_layer_capacity);
 void ds4_gpu_zero_condition_note(int which);
 
 /* Stage the keys a node sees from where they live: the ring with its start and

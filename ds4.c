@@ -41348,6 +41348,12 @@ static uint32_t g_ds41_park_last_first_layer_misses;
 /* Set by the block step when it refuses for a missing expert, so the caller can
  * tell a park from a step that broke. Read and cleared in one place. */
 static bool g_ds41_park_refused;
+/* How many leading rows of the parked block ran on the model's own state. The
+ * caller commits that many and discards the rest. */
+static uint32_t g_ds41_park_last_prefix;
+/* Blocks whose accepted prefix was shortened by a park rather than by a
+ * mispredicted token. */
+static uint64_t g_ds41_park_capped;
 
 static uint64_t g_ds41_fuse_sites;
 
@@ -41403,9 +41409,11 @@ static void ds41_decode_path_report(void) {
         fprintf(stderr, "\n");
         ds41_view_site_report();
         if (g_ds41_park_blocks)
-            fprintf(stderr, "ds4:   parked: %llu blocks refused over %llu missing "
+            fprintf(stderr, "ds4:   parked: %llu blocks, %llu of them with the "
+                    "accepted prefix cut short, over %llu missing "
                     "assignments, %llu invalid ids, %llu records dropped\n",
                     (unsigned long long)g_ds41_park_blocks,
+                    (unsigned long long)g_ds41_park_capped,
                     (unsigned long long)g_ds41_park_misses,
                     (unsigned long long)g_ds41_park_invalid,
                     (unsigned long long)g_ds41_park_dropped);
@@ -47475,9 +47483,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * the caller re-runs once the misses have been serviced. */
     if (ok) {
         uint32_t records[DS41_BLOCK_MISS_MAX * 4];
+        uint32_t park_layers[DS4_TP_BATCH_MAX_ROWS] = {0};
         uint32_t misses = 0, parked = 0, invalid = 0, dropped = 0;
         if (!ds4_gpu_moe_block_miss_read(records, DS41_BLOCK_MISS_MAX,
-                                         &misses, &parked, &invalid, &dropped)) {
+                                         &misses, &parked, &invalid, &dropped,
+                                         park_layers, DS4_TP_BATCH_MAX_ROWS)) {
             ok = false;
         } else if (misses || parked || invalid || dropped) {
             g_ds41_park_blocks++;
@@ -47510,12 +47520,32 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     "%u invalid ids, %u records dropped\n",
                     misses, layers_seen, first_layer, first_expert, parked,
                     invalid, dropped);
-            /* The readback path is the service: one block on it loads what was
-             * missing and fills the table, so the next block can decide on the
+            /* Where the block stops, not whether it does. Row r parked at the
+             * layer park_layers[r] names, and everything before the lowest such
+             * row ran on the model's own state: those rows are committable and
+             * the rest are not, because a row that contributed zero is read by
+             * every row after it. The caller caps the accepted prefix there.
+             *
+             * The readback path is the service: one block on it loads what was
+             * missing and fills the table, so the block after can decide on the
              * device again. */
+            uint32_t first_parked = rows;
+            for (uint32_t r = 0; r < rows && r < DS4_TP_BATCH_MAX_ROWS; r++)
+                if (park_layers[r] && r < first_parked) first_parked = r;
+            g_ds41_park_last_prefix = first_parked;
+            fprintf(stderr, "ds4:   the resident prefix is %u of %u rows; row %u "
+                    "parked at layer %u\n", first_parked, rows, first_parked,
+                    first_parked < rows && park_layers[first_parked] ?
+                        park_layers[first_parked] - 1u : 0u);
             ds4_gpu_stream_block_residency_suspend();
+            /* Not a refusal. The device's own accept decision already stops at
+             * or before the parked row - that row's logits are not the model's,
+             * so they do not match the candidate - and the rows before it ran on
+             * state the model would have produced. Capping the accepted prefix at
+             * the parked row removes the one case the argmax cannot see, a
+             * poisoned row whose logits agree by coincidence, and the rest of the
+             * block is discarded the way a mispredicted suffix always was. */
             g_ds41_park_refused = true;
-            ok = false;
         }
     }
     g_ds41_view_block_scope = view_scope_was;
@@ -85410,36 +85440,16 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     const bool done = ds4_gpu_end_commands() != 0;
     g_ds41_txn_ms_verify += (now_sec() - t_verify) * 1000.0;
     if (!ok || !done) {
-        /* A park is not a failed step. The transaction published nothing, so the
-         * session is still the one the block started from and invalidating it
-         * would throw away the state the repair needs - which is what turned the
-         * forced-miss test's second block into "needs a synchronised ds41
-         * session". Put back what the block touched outside the parked ring,
-         * exactly as the A=0 path does, and leave the session synchronised. */
-        const bool parked = g_ds41_park_refused;
-        g_ds41_park_refused = false;
-        free(rows);
-        if (parked) {
-            s->ds41_graph.history = hist_before;
-            s->ds41_graph.block_history_rows = 0;
-            if (carry_before && ds4_gpu_synchronize())
-                for (uint32_t c = 0; c < 4u; c++) {
-                    (void)ds4_gpu_tensor_write(s->ds41_graph.previous_kv[c], 0,
-                            carry_before + (size_t)c * 2u * 512u, 512u * 4u);
-                    (void)ds4_gpu_tensor_write(s->ds41_graph.previous_score[c], 0,
-                            carry_before + ((size_t)c * 2u + 1u) * 512u, 512u * 4u);
-                }
-            s->ds41_graph.pos = pos0;
-            free(carry_before);
-            if (err && errlen)
-                snprintf(err, errlen, "verify block parked on a missing expert");
-            return -1;
-        }
-        free(carry_before);
+        free(rows); free(carry_before);
         ds4_session_invalidate(s);
         if (err && errlen) snprintf(err, errlen, "verify block step failed");
         return -1;
     }
+    /* A park is a shorter accept, not a failure. The block ran, the transaction
+     * published nothing yet, and the rows before the parked one are the model's;
+     * the cap below is applied to whatever the accept decided. */
+    const uint32_t park_cap = g_ds41_park_refused ? g_ds41_park_last_prefix : UINT32_MAX;
+    g_ds41_park_refused = false;
 
     /* Row i answers position pos0+i, so it predicts candidates[i+1]. */
     const double t_accept = now_sec();
@@ -85471,6 +85481,15 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
         }
         const int next = sample_argmax(rows + (size_t)(k - 1) * DS4_N_VOCAB, DS4_N_VOCAB);
         if (n == k) arg_at_n = next;
+    }
+    /* The parked row's logits are not the model's, so an accept that reached past
+     * it agreed with the candidate by coincidence. Cap there, and say the next
+     * token is unknown: it would have to come from a row the block did not
+     * compute correctly, and the caller's single step is where it comes from. */
+    if (park_cap != UINT32_MAX && (uint32_t)n > park_cap) {
+        n = (int)park_cap;
+        arg_at_n = -1;
+        g_ds41_park_capped++;
     }
     const int next = arg_at_n;
     free(rows);
@@ -85749,19 +85768,25 @@ static void ds41_force_miss_test(ds4_session *seed, const ds4_model *m,
     const uint64_t parks0 = g_ds41_park_blocks;
     ds4_gpu_stream_expert_force_layer_miss((uint32_t)layer);
     const int refused = ok ? ds4_session_verify_block_ex(blk, cand, (int)k, (int)k, acc,
-                                                        err, sizeof(err)) : 0;
+                                                        err, sizeof(err)) : -1;
     const uint64_t parks = g_ds41_park_blocks - parks0;
     const uint64_t want_mask = 1ull << (uint64_t)layer;
-    fprintf(stderr, "ds4:   forced miss: block returned %d, %llu park%s, %u assignments "
+    fprintf(stderr, "ds4:   forced miss: block committed %d, %llu park%s, %u assignments "
             "released (%u of them in the evicted layer) over layer mask 0x%llx, "
             "rows 0x%x\n",
             refused, (unsigned long long)parks, parks == 1 ? "" : "s",
             g_ds41_park_last_misses, g_ds41_park_last_first_layer_misses,
             (unsigned long long)g_ds41_park_last_layers_mask,
             g_ds41_park_last_rows);
-    if (refused >= 0 || parks != 1 || g_ds41_park_last_layers_mask != want_mask) {
+    /* Every row selects six experts of the evicted layer, so every row parks
+     * there, the resident prefix is empty and the block commits nothing - which
+     * is a shorter accept, not a refusal: the session stays where it was. A
+     * partial eviction would leave a non-empty prefix and commit it. */
+    if (refused != 0 || parks != 1 || g_ds41_park_last_layers_mask != want_mask ||
+        g_ds41_park_last_first_layer_misses != g_ds41_park_last_misses) {
         fprintf(stderr, "ds4:   forced miss: FAIL (expected one park naming only "
-                "layer %ld and no commit)\n", layer);
+                "layer %ld, every released assignment in it, and an empty "
+                "committed prefix)\n", layer);
         goto done;
     }
 

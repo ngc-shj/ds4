@@ -16576,7 +16576,8 @@ static int ds4_gpu_encode_stream_expert_cache_validate(
  * to wait for the host. Sized for the worst case a block can produce - every
  * (row, slot) missing - so a full list is a bug and not a working state. */
 enum {
-    DS4_METAL_MOE_BLOCK_MISS_HEADER = 4,
+    /* Four counters then one park layer a row. */
+    DS4_METAL_MOE_BLOCK_MISS_HEADER = 4 + 32,
     DS4_METAL_MOE_BLOCK_MISS_RECORD = 4,
     /* The verifier's row cap (DS4_TP_BATCH_MAX_ROWS) times the slots a row.
      * Stated here rather than included because this file does not depend on the
@@ -16646,10 +16647,17 @@ int ds4_gpu_moe_block_miss_read(uint32_t *records,
                                 uint32_t *count,
                                 uint32_t *parked_rows,
                                 uint32_t *invalid,
-                                uint32_t *dropped) {
+                                uint32_t *dropped,
+                                uint32_t *park_layers,
+                                uint32_t  park_layer_capacity) {
     id<MTLBuffer> b = g_moe_block_miss_buffer;
     if (!count || !parked_rows || !invalid || !dropped) return 0;
-    if (!b) { *count = *parked_rows = *invalid = *dropped = 0; return 1; }
+    if (!b) {
+        *count = *parked_rows = *invalid = *dropped = 0;
+        for (uint32_t i = 0; park_layers && i < park_layer_capacity; i++)
+            park_layers[i] = 0;
+        return 1;
+    }
     /* Read the host-visible copy of a shared buffer, which is only meaningful
      * once the work that wrote it has completed. The caller owns that ordering:
      * this is called after the block closes, never between layers. */
@@ -16659,6 +16667,8 @@ int ds4_gpu_moe_block_miss_read(uint32_t *records,
     *invalid = w[2];
     *dropped = w[3];
     *count = n;
+    for (uint32_t i = 0; park_layers && i < park_layer_capacity && i < 32u; i++)
+        park_layers[i] = w[4 + i];
     if (!records) return 1;
     const uint32_t take = n < capacity ? n : capacity;
     for (uint32_t i = 0; i < take * DS4_METAL_MOE_BLOCK_MISS_RECORD; i++)
