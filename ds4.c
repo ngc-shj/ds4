@@ -84594,6 +84594,116 @@ typedef struct {
     ds41_verify_result result;
 } ds41_block_slot;
 
+/* One unit of routed work: a node, which of its six selected experts, and which
+ * expert that is. Miss is a property of the expert and waiting is a property of
+ * the node, and those are not the same set - three nodes can select the same
+ * missing expert, and then there is one thing to repair and three nodes to wake. */
+typedef struct {
+    uint32_t node;
+    uint32_t slot;
+    uint32_t expert;
+    uint8_t done;          /* the result is in expert_output[node][slot] */
+    uint8_t runs;          /* how many times it executed; has to end at one */
+} ds41_assignment;
+
+#define DS41_SLOTS_PER_NODE 6u
+#define DS41_MAX_ASSIGN (DS4_TP_BATCH_MAX_ROWS * DS41_SLOTS_PER_NODE)
+
+typedef struct {
+    ds41_assignment a[DS41_MAX_ASSIGN];
+    uint32_t count;
+    uint32_t miss_expert[DS41_MAX_ASSIGN];   /* unique, one descriptor an expert */
+    uint32_t miss_count;
+    uint32_t done_mask[DS4_TP_BATCH_MAX_ROWS];
+    uint32_t missing_mask[DS4_TP_BATCH_MAX_ROWS];
+    uint64_t repairs;
+    uint64_t duplicate_adds;
+} ds41_routed_work;
+
+/* Build the assignments from a selection. */
+static void ds41_work_build(ds41_routed_work *w, const ds41_block_slot *slot,
+                            const uint32_t *selected) {
+    memset(w, 0, sizeof(*w));
+    if (!slot || !selected) return;
+    for (uint32_t n = 0; n < slot->node_count; n++)
+        for (uint32_t sl = 0; sl < DS41_SLOTS_PER_NODE; sl++) {
+            if (w->count >= DS41_MAX_ASSIGN) return;
+            w->a[w->count++] = (ds41_assignment){
+                .node = n, .slot = sl,
+                .expert = selected[n * DS41_SLOTS_PER_NODE + sl] };
+        }
+}
+
+/* Residency lookup. One miss descriptor an expert however many nodes chose it, and
+ * missing_mask set on every node and slot that needs it - which is what makes the
+ * repair one operation and the wake a set. */
+static void ds41_work_lookup(ds41_routed_work *w, ds41_block_slot *slot,
+                             bool (*resident)(uint32_t expert)) {
+    if (!w || !slot || !resident) return;
+    for (uint32_t i = 0; i < w->count; i++) {
+        const ds41_assignment *a = &w->a[i];
+        if (resident(a->expert)) continue;
+        w->missing_mask[a->node] |= 1u << a->slot;
+        bool seen = false;
+        for (uint32_t j = 0; j < w->miss_count; j++)
+            if (w->miss_expert[j] == a->expert) { seen = true; break; }
+        if (!seen && w->miss_count < DS41_MAX_ASSIGN)
+            w->miss_expert[w->miss_count++] = a->expert;
+    }
+    for (uint32_t n = 0; n < slot->node_count; n++)
+        if (w->missing_mask[n]) slot->cursor[n].state = DS41_NODE_WAIT_EXPERT;
+}
+
+/* Run what is resident. A slot already done is not run again, which is the half of
+ * exactly-once that resume gets wrong if the accounting is per node. */
+static void ds41_work_run_resident(ds41_routed_work *w) {
+    if (!w) return;
+    for (uint32_t i = 0; i < w->count; i++) {
+        ds41_assignment *a = &w->a[i];
+        if (a->done) { w->duplicate_adds++; continue; }
+        if (w->missing_mask[a->node] & (1u << a->slot)) continue;
+        a->done = 1;
+        a->runs++;
+        w->done_mask[a->node] |= 1u << a->slot;
+    }
+}
+
+/* One repair for one expert, releasing every assignment that referenced it. */
+static void ds41_work_repair(ds41_routed_work *w, uint32_t expert) {
+    if (!w) return;
+    w->repairs++;
+    for (uint32_t i = 0; i < w->count; i++) {
+        ds41_assignment *a = &w->a[i];
+        if (a->expert != expert) continue;
+        w->missing_mask[a->node] &= ~(1u << a->slot);
+        if (a->done) { w->duplicate_adds++; continue; }
+        a->done = 1;
+        a->runs++;
+        w->done_mask[a->node] |= 1u << a->slot;
+    }
+    for (uint32_t j = 0; j < w->miss_count; j++)
+        if (w->miss_expert[j] == expert) {
+            w->miss_expert[j] = w->miss_expert[--w->miss_count];
+            break;
+        }
+}
+
+/* A node becomes ready when all six of its slots are done, not when the expert it
+ * waited on is repaired: the six are reduced in slot order and a node whose fifth
+ * slot is still missing would reduce five. */
+static uint32_t ds41_work_wake(const ds41_routed_work *w, ds41_block_slot *slot) {
+    uint32_t woken = 0;
+    if (!w || !slot) return 0;
+    const uint32_t all = (1u << DS41_SLOTS_PER_NODE) - 1u;
+    for (uint32_t n = 0; n < slot->node_count; n++) {
+        if (slot->cursor[n].state != DS41_NODE_WAIT_EXPERT) continue;
+        if (w->done_mask[n] != all) continue;
+        slot->cursor[n].state = DS41_NODE_READY;
+        woken++;
+    }
+    return woken;
+}
+
 /* A node's ancestors, root first, in the order a single pass would have run them.
  * Returns 0 if the chain is not strictly increasing in depth or does not end at
  * the root, because attention reads the transaction delta through this list and a
@@ -85813,6 +85923,9 @@ regime_done:
  * each way a layout can be wrong and requires a refusal: an unaligned offset, one
  * past the end of its arena, two regions on the same byte, and the KV and carry
  * deltas overlapping. DS4_V41_ARENA_CHECK=1. */
+/* Everything is resident except 999. */
+static bool ds41_test_resident(uint32_t expert) { return expert != 999u; }
+
 static void ds41_arena_layout_check(void) {
     if (!getenv("DS4_V41_ARENA_CHECK")) return;
     const uint32_t layers = DS4_N_LAYER;
@@ -85919,6 +86032,63 @@ static void ds41_arena_layout_check(void) {
     if (ds41_expert_work_valid(&w, 0x4000, 9, false)) abad++;    /* evicted */
     if (ds41_expert_work_valid(&w, 0, 9, true)) abad++;          /* no address */
     fprintf(stderr, "ds4: expert address lifetime: 5 cases, %d wrong\n", abad);
+
+    /* Shared miss fanout, in the shape the pass table asks for. Three of the seven
+     * nodes select expert 999, which is not resident; everything else is. */
+    {
+        ds41_block_slot ws;
+        memset(&ws, 0, sizeof(ws));
+        ws.node_count = 7;
+        for (uint32_t i = 0; i < 7; i++) {
+            ws.parent[i] = par[i];
+            ws.depth[i] = dep[i];
+            ws.cursor[i] = (ds41_node_cursor){ .layer = 0,
+                                               .phase = DS41_PHASE_ROUTED,
+                                               .state = DS41_NODE_READY };
+        }
+        uint32_t sel[7 * DS41_SLOTS_PER_NODE];
+        for (uint32_t n = 0; n < 7; n++)
+            for (uint32_t sl = 0; sl < DS41_SLOTS_PER_NODE; sl++)
+                sel[n * DS41_SLOTS_PER_NODE + sl] = 100u + n * DS41_SLOTS_PER_NODE + sl;
+        /* Nodes 1, 4 and 6 all want the same absent expert, in different slots. */
+        sel[1 * DS41_SLOTS_PER_NODE + 0] = 999u;
+        sel[4 * DS41_SLOTS_PER_NODE + 3] = 999u;
+        sel[6 * DS41_SLOTS_PER_NODE + 5] = 999u;
+
+        ds41_routed_work work;
+        ds41_work_build(&work, &ws, sel);
+        ds41_work_lookup(&work, &ws, ds41_test_resident);
+        const uint32_t unique_missing = work.miss_count;
+        uint32_t missing_assignments = 0, waiting = 0;
+        for (uint32_t i = 0; i < work.count; i++)
+            if (work.missing_mask[work.a[i].node] & (1u << work.a[i].slot))
+                missing_assignments++;
+        for (uint32_t n = 0; n < 7; n++)
+            if (ws.cursor[n].state == DS41_NODE_WAIT_EXPERT) waiting++;
+        ds41_work_run_resident(&work);
+        const uint32_t woken_early = ds41_work_wake(&work, &ws);
+        ds41_work_repair(&work, 999u);
+        const uint32_t woken_after = ds41_work_wake(&work, &ws);
+        uint32_t not_once = 0;
+        for (uint32_t i = 0; i < work.count; i++)
+            if (work.a[i].runs != 1u) not_once++;
+        int wbad = 0;
+        if (unique_missing != 1u) wbad++;
+        if (missing_assignments != 3u) wbad++;
+        if (waiting != 3u) wbad++;
+        if (work.repairs != 1u) wbad++;
+        if (woken_early != 0u) wbad++;        /* not before all six are in */
+        if (woken_after != 3u) wbad++;
+        if (not_once) wbad++;
+        if (work.duplicate_adds) wbad++;
+        if (work.miss_count) wbad++;
+        fprintf(stderr, "ds4: shared miss fanout: unique missing %u, missing "
+                "assignments %u, WAIT nodes %u, repairs %llu, woken before/after "
+                "%u/%u, assignments not run exactly once %u, duplicate adds %llu, "
+                "%d wrong\n", unique_missing, missing_assignments, waiting,
+                (unsigned long long)work.repairs, woken_early, woken_after, not_once,
+                (unsigned long long)work.duplicate_adds, wbad);
+    }
 
     /* The zero-condition counters, shown to move. A counter that reads zero
      * because it is broken looks exactly like a path that did nothing, so the
