@@ -171,6 +171,16 @@ int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring, uint32_t ring_c
 int ds4_gpu_dsv41_block_accept_warm(void);
 /* Encode the accept decision so the performance path never reads the vocabulary:
  * the result is two words in a caller-owned tensor, read after the queue closes. */
+/* Publish the accepted prefix of one layer's KV delta into the committed ring,
+ * with the count taken from the accept kernel's output rather than from the
+ * host. slots names the path; NULL means the identity. */
+int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
+                                     const ds4_gpu_tensor *delta,
+                                     const ds4_gpu_tensor *accept,
+                                     const ds4_gpu_tensor *slots,
+                                     uint32_t depth, uint32_t row_floats,
+                                     uint32_t ring_cap, uint32_t delta_start,
+                                     uint32_t cap);
 int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
                                       const ds4_gpu_tensor *tokens,
                                       ds4_gpu_tensor *argmax,

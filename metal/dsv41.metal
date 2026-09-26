@@ -270,6 +270,42 @@ struct ds4_metal_args_dsv41_block_accept {
     uint32_t max_commit;
 };
 
+/* Publishing the accepted prefix of one layer's KV delta into the committed
+ * ring. The count is read from the accept kernel's own output, so the host does
+ * not have to learn it before the rows can land; and one dispatch a layer
+ * replaces one blit a row a layer - 320 of them a block at forty layers and
+ * eight rows.
+ *
+ * slots is the path: slots[i] is the delta row that path index i holds. A linear
+ * block passes none and the identity is used. */
+struct ds4_metal_args_dsv41_block_publish {
+    uint32_t depth;
+    uint32_t row_floats;
+    uint32_t ring_cap;
+    uint32_t delta_start;
+    uint32_t cap;          /* an upper bound on the accepted count */
+    uint32_t has_slots;
+};
+
+kernel void kernel_dsv41_block_publish(
+        constant ds4_metal_args_dsv41_block_publish &args,
+        device const uint32_t *accepted,
+        device const uint32_t *slots,
+        device const float *delta,
+        device float *window,
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint i = gid.y;
+    const uint col = gid.x;
+    if (i >= args.depth || col >= args.row_floats) return;
+    const uint n = min(accepted[0], args.cap);
+    if (i >= n) return;
+    const uint src = args.has_slots ? slots[i] : i;
+    if (src >= args.depth) return;
+    const uint ring = (args.delta_start + i) % args.ring_cap;
+    window[(ulong)ring * args.row_floats + col] =
+        delta[(ulong)src * args.row_floats + col];
+}
+
 kernel void kernel_dsv41_block_accept(
         constant ds4_metal_args_dsv41_block_accept &args,
         device const uint32_t *argmax,

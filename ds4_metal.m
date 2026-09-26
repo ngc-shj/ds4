@@ -52768,6 +52768,53 @@ int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring, uint32_t ring_c
     return 1;
 }
 
+/* One dispatch a layer, gated by the accept count the device already wrote.
+ * Encoded in the same command buffer as the accept, after it, so the rows land
+ * without the host learning the count first. */
+int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
+                                     const ds4_gpu_tensor *delta,
+                                     const ds4_gpu_tensor *accept,
+                                     const ds4_gpu_tensor *slots,
+                                     uint32_t depth, uint32_t row_floats,
+                                     uint32_t ring_cap, uint32_t delta_start,
+                                     uint32_t cap) {
+    if (!window || !delta || !accept || !depth || !row_floats || !ring_cap) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!dsv41_tensor_has_floats(delta, (uint64_t)depth * row_floats) ||
+        ds4_gpu_tensor_bytes(accept) < sizeof(uint32_t)) {
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv41_block_publish");
+        id<MTLBuffer> winbuf = ds4_gpu_tensor_buffer(window);
+        id<MTLBuffer> delbuf = ds4_gpu_tensor_buffer(delta);
+        id<MTLBuffer> accbuf = ds4_gpu_tensor_buffer(accept);
+        if (!pipeline || !winbuf || !delbuf || !accbuf) return 0;
+        const uint32_t args[6] = {
+            depth, row_floats, ring_cap, delta_start, cap, slots ? 1u : 0u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<DS4Encoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:args length:sizeof(args) atIndex:0];
+        [enc setBuffer:accbuf offset:ds4_gpu_tensor_offset(accept) atIndex:1];
+        [enc setBuffer:slots ? ds4_gpu_tensor_buffer(slots) : accbuf
+                offset:slots ? ds4_gpu_tensor_offset(slots) : ds4_gpu_tensor_offset(accept)
+               atIndex:2];
+        [enc setBuffer:delbuf offset:ds4_gpu_tensor_offset(delta) atIndex:3];
+        [enc setBuffer:winbuf offset:ds4_gpu_tensor_offset(window) atIndex:4];
+        const NSUInteger tw = row_floats < 256u ? row_floats : 256u;
+        ds4_gpu_dispatch(enc,
+                         MTLSizeMake((row_floats + tw - 1u) / tw, depth, 1),
+                         MTLSizeMake(tw, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 block publish");
+    }
+}
+
 int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
                                       const ds4_gpu_tensor *tokens,
                                       ds4_gpu_tensor *argmax,

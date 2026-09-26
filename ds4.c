@@ -1385,6 +1385,18 @@ static bool ds41_kv_source(uint32_t il) {
     return il == 2 || il == 8 || il == 14 || il == 20;
 }
 
+/* The publish moves to the device when this is set. Off by default while the
+ * host copies are the reference the full-logits comparison is made against. */
+static bool ds41_device_publish(void) {
+    static int checked, on;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("DS4_METAL_V41_DEVICE_PUBLISH");
+        on = e && e[0] && atoi(e) != 0;
+    }
+    return on != 0;
+}
+
 static bool ds41_index_source(uint32_t il) {
     return ds41_kv_source(il) || il == 24 || il == 28 || il == 32 || il == 36;
 }
@@ -40429,6 +40441,9 @@ typedef struct {
      * stack down when the row cap went from eight to sixteen. */
     struct ds41_view_entry *views;
     uint32_t view_count;
+    /* Set when the device published the accepted prefix, so the host commit
+     * knows there is nothing left to copy. */
+    uint32_t device_published;
 } ds41_gpu_graph;
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
@@ -47411,6 +47426,24 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                                (uint32_t)(logits_bytes / 4u),
                                                acc->max_commit) != 0;
         const double e1 = now_sec();
+        /* The publish rides in the same buffer as the accept that decided it, so
+         * the rows land without the host learning the count first. That is what
+         * makes the read after this a bookkeeping read rather than a dependency,
+         * and it replaces one blit a row a layer - 320 a block at forty layers
+         * and eight rows - with one dispatch a layer.
+         * DS4_METAL_V41_DEVICE_PUBLISH=1 while the host path is still the
+         * reference the logits are compared against. */
+        if (ok && g->block_kv_delta_rows && ds41_device_publish()) {
+            g->device_published = 0;
+            for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+                if (!g->block_kv_delta[il] || !g->window[il]) { ok = false; break; }
+                ok = ds4_gpu_dsv41_block_publish_rows(
+                        g->window[il], g->block_kv_delta[il], g->block_accept, NULL,
+                        g->block_kv_delta_rows, 512u, 128u,
+                        g->block_kv_delta_start, acc->max_commit) != 0;
+            }
+            g->device_published = ok ? 1u : 0u;
+        }
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double e2 = now_sec();
         if (ok) ok = ds4_gpu_tensor_read(g->block_accept, 0, out, sizeof(out)) != 0;
@@ -84786,8 +84819,15 @@ static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
     if (!ds41_block_carry_commit(g, accepted)) return false;
     g->block_carry_rows = 0;
     g->block_carry_owners = 0;
-    if (accepted == 0) { g->block_kv_delta_rows = 0; return true; }
+    if (accepted == 0) { g->block_kv_delta_rows = 0; g->device_published = 0; return true; }
     if (accepted > g->block_kv_delta_rows) return false;
+    /* Already landed: the publish rode in the accept's own command buffer, gated
+     * by the count the accept wrote, so there is nothing here to copy. */
+    if (g->device_published) {
+        g->device_published = 0;
+        g->block_kv_delta_rows = 0;
+        return true;
+    }
     /* The linear path: node i is row i. One mechanism, not two. */
     uint32_t slot[DS4_TP_BATCH_MAX_ROWS];
     for (uint32_t i = 0; i < accepted && i < DS4_TP_BATCH_MAX_ROWS; i++) slot[i] = i;
