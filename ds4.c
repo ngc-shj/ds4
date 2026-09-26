@@ -80255,6 +80255,8 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w);
 static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
                                       const ds4_weights *w);
+static void ds41_block_dag_test(ds4_session *seed, const ds4_model *m,
+                                const ds4_weights *w);
 static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weights *w);
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
@@ -83991,6 +83993,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             ds41_rowtile_check(&e->model, &e->weights);
             ds41_block_txn_test(s, &e->model, &e->weights);
             ds41_block_txn_chain_test(s, &e->model, &e->weights);
+            ds41_block_dag_test(s, &e->model, &e->weights);
             ds41_k_sweep(s, &e->model, &e->weights);
             ds41_oracle_block_bench(s, &e->model, &e->weights);
             ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
@@ -84424,9 +84427,103 @@ static uint32_t ds41_dag_path(const ds41_candidate_dag *dag, uint32_t node,
         if (up == at) break;               /* a cycle is a caller bug, not a loop here */
         at = up;
     }
-    for (uint32_t i = 0; i + 1 < n; i++, n--) {
-        const uint32_t t = out[i]; out[i] = out[n - 1]; out[n - 1] = t;
+    /* Reverse in place with its own indices. Decrementing n as the loop counter
+     * also shortened the answer: a path of three came back as two, which the
+     * branching test caught on its first run. */
+    for (uint32_t i = 0, j = n ? n - 1u : 0u; i < j; i++, j--) {
+        const uint32_t t = out[i]; out[i] = out[j]; out[j] = t;
     }
+    return n;
+}
+
+/* The state a node can be in. Fixed now, before the layers move, because a layer
+ * that answers synchronously has the wrong signature: a missing expert must leave
+ * the node waiting with a descriptor the host can service, not send the host back
+ * to read the selection. Only READY, RUNNING, LAYER_DONE, REJECTED and COMMITTED
+ * are reachable while every expert is resident; WAIT_EXPERT is in the ABI from the
+ * start so nothing has to be rewritten when it becomes reachable. */
+enum ds41_node_state {
+    DS41_NODE_READY = 0,
+    DS41_NODE_RUNNING,
+    DS41_NODE_WAIT_EXPERT,
+    DS41_NODE_LAYER_DONE,
+    DS41_NODE_REJECTED,
+    DS41_NODE_COMMITTED,
+};
+
+/* One block in flight. Everything is an offset into an arena the slot owns, so
+ * nothing here is a process global and nothing is allocated on the hot path. The
+ * generation ticket is what makes reuse checkable: a descriptor carrying an old
+ * generation is a bug, not a slow path. */
+typedef struct {
+    uint64_t generation;
+    uint32_t node_count;
+    uint32_t base_pos;                 /* the committed frontier the block starts on */
+    uint8_t state[DS4_TP_BATCH_MAX_ROWS];
+    uint32_t parent[DS4_TP_BATCH_MAX_ROWS];
+    uint32_t depth[DS4_TP_BATCH_MAX_ROWS];
+    int token[DS4_TP_BATCH_MAX_ROWS];
+    uint32_t ready_mask;               /* nodes a layer may run */
+    uint32_t miss_mask;                /* nodes waiting on an expert */
+    ds41_verify_result result;
+} ds41_block_slot;
+
+/* The DAG entry. A linear block is the case depth[i] == i, and that is the only
+ * case the layers can run today: the batch step requires positions[i] ==
+ * positions[0] + i, so a branching DAG is refused before its first dispatch
+ * rather than computed as if the siblings were a sequence. That refusal is the
+ * honest state of the layer computation, and the test below asks for it. */
+static int ds41_verify_block_dag(ds4_session *s, const ds41_candidate_dag *dag,
+                                 ds41_block_slot *slot, char *err, size_t errlen) {
+    if (!s || !dag || !slot || !dag->node_count ||
+        dag->node_count > DS4_TP_BATCH_MAX_ROWS) {
+        if (err && errlen) snprintf(err, errlen, "verify dag: bad shape");
+        return -1;
+    }
+    memset(slot, 0, sizeof(*slot));
+    static uint64_t generation;
+    slot->generation = ++generation;
+    slot->node_count = dag->node_count;
+    slot->base_pos = s->ds41_graph.pos;
+    bool linear = true;
+    for (uint32_t i = 0; i < dag->node_count; i++) {
+        slot->parent[i] = dag->parent[i];
+        slot->depth[i] = dag->depth[i];
+        slot->token[i] = dag->token[i];
+        slot->state[i] = DS41_NODE_READY;
+        slot->ready_mask |= 1u << i;
+        if (dag->depth[i] != i) linear = false;
+        if (i && dag->parent[i] != i - 1u) linear = false;
+        if (!i && dag->parent[i] != DS41_DAG_ROOT) linear = false;
+    }
+    if (!linear) {
+        /* Every node would have to see its parent's KV and none of its
+         * siblings'. The block gives row i the rows before it, which is the same
+         * thing only when the DAG is a chain. */
+        for (uint32_t i = 0; i < dag->node_count; i++)
+            slot->state[i] = DS41_NODE_REJECTED;
+        slot->result.status = DS41_VERIFY_REFUSED;
+        slot->result.accepted_node = DS41_DAG_ROOT;
+        if (err && errlen)
+            snprintf(err, errlen, "verify dag: branching is refused - the layers "
+                     "run K consecutive positions, so a node would see its siblings");
+        return -1;
+    }
+    int accepted[DS4_TP_BATCH_MAX_ROWS];
+    const int n = ds4_session_verify_block_ex(s, dag->token, (int)dag->node_count,
+                                              (int)(dag->max_depth ? dag->max_depth
+                                                                   : dag->node_count),
+                                              accepted, err, errlen);
+    if (n < 0) {
+        slot->result.status = DS41_VERIFY_FAILED;
+        slot->result.accepted_node = DS41_DAG_ROOT;
+        return -1;
+    }
+    slot->result.status = DS41_VERIFY_OK;
+    slot->result.accepted_depth = (uint32_t)n;
+    slot->result.accepted_node = n ? (uint32_t)(n - 1) : DS41_DAG_ROOT;
+    for (uint32_t i = 0; i < dag->node_count; i++)
+        slot->state[i] = i < (uint32_t)n ? DS41_NODE_COMMITTED : DS41_NODE_REJECTED;
     return n;
 }
 
@@ -85495,6 +85592,83 @@ regime_done:
         free(padded);
         memset(acc, 0, sizeof(acc));
     }
+}
+
+/* A branching DAG, which is the test the linear A sweep is not.
+ *
+ *          0
+ *        /   \
+ *       1     2
+ *      / \   / \
+ *     3   4 5   6
+ *
+ * For each leaf the accepted path is three nodes, and what has to hold is that a
+ * node read its parent's state and none of its siblings'. Against a reference that
+ * ran that path as single steps: every node's logits, the state after committing
+ * the path, and sixteen positions after it.
+ *
+ * Today this is expected to refuse. The layers run K consecutive positions, so
+ * row i is shown rows 0..i-1 - which is a node's parent path only when the DAG is
+ * a chain. A refusal is the correct answer while that is true; computing something
+ * for a branching DAG would be the bug. DS4_V41_BLOCK_DAG_TEST=1. */
+static void ds41_block_dag_test(ds4_session *seed, const ds4_model *m,
+                                const ds4_weights *w) {
+    if (!getenv("DS4_V41_BLOCK_DAG_TEST")) return;
+    ds4_engine *e = seed->engine;
+    const int ctx = seed->ctx_size;
+    ds4_tokens prompt = { .v = seed->checkpoint.v, .len = seed->checkpoint.len,
+                          .cap = seed->checkpoint.cap };
+    if (prompt.len < 1) return;
+    static const uint32_t parent[7] = { DS41_DAG_ROOT, 0, 0, 1, 1, 2, 2 };
+    static const uint32_t depth[7]  = { 0, 1, 1, 2, 2, 2, 2 };
+    static const uint32_t leaf[4]   = { 3, 4, 5, 6 };
+
+    float *lg = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int *oracle = malloc(16u * sizeof(int));
+    ds4_session *ref = NULL, *blk = NULL;
+    char err[256];
+    if (!lg || !oracle) goto done;
+
+    /* Tokens for the nodes: the oracle's own continuation for one branch and a
+     * different token for the other, so the siblings really differ. */
+    if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "dag oracle")) goto done;
+    oracle[0] = prompt.v[prompt.len - 1];
+    for (int i = 0; i < 6; i++) {
+        if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg)) goto done;
+        oracle[i + 1] = sample_argmax(lg, DS4_N_VOCAB);
+    }
+    ds4_session_free(ref); ref = NULL;
+
+    int token[7];
+    token[0] = oracle[0];
+    token[1] = oracle[1];
+    token[2] = oracle[1] == oracle[2] ? oracle[3] : oracle[2];   /* a real sibling */
+    token[3] = oracle[2];
+    token[4] = oracle[3];
+    token[5] = oracle[2];
+    token[6] = oracle[3];
+
+    fprintf(stderr, "ds4: branching DAG, 7 nodes over 3 depths, from position %d\n",
+            prompt.len);
+    for (uint32_t li = 0; li < 4; li++) {
+        const ds41_candidate_dag dag = { .node_count = 7, .token = token,
+                                         .parent = parent, .depth = depth,
+                                         .max_depth = 3 };
+        ds41_block_slot slot;
+        if (!ds41_txn_prefill(&blk, e, &prompt, ctx, "dag block")) goto done;
+        const int got = ds41_verify_block_dag(blk, &dag, &slot, err, sizeof(err));
+        uint32_t path[8];
+        const uint32_t plen = ds41_dag_path(&dag, leaf[li], path, 8);
+        fprintf(stderr, "ds4:   leaf %u: path length %u, got %d, status %u (%s)\n",
+                leaf[li], plen, got, slot.result.status,
+                got < 0 ? err : "committed");
+        ds4_session_free(blk); blk = NULL;
+        if (got < 0) break;      /* the refusal is the same for every leaf */
+    }
+done:
+    if (ref) ds4_session_free(ref);
+    if (blk) ds4_session_free(blk);
+    free(lg); free(oracle);
 }
 
 /* DS4_V41_BLOCK_TXN_TEST=1 runs the sweep where the prompt ends.
