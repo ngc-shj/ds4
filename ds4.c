@@ -86259,6 +86259,62 @@ static void ds41_dag_stage_check(void) {
         (void)ds4_gpu_end_commands();
         fprintf(stderr, "ds4: DAG KV stage bounds: 6 cases, %d wrong\n", rbad);
     }
+
+    /* Per-node RoPE against the strided form. Fed the positions a chain implies,
+     * the two have to produce the same bits - same frequencies, same precise cos
+     * and sin, same bf16 rounding on store. If they do not, the tree's positions
+     * would be carrying a different rotation than the chain's. */
+    {
+        enum { RW = 512u, RH = 2u, RR = 8u };
+        ds4_gpu_tensor *xa = ds4_gpu_tensor_alloc((uint64_t)RW * RH * RR * sizeof(float));
+        ds4_gpu_tensor *xb = ds4_gpu_tensor_alloc((uint64_t)RW * RH * RR * sizeof(float));
+        ds4_gpu_tensor *pos = ds4_gpu_tensor_alloc(RR * sizeof(uint32_t));
+        float *seed = malloc((size_t)RW * RH * RR * sizeof(float));
+        float *ra = malloc((size_t)RW * RH * RR * sizeof(float));
+        float *rb = malloc((size_t)RW * RH * RR * sizeof(float));
+        int rr_bad = 0, rr_cases = 0;
+        if (xa && xb && pos && seed && ra && rb) {
+            for (uint32_t i = 0; i < RW * RH * RR; i++)
+                seed[i] = (float)((i % 977u) + 1u) * 0.013f - 3.1f;
+            const uint32_t starts[] = { 0u, 1u, 31u, 127u, 1000u };
+            for (uint32_t si = 0; si < 5; si++)
+                for (int comp = 0; comp < 2; comp++)
+                    for (int inv = 0; inv < 2; inv++) {
+                        uint32_t hp[RR];
+                        for (uint32_t r = 0; r < RR; r++) hp[r] = starts[si] + r;
+                        if (!ds4_gpu_tensor_write(xa, 0, seed,
+                                (uint64_t)RW * RH * RR * sizeof(float)) ||
+                            !ds4_gpu_tensor_write(xb, 0, seed,
+                                (uint64_t)RW * RH * RR * sizeof(float)) ||
+                            !ds4_gpu_tensor_write(pos, 0, hp, sizeof(hp))) { rr_bad++; break; }
+                        if (!ds4_gpu_begin_commands()) { rr_bad++; break; }
+                        const bool o1 = ds4_gpu_dsv41_rope_stride(xa, RW, RH, RR,
+                                starts[si], 1u, comp != 0, inv != 0) != 0;
+                        const bool o2 = ds4_gpu_dsv41_rope_nodes(xb, RW, RH, RR, pos, 0,
+                                comp != 0, inv != 0) != 0;
+                        if (!o1 || !o2 || !ds4_gpu_end_commands() ||
+                            !ds4_gpu_synchronize()) { rr_bad++; break; }
+                        if (!ds4_gpu_tensor_read(xa, 0, ra,
+                                (uint64_t)RW * RH * RR * sizeof(float)) ||
+                            !ds4_gpu_tensor_read(xb, 0, rb,
+                                (uint64_t)RW * RH * RR * sizeof(float))) { rr_bad++; break; }
+                        rr_cases++;
+                        if (memcmp(ra, rb, (size_t)RW * RH * RR * sizeof(float)) != 0) {
+                            uint32_t f = 0;
+                            while (f < RW * RH * RR && ra[f] == rb[f]) f++;
+                            fprintf(stderr, "ds4: per-node RoPE differs at start %u "
+                                    "compressed %d inverse %d, first float %u: "
+                                    "%.9g vs %.9g\n", starts[si], comp, inv, f,
+                                    ra[f], rb[f]);
+                            rr_bad++;
+                        }
+                    }
+        } else rr_bad++;
+        fprintf(stderr, "ds4: per-node RoPE against the strided form: %d cases, "
+                "%d wrong\n", rr_cases, rr_bad);
+        ds4_gpu_tensor_free(xa); ds4_gpu_tensor_free(xb); ds4_gpu_tensor_free(pos);
+        free(seed); free(ra); free(rb);
+    }
 done:
     ds4_gpu_tensor_free(ring); ds4_gpu_tensor_free(delta); ds4_gpu_tensor_free(linear);
     ds4_gpu_tensor_free(path); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b);

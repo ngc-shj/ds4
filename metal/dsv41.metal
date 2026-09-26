@@ -59,6 +59,30 @@ kernel void kernel_dsv41_rope(
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }
 
+/* RoPE at a position a node carries, not one the row index implies.
+ *
+ * kernel_dsv41_rope takes start + row * stride, which is every position a chain
+ * can be at and no position a tree needs: siblings share a depth and a branch
+ * skips none, so the position has to come from the node's own descriptor. The
+ * arithmetic is the same to the bit - the same frequency a lane, precise cos and
+ * sin, the same bf16 rounding on store - so a chain fed positions start + row
+ * produces what the other kernel does. */
+kernel void kernel_dsv41_rope_nodes(
+        constant ds4_metal_args_dsv41_rope &args,
+        device float *x,
+        device const uint *positions,
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const float theta = float(positions[group.y]) * args.frequencies[lane];
+    const float c = precise::cos(theta);
+    const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
+    const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
+                    args.width - 64u + 2u * lane;
+    const float re = x[i], im = x[i + 1u];
+    x[i] = dsv41_bf16(re * c - im * s);
+    x[i + 1u] = dsv41_bf16(re * s + im * c);
+}
+
 kernel void kernel_dsv41_quantize(
         constant ds4_metal_args_dsv41_quantize &args,
         device float *x,

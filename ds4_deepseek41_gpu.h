@@ -71,6 +71,11 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
 /* Compressed pairs advance two absolute token positions per stored row. */
+/* RoPE at the position each node carries, for a DAG whose positions are not
+ * start + row * stride. Same frequencies and arithmetic as the strided form. */
+int ds4_gpu_dsv41_rope_nodes(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                             uint32_t rows, const ds4_gpu_tensor *positions,
+                             uint32_t position_offset, bool compressed, bool inverse);
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
                              bool compressed, bool inverse);
