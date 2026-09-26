@@ -142,6 +142,75 @@ struct ds4_metal_args_flash_kv_stage_f16 {
 // by an already-F16 compressed cache. Pack both regions into the contiguous
 // F16 FlashAttention scratch in one dispatch. The raw conversion expression
 // and compressed ushort4 transport exactly match the standalone copy kernels.
+/* The same staging, with the logical-to-physical map made explicit.
+ *
+ * The kernel it is based on already resolves the ring's two segments by modular
+ * arithmetic, which means the host-side prefix buffer was never something the
+ * kernel needed - the block path built a linear copy of its own accord. Here the
+ * map is stated in full:
+ *
+ *   logical key < prefix_rows   ->  ring[(raw_start + logical) % raw_cap]
+ *   logical key >= prefix_rows  ->  delta[ path[logical - prefix_rows] ]
+ *
+ * so the committed prefix is read in place and shared by every query, while the
+ * ancestor path is an indirection through one index list per node. Nothing is
+ * copied into a staging buffer first, nothing is staged per node on the host, and
+ * a branching DAG is expressible: a node's ancestors need not be adjacent
+ * anywhere, only listed in root-to-self order.
+ *
+ * The values and their order are the ones the kernel below would have produced, so
+ * the FlashAttention pass that consumes this does not change and cannot answer
+ * differently. */
+struct ds4_metal_args_flash_kv_stage_dag_f16 {
+    uint raw_cap;
+    uint raw_start;
+    uint n_raw;
+    uint n_comp;
+    uint pad_rows;
+    uint shared_pad;
+    uint prefix_rows;      /* logical keys below this come from the ring */
+    uint delta_row_vecs;   /* float4 per delta row; 128 for a 512-wide key */
+};
+
+kernel void kernel_dsv4_flash_kv_stage_dag_f16(
+        constant ds4_metal_args_flash_kv_stage_dag_f16 & args,
+        device const char * ring_src,
+        device const char * delta_src,
+        device const uint * path,
+        device const char * comp_src,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    constexpr uint row_vecs = 128;
+    const uint raw_vecs = args.n_raw * row_vecs;
+    const uint n_keys = args.n_raw + args.n_comp;
+    const uint total_vecs = n_keys * row_vecs;
+
+    if (gid < raw_vecs) {
+        const uint logical_row = gid >> 7;
+        const uint col = gid & 127u;
+        device packed_half4 *dst_half = (device packed_half4 *)dst;
+        float4 value;
+        if (logical_row < args.prefix_rows) {
+            uint physical_row = args.raw_start + logical_row;
+            if (physical_row >= args.raw_cap) physical_row -= args.raw_cap;
+            device const packed_float4 *ring = (device const packed_float4 *)ring_src;
+            value = float4(ring[physical_row * row_vecs + col]);
+        } else {
+            const uint node = path[logical_row - args.prefix_rows];
+            device const packed_float4 *delta = (device const packed_float4 *)delta_src;
+            value = float4(delta[(ulong)node * args.delta_row_vecs + col]);
+        }
+        dst_half[gid] = packed_half4(half4(value));
+        return;
+    }
+    if (gid < total_vecs) {
+        device const packed_ushort4 *comp = (device const packed_ushort4 *)comp_src;
+        device packed_ushort4 *dst_bits = (device packed_ushort4 *)dst;
+        dst_bits[gid] = comp[gid - raw_vecs];
+        return;
+    }
+}
+
 kernel void kernel_dsv4_flash_kv_stage_f16(
         constant ds4_metal_args_flash_kv_stage_f16 & args,
         device const char * raw_src,
