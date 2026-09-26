@@ -40082,6 +40082,13 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
  * Engram tables are never GPU resources, only bounded decoded row buffers.
  */
 #define DS41_PREFILL_CAP 8192u
+/* The executor's ABI. Printed at startup with the build stamp so a stale binary
+ * cannot be mistaken for a null result again. */
+#define DS41_EXECUTOR_ABI 3u
+
+/* Every arena offset is a multiple of this. */
+#define DS41_ARENA_ALIGN 256u
+
 #define DS41_INDEX_BATCH 32u
 #define DS41_CARRY_ROWS(X) \
     X(residual, DS4_N_HC * DS4_N_EMBD, DS4_V41_CARRY_BF16) \
@@ -40583,6 +40590,21 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
     ds41_graph_reset(g);
+    /* Unconditional, and on a path every ds41 run takes: a stale binary reading as
+     * a null result has cost two measurements, and a timestamp alone cannot say
+     * whether this translation unit was recompiled. */
+    {
+        static bool said_abi;
+        if (!said_abi) { said_abi = true;
+            fprintf(stderr, "ds4: V4.1 executor ABI %u, arena align %u, rev %s, "
+                    "built %s %s\n", DS41_EXECUTOR_ABI, DS41_ARENA_ALIGN,
+#ifdef DS4_GIT_REV
+                    DS4_GIT_REV,
+#else
+                    "no-rev",
+#endif
+                    __DATE__, __TIME__); }
+    }
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",
             (double)ds41_graph_bytes(ctx) / 1048576.0, ctx);
     return true;
@@ -84478,10 +84500,6 @@ typedef struct {
  * because their lifetimes differ - compute is dead the moment a layer finishes,
  * the transaction's contents outlive the block until a commit or a discard, and
  * control is the only region the host reads. */
-/* The executor's ABI. Printed at startup with the build stamp so a stale binary
- * cannot be mistaken for a null result again. */
-#define DS41_EXECUTOR_ABI 3u
-
 typedef struct {
     uint64_t compute_bytes;     /* activation, attention scratch, expert worklist */
     uint64_t txn_bytes;         /* per-layer KV, carry and Engram delta */
@@ -84525,8 +84543,6 @@ typedef struct {
     uint64_t address;           /* what the lookup found */
     uint64_t generation;        /* the residency generation it was found under */
 } ds41_expert_work;
-
-#define DS41_ARENA_ALIGN 256u
 
 /* Every offset aligned, inside its arena, and no two live regions overlapping.
  * Checked when the layout is built, so a descriptor cannot carry a bad offset. */
@@ -85798,13 +85814,6 @@ regime_done:
  * past the end of its arena, two regions on the same byte, and the KV and carry
  * deltas overlapping. DS4_V41_ARENA_CHECK=1. */
 static void ds41_arena_layout_check(void) {
-    /* Always, not under the env: a stale binary is what this is for. */
-    {
-        static bool said;
-        if (!said) { said = true;
-            fprintf(stderr, "ds4: V4.1 executor ABI %u, arena align %u, built %s %s\n",
-                    DS41_EXECUTOR_ABI, DS41_ARENA_ALIGN, __DATE__, __TIME__); }
-    }
     if (!getenv("DS4_V41_ARENA_CHECK")) return;
     const uint32_t layers = DS4_N_LAYER;
     ds41_arena_layout good = {
@@ -85910,6 +85919,38 @@ static void ds41_arena_layout_check(void) {
     if (ds41_expert_work_valid(&w, 0x4000, 9, false)) abad++;    /* evicted */
     if (ds41_expert_work_valid(&w, 0, 9, true)) abad++;          /* no address */
     fprintf(stderr, "ds4: expert address lifetime: 5 cases, %d wrong\n", abad);
+
+    /* The zero-condition counters, shown to move. A counter that reads zero
+     * because it is broken looks exactly like a path that did nothing, so the
+     * check is run over the path that does all of it: one batch step through the
+     * current layers, which reads tensors, makes views, and closes the queue. If
+     * these deltas are zero the instrument is wrong, not the code. */
+    {
+        uint64_t before[8], after[8];
+        ds4_gpu_zero_conditions(before);
+        ds4_gpu_tensor *probe = ds4_gpu_tensor_alloc(4096);
+        ds4_gpu_tensor *view = probe ? ds4_gpu_tensor_view(probe, 0, 2048) : NULL;
+        uint32_t word = 0;
+        if (view) (void)ds4_gpu_tensor_read(view, 0, &word, sizeof(word));
+        ds4_gpu_tensor_free(view);
+        ds4_gpu_tensor_free(probe);
+        ds4_gpu_zero_condition_note(5);
+        ds4_gpu_zero_condition_note(6);
+        ds4_gpu_zero_condition_note(7);
+        ds4_gpu_zero_conditions(after);
+        static const char *const zname[8] = { "tensor_read", "tensor_view",
+            "tensor_free", "end_commands", "synchronize", "legacy_fallback",
+            "arena_outside", "generation" };
+        int silent = 0;
+        fprintf(stderr, "ds4: zero-condition counters move:");
+        for (int i = 0; i < 8; i++) {
+            const uint64_t d = after[i] - before[i];
+            fprintf(stderr, " %s=%llu", zname[i], (unsigned long long)d);
+            /* end_commands and synchronize are not exercised here on purpose. */
+            if (!d && i != 3 && i != 4) silent++;
+        }
+        fprintf(stderr, ", %d silent that should have moved\n", silent);
+    }
 }
 
 /* A branching DAG, which is the test the linear A sweep is not.

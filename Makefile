@@ -13,6 +13,11 @@ GLM53_KDA_ROCM_TEST := tests/test_glm53_kda_rocm
 
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
+# The revision the binary was built from, and whether the tree was dirty. A
+# build timestamp cannot say whether a given translation unit was recompiled,
+# and a stale object reading as a null result has cost two measurements.
+DS4_GIT_REV := $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)$(shell git diff --quiet HEAD 2>/dev/null || echo -dirty)
+CFLAGS += -DDS4_GIT_REV=\"$(DS4_GIT_REV)\"
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 

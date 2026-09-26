@@ -9603,7 +9603,42 @@ int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t contex
     return 0;
 }
 
+/* What a descriptor-only layer must not do, counted where it would happen.
+ *
+ * "The code does not call it" is not the claim - the claim is that one executed
+ * layer did none of these. A harness reads the counters before entering the
+ * descriptor path and after it leaves, and requires every delta to be zero. */
+uint64_t g_ds41_zc_tensor_read;
+uint64_t g_ds41_zc_tensor_view;
+uint64_t g_ds41_zc_tensor_free;
+uint64_t g_ds41_zc_end_commands;
+uint64_t g_ds41_zc_synchronize;
+uint64_t g_ds41_zc_legacy_fallback;
+uint64_t g_ds41_zc_arena_outside;
+uint64_t g_ds41_zc_generation;
+
+void ds4_gpu_zero_conditions(uint64_t out[8]) {
+    out[0] = g_ds41_zc_tensor_read;
+    out[1] = g_ds41_zc_tensor_view;
+    out[2] = g_ds41_zc_tensor_free;
+    out[3] = g_ds41_zc_end_commands;
+    out[4] = g_ds41_zc_synchronize;
+    out[5] = g_ds41_zc_legacy_fallback;
+    out[6] = g_ds41_zc_arena_outside;
+    out[7] = g_ds41_zc_generation;
+}
+
+void ds4_gpu_zero_condition_note(int which) {
+    switch (which) {
+        case 5: g_ds41_zc_legacy_fallback++; break;
+        case 6: g_ds41_zc_arena_outside++; break;
+        case 7: g_ds41_zc_generation++; break;
+        default: break;
+    }
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes) {
+    g_ds41_zc_tensor_view++;
     if (!base) return NULL;
     const DS4MetalTensor *base_obj = ds4_gpu_tensor_const_obj(base);
     if (offset > base_obj.bytes || bytes > base_obj.bytes - offset) return NULL;
@@ -9630,6 +9665,7 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 }
 
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
+    g_ds41_zc_tensor_free++;
     if (!tensor) return;
     @autoreleasepool {
         uint8_t owner = 0;
@@ -9691,6 +9727,7 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *da
 }
 
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
+    g_ds41_zc_tensor_read++;
     if (!tensor || (!data && bytes != 0)) return 0;
     const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
     if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
@@ -12320,6 +12357,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 }
 
 int ds4_gpu_end_commands(void) {
+    g_ds41_zc_end_commands++;
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
@@ -12382,6 +12420,7 @@ static int ds4_gpu_flash_attn_stage_profile_boundary(
 }
 
 int ds4_gpu_synchronize(void) {
+    g_ds41_zc_synchronize++;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return ds4_gpu_end_commands();
     ds4_gpu_parallel_ffn_reset_state(YES);

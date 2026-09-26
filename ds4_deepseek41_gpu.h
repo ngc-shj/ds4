@@ -87,6 +87,13 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
 void ds4_gpu_moe_expert_major_override(int mode);
 uint64_t ds4_gpu_moe_expert_major_dispatches(void);
 int ds4_gpu_moe_expert_major_enabled_host(void);
+/* The zero conditions a descriptor-only layer has to hold, counted where they
+ * would happen: tensor read, view, free, end commands, synchronize, legacy
+ * fallback, a write outside an arena, a generation violation. A harness takes a
+ * delta around the descriptor path and requires every one to be zero. */
+void ds4_gpu_zero_conditions(uint64_t out[8]);
+void ds4_gpu_zero_condition_note(int which);
+
 /* Compile the accept pipelines, so first use does not land inside a timed arm. */
 int ds4_gpu_dsv41_block_accept_warm(void);
 /* Encode the accept decision so the performance path never reads the vocabulary:
