@@ -16591,9 +16591,24 @@ static id<MTLBuffer> g_moe_block_miss_buffer;
  * and populates the table, so the device path is stood down for exactly that
  * long. Counted down by the per-block reset, not by the per-layer branch. */
 static uint32_t g_block_residency_suspend;
+/* A layer to evict on the next per-block reset, requested from ds4.c before the
+ * cache's own declarations are in scope. */
+static int32_t g_force_layer_miss_pending = -1;
+static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer);
 
 void ds4_gpu_stream_block_residency_suspend(void) {
     g_block_residency_suspend = 2;
+}
+
+/* Evict every entry of one layer, which zeroes that layer's address slots and
+ * moves the generation. The next block then sees a miss the cache's own policy
+ * did not produce, which is the only way to exercise the park path on a machine
+ * whose working set is resident: a test that waits for a natural miss is a test
+ * that does not run. */
+void ds4_gpu_stream_expert_force_layer_miss(uint32_t layer) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    g_force_layer_miss_pending = (int32_t)layer;
+    fprintf(stderr, "ds4: forced a miss: layer %u evicted from the expert cache\n", layer);
 }
 
 static id<MTLBuffer> ds4_gpu_moe_block_miss_buffer(void) {
@@ -16614,6 +16629,13 @@ static id<MTLBuffer> ds4_gpu_moe_block_miss_buffer(void) {
 
 void ds4_gpu_moe_block_miss_reset(void) {
     if (g_block_residency_suspend) g_block_residency_suspend--;
+    if (g_force_layer_miss_pending >= 0) {
+        const uint32_t layer = (uint32_t)g_force_layer_miss_pending;
+        g_force_layer_miss_pending = -1;
+        ds4_gpu_stream_expert_cache_clear_layer(layer);
+        fprintf(stderr, "ds4: forced a miss: layer %u evicted from the expert cache\n",
+                layer);
+    }
     id<MTLBuffer> b = ds4_gpu_moe_block_miss_buffer();
     if (!b) return;
     memset([b contents], 0, [b length]);

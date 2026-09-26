@@ -111,6 +111,8 @@ void ds4_gpu_moe_block_miss_reset(void);
 /* Stand the device-residency path down for the next block, so a block that
  * parked makes progress on the readback path instead of parking again. */
 void ds4_gpu_stream_block_residency_suspend(void);
+/* Evict one layer so the next block's residency check reports a miss. */
+void ds4_gpu_stream_expert_force_layer_miss(uint32_t layer);
 uint64_t ds4_gpu_resident_addr_batch_layers(void);
 /* [0] the compressor pool's row view, [1] the attention output k-slice tail. */
 void ds4_gpu_view_sites_metal(uint64_t out[2]);

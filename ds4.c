@@ -19064,8 +19064,7 @@ static uint64_t g_ds41_view_site_overflow;
  * about the block. Only what a block does is a zero condition. */
 static int g_ds41_view_block_scope;
 
-static ds4_gpu_tensor *ds41_view_at(int line, const ds4_gpu_tensor *base,
-                                    uint64_t off, uint64_t bytes) {
+static void ds41_view_site_note(int line) {
     uint32_t i = 0;
     for (; i < DS41_VIEW_SITES && g_ds41_view_sites[i].line; i++)
         if (g_ds41_view_sites[i].line == line) break;
@@ -19076,6 +19075,11 @@ static ds4_gpu_tensor *ds41_view_at(int line, const ds4_gpu_tensor *base,
     } else {
         g_ds41_view_site_overflow++;
     }
+}
+
+static ds4_gpu_tensor *ds41_view_at(int line, const ds4_gpu_tensor *base,
+                                    uint64_t off, uint64_t bytes) {
+    ds41_view_site_note(line);
     return ds4_gpu_tensor_view(base, off, bytes);
 }
 #define ds4_gpu_tensor_view(base, off, bytes) \
@@ -40434,6 +40438,7 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
  * falling back to an allocation the counters would then have to explain. */
 enum { DS41_VIEW_CACHE = 4096 };
 static struct ds41_view_entry {
+    const void           *owner;   /* the graph whose buffer this views */
     const ds4_gpu_tensor *base;
     uint64_t              off;
     uint64_t              bytes;
@@ -40441,7 +40446,9 @@ static struct ds41_view_entry {
 } g_ds41_views[DS41_VIEW_CACHE];
 static uint32_t g_ds41_view_count;
 
-static ds4_gpu_tensor *ds41_view(const ds4_gpu_tensor *base, uint64_t off, uint64_t bytes) {
+static ds4_gpu_tensor *ds41_view_impl(int line, const void *owner,
+                                     const ds4_gpu_tensor *base,
+                                     uint64_t off, uint64_t bytes) {
     if (!base) return NULL;
     for (uint32_t i = 0; i < g_ds41_view_count; i++) {
         const struct ds41_view_entry *e = &g_ds41_views[i];
@@ -40455,11 +40462,18 @@ static ds4_gpu_tensor *ds41_view(const ds4_gpu_tensor *base, uint64_t off, uint6
                     "configuration\n", DS41_VIEW_CACHE); }
         return NULL;
     }
-    ds4_gpu_tensor *v = ds4_gpu_tensor_view(base, off, bytes);
+    /* A miss is the thing to report, and it belongs to the caller's line, not to
+     * this one. Parenthesised so the tally macro below does not rewrite it: a
+     * cached view is not a view a block made. */
+    ds4_gpu_tensor *v = (ds4_gpu_tensor_view)(base, off, bytes);
     if (!v) return NULL;
-    g_ds41_views[g_ds41_view_count++] = (struct ds41_view_entry){ base, off, bytes, v };
+    ds41_view_site_note(line);
+    g_ds41_views[g_ds41_view_count++] =
+        (struct ds41_view_entry){ owner, base, off, bytes, v };
     return v;
 }
+#define ds41_view(owner, base, off, bytes) \
+    ds41_view_impl(__LINE__, (owner), (base), (off), (bytes))
 
 /* The bases belong to a graph, so a graph going away takes every view of it.
  * Clearing all of them costs one re-warm and needs no ownership bookkeeping,
@@ -40467,16 +40481,23 @@ static ds4_gpu_tensor *ds41_view(const ds4_gpu_tensor *base, uint64_t off, uint6
  * global command buffer means no other session is inside a block step here. A
  * cached view is only ever held in a local for the length of one step, so
  * nothing outlives the clear. */
-static void ds41_view_cache_clear(void) {
-    for (uint32_t i = 0; i < g_ds41_view_count; i++)
-        ds4_gpu_tensor_free(g_ds41_views[i].view);
-    memset(g_ds41_views, 0, sizeof(g_ds41_views));
-    g_ds41_view_count = 0;
+static void ds41_view_cache_forget(const void *owner) {
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < g_ds41_view_count; i++) {
+        if (g_ds41_views[i].owner == owner) {
+            ds4_gpu_tensor_free(g_ds41_views[i].view);
+            continue;
+        }
+        g_ds41_views[keep++] = g_ds41_views[i];
+    }
+    for (uint32_t i = keep; i < g_ds41_view_count; i++)
+        g_ds41_views[i] = (struct ds41_view_entry){ 0 };
+    g_ds41_view_count = keep;
 }
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
-    ds41_view_cache_clear();
+    ds41_view_cache_forget(g);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     ds4_gpu_decode_graphs_invalidate();
 #endif
@@ -40718,6 +40739,40 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
                 (uint64_t)i * (count) * 4u, (uint64_t)(count) * 4u))) goto fail;
     DS41_PREFILL_ROWS(DS41_BATCH_VIEW)
 #undef DS41_BATCH_VIEW
+    /* Every view the block executor can ask for, made here. The cache would
+     * make them on a graph's first block anyway, but "the hot path allocates
+     * nothing" is a claim about every block including the first, and the shapes
+     * are all decided by the configuration: a row count from one to the cap, a
+     * row index below the cap, a chunk offset that is a multiple of the index
+     * batch. Warming them costs about 1,200 entries once. */
+    {
+        const uint64_t head_bytes =
+            (uint64_t)(DS4_N_HEAD / g->tp_world) * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t gather_bytes =
+            (uint64_t)DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM * sizeof(float);
+        const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+        const uint64_t q_bytes =
+            (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        const uint64_t w_bytes = (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float);
+        for (uint32_t r = 1; r <= g->prefill_cap; r++) {
+#define DS41_BATCH_WARM(name, width)             (void)ds41_view(g, g->batch.name, 0, (uint64_t)r * (width) * sizeof(float));
+            DS41_PREFILL_ROWS(DS41_BATCH_WARM)
+#undef DS41_BATCH_WARM
+            (void)ds41_view(g, g->batch.mid, 0, (uint64_t)r * logits_bytes);
+        }
+        for (uint32_t i = 0; i < g->prefill_cap; i++) {
+            (void)ds41_view(g, g->batch.q, (uint64_t)i * head_bytes, head_bytes);
+            (void)ds41_view(g, g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
+            if (g->block_selected_kv)
+                (void)ds41_view(g, g->block_selected_kv,
+                                (uint64_t)i * gather_bytes, gather_bytes);
+        }
+        for (uint32_t off = 0; off < g->prefill_cap; off += DS41_INDEX_BATCH)
+            for (uint32_t r = 1; r <= DS41_INDEX_BATCH; r++) {
+                (void)ds41_view(g, g->batch.index_q, off * q_bytes, r * q_bytes);
+                (void)ds41_view(g, g->batch.index_weights, off * w_bytes, r * w_bytes);
+            }
+    }
     if (!ds4_gpu_tensor_fill_f32(g->batch.block_mask, 0,
         (uint64_t)g->prefill_cap * ((g->ctx + 7u) / 8u))) goto fail;
 #define DS41_CARRY_ALLOC(name, count, format) \
@@ -41267,6 +41322,10 @@ enum { DS41_BLOCK_MISS_MAX = DS4_TP_BATCH_MAX_ROWS * 6 };
 static uint64_t g_ds41_park_blocks, g_ds41_park_misses, g_ds41_park_invalid,
                 g_ds41_park_dropped;
 static uint32_t g_ds41_park_rows_mask;
+/* What the most recent park reported, so a forced-miss test can assert on the
+ * fanout rather than on a log line. */
+static uint64_t g_ds41_park_last_layers_mask;
+static uint32_t g_ds41_park_last_misses, g_ds41_park_last_rows;
 
 static uint64_t g_ds41_fuse_sites;
 
@@ -43324,8 +43383,8 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
         const uint32_t rows = count - off < DS41_INDEX_BATCH ? count - off : DS41_INDEX_BATCH;
         const uint64_t q_bytes = DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         const uint64_t w_bytes = DS4_N_INDEXER_HEAD * sizeof(float);
-        ds4_gpu_tensor *q = ds41_view(b->index_q, off * q_bytes, rows * q_bytes);
-        ds4_gpu_tensor *weights = ds41_view(b->index_weights, off * w_bytes, rows * w_bytes);
+        ds4_gpu_tensor *q = ds41_view(g, b->index_q, off * q_bytes, rows * q_bytes);
+        ds4_gpu_tensor *weights = ds41_view(g, b->index_weights, off * w_bytes, rows * w_bytes);
         bool ok = q && weights && (packed ?
             ds4_gpu_dsv41_indexer_scores_packed(g->index_scores, q, weights,
                 g->index_cache[owner], g->index_packed, n_comp, rows, start + off, ratio, count, off) :
@@ -46371,7 +46430,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     ds4_gpu_tensor *gathers[DS4_TP_BATCH_MAX_ROWS] = {0};
     bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
-    if (ok) ok = (active.name = ds41_view(g->batch.name, 0, \
+    if (ok) ok = (active.name = ds41_view(g, g->batch.name, 0, \
         (uint64_t)rows * (width) * sizeof(float))) != NULL;
     DS41_PREFILL_ROWS(DS41_SESSION_VIEW)
 #undef DS41_SESSION_VIEW
@@ -46399,10 +46458,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                              (row_gather_e && row_gather_e[0] && atoi(row_gather_e) != 0)) &&
                             g->block_selected_kv != NULL;
     for (int i = 0; ok && i < count; i++) {
-        queries[i] = ds41_view(g->batch.q, (uint64_t)i * head_bytes, head_bytes);
-        heads[i] = ds41_view(g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
+        queries[i] = ds41_view(g, g->batch.q, (uint64_t)i * head_bytes, head_bytes);
+        heads[i] = ds41_view(g, g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
         if (row_gather)
-            gathers[i] = ds41_view(g->block_selected_kv,
+            gathers[i] = ds41_view(g, g->block_selected_kv,
                                    (uint64_t)i * gather_bytes, gather_bytes);
         ok = queries[i] && heads[i] && (!row_gather || gathers[i]);
     }
@@ -47261,7 +47320,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     ds4_gpu_tensor *batch_logits = NULL;
     if (ok && !prefill_only && !getenv("DS4_METAL_DISABLE_V41_BATCH_HEAD") &&
         ds4_gpu_tensor_bytes(g->batch.mid) >= rows * logits_bytes)
-        batch_logits = ds41_view(g->batch.mid, 0, rows * logits_bytes);
+        batch_logits = ds41_view(g, g->batch.mid, 0, rows * logits_bytes);
     /* Pure prefill publishes only its final row; the caller computes the head
      * once at the complete prompt frontier. */
     const int first_output = prefill_only ? count - 1 : 0;
@@ -47416,6 +47475,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                     layers_seen++;
                 }
             }
+            g_ds41_park_last_layers_mask = layer_mask;
+            g_ds41_park_last_misses = misses;
+            g_ds41_park_last_rows = parked;
             fprintf(stderr, "ds4: V4.1 verify block parked: %u assignments missing "
                     "an address over %u layers (first layer %u expert %u), rows 0x%x, "
                     "%u invalid ids, %u records dropped\n",
@@ -80595,6 +80657,8 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
                                     const ds4_weights *w);
 static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w);
+static void ds41_force_miss_test(ds4_session *seed, const ds4_model *m,
+                                 const ds4_weights *w);
 static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
                                       const ds4_weights *w);
 static void ds41_block_dag_test(ds4_session *seed, const ds4_model *m,
@@ -84336,6 +84400,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             selftest_done = 1;
             ds41_rowtile_check(&e->model, &e->weights);
             ds41_block_txn_test(s, &e->model, &e->weights);
+            ds41_force_miss_test(s, &e->model, &e->weights);
             ds41_block_txn_chain_test(s, &e->model, &e->weights);
             ds41_arena_layout_check();
             ds41_dag_stage_check();
@@ -85571,6 +85636,104 @@ static uint32_t ds41_txn_state_diff(ds41_gpu_graph *a, ds41_gpu_graph *b,
             }
         }
     return bad;
+}
+
+/* One forced miss, one repair. Everything about the park path is untestable on
+ * a machine whose working set stays resident - the cache reports 240 hits and 0
+ * misses a token - so the miss is made: a layer is evicted, which zeroes its
+ * address slots and moves the generation.
+ *
+ * What has to hold is not just that the block noticed. The layer's six slots are
+ * shared by all eight rows, so every assignment that referenced the evicted
+ * experts has to be released together; a block that committed the rows whose
+ * experts happened to be elsewhere would be the failure this exists to catch.
+ * Then the readback path services the layer and the next block has to commit the
+ * same logits the oracle did, bit for bit.
+ * DS4_V41_FORCE_MISS_TEST=<layer>. */
+static void ds41_force_miss_test(ds4_session *seed, const ds4_model *m,
+                                 const ds4_weights *w) {
+    const char *env = getenv("DS4_V41_FORCE_MISS_TEST");
+    if (!env || !env[0]) return;
+    const long layer = atol(env);
+    if (layer < 0 || layer >= (long)DS4_N_LAYER) {
+        fprintf(stderr, "ds4:   forced miss: layer %ld is outside 0..%u\n",
+                layer, DS4_N_LAYER - 1u);
+        return;
+    }
+    const long k = 8;
+    ds4_engine *e = seed->engine;
+    const int ctx = seed->ctx_size;
+    ds4_tokens prompt = { .v = seed->checkpoint.v, .len = seed->checkpoint.len,
+                          .cap = seed->checkpoint.cap };
+    if (prompt.len < 1) return;
+
+    float *lg_ref = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    float *lg_blk = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    int *oracle = malloc((size_t)(k + 2) * sizeof(int));
+    int cand[DS4_TP_BATCH_MAX_ROWS], acc[DS4_TP_BATCH_MAX_ROWS];
+    char err[192];
+    ds4_session *ref = NULL, *blk = NULL, *warm = NULL;
+    if (!lg_ref || !lg_blk || !oracle) goto done;
+
+    if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "oracle")) goto done;
+    oracle[0] = prompt.v[prompt.len - 1];
+    for (long i = 0; i <= k; i++) {
+        if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg_ref)) goto done;
+        oracle[i + 1] = sample_argmax(lg_ref, DS4_N_VOCAB);
+    }
+    ds4_session_free(ref); ref = NULL;
+
+    if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "reference") ||
+        !ds41_txn_prefill(&blk, e, &prompt, ctx, "block")) goto done;
+    fprintf(stderr, "ds4: forced expert miss at layer %ld, block starts at %d, k=%ld\n",
+            layer, prompt.len, k);
+
+    bool ok = true;
+    for (long i = 0; ok && i < k; i++)
+        ok = ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg_ref);
+    for (long j = 0; j < k; j++) cand[j] = oracle[j];
+
+    const uint64_t parks0 = g_ds41_park_blocks;
+    ds4_gpu_stream_expert_force_layer_miss((uint32_t)layer);
+    const int refused = ok ? ds4_session_verify_block_ex(blk, cand, (int)k, (int)k, acc,
+                                                        err, sizeof(err)) : 0;
+    const uint64_t parks = g_ds41_park_blocks - parks0;
+    const uint64_t want_mask = 1ull << (uint64_t)layer;
+    fprintf(stderr, "ds4:   forced miss: block returned %d, %llu park%s, %u assignments "
+            "released over layer mask 0x%llx, rows 0x%x\n",
+            refused, (unsigned long long)parks, parks == 1 ? "" : "s",
+            g_ds41_park_last_misses, (unsigned long long)g_ds41_park_last_layers_mask,
+            g_ds41_park_last_rows);
+    if (refused >= 0 || parks != 1 || g_ds41_park_last_layers_mask != want_mask) {
+        fprintf(stderr, "ds4:   forced miss: FAIL (expected one park naming only "
+                "layer %ld and no commit)\n", layer);
+        goto done;
+    }
+
+    const int got = ds4_session_verify_block_ex(blk, cand, (int)k, (int)k, acc,
+                                               err, sizeof(err));
+    if (got != (int)k) {
+        fprintf(stderr, "ds4:   forced miss: repair committed %d of %ld (%s)\n",
+                got, k, got < 0 ? err : "wrong count");
+        goto done;
+    }
+    if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[k], lg_ref) ||
+        !ds41_graph_step(&blk->ds41_graph, m, w, oracle[k], lg_blk)) {
+        fprintf(stderr, "ds4:   forced miss: the follow-up step failed\n");
+        goto done;
+    }
+    uint64_t differ = 0;
+    for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+        if (memcmp(&lg_ref[v], &lg_blk[v], sizeof(float)) != 0) differ++;
+    fprintf(stderr, "ds4:   forced miss: repair committed %ld of %ld, %llu of %u logits "
+            "differ -> %s\n", k, k, (unsigned long long)differ, DS4_N_VOCAB,
+            differ ? "FAIL" : "PASS");
+
+done:
+    if (ref) ds4_session_free(ref);
+    if (blk) ds4_session_free(blk);
+    if (warm) ds4_session_free(warm);
+    free(lg_ref); free(lg_blk); free(oracle);
 }
 
 static void ds41_block_txn_test_at(ds4_session *seed, const ds4_model *m,
