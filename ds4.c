@@ -84478,6 +84478,10 @@ typedef struct {
  * because their lifetimes differ - compute is dead the moment a layer finishes,
  * the transaction's contents outlive the block until a commit or a discard, and
  * control is the only region the host reads. */
+/* The executor's ABI. Printed at startup with the build stamp so a stale binary
+ * cannot be mistaken for a null result again. */
+#define DS41_EXECUTOR_ABI 3u
+
 typedef struct {
     uint64_t compute_bytes;     /* activation, attention scratch, expert worklist */
     uint64_t txn_bytes;         /* per-layer KV, carry and Engram delta */
@@ -84487,11 +84491,40 @@ typedef struct {
     uint64_t miss_queue_off;
     uint64_t result_off;
     uint64_t counter_off;
+    /* An ancestor path is not a range. In a branching DAG a node's ancestors are
+     * not adjacent anywhere, so attention is given an index list per node -
+     * root first, in the order a single pass would have produced them - and reads
+     * the transaction delta through it. The order is part of the answer, which is
+     * why it is checked rather than assumed: reversing a path with the length as
+     * both counter and bound already returned three nodes as two once. */
+    uint64_t path_nodes_off;    /* into control: uint32 per (node, ancestor) */
+    uint64_t path_nodes_stride; /* bytes per node */
+    /* A partial expert result may not be added to the row. With one of six
+     * missing, the five resident ones are computed and kept per slot; the sixth
+     * arrives after the repair, and only then are all six reduced in slot order.
+     * Adding as they arrive would either double-count on resume or change the
+     * reduction order, and both change the answer. */
+    uint64_t expert_out_off;    /* into compute: [node][slot][out_dim] */
+    uint64_t expert_out_stride; /* bytes per node */
+    uint64_t expert_done_off;   /* into control: a slot mask per node */
     uint64_t kv_delta_off;      /* into txn, per layer */
     uint64_t kv_delta_stride;
     uint64_t carry_delta_off;
     uint64_t carry_delta_stride;
 } ds41_arena_layout;
+
+/* What a unit of expert work is bound to. An expert that was resident when the
+ * worklist was built can be evicted before the work runs, and the answer would be
+ * silently wrong, so the descriptor carries what it was promised and the execution
+ * checks it. A mismatch is an invariant violation, not a slower path. */
+typedef struct {
+    uint32_t layer;
+    uint32_t expert;
+    uint32_t node;
+    uint32_t slot;              /* which of the node's selected experts */
+    uint64_t address;           /* what the lookup found */
+    uint64_t generation;        /* the residency generation it was found under */
+} ds41_expert_work;
 
 #define DS41_ARENA_ALIGN 256u
 
@@ -84508,6 +84541,11 @@ static bool ds41_arena_layout_valid(const ds41_arena_layout *l, uint32_t layers)
     for (int i = 0; i < 5; i++)
         for (int j = i + 1; j < 5; j++)
             if (control[i] == control[j]) return false;
+    if (l->path_nodes_off % DS41_ARENA_ALIGN ||
+        l->path_nodes_stride % DS41_ARENA_ALIGN ||
+        l->expert_done_off % DS41_ARENA_ALIGN ||
+        l->expert_out_off % DS41_ARENA_ALIGN ||
+        l->expert_out_stride % DS41_ARENA_ALIGN) return false;
     if (l->kv_delta_off % DS41_ARENA_ALIGN || l->carry_delta_off % DS41_ARENA_ALIGN)
         return false;
     if (l->kv_delta_stride % DS41_ARENA_ALIGN ||
@@ -84540,6 +84578,60 @@ typedef struct {
     ds41_verify_result result;
 } ds41_block_slot;
 
+/* A node's ancestors, root first, in the order a single pass would have run them.
+ * Returns 0 if the chain is not strictly increasing in depth or does not end at
+ * the root, because attention reads the transaction delta through this list and a
+ * wrong order is a wrong answer rather than a slow one. */
+static uint32_t ds41_slot_path(const ds41_block_slot *slot, uint32_t node,
+                               uint32_t *out, uint32_t cap) {
+    if (!slot || node >= slot->node_count) return 0;
+    uint32_t n = 0;
+    for (uint32_t at = node; at != DS41_DAG_ROOT; n++) {
+        if (n >= cap || at >= slot->node_count) return 0;
+        out[n] = at;
+        const uint32_t up = slot->parent[at];
+        if (up != DS41_DAG_ROOT &&
+            (up >= slot->node_count || slot->depth[up] + 1u != slot->depth[at]))
+            return 0;                       /* not a chain of consecutive depths */
+        at = up;
+    }
+    for (uint32_t i = 0, j = n ? n - 1u : 0u; i < j; i++, j--) {
+        const uint32_t t = out[i]; out[i] = out[j]; out[j] = t;
+    }
+    for (uint32_t i = 0; i < n; i++)
+        if (slot->depth[out[i]] != i) return 0;   /* root first, one depth a step */
+    return n;
+}
+
+/* Whether a node may run one (layer, phase).
+ *
+ * Its own previous phase has to be done, and attention needs more than that: it
+ * reads its ancestors' KV for this layer, so an ancestor parked on a missing
+ * expert blocks its descendants at ATTN even though an unrelated sibling carries
+ * on. A rule that only said "siblings advance" would let a descendant read an
+ * ancestor's KV that does not exist yet. */
+static bool ds41_node_ready(const ds41_block_slot *slot, uint32_t node,
+                            uint16_t layer, uint8_t phase) {
+    if (!slot || node >= slot->node_count) return false;
+    const ds41_node_cursor c = slot->cursor[node];
+    if (c.state != DS41_NODE_READY || c.layer != layer || c.phase != phase)
+        return false;
+    if (phase != DS41_PHASE_ATTN) return true;
+    for (uint32_t at = slot->parent[node]; at != DS41_DAG_ROOT; ) {
+        if (at >= slot->node_count) return false;
+        const ds41_node_cursor a = slot->cursor[at];
+        /* The ancestor has to have finished this layer's KV, which means it is
+         * past ATTN in this layer or already beyond the layer. */
+        const bool kv_done = a.layer > layer ||
+            (a.layer == layer && a.phase > DS41_PHASE_ATTN) ||
+            a.state == DS41_NODE_COMMITTED;
+        if (!kv_done || a.state == DS41_NODE_WAIT_EXPERT ||
+            a.state == DS41_NODE_REJECTED) return false;
+        at = slot->parent[at];
+    }
+    return true;
+}
+
 /* The nodes standing at one (layer, phase) and ready to run. Weight sharing
  * depends on this being a set rather than a sequence: whoever is here reads the
  * same weights, and whoever is waiting is simply not in it. */
@@ -84548,10 +84640,19 @@ static uint32_t ds41_slot_ready_mask(const ds41_block_slot *slot, uint16_t layer
     uint32_t mask = 0;
     if (!slot) return 0;
     for (uint32_t i = 0; i < slot->node_count && i < 32u; i++)
-        if (slot->cursor[i].layer == layer && slot->cursor[i].phase == phase &&
-            slot->cursor[i].state == DS41_NODE_READY)
-            mask |= 1u << i;
+        if (ds41_node_ready(slot, i, layer, phase)) mask |= 1u << i;
     return mask;
+}
+
+/* What the work was promised against what is true now. Called before the work
+ * runs, and a mismatch stops the block: an expert that was resident when the
+ * worklist was built can be evicted before it executes, and using the stale
+ * address would answer with whatever now occupies it. */
+static bool ds41_expert_work_valid(const ds41_expert_work *w, uint64_t now_address,
+                                   uint64_t now_generation, bool resident) {
+    if (!w) return false;
+    return resident && now_address != 0 && now_address == w->address &&
+           now_generation == w->generation;
 }
 
 static uint32_t ds41_slot_miss_mask(const ds41_block_slot *slot) {
@@ -85697,6 +85798,13 @@ regime_done:
  * past the end of its arena, two regions on the same byte, and the KV and carry
  * deltas overlapping. DS4_V41_ARENA_CHECK=1. */
 static void ds41_arena_layout_check(void) {
+    /* Always, not under the env: a stale binary is what this is for. */
+    {
+        static bool said;
+        if (!said) { said = true;
+            fprintf(stderr, "ds4: V4.1 executor ABI %u, arena align %u, built %s %s\n",
+                    DS41_EXECUTOR_ABI, DS41_ARENA_ALIGN, __DATE__, __TIME__); }
+    }
     if (!getenv("DS4_V41_ARENA_CHECK")) return;
     const uint32_t layers = DS4_N_LAYER;
     ds41_arena_layout good = {
@@ -85734,6 +85842,74 @@ static void ds41_arena_layout_check(void) {
     }
     fprintf(stderr, "ds4: arena layout: %zu cases, %d wrong\n",
             sizeof(cases) / sizeof(cases[0]), bad);
+
+    /* The other three contracts, each asked to refuse.
+     *
+     *          0
+     *        /   \
+     *       1     2
+     *      / \   / \
+     *     3   4 5   6
+     */
+    ds41_block_slot slot;
+    memset(&slot, 0, sizeof(slot));
+    slot.node_count = 7;
+    static const uint32_t par[7] = { DS41_DAG_ROOT, 0, 0, 1, 1, 2, 2 };
+    static const uint32_t dep[7] = { 0, 1, 1, 2, 2, 2, 2 };
+    for (uint32_t i = 0; i < 7; i++) {
+        slot.parent[i] = par[i];
+        slot.depth[i] = dep[i];
+        slot.cursor[i] = (ds41_node_cursor){ .layer = 0, .phase = DS41_PHASE_ATTN,
+                                             .state = DS41_NODE_READY };
+    }
+    int pbad = 0;
+    uint32_t path[8];
+    /* Node 3's path is 0, 1, 3 - root first, one depth a step. */
+    if (ds41_slot_path(&slot, 3, path, 8) != 3 ||
+        path[0] != 0 || path[1] != 1 || path[2] != 3) pbad++;
+    if (ds41_slot_path(&slot, 6, path, 8) != 3 ||
+        path[1] != 2 || path[2] != 6) pbad++;
+    /* A depth that does not step by one has to be refused, not reordered. */
+    slot.depth[1] = 5;
+    if (ds41_slot_path(&slot, 3, path, 8) != 0) pbad++;
+    slot.depth[1] = 1;
+    /* A capacity smaller than the path is a refusal too. */
+    if (ds41_slot_path(&slot, 3, path, 2) != 0) pbad++;
+    fprintf(stderr, "ds4: ancestor path: 4 cases, %d wrong\n", pbad);
+
+    /* Readiness at ATTN: an ancestor parked blocks its descendants and nothing
+     * else. Node 1 waits on an expert; 3 and 4 are its children, 2, 5 and 6 are
+     * not. */
+    int rbad = 0;
+    for (uint32_t i = 0; i < 7; i++)
+        slot.cursor[i] = (ds41_node_cursor){ .layer = 0, .phase = DS41_PHASE_ATTN,
+                                             .state = DS41_NODE_READY };
+    /* Ancestors have to be past ATTN for a descendant to read their KV. */
+    slot.cursor[0].phase = DS41_PHASE_ROUTED;
+    slot.cursor[1].phase = DS41_PHASE_ROUTED;
+    slot.cursor[2].phase = DS41_PHASE_ROUTED;
+    if (!ds41_node_ready(&slot, 3, 0, DS41_PHASE_ATTN)) rbad++;
+    if (!ds41_node_ready(&slot, 5, 0, DS41_PHASE_ATTN)) rbad++;
+    slot.cursor[1].state = DS41_NODE_WAIT_EXPERT;
+    if (ds41_node_ready(&slot, 3, 0, DS41_PHASE_ATTN)) rbad++;   /* blocked */
+    if (ds41_node_ready(&slot, 4, 0, DS41_PHASE_ATTN)) rbad++;   /* blocked */
+    if (!ds41_node_ready(&slot, 5, 0, DS41_PHASE_ATTN)) rbad++;  /* unrelated */
+    if (!ds41_node_ready(&slot, 6, 0, DS41_PHASE_ATTN)) rbad++;  /* unrelated */
+    const uint32_t ready = ds41_slot_ready_mask(&slot, 0, DS41_PHASE_ATTN);
+    if (ready != ((1u << 5) | (1u << 6))) rbad++;
+    fprintf(stderr, "ds4: ancestor-aware readiness: 7 cases, %d wrong, ready mask "
+            "%#x\n", rbad, ready);
+
+    /* The address a unit of work was promised. */
+    int abad = 0;
+    const ds41_expert_work w = { .layer = 7, .expert = 123, .node = 3, .slot = 2,
+                                 .address = 0x4000, .generation = 9 };
+    if (!ds41_expert_work_valid(&w, 0x4000, 9, true)) abad++;    /* unchanged */
+    if (ds41_expert_work_valid(&w, 0x4000, 10, true)) abad++;    /* re-admitted */
+    if (ds41_expert_work_valid(&w, 0x8000, 9, true)) abad++;     /* moved */
+    if (ds41_expert_work_valid(&w, 0x4000, 9, false)) abad++;    /* evicted */
+    if (ds41_expert_work_valid(&w, 0, 9, true)) abad++;          /* no address */
+    fprintf(stderr, "ds4: expert address lifetime: 5 cases, %d wrong\n", abad);
 }
 
 /* A branching DAG, which is the test the linear A sweep is not.
