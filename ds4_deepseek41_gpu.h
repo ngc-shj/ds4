@@ -94,6 +94,18 @@ int ds4_gpu_moe_expert_major_enabled_host(void);
 void ds4_gpu_zero_conditions(uint64_t out[8]);
 void ds4_gpu_zero_condition_note(int which);
 
+/* Stage the keys a node sees from where they live: the ring with its start and
+ * capacity, the transaction delta, and the node's ancestor list as an offset and a
+ * length into one path array. No linear prefix buffer, no per-call views. */
+int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring,
+                                     uint32_t ring_start, uint32_t ring_cap,
+                                     const ds4_gpu_tensor *delta,
+                                     uint32_t delta_row_floats,
+                                     const ds4_gpu_tensor *path,
+                                     uint32_t path_offset, uint32_t path_length,
+                                     const ds4_gpu_tensor *comp, uint32_t n_comp,
+                                     ds4_gpu_tensor *dst, uint32_t prefix_rows);
+
 /* Compile the accept pipelines, so first use does not land inside a timed arm. */
 int ds4_gpu_dsv41_block_accept_warm(void);
 /* Encode the accept decision so the performance path never reads the vocabulary:

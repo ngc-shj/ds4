@@ -52059,6 +52059,63 @@ int ds4_gpu_dsv41_block_accept_warm(void) {
  *
  * `argmax` and `result` belong to the caller so nothing here is a process
  * global: several blocks may be in flight and a global would tie them together. */
+/* Stage the keys a node sees, from where they live.
+ *
+ * The entry takes the arenas and the descriptors, not a prefix tensor: the ring
+ * with its start and capacity, the transaction delta, and the node's ancestor list
+ * as an offset and a length into one path array. Nothing is copied into a linear
+ * buffer first and nothing is viewed per call.
+ *
+ * The prefix is shared logically - every node names the same committed keys - but
+ * each query still rescans the ring, so this removes the materialisation and not
+ * the scan. Sharing the scan physically is a later step inside the query tile. */
+int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring,
+                                     uint32_t ring_start, uint32_t ring_cap,
+                                     const ds4_gpu_tensor *delta,
+                                     uint32_t delta_row_floats,
+                                     const ds4_gpu_tensor *path,
+                                     uint32_t path_offset, uint32_t path_length,
+                                     const ds4_gpu_tensor *comp, uint32_t n_comp,
+                                     ds4_gpu_tensor *dst, uint32_t prefix_rows) {
+    if (!ring || !dst || !ring_cap || (path_length && (!delta || !path))) return 0;
+    if (prefix_rows > ring_cap) return 0;
+    if (delta_row_floats % 4u) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t n_raw = prefix_rows + path_length;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_flash_kv_stage_dag_f16");
+        if (!pipeline) return 0;
+        const uint32_t args[8] = { ring_cap, ring_start, n_raw, n_comp, 0u, 0u,
+                                   prefix_rows, delta_row_floats / 4u };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<DS4Encoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(ring) offset:ds4_gpu_tensor_offset(ring) atIndex:1];
+        [enc setBuffer:delta ? ds4_gpu_tensor_buffer(delta) : ds4_gpu_tensor_buffer(ring)
+                offset:delta ? ds4_gpu_tensor_offset(delta) : ds4_gpu_tensor_offset(ring)
+               atIndex:2];
+        [enc setBuffer:path ? ds4_gpu_tensor_buffer(path) : ds4_gpu_tensor_buffer(ring)
+                offset:(path ? ds4_gpu_tensor_offset(path) : ds4_gpu_tensor_offset(ring)) +
+                       (NSUInteger)path_offset * sizeof(uint32_t)
+               atIndex:3];
+        [enc setBuffer:comp ? ds4_gpu_tensor_buffer(comp) : ds4_gpu_tensor_buffer(ring)
+                offset:comp ? ds4_gpu_tensor_offset(comp) : ds4_gpu_tensor_offset(ring)
+               atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(dst) offset:ds4_gpu_tensor_offset(dst) atIndex:5];
+        const uint32_t vecs = (n_raw + n_comp) * 128u;
+        const NSUInteger tw = 256;
+        ds4_gpu_dispatch(enc, MTLSizeMake((vecs + tw - 1u) / tw, 1, 1), MTLSizeMake(tw, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (owned && !ds4_gpu_finish_command_buffer(cb, owned, "V4.1 DAG KV stage"))
+            return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_dsv41_block_accept_encode(const ds4_gpu_tensor *logits,
                                       const ds4_gpu_tensor *tokens,
                                       ds4_gpu_tensor *argmax,

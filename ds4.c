@@ -80280,6 +80280,7 @@ static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
 static void ds41_block_dag_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w);
 static void ds41_arena_layout_check(void);
+static void ds41_dag_stage_check(void);
 static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weights *w);
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
@@ -84017,6 +84018,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             ds41_block_txn_test(s, &e->model, &e->weights);
             ds41_block_txn_chain_test(s, &e->model, &e->weights);
             ds41_arena_layout_check();
+            ds41_dag_stage_check();
             ds41_block_dag_test(s, &e->model, &e->weights);
             ds41_k_sweep(s, &e->model, &e->weights);
             ds41_oracle_block_bench(s, &e->model, &e->weights);
@@ -86138,6 +86140,91 @@ static void ds41_arena_layout_check(void) {
         }
         fprintf(stderr, ", %d silent that should have moved\n", silent);
     }
+}
+
+/* The descriptor staging against the linear one, at the operator boundary.
+ *
+ * The two are meant to produce the same half4 sequence: the same committed keys in
+ * the same order, then the block's own rows in ancestor order. The claim is only
+ * that the input sequence is identical by design, so the FlashAttention arithmetic
+ * downstream is unchanged - an offset or index error is exactly what this memcmp is
+ * for, and it is checked across a ring wrap because that is where the modular step
+ * is easy to get wrong. DS4_V41_DAG_STAGE_CHECK=1. */
+static void ds41_dag_stage_check(void) {
+    if (!getenv("DS4_V41_DAG_STAGE_CHECK")) return;
+    enum { CAP = 128u, ROW = 512u, DELTA_ROWS = 8u };
+    ds4_gpu_tensor *ring = ds4_gpu_tensor_alloc((uint64_t)CAP * ROW * sizeof(float));
+    ds4_gpu_tensor *delta = ds4_gpu_tensor_alloc((uint64_t)DELTA_ROWS * ROW * sizeof(float));
+    ds4_gpu_tensor *linear = ds4_gpu_tensor_alloc((uint64_t)(CAP + DELTA_ROWS) * ROW * sizeof(float));
+    ds4_gpu_tensor *path = ds4_gpu_tensor_alloc(DELTA_ROWS * sizeof(uint32_t));
+    ds4_gpu_tensor *a = ds4_gpu_tensor_alloc((uint64_t)(CAP + DELTA_ROWS) * ROW * sizeof(uint16_t));
+    ds4_gpu_tensor *b = ds4_gpu_tensor_alloc((uint64_t)(CAP + DELTA_ROWS) * ROW * sizeof(uint16_t));
+    float *host = malloc((size_t)(CAP + DELTA_ROWS) * ROW * sizeof(float));
+    uint16_t *ha = malloc((size_t)(CAP + DELTA_ROWS) * ROW * sizeof(uint16_t));
+    uint16_t *hb = malloc((size_t)(CAP + DELTA_ROWS) * ROW * sizeof(uint16_t));
+    uint32_t hpath[DELTA_ROWS];
+    if (!ring || !delta || !linear || !path || !a || !b || !host || !ha || !hb) goto done;
+
+    /* Distinct values a row, so a wrong row shows up rather than cancelling. */
+    for (uint32_t r = 0; r < CAP; r++)
+        for (uint32_t c = 0; c < ROW; c++) host[r * ROW + c] = (float)(r * 1000u + c);
+    if (!ds4_gpu_tensor_write(ring, 0, host, (uint64_t)CAP * ROW * sizeof(float))) goto done;
+    for (uint32_t r = 0; r < DELTA_ROWS; r++)
+        for (uint32_t c = 0; c < ROW; c++)
+            host[r * ROW + c] = (float)(500000u + r * 1000u + c);
+    if (!ds4_gpu_tensor_write(delta, 0, host, (uint64_t)DELTA_ROWS * ROW * sizeof(float))) goto done;
+    if (!ds4_gpu_synchronize()) goto done;
+
+    int bad = 0, cases = 0;
+    /* Starts either side of the wrap, and prefixes that reach it. */
+    const uint32_t starts[] = { 0u, 100u, 120u, 127u };
+    const uint32_t prefixes[] = { 8u, 64u, 120u, 127u };
+    for (uint32_t si = 0; si < 4; si++)
+        for (uint32_t pi = 0; pi < 4; pi++)
+            for (uint32_t d = 1; d <= 4; d++) {
+                const uint32_t start = starts[si], prefix = prefixes[pi];
+                /* The ancestor order the linear form would have produced. */
+                for (uint32_t j = 0; j < d; j++) hpath[j] = j;
+                if (!ds4_gpu_tensor_write(path, 0, hpath, d * sizeof(uint32_t))) goto done;
+                /* The copies and the two stages need a command scope; without one
+                 * a tensor copy does not run and the check fell out of its own
+                 * goto without printing. */
+                if (!ds4_gpu_begin_commands()) goto done;
+                /* The linear reference: the same keys, copied into one buffer. */
+                for (uint32_t j = 0; j < prefix; j++) {
+                    const uint32_t phys = (start + j) % CAP;
+                    if (!ds4_gpu_tensor_copy(linear, (uint64_t)j * ROW * 4u, ring,
+                                             (uint64_t)phys * ROW * 4u, ROW * 4u)) goto done;
+                }
+                for (uint32_t j = 0; j < d; j++)
+                    if (!ds4_gpu_tensor_copy(linear, (uint64_t)(prefix + j) * ROW * 4u,
+                                             delta, (uint64_t)hpath[j] * ROW * 4u,
+                                             ROW * 4u)) goto done;
+                const uint32_t n_raw = prefix + d;
+                if (!ds4_gpu_dsv41_flash_kv_stage_dag(linear, 0, CAP + DELTA_ROWS, NULL, 4u,
+                                                      NULL, 0, 0, NULL, 0, a, n_raw) ||
+                    !ds4_gpu_dsv41_flash_kv_stage_dag(ring, start, CAP, delta, ROW,
+                                                      path, 0, d, NULL, 0, b, prefix) ||
+                    !ds4_gpu_end_commands() || !ds4_gpu_synchronize()) goto done;
+                const uint64_t bytes = (uint64_t)n_raw * ROW * sizeof(uint16_t);
+                if (!ds4_gpu_tensor_read(a, 0, ha, bytes) ||
+                    !ds4_gpu_tensor_read(b, 0, hb, bytes)) goto done;
+                cases++;
+                if (memcmp(ha, hb, (size_t)bytes) != 0) {
+                    uint64_t first = 0;
+                    while (first < bytes / 2u && ha[first] == hb[first]) first++;
+                    fprintf(stderr, "ds4: DAG stage differs at start %u prefix %u depth "
+                            "%u, first half at %llu\n", start, prefix, d,
+                            (unsigned long long)first);
+                    bad++;
+                }
+            }
+    fprintf(stderr, "ds4: DAG KV stage against the linear form: %d cases, %d differ\n",
+            cases, bad);
+done:
+    ds4_gpu_tensor_free(ring); ds4_gpu_tensor_free(delta); ds4_gpu_tensor_free(linear);
+    ds4_gpu_tensor_free(path); ds4_gpu_tensor_free(a); ds4_gpu_tensor_free(b);
+    free(host); free(ha); free(hb);
 }
 
 /* A branching DAG, which is the test the linear A sweep is not.
