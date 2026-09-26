@@ -80257,6 +80257,7 @@ static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
                                       const ds4_weights *w);
 static void ds41_block_dag_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w);
+static void ds41_arena_layout_check(void);
 static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weights *w);
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
@@ -83993,6 +83994,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             ds41_rowtile_check(&e->model, &e->weights);
             ds41_block_txn_test(s, &e->model, &e->weights);
             ds41_block_txn_chain_test(s, &e->model, &e->weights);
+            ds41_arena_layout_check();
             ds41_block_dag_test(s, &e->model, &e->weights);
             ds41_k_sweep(s, &e->model, &e->weights);
             ds41_oracle_block_bench(s, &e->model, &e->weights);
@@ -84451,22 +84453,114 @@ enum ds41_node_state {
     DS41_NODE_COMMITTED,
 };
 
-/* One block in flight. Everything is an offset into an arena the slot owns, so
- * nothing here is a process global and nothing is allocated on the hot path. The
- * generation ticket is what makes reuse checkable: a descriptor carrying an old
- * generation is a bug, not a slow path. */
+/* Where in the graph a node is. A mask of ready nodes cannot say which layer and
+ * which part of it to resume from, and resuming is the whole point of parking a
+ * node: the ready queue is keyed on (layer, phase) so the nodes standing at the
+ * same point batch together and keep the weight shared, while a node waiting on an
+ * expert drops out of that key and the others carry on. */
+enum ds41_node_phase {
+    DS41_PHASE_FRONT = 0,   /* embedding, pre, the narrow projections */
+    DS41_PHASE_ATTN,        /* attention over the ancestor path */
+    DS41_PHASE_ROUTED,      /* router, shared and routed experts */
+    DS41_PHASE_FINISH,      /* the layer's residual and hand-off */
+};
+
+typedef struct {
+    uint16_t layer;
+    uint8_t phase;          /* enum ds41_node_phase */
+    uint8_t state;          /* enum ds41_node_state */
+} ds41_node_cursor;
+
+/* Three arenas, by who writes them and when.
+ *
+ * Splitting only the offsets is not enough: a call that wraps an offset in a new
+ * tensor each time has moved the allocation, not removed it. These are separate
+ * because their lifetimes differ - compute is dead the moment a layer finishes,
+ * the transaction's contents outlive the block until a commit or a discard, and
+ * control is the only region the host reads. */
+typedef struct {
+    uint64_t compute_bytes;     /* activation, attention scratch, expert worklist */
+    uint64_t txn_bytes;         /* per-layer KV, carry and Engram delta */
+    uint64_t control_bytes;     /* descriptors, cursors, miss queue, result, counters */
+    uint64_t node_desc_off;     /* into control */
+    uint64_t cursor_off;
+    uint64_t miss_queue_off;
+    uint64_t result_off;
+    uint64_t counter_off;
+    uint64_t kv_delta_off;      /* into txn, per layer */
+    uint64_t kv_delta_stride;
+    uint64_t carry_delta_off;
+    uint64_t carry_delta_stride;
+} ds41_arena_layout;
+
+#define DS41_ARENA_ALIGN 256u
+
+/* Every offset aligned, inside its arena, and no two live regions overlapping.
+ * Checked when the layout is built, so a descriptor cannot carry a bad offset. */
+static bool ds41_arena_layout_valid(const ds41_arena_layout *l, uint32_t layers) {
+    if (!l || !layers) return false;
+    const uint64_t control[5] = { l->node_desc_off, l->cursor_off, l->miss_queue_off,
+                                  l->result_off, l->counter_off };
+    for (int i = 0; i < 5; i++) {
+        if (control[i] % DS41_ARENA_ALIGN) return false;
+        if (control[i] >= l->control_bytes) return false;
+    }
+    for (int i = 0; i < 5; i++)
+        for (int j = i + 1; j < 5; j++)
+            if (control[i] == control[j]) return false;
+    if (l->kv_delta_off % DS41_ARENA_ALIGN || l->carry_delta_off % DS41_ARENA_ALIGN)
+        return false;
+    if (l->kv_delta_stride % DS41_ARENA_ALIGN ||
+        l->carry_delta_stride % DS41_ARENA_ALIGN) return false;
+    const uint64_t kv_end = l->kv_delta_off + (uint64_t)layers * l->kv_delta_stride;
+    const uint64_t carry_end = l->carry_delta_off + 4ull * l->carry_delta_stride;
+    if (kv_end > l->txn_bytes || carry_end > l->txn_bytes) return false;
+    /* The two transaction regions must not share a byte. */
+    return kv_end <= l->carry_delta_off || carry_end <= l->kv_delta_off;
+}
+
+/* One block in flight, owning its arenas. There is no current slot: every entry
+ * point takes the slot and its generation, so a descriptor built for an earlier
+ * block is caught rather than followed. */
 typedef struct {
     uint64_t generation;
+    uint32_t capacity_nodes;
     uint32_t node_count;
     uint32_t base_pos;                 /* the committed frontier the block starts on */
-    uint8_t state[DS4_TP_BATCH_MAX_ROWS];
+    ds41_arena_layout layout;
+    ds4_gpu_tensor *compute_arena;
+    ds4_gpu_tensor *txn_arena;
+    ds4_gpu_tensor *control;
+    /* Host mirrors of what the DAG said, so the layers can be driven without
+     * reading the control arena back. The device reads the control copy. */
+    ds41_node_cursor cursor[DS4_TP_BATCH_MAX_ROWS];
     uint32_t parent[DS4_TP_BATCH_MAX_ROWS];
     uint32_t depth[DS4_TP_BATCH_MAX_ROWS];
     int token[DS4_TP_BATCH_MAX_ROWS];
-    uint32_t ready_mask;               /* nodes a layer may run */
-    uint32_t miss_mask;                /* nodes waiting on an expert */
     ds41_verify_result result;
 } ds41_block_slot;
+
+/* The nodes standing at one (layer, phase) and ready to run. Weight sharing
+ * depends on this being a set rather than a sequence: whoever is here reads the
+ * same weights, and whoever is waiting is simply not in it. */
+static uint32_t ds41_slot_ready_mask(const ds41_block_slot *slot, uint16_t layer,
+                                     uint8_t phase) {
+    uint32_t mask = 0;
+    if (!slot) return 0;
+    for (uint32_t i = 0; i < slot->node_count && i < 32u; i++)
+        if (slot->cursor[i].layer == layer && slot->cursor[i].phase == phase &&
+            slot->cursor[i].state == DS41_NODE_READY)
+            mask |= 1u << i;
+    return mask;
+}
+
+static uint32_t ds41_slot_miss_mask(const ds41_block_slot *slot) {
+    uint32_t mask = 0;
+    if (!slot) return 0;
+    for (uint32_t i = 0; i < slot->node_count && i < 32u; i++)
+        if (slot->cursor[i].state == DS41_NODE_WAIT_EXPERT) mask |= 1u << i;
+    return mask;
+}
 
 /* The DAG entry. A linear block is the case depth[i] == i, and that is the only
  * case the layers can run today: the batch step requires positions[i] ==
@@ -84490,8 +84584,9 @@ static int ds41_verify_block_dag(ds4_session *s, const ds41_candidate_dag *dag,
         slot->parent[i] = dag->parent[i];
         slot->depth[i] = dag->depth[i];
         slot->token[i] = dag->token[i];
-        slot->state[i] = DS41_NODE_READY;
-        slot->ready_mask |= 1u << i;
+        slot->cursor[i] = (ds41_node_cursor){ .layer = 0,
+                                              .phase = DS41_PHASE_FRONT,
+                                              .state = DS41_NODE_READY };
         if (dag->depth[i] != i) linear = false;
         if (i && dag->parent[i] != i - 1u) linear = false;
         if (!i && dag->parent[i] != DS41_DAG_ROOT) linear = false;
@@ -84501,7 +84596,7 @@ static int ds41_verify_block_dag(ds4_session *s, const ds41_candidate_dag *dag,
          * siblings'. The block gives row i the rows before it, which is the same
          * thing only when the DAG is a chain. */
         for (uint32_t i = 0; i < dag->node_count; i++)
-            slot->state[i] = DS41_NODE_REJECTED;
+            slot->cursor[i].state = DS41_NODE_REJECTED;
         slot->result.status = DS41_VERIFY_REFUSED;
         slot->result.accepted_node = DS41_DAG_ROOT;
         if (err && errlen)
@@ -84523,7 +84618,8 @@ static int ds41_verify_block_dag(ds4_session *s, const ds41_candidate_dag *dag,
     slot->result.accepted_depth = (uint32_t)n;
     slot->result.accepted_node = n ? (uint32_t)(n - 1) : DS41_DAG_ROOT;
     for (uint32_t i = 0; i < dag->node_count; i++)
-        slot->state[i] = i < (uint32_t)n ? DS41_NODE_COMMITTED : DS41_NODE_REJECTED;
+        slot->cursor[i].state = i < (uint32_t)n ? DS41_NODE_COMMITTED
+                                               : DS41_NODE_REJECTED;
     return n;
 }
 
@@ -85592,6 +85688,52 @@ regime_done:
         free(padded);
         memset(acc, 0, sizeof(acc));
     }
+}
+
+/* The arena layout's own checks, asked to fail.
+ *
+ * A validator that only ever sees valid input proves nothing, so this hands it
+ * each way a layout can be wrong and requires a refusal: an unaligned offset, one
+ * past the end of its arena, two regions on the same byte, and the KV and carry
+ * deltas overlapping. DS4_V41_ARENA_CHECK=1. */
+static void ds41_arena_layout_check(void) {
+    if (!getenv("DS4_V41_ARENA_CHECK")) return;
+    const uint32_t layers = DS4_N_LAYER;
+    ds41_arena_layout good = {
+        .compute_bytes = 1u << 20, .txn_bytes = 1u << 24, .control_bytes = 1u << 16,
+        .node_desc_off = 0, .cursor_off = 256, .miss_queue_off = 512,
+        .result_off = 768, .counter_off = 1024,
+        .kv_delta_off = 0,
+        .kv_delta_stride = DS4_TP_BATCH_MAX_ROWS * 512u * 4u,
+        .carry_delta_off = (uint64_t)layers * DS4_TP_BATCH_MAX_ROWS * 512u * 4u,
+        .carry_delta_stride = DS4_TP_BATCH_MAX_ROWS * 512u * 4u,
+    };
+    struct { const char *what; ds41_arena_layout l; bool want; } cases[] = {
+        { "a layout that is right", good, true },
+        { "an unaligned control offset", good, false },
+        { "a control offset past the arena", good, false },
+        { "two control regions on one byte", good, false },
+        { "an unaligned delta stride", good, false },
+        { "a KV delta past the arena", good, false },
+        { "KV and carry deltas overlapping", good, false },
+    };
+    cases[1].l.cursor_off = 255;
+    cases[2].l.result_off = good.control_bytes;
+    cases[3].l.miss_queue_off = cases[3].l.cursor_off;
+    cases[4].l.kv_delta_stride = good.kv_delta_stride + 1u;
+    cases[5].l.txn_bytes = 1u << 10;
+    cases[6].l.carry_delta_off = good.kv_delta_stride;   /* inside the KV region */
+    int bad = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const bool got = ds41_arena_layout_valid(&cases[i].l, layers);
+        if (got != cases[i].want) {
+            fprintf(stderr, "ds4: arena layout check: %s was %s\n", cases[i].what,
+                    got ? "accepted" : "refused");
+            bad++;
+        }
+    }
+    fprintf(stderr, "ds4: arena layout: %zu cases, %d wrong\n",
+            sizeof(cases) / sizeof(cases[0]), bad);
 }
 
 /* A branching DAG, which is the test the linear A sweep is not.
