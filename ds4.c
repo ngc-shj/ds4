@@ -41049,6 +41049,11 @@ uint64_t g_ds41_txn_base_write;
 uint64_t g_ds41_accept_gpu, g_ds41_accept_readback;
 /* Nodes attended to one at a time from the host. Zero is the goal. */
 uint64_t g_ds41_zc_attn_row_loop;
+/* The zero conditions over the block step itself, not over the process. A
+ * process-wide total has a prefill and a session creation in it, so a zero there
+ * cannot be told from a zero that was never looked for. */
+uint64_t g_ds41_zc_block[8];
+uint64_t g_ds41_zc_blocks;
 /* encode, close, read, reopen. */
 double g_ds41_acc_ms[4];
 /* -1 takes the environment. A harness forces an arm so the two passes can be
@@ -41170,6 +41175,17 @@ static void ds41_decode_path_report(void) {
     if (g_ds41_zc_attn_row_loop)
         fprintf(stderr, "ds4:   host row loop: %llu nodes attended one at a time\n",
                 (unsigned long long)g_ds41_zc_attn_row_loop);
+    if (g_ds41_zc_blocks) {
+        static const char *const zn[8] = { "tensor_read", "tensor_view", "tensor_free",
+            "end_commands", "synchronize", "legacy_fallback", "arena_outside",
+            "generation" };
+        fprintf(stderr, "ds4:   over %llu verify blocks, host row loop %llu:",
+                (unsigned long long)g_ds41_zc_blocks,
+                (unsigned long long)g_ds41_zc_attn_row_loop);
+        for (int i = 0; i < 8; i++)
+            fprintf(stderr, " %s=%llu", zn[i], (unsigned long long)g_ds41_zc_block[i]);
+        fprintf(stderr, "\n");
+    }
     if (g_ds41_accept_gpu || g_ds41_accept_readback)
         fprintf(stderr, "ds4:   accept: %llu blocks decided on the device, "
                 "%llu logit rows read back; device accept encode %.2f, close "
@@ -46162,6 +46178,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     /* Consecutive positions in one session and publishing only the frontier
      * row are separate things; a verifier wants the first and not the second. */
     const bool prefill_only = mode == DS41_STEP_PREFILL;
+    const bool zc_scope = mode == DS41_STEP_VERIFY_PRODUCTION ||
+                          mode == DS41_STEP_VERIFY_CORRECTNESS;
+    uint64_t zc_before[8] = {0};
+    if (zc_scope) ds4_gpu_zero_conditions(zc_before);
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     /* The streaming expert cache can serve a whole batch from one address
@@ -47216,6 +47236,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     }
     free(engram);
     free(moe_rows);
+    if (zc_scope) {
+        uint64_t zc_after[8];
+        ds4_gpu_zero_conditions(zc_after);
+        for (int i = 0; i < 8; i++) g_ds41_zc_block[i] += zc_after[i] - zc_before[i];
+        g_ds41_zc_blocks++;
+    }
     return ok;
 }
 
