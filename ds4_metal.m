@@ -29823,6 +29823,22 @@ static int ds4_gpu_encode_copy_raw_ring_to_f16(
     return 1;
 }
 
+/* Where a node's keys come from, when they are not one contiguous window.
+ *
+ * Passed down from the attention entry to the staging step and nowhere else: mask,
+ * pad, the FlashAttention pass and the reduce are the same code on both sources.
+ * NULL means the linear window the old callers describe. */
+typedef struct {
+    const ds4_gpu_tensor *delta;
+    const ds4_gpu_tensor *path;
+    uint32_t delta_row_floats;
+    uint32_t path_offset;
+    uint32_t path_length;
+    uint32_t sequence_rows;
+    uint32_t committed_rows;
+    uint32_t ring_cap;
+} ds4_gpu_kv_source_dag;
+
 static int ds4_gpu_encode_flash_kv_stage_f16(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        raw,
@@ -29843,7 +29859,8 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         NSUInteger           pad_offset,
         bool                 fuse_pad,
         bool                 shared_pad,
-        bool                *did_fuse_pad) {
+        bool                *did_fuse_pad,
+        const ds4_gpu_kv_source_dag *dag) {
     if (did_fuse_pad) *did_fuse_pad = false;
     if (!cb || !raw || !comp || !dst || raw_cap == 0 ||
         raw_start >= raw_cap || n_raw == 0 || n_raw > raw_cap ||
@@ -29884,6 +29901,56 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         fprintf(stderr,
                 "ds4: required Metal gathered KV staging kernel was not selected\n");
         return 0;
+    }
+
+    /* The only thing a DAG source changes is where the keys are read from. The
+     * mask, the pad, the FlashAttention pass and the reduce below are the same code
+     * on both, which is what keeps the two answers comparable. */
+    if (dag) {
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_flash_kv_stage_dag_f16");
+        if (!pipeline || !dag->ring_cap) return 0;
+        const uint32_t vstart = dag->sequence_rows > dag->ring_cap ?
+            dag->sequence_rows - dag->ring_cap : 0u;
+        const uint32_t vcount = dag->sequence_rows - vstart;
+        if (vcount != n_raw) return 0;          /* the caller's window and ours must agree */
+        if (dag->sequence_rows - dag->committed_rows != dag->path_length) return 0;
+        if (dag->path_length && (!dag->delta || !dag->path)) return 0;
+        if (dag->delta_row_floats % 4u) return 0;
+        if (dag->path_length) {
+            const uint64_t rows = ds4_gpu_tensor_bytes(dag->delta) /
+                                  ((uint64_t)dag->delta_row_floats * sizeof(float));
+            if (!rows || dag->path_length > rows) return 0;
+            const uint64_t need =
+                ((uint64_t)dag->path_offset + dag->path_length) * sizeof(uint32_t);
+            if (ds4_gpu_tensor_bytes(dag->path) < need) return 0;
+        }
+        const uint32_t dargs[6] = { dag->ring_cap, vstart, vcount,
+                                    dag->committed_rows, n_comp,
+                                    dag->delta_row_floats / 4u };
+        id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+        if (!enc) return 0;
+        /* The producer wrote the delta in this same encoder. */
+        (void)ds4_gpu_concurrent_section_barrier();
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:dargs length:sizeof(dargs) atIndex:0];
+        [enc setBuffer:raw offset:raw_offset atIndex:1];
+        [enc setBuffer:dag->delta ? ds4_gpu_tensor_buffer(dag->delta) : raw
+                offset:dag->delta ? ds4_gpu_tensor_offset(dag->delta) : raw_offset
+               atIndex:2];
+        [enc setBuffer:dag->path ? ds4_gpu_tensor_buffer(dag->path) : raw
+                offset:(dag->path ? ds4_gpu_tensor_offset(dag->path) : raw_offset) +
+                       (NSUInteger)dag->path_offset * sizeof(uint32_t)
+               atIndex:3];
+        [enc setBuffer:comp ? comp : raw offset:comp ? comp_offset : raw_offset atIndex:4];
+        [enc setBuffer:dst offset:dst_offset atIndex:5];
+        const uint32_t vecs = (vcount + n_comp) * 128u;
+        const NSUInteger nth = 256;
+        ds4_gpu_dispatch(enc, MTLSizeMake((vecs + nth - 1u) / nth, 1, 1),
+                         MTLSizeMake(nth, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        (void)ds4_gpu_concurrent_section_barrier();
+        return 1;
     }
 
     if (use_fusion) {
@@ -30010,7 +30077,8 @@ int ds4_gpu_flash_kv_stage_f16_tensor(
                 0,
                 false,
                 false,
-                NULL)) {
+                NULL,
+                                                             NULL)) {
             return 0;
         }
         if (!ds4_gpu_finish_command_buffer(
@@ -31648,7 +31716,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         uint32_t               slot,
         uint32_t               slots,
         uint32_t               slot_keys,
-        int                    phase) {
+        int                    phase,
+        const ds4_gpu_kv_source_dag *dag) {
     if (slots == 0u) slots = 1u;
     if (slot >= slots) return 0;
     const uint32_t n_keys = n_raw + n_comp;
@@ -31883,7 +31952,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
             pad_off,
             all && has_kvpad,
             use_shared_kvpad,
-            &pad_fused)) {
+            &pad_fused,
+                                                             NULL)) {
         return 0;
     }
 
@@ -33324,7 +33394,8 @@ static int ds4_gpu_attention_decode_heads_impl(
         uint32_t                slot,
         uint32_t                slots,
         uint32_t                slot_keys,
-        int                     phase) {
+        int                     phase,
+        const ds4_gpu_kv_source_dag *dag) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||
@@ -33419,7 +33490,8 @@ static int ds4_gpu_attention_decode_heads_impl(
                                                              slot,
                                                              slots,
                                                              slot_keys,
-                                                             phase)) {
+                                                             phase,
+                                                             NULL)) {
             return 0;
         }
 
@@ -33533,7 +33605,8 @@ int ds4_gpu_attention_decode_heads_block_tensor(
                     g_flash_attn_kv_buffer, (NSUInteger)i * kv_stride,
                     g_flash_attn_mask_buffer, (NSUInteger)i * mask_stride,
                     g_flash_attn_pad_buffer, (NSUInteger)i * pad_bytes,
-                    false, false, &fused)) return 0;
+                    false, false, &fused,
+                                                             NULL)) return 0;
         }
 
         id<MTLComputePipelineState> vec = ds4_gpu_get_flash_attn_vec_pipeline(
@@ -33609,7 +33682,8 @@ int ds4_gpu_attention_decode_heads_tensor(
     return ds4_gpu_attention_decode_heads_impl(heads, model_map, model_size,
         sinks_offset, q, raw_kv, n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16,
         n_comp, comp_mask, use_mask, n_head, head_dim, 0u, 1u, 0u,
-        DS4_FLASH_PHASE_ALL);
+        DS4_FLASH_PHASE_ALL,
+                                                             NULL);
 }
 
 /* Raw-only attention for the K rows of a block, in the shapes that separate
@@ -33880,7 +33954,8 @@ int ds4_gpu_attention_decode_heads_phase_tensor(
     if (n_comp == 0u && phase != DS4_FLASH_PHASE_ALL) return 0;
     return ds4_gpu_attention_decode_heads_impl(heads, model_map, model_size,
         sinks_offset, q, raw_kv, n_raw, raw_cap, raw_start, comp_kv, comp_kv_f16,
-        n_comp, comp_mask, use_mask, n_head, head_dim, slot, slots, slot_keys, phase);
+        n_comp, comp_mask, use_mask, n_head, head_dim, slot, slots, slot_keys, phase,
+                                                             NULL);
 }
 
 static int ds4_gpu_swiglu_round(

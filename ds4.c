@@ -40324,6 +40324,11 @@ typedef struct {
      * row - the whole of what the performance path brings back. */
     ds4_gpu_tensor *block_argmax;
     ds4_gpu_tensor *block_accept;
+    /* The position each node sits at, and its ancestor list. Both are read by the
+     * GPU - the producer rotates at these positions and the staging resolves keys
+     * through the path - so neither goes back to the host inside a layer. */
+    ds4_gpu_tensor *block_positions;
+    ds4_gpu_tensor *block_path;
     /* The contract the session's committed positions were produced under. */
     ds41_decode_contract_id contract;
     /* Fail-closed: a write into the committed arena while a transaction is
@@ -40381,6 +40386,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
             free(g->block_history);
             ds4_gpu_tensor_free(g->block_argmax);
             ds4_gpu_tensor_free(g->block_accept);
+            ds4_gpu_tensor_free(g->block_positions);
+            ds4_gpu_tensor_free(g->block_path);
         }
         free(g->tag_pos[i]); free(g->tag_ipos[i]);
         free(g->tag_epoch[i]); free(g->tag_committed[i]);
@@ -40517,7 +40524,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
                 (uint64_t)DS4_TP_BATCH_MAX_ROWS * ((DS4_N_VOCAB + 4095u) / 4096u) *
                     2u * sizeof(uint32_t));
             g->block_accept = ds4_gpu_tensor_alloc(2u * sizeof(uint32_t));
-            if (!g->block_argmax || !g->block_accept) goto fail;
+            g->block_positions = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_TP_BATCH_MAX_ROWS * sizeof(uint32_t));
+            /* One ancestor list a node, at most as deep as the block. */
+            g->block_path = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_TP_BATCH_MAX_ROWS * DS4_TP_BATCH_MAX_ROWS *
+                sizeof(uint32_t));
+            if (!g->block_argmax || !g->block_accept || !g->block_positions ||
+                !g->block_path) goto fail;
         }
         if (getenv("DS4_V41_TXN_TAGS")) {
             g->tag_rows[i] = (uint32_t)cap;
@@ -42228,6 +42242,34 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
  * pos+K-1-128, which row 0 still needs whenever the window is full - so
  * reordering the writes ahead of the reads is only correct in a linear buffer,
  * and only looks correct below 128 positions. */
+/* The block's KV, for every node, without a host loop over them.
+ *
+ * The per-node function below is four dispatches a node: rotate the query, rotate
+ * the key, quantise it, write it. Here each of those is one dispatch over the whole
+ * block, the rotation takes its position from the node's descriptor, and the write
+ * lands in block_kv_delta[layer][node] rather than in a linear prefix buffer that
+ * would then have to be copied into the delta.
+ *
+ * That second part matters as much as the first: raw_prefill was doing two jobs, and
+ * removing only the materialisation would leave the transaction with nothing to
+ * commit. The producer writes where the commit reads. */
+static bool ds41_attention_block_pre_all(ds41_gpu_graph *g, const ds4_model *m,
+                                         const ds4_layer_weights *l, uint32_t il,
+                                         uint32_t rows, ds4_gpu_tensor *delta) {
+    ds41_prefill_row *b = &g->batch;
+    const uint32_t heads = DS4_N_HEAD / g->tp_world;
+    const bool compressed = ds4_layer_compress_ratio(il) != 0;
+    if (!delta || !g->block_positions) return false;
+    (void)m; (void)l;
+    return ds4_gpu_dsv41_rope_nodes(b->q, DS4_N_HEAD_DIM, heads, rows,
+                                    g->block_positions, 0, compressed, false) &&
+           ds4_gpu_dsv41_rope_nodes(b->kv, DS4_N_HEAD_DIM, 1, rows,
+                                    g->block_positions, 0, compressed, false) &&
+           ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, rows, DS4_V41_FP8_E8M0) &&
+           ds4_gpu_tensor_copy(delta, 0, b->kv, 0,
+                               (uint64_t)rows * DS4_N_HEAD_DIM * sizeof(float)) != 0;
+}
+
 static bool ds41_attention_block_pre(ds41_gpu_graph *g, const ds4_model *m,
                                      const ds4_layer_weights *l, uint32_t il,
                                      ds4_gpu_tensor *raw, uint32_t slot) {
@@ -84531,6 +84573,16 @@ typedef struct {
     uint64_t kv_delta_stride;
     uint64_t carry_delta_off;
     uint64_t carry_delta_stride;
+    /* Branch-private compressor and indexer state. Every one of these is indexed by
+     * node, because a node's carry, its compressed row and its selection are
+     * versions on its own path - shared buffers are how a sibling's value reaches a
+     * node that never chose it. Committed state is never written here. */
+    uint64_t carry_kv_off;          /* [owner][node] */
+    uint64_t carry_score_off;       /* [owner][node] */
+    uint64_t compressed_delta_off;  /* [owner][node] */
+    uint64_t index_delta_off;       /* [node] */
+    uint64_t selected_comp_off;     /* [node] */
+    uint64_t publish_done_off;      /* [node], a slot mask */
 } ds41_arena_layout;
 
 /* What a unit of expert work is bound to. An expert that was resident when the
@@ -84704,6 +84756,37 @@ static uint32_t ds41_work_wake(const ds41_routed_work *w, ds41_block_slot *slot)
         woken++;
     }
     return woken;
+}
+
+/* Which carry version a node reads, settled when the descriptor is built.
+ *
+ * pool2 with one row at absolute position p pairs only when p is odd: an even
+ * position writes the carry and reads nothing, an odd one reads the version the
+ * position before it left and pools against it. In a chain "the position before"
+ * is row p-1; in a DAG it is the node's parent, and nothing else - a sibling sits
+ * at the same depth and must not be visible.
+ *
+ * Returning the source at descriptor time rather than letting the host's loop order
+ * decide is the point. An order-dependent carry is how a sibling leaks in.
+ *
+ * DS41_CARRY_NONE: the node only writes a carry, it does not read one.
+ * DS41_CARRY_COMMITTED: it reads the carry the committed prefix left. */
+#define DS41_CARRY_NONE      (UINT32_MAX - 1u)
+#define DS41_CARRY_COMMITTED (UINT32_MAX)
+
+static uint32_t ds41_carry_source(const ds41_block_slot *slot, uint32_t node,
+                                 uint32_t ratio) {
+    if (!slot || node >= slot->node_count) return DS41_CARRY_NONE;
+    if (ratio != 2u) return DS41_CARRY_NONE;      /* only the pooled owners carry */
+    const uint32_t abs_pos = slot->base_pos + slot->depth[node];
+    if ((abs_pos & 1u) == 0u) return DS41_CARRY_NONE;
+    const uint32_t up = slot->parent[node];
+    if (up == DS41_DAG_ROOT) return DS41_CARRY_COMMITTED;
+    if (up >= slot->node_count) return DS41_CARRY_NONE;
+    /* The parent must be the position immediately before, or the descriptor is
+     * inconsistent and pooling would pair across a gap. */
+    if (slot->depth[up] + 1u != slot->depth[node]) return DS41_CARRY_NONE;
+    return up;
 }
 
 /* A node's ancestors, root first, in the order a single pass would have run them.
@@ -86109,6 +86192,56 @@ static void ds41_arena_layout_check(void) {
                 (unsigned long long)work.duplicate_adds, wbad);
     }
 
+    /* The carry source, on the tree, at both parities of the block start.
+     *
+     *          0
+     *        /   \
+     *       1     2          depth 0, 1, 1, 2, 2, 2, 2
+     *      / \   / \
+     *     3   4 5   6
+     *
+     * An even absolute position writes a carry and reads none; an odd one reads its
+     * parent's version, or the committed one at the frontier. What must never come
+     * back is a sibling: node 4's source is 1, never 3.
+     */
+    {
+        ds41_block_slot cs;
+        memset(&cs, 0, sizeof(cs));
+        cs.node_count = 7;
+        for (uint32_t i = 0; i < 7; i++) { cs.parent[i] = par[i]; cs.depth[i] = dep[i]; }
+        int cbad = 0;
+        /* An even block start: depths 0 and 2 are even positions, depth 1 is odd. */
+        cs.base_pos = 100u;
+        if (ds41_carry_source(&cs, 0, 2u) != DS41_CARRY_NONE) cbad++;      /* 100 even */
+        if (ds41_carry_source(&cs, 1, 2u) != 0u) cbad++;                   /* 101 odd -> 0 */
+        if (ds41_carry_source(&cs, 2, 2u) != 0u) cbad++;                   /* 101 odd -> 0 */
+        if (ds41_carry_source(&cs, 3, 2u) != DS41_CARRY_NONE) cbad++;      /* 102 even */
+        if (ds41_carry_source(&cs, 6, 2u) != DS41_CARRY_NONE) cbad++;      /* 102 even */
+        /* An odd block start: depth 0 is odd and sits at the frontier. */
+        cs.base_pos = 101u;
+        if (ds41_carry_source(&cs, 0, 2u) != DS41_CARRY_COMMITTED) cbad++;
+        if (ds41_carry_source(&cs, 1, 2u) != DS41_CARRY_NONE) cbad++;      /* 102 even */
+        if (ds41_carry_source(&cs, 3, 2u) != 1u) cbad++;                   /* 103 odd -> 1 */
+        if (ds41_carry_source(&cs, 4, 2u) != 1u) cbad++;                   /* 103 odd -> 1 */
+        if (ds41_carry_source(&cs, 5, 2u) != 2u) cbad++;                   /* 103 odd -> 2 */
+        if (ds41_carry_source(&cs, 6, 2u) != 2u) cbad++;                   /* 103 odd -> 2 */
+        /* Never a sibling, whatever the parity. */
+        for (uint32_t bp = 100u; bp <= 101u; bp++) {
+            cs.base_pos = bp;
+            static const uint32_t sib[7] = { 0u, 2u, 1u, 4u, 3u, 6u, 5u };
+            for (uint32_t n = 1; n < 7; n++)
+                if (ds41_carry_source(&cs, n, 2u) == sib[n]) cbad++;
+        }
+        /* A ratio that does not pool carries nothing. */
+        cs.base_pos = 101u;
+        if (ds41_carry_source(&cs, 0, 1u) != DS41_CARRY_NONE) cbad++;
+        /* A parent that is not the position before is refused rather than paired. */
+        cs.depth[1] = 5u;
+        if (ds41_carry_source(&cs, 3, 2u) != DS41_CARRY_NONE) cbad++;
+        cs.depth[1] = 1u;
+        fprintf(stderr, "ds4: carry source on the tree: 25 cases, %d wrong\n", cbad);
+    }
+
     /* The zero-condition counters, shown to move. A counter that reads zero
      * because it is broken looks exactly like a path that did nothing, so the
      * check is run over the path that does all of it: one batch step through the
@@ -86377,21 +86510,75 @@ static void ds41_block_dag_test(ds4_session *seed, const ds4_model *m,
 
     fprintf(stderr, "ds4: branching DAG, 7 nodes over 3 depths, from position %d\n",
             prompt.len);
+    /* Path decomposition: a leaf's ancestors are a chain, so the block machinery can
+     * run one leaf's path today. What this establishes is the DAG's semantics end to
+     * end - a node reads its own ancestors and nothing else, the commit publishes the
+     * chosen path, and the state after it is a session's that only ever saw those
+     * tokens. It is not the shared executor: the four leaves do not share work here,
+     * they are four blocks. That is the correctness oracle the shared form will be
+     * held against. */
+    int leaves_ok = 0, leaves_run = 0;
     for (uint32_t li = 0; li < 4; li++) {
         const ds41_candidate_dag dag = { .node_count = 7, .token = token,
                                          .parent = parent, .depth = depth,
                                          .max_depth = 3 };
-        ds41_block_slot slot;
-        if (!ds41_txn_prefill(&blk, e, &prompt, ctx, "dag block")) goto done;
-        const int got = ds41_verify_block_dag(blk, &dag, &slot, err, sizeof(err));
         uint32_t path[8];
         const uint32_t plen = ds41_dag_path(&dag, leaf[li], path, 8);
-        fprintf(stderr, "ds4:   leaf %u: path length %u, got %d, status %u (%s)\n",
-                leaf[li], plen, got, slot.result.status,
-                got < 0 ? err : "committed");
+        if (plen != 3) { fprintf(stderr, "ds4:   leaf %u: path length %u\n",
+                                 leaf[li], plen); continue; }
+        int cand[DS4_TP_BATCH_MAX_ROWS], acc[DS4_TP_BATCH_MAX_ROWS];
+        for (uint32_t j = 0; j < plen; j++) cand[j] = token[path[j]];
+        if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "dag reference") ||
+            !ds41_txn_prefill(&blk, e, &prompt, ctx, "dag block")) goto done;
+        leaves_run++;
+        /* The block runs the leaf's path and commits all of it. */
+        const int got = ds4_session_verify_block_ex(blk, cand, (int)plen, (int)plen,
+                                                   acc, err, sizeof(err));
+        if (got < 0) {
+            fprintf(stderr, "ds4:   leaf %u: refused (%s)\n", leaf[li], err);
+            goto next_leaf;
+        }
+        /* A short commit is the verifier agreeing with fewer candidates, not a DAG
+         * failure: the siblings carry tokens the model does not continue with, which
+         * is the point of making them siblings. What has to hold is that the state
+         * after committing `got` of them is a session's that saw exactly those. The
+         * first version of this required the whole path and read the accept decision
+         * as a mismatch. */
+        bool ok = true;
+        for (int j = 0; ok && j < got; j++)
+            ok = ds41_graph_step(&ref->ds41_graph, m, w, cand[j], lg);
+        if (!ok) { fprintf(stderr, "ds4:   leaf %u: the reference stopped\n", leaf[li]);
+                   goto next_leaf; }
+        /* Both answer the position after the path, from their own state. */
+        const int feed = oracle[0];
+        float *lg2 = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (!lg2) goto next_leaf;
+        uint64_t differ = 0;
+        long bad_at = -1;
+        for (long t = 0; t < 16 && bad_at < 0; t++) {
+            if (!ds41_graph_step(&ref->ds41_graph, m, w, feed, lg) ||
+                !ds41_graph_step(&blk->ds41_graph, m, w, feed, lg2)) { bad_at = t; break; }
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                if (memcmp(&lg[v], &lg2[v], sizeof(float)) != 0) differ++;
+            if (differ) bad_at = t;
+        }
+        free(lg2);
+        if (bad_at < 0) {
+            fprintf(stderr, "ds4:   leaf %u: path %u,%u,%u, %d of %u committed, all %u "
+                    "logits identical for 16 positions after\n", leaf[li], path[0],
+                    path[1], path[2], got, plen, DS4_N_VOCAB);
+            leaves_ok++;
+        } else {
+            fprintf(stderr, "ds4:   leaf %u: position %ld after the commit differs, "
+                    "%llu of %u logits\n", leaf[li], bad_at,
+                    (unsigned long long)differ, DS4_N_VOCAB);
+        }
+next_leaf:
+        ds4_session_free(ref); ref = NULL;
         ds4_session_free(blk); blk = NULL;
-        if (got < 0) break;      /* the refusal is the same for every leaf */
     }
+    fprintf(stderr, "ds4: branching DAG by path decomposition: %d of %d leaves match "
+            "canonical and hold for 16 positions\n", leaves_ok, leaves_run);
 done:
     if (ref) ds4_session_free(ref);
     if (blk) ds4_session_free(blk);
