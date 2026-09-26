@@ -40313,6 +40313,15 @@ static bool ds41_decode_contract_same(const ds41_decode_contract_id *a,
            a->flash_nwg == b->flash_nwg && a->fit_splits == b->fit_splits;
 }
 
+/* One cached view: a pure function of (base, offset, bytes) over a buffer the
+ * graph owns, so it is made once and kept for the graph's life. */
+struct ds41_view_entry {
+    const ds4_gpu_tensor *base;
+    uint64_t              off;
+    uint64_t              bytes;
+    ds4_gpu_tensor       *view;
+};
+
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
@@ -40415,6 +40424,11 @@ typedef struct {
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
+    /* Views of this graph's own buffers, made once and kept. Heap, not inline:
+     * an array of this size inside the struct is what took a worker thread's
+     * stack down when the row cap went from eight to sixteen. */
+    struct ds41_view_entry *views;
+    uint32_t view_count;
 } ds41_gpu_graph;
 
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
@@ -40436,25 +40450,24 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
  * multiple of a stride the configuration fixes. A site whose byte count grows
  * with the sequence does not belong here, and overflow refuses rather than
  * falling back to an allocation the counters would then have to explain. */
-enum { DS41_VIEW_CACHE = 4096 };
-static struct ds41_view_entry {
-    const void           *owner;   /* the graph whose buffer this views */
-    const ds4_gpu_tensor *base;
-    uint64_t              off;
-    uint64_t              bytes;
-    ds4_gpu_tensor       *view;
-} g_ds41_views[DS41_VIEW_CACHE];
-static uint32_t g_ds41_view_count;
+/* One cache a graph, on the heap. A single shared table was the wrong shape
+ * twice: clearing it on any graph's exit threw away every other graph's entries,
+ * and pre-warming about 1,200 shapes a graph overflowed a fixed 4,096 as soon as
+ * a harness held four sessions - at which point ds41_view returned NULL and the
+ * block failed rather than falling back, which is how the overflow announced
+ * itself. Sized for the shapes one graph's configuration can ask for. */
+enum { DS41_VIEW_CACHE = 2048 };
 
-static ds4_gpu_tensor *ds41_view_impl(int line, const void *owner,
+static ds4_gpu_tensor *ds41_view_impl(int line, struct ds41_view_entry *cache,
+                                     uint32_t *count,
                                      const ds4_gpu_tensor *base,
                                      uint64_t off, uint64_t bytes) {
-    if (!base) return NULL;
-    for (uint32_t i = 0; i < g_ds41_view_count; i++) {
-        const struct ds41_view_entry *e = &g_ds41_views[i];
+    if (!base || !cache || !count) return NULL;
+    for (uint32_t i = 0; i < *count; i++) {
+        const struct ds41_view_entry *e = &cache[i];
         if (e->base == base && e->off == off && e->bytes == bytes) return e->view;
     }
-    if (g_ds41_view_count == DS41_VIEW_CACHE) {
+    if (*count == DS41_VIEW_CACHE) {
         static bool said;
         if (!said) { said = true;
             fprintf(stderr, "ds4: the V4.1 view cache is full at %d entries, which "
@@ -40468,12 +40481,11 @@ static ds4_gpu_tensor *ds41_view_impl(int line, const void *owner,
     ds4_gpu_tensor *v = (ds4_gpu_tensor_view)(base, off, bytes);
     if (!v) return NULL;
     ds41_view_site_note(line);
-    g_ds41_views[g_ds41_view_count++] =
-        (struct ds41_view_entry){ owner, base, off, bytes, v };
+    cache[(*count)++] = (struct ds41_view_entry){ base, off, bytes, v };
     return v;
 }
-#define ds41_view(owner, base, off, bytes) \
-    ds41_view_impl(__LINE__, (owner), (base), (off), (bytes))
+#define ds41_view(g, base, off, bytes) \
+    ds41_view_impl(__LINE__, (g)->views, &(g)->view_count, (base), (off), (bytes))
 
 /* The bases belong to a graph, so a graph going away takes every view of it.
  * Clearing all of them costs one re-warm and needs no ownership bookkeeping,
@@ -40481,23 +40493,17 @@ static ds4_gpu_tensor *ds41_view_impl(int line, const void *owner,
  * global command buffer means no other session is inside a block step here. A
  * cached view is only ever held in a local for the length of one step, so
  * nothing outlives the clear. */
-static void ds41_view_cache_forget(const void *owner) {
-    uint32_t keep = 0;
-    for (uint32_t i = 0; i < g_ds41_view_count; i++) {
-        if (g_ds41_views[i].owner == owner) {
-            ds4_gpu_tensor_free(g_ds41_views[i].view);
-            continue;
-        }
-        g_ds41_views[keep++] = g_ds41_views[i];
-    }
-    for (uint32_t i = keep; i < g_ds41_view_count; i++)
-        g_ds41_views[i] = (struct ds41_view_entry){ 0 };
-    g_ds41_view_count = keep;
+static void ds41_view_cache_free(struct ds41_view_entry *cache, uint32_t *count) {
+    if (!cache || !count) return;
+    for (uint32_t i = 0; i < *count; i++) ds4_gpu_tensor_free(cache[i].view);
+    *count = 0;
 }
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
-    ds41_view_cache_forget(g);
+    ds41_view_cache_free(g->views, &g->view_count);
+    free(g->views);
+    g->views = NULL;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     ds4_gpu_decode_graphs_invalidate();
 #endif
@@ -40739,6 +40745,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
                 (uint64_t)i * (count) * 4u, (uint64_t)(count) * 4u))) goto fail;
     DS41_PREFILL_ROWS(DS41_BATCH_VIEW)
 #undef DS41_BATCH_VIEW
+    g->views = calloc(DS41_VIEW_CACHE, sizeof(g->views[0]));
+    g->view_count = 0;
+    if (!g->views) goto fail;
     /* Every view the block executor can ask for, made here. The cache would
      * make them on a graph's first block anyway, but "the hot path allocates
      * nothing" is a claim about every block including the first, and the shapes
@@ -40754,20 +40763,27 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         const uint64_t q_bytes =
             (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         const uint64_t w_bytes = (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float);
-        for (uint32_t r = 1; r <= g->prefill_cap; r++) {
+        /* The verifier's row count, not the prefill cap: a block is at most
+         * DS4_TP_BATCH_MAX_ROWS wide, while prefill_cap can be far larger, and
+         * warming every prefill width is what filled the cache and made every
+         * block refuse. Prefill widths are outside a verify block and so outside
+         * what this is a claim about. */
+        const uint32_t warm_rows = g->prefill_cap < (uint32_t)DS4_TP_BATCH_MAX_ROWS ?
+                                   g->prefill_cap : (uint32_t)DS4_TP_BATCH_MAX_ROWS;
+        for (uint32_t r = 1; r <= warm_rows; r++) {
 #define DS41_BATCH_WARM(name, width)             (void)ds41_view(g, g->batch.name, 0, (uint64_t)r * (width) * sizeof(float));
             DS41_PREFILL_ROWS(DS41_BATCH_WARM)
 #undef DS41_BATCH_WARM
             (void)ds41_view(g, g->batch.mid, 0, (uint64_t)r * logits_bytes);
         }
-        for (uint32_t i = 0; i < g->prefill_cap; i++) {
+        for (uint32_t i = 0; i < warm_rows; i++) {
             (void)ds41_view(g, g->batch.q, (uint64_t)i * head_bytes, head_bytes);
             (void)ds41_view(g, g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
             if (g->block_selected_kv)
                 (void)ds41_view(g, g->block_selected_kv,
                                 (uint64_t)i * gather_bytes, gather_bytes);
         }
-        for (uint32_t off = 0; off < g->prefill_cap; off += DS41_INDEX_BATCH)
+        for (uint32_t off = 0; off < warm_rows; off += DS41_INDEX_BATCH)
             for (uint32_t r = 1; r <= DS41_INDEX_BATCH; r++) {
                 (void)ds41_view(g, g->batch.index_q, off * q_bytes, r * q_bytes);
                 (void)ds41_view(g, g->batch.index_weights, off * w_bytes, r * w_bytes);
@@ -41326,6 +41342,12 @@ static uint32_t g_ds41_park_rows_mask;
  * fanout rather than on a log line. */
 static uint64_t g_ds41_park_last_layers_mask;
 static uint32_t g_ds41_park_last_misses, g_ds41_park_last_rows;
+/* How much of the miss list the first layer accounts for. An eviction of one
+ * layer should account for all of it; anything else is a second effect. */
+static uint32_t g_ds41_park_last_first_layer_misses;
+/* Set by the block step when it refuses for a missing expert, so the caller can
+ * tell a park from a step that broke. Read and cleared in one place. */
+static bool g_ds41_park_refused;
 
 static uint64_t g_ds41_fuse_sites;
 
@@ -46393,6 +46415,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * appends to it and nothing reads it until the block has closed. Resetting
      * here is what makes the count at the end a statement about this block. */
     ds4_gpu_moe_block_miss_reset();
+    /* Cleared here as well as where it is read: a caller that does not check it
+     * would otherwise leave it set for whoever fails next. */
+    g_ds41_park_refused = false;
     const int view_scope_was = g_ds41_view_block_scope;
     if (zc_scope) g_ds41_view_block_scope = 1;
     const bool shared_owner = g->tp_world == 2 &&
@@ -47466,15 +47491,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             const uint32_t take = misses < DS41_BLOCK_MISS_MAX ? misses : DS41_BLOCK_MISS_MAX;
             uint32_t first_layer = take ? records[0] : 0u;
             uint32_t first_expert = take ? records[3] : 0u;
-            uint32_t layers_seen = 0;
+            uint32_t layers_seen = 0, in_first = 0;
             uint64_t layer_mask = 0;
             for (uint32_t i = 0; i < take; i++) {
                 const uint32_t layer = records[i * 4u];
+                if (layer == first_layer) in_first++;
                 if (layer < 64u && !((layer_mask >> layer) & 1ull)) {
                     layer_mask |= 1ull << layer;
                     layers_seen++;
                 }
             }
+            g_ds41_park_last_first_layer_misses = in_first;
             g_ds41_park_last_layers_mask = layer_mask;
             g_ds41_park_last_misses = misses;
             g_ds41_park_last_rows = parked;
@@ -47487,6 +47514,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
              * missing and fills the table, so the next block can decide on the
              * device again. */
             ds4_gpu_stream_block_residency_suspend();
+            g_ds41_park_refused = true;
             ok = false;
         }
     }
@@ -85382,7 +85410,32 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     const bool done = ds4_gpu_end_commands() != 0;
     g_ds41_txn_ms_verify += (now_sec() - t_verify) * 1000.0;
     if (!ok || !done) {
-        free(rows); free(carry_before);
+        /* A park is not a failed step. The transaction published nothing, so the
+         * session is still the one the block started from and invalidating it
+         * would throw away the state the repair needs - which is what turned the
+         * forced-miss test's second block into "needs a synchronised ds41
+         * session". Put back what the block touched outside the parked ring,
+         * exactly as the A=0 path does, and leave the session synchronised. */
+        const bool parked = g_ds41_park_refused;
+        g_ds41_park_refused = false;
+        free(rows);
+        if (parked) {
+            s->ds41_graph.history = hist_before;
+            s->ds41_graph.block_history_rows = 0;
+            if (carry_before && ds4_gpu_synchronize())
+                for (uint32_t c = 0; c < 4u; c++) {
+                    (void)ds4_gpu_tensor_write(s->ds41_graph.previous_kv[c], 0,
+                            carry_before + (size_t)c * 2u * 512u, 512u * 4u);
+                    (void)ds4_gpu_tensor_write(s->ds41_graph.previous_score[c], 0,
+                            carry_before + ((size_t)c * 2u + 1u) * 512u, 512u * 4u);
+                }
+            s->ds41_graph.pos = pos0;
+            free(carry_before);
+            if (err && errlen)
+                snprintf(err, errlen, "verify block parked on a missing expert");
+            return -1;
+        }
+        free(carry_before);
         ds4_session_invalidate(s);
         if (err && errlen) snprintf(err, errlen, "verify block step failed");
         return -1;
@@ -85700,9 +85753,11 @@ static void ds41_force_miss_test(ds4_session *seed, const ds4_model *m,
     const uint64_t parks = g_ds41_park_blocks - parks0;
     const uint64_t want_mask = 1ull << (uint64_t)layer;
     fprintf(stderr, "ds4:   forced miss: block returned %d, %llu park%s, %u assignments "
-            "released over layer mask 0x%llx, rows 0x%x\n",
+            "released (%u of them in the evicted layer) over layer mask 0x%llx, "
+            "rows 0x%x\n",
             refused, (unsigned long long)parks, parks == 1 ? "" : "s",
-            g_ds41_park_last_misses, (unsigned long long)g_ds41_park_last_layers_mask,
+            g_ds41_park_last_misses, g_ds41_park_last_first_layer_misses,
+            (unsigned long long)g_ds41_park_last_layers_mask,
             g_ds41_park_last_rows);
     if (refused >= 0 || parks != 1 || g_ds41_park_last_layers_mask != want_mask) {
         fprintf(stderr, "ds4:   forced miss: FAIL (expected one park naming only "
