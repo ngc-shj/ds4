@@ -2667,6 +2667,16 @@ struct ds4_metal_stream_expert_validate_args {
     uint32_t n_expert;
 };
 
+/* One record a missing (row, slot): the block executor needs to know which
+ * assignments could not run, not just that something could not. */
+struct ds4_metal_moe_block_residency_args {
+    uint32_t n_total_expert;
+    uint32_t n_expert;     /* slots a row */
+    uint32_t n_rows;       /* rows in the block */
+    uint32_t layer;
+    uint32_t max_records;
+};
+
 struct ds4_metal_stream_expert_split_args {
     uint32_t active_mask;
     uint32_t accumulate;
@@ -4887,6 +4897,61 @@ kernel void kernel_stream_expert_cache_validate(
     status[0] = (miss_mask == 0 && invalid_mask == 0) ? 1u : 0u;
     status[1] = miss_mask;
     status[2] = invalid_mask;
+}
+
+/* Residency, decided on the device. The host used to learn which experts a
+ * layer needed by draining the queue and reading the selected ids back, once a
+ * layer; that wait is the whole reason forty layers ran in series. Here the
+ * addresses are looked up where they are used, and the only thing that leaves
+ * the device is a list of the assignments that had no address - read once a
+ * block, not once a layer.
+ *
+ * Word layout of `out`:
+ *   [0] record count (atomic)
+ *   [1] parked row mask
+ *   [2] invalid id count
+ *   [3] records dropped because the list was full
+ *   [4 + 4*i .. ] {layer, row, slot, expert} a record
+ *
+ * A dropped record must not read as "all resident", which is why [3] exists and
+ * why the host treats it as a refusal rather than as a smaller miss list. */
+kernel void kernel_dsv41_moe_block_residency(
+        constant ds4_metal_moe_block_residency_args & args,
+        device const char * ids,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const uint64_t * down_addrs,
+        device atomic_uint * out,
+        uint tid [[thread_position_in_grid]]) {
+    const uint32_t pairs = args.n_rows * args.n_expert;
+    if (tid >= pairs) return;
+
+    const uint32_t row = tid / args.n_expert;
+    const uint32_t slot = tid % args.n_expert;
+    device const int32_t *selected = (device const int32_t *)ids;
+    const int32_t expert = selected[tid];
+
+    if (expert < 0 || (uint32_t)expert >= args.n_total_expert || (uint32_t)expert >= 384) {
+        atomic_fetch_add_explicit(&out[2], 1u, memory_order_relaxed);
+        atomic_fetch_or_explicit(&out[1], 1u << min(row, 31u), memory_order_relaxed);
+        return;
+    }
+
+    const uint32_t e = (uint32_t)expert;
+    if (gate_addrs[e] != 0 && up_addrs[e] != 0 && down_addrs[e] != 0) return;
+
+    atomic_fetch_or_explicit(&out[1], 1u << min(row, 31u), memory_order_relaxed);
+    const uint32_t slot_index =
+        atomic_fetch_add_explicit(&out[0], 1u, memory_order_relaxed);
+    if (slot_index >= args.max_records) {
+        atomic_fetch_add_explicit(&out[3], 1u, memory_order_relaxed);
+        return;
+    }
+    device atomic_uint *rec = &out[4 + 4u * slot_index];
+    atomic_store_explicit(&rec[0], args.layer, memory_order_relaxed);
+    atomic_store_explicit(&rec[1], row, memory_order_relaxed);
+    atomic_store_explicit(&rec[2], slot, memory_order_relaxed);
+    atomic_store_explicit(&rec[3], e, memory_order_relaxed);
 }
 
 kernel void kernel_mul_mv_id_q4_K_pair_f32(

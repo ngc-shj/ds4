@@ -97,6 +97,27 @@ int ds4_gpu_moe_expert_major_enabled_host(void);
  * fallback, a write outside an arena, a generation violation. A harness takes a
  * delta around the descriptor path and requires every one to be zero. */
 void ds4_gpu_zero_conditions(uint64_t out[8]);
+/* Layer-blocks whose routed MoE took the full per-layer expert address table:
+ * no selected readback and no cache pin, so no queue boundary either. */
+uint64_t ds4_gpu_full_addr_batch_layers(void);
+
+/* The verify block's expert miss list, decided on the device. Reset before the
+ * block, appended to by every routed layer without a queue boundary, and read
+ * once after the block closes. Each record is {layer, row, slot, expert}.
+ * `dropped` non-zero means the list overflowed and the block must refuse: a
+ * truncated list reads like a smaller miss, which is the one failure mode that
+ * would commit a wrong answer quietly. */
+void ds4_gpu_moe_block_miss_reset(void);
+/* Stand the device-residency path down for the next block, so a block that
+ * parked makes progress on the readback path instead of parking again. */
+void ds4_gpu_stream_block_residency_suspend(void);
+uint64_t ds4_gpu_resident_addr_batch_layers(void);
+int ds4_gpu_moe_block_miss_read(uint32_t *records,
+                                uint32_t  capacity,
+                                uint32_t *count,
+                                uint32_t *parked_rows,
+                                uint32_t *invalid,
+                                uint32_t *dropped);
 void ds4_gpu_zero_condition_note(int which);
 
 /* Stage the keys a node sees from where they live: the ring with its start and

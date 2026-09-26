@@ -539,6 +539,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline;
 static id<MTLComputePipelineState> g_moe_stream_expert_cache_validate_pipeline;
+static id<MTLComputePipelineState> g_moe_block_residency_pipeline;
 static id<MTLComputePipelineState> g_moe_q4_gather_slots6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_table_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_table_q4_k_sum6_pipeline;
@@ -6117,6 +6118,14 @@ typedef struct {
 } ds4_gpu_stream_expert_validate_args;
 
 typedef struct {
+    uint32_t n_total_expert;
+    uint32_t n_expert;
+    uint32_t n_rows;
+    uint32_t layer;
+    uint32_t max_records;
+} ds4_gpu_moe_block_residency_args;
+
+typedef struct {
     uint32_t active_mask;
     uint32_t accumulate;
 } ds4_gpu_stream_expert_split_args;
@@ -8284,6 +8293,24 @@ int ds4_gpu_init(void) {
             [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_stream_expert_cache_validate_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_stream_expert_cache_validate pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_dsv41_moe_block_residency"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv41_moe_block_residency function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_block_residency_pipeline =
+            [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_block_residency_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv41_moe_block_residency pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -12573,6 +12600,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline = nil;
         g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline = nil;
         g_moe_stream_expert_cache_validate_pipeline = nil;
+        g_moe_block_residency_pipeline = nil;
         g_moe_q4_gather_slots6_pipeline = nil;
         g_moe_mul_mv_table_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_table_q4_k_sum6_pipeline = nil;
@@ -15442,6 +15470,22 @@ static int ds4_gpu_glm_streaming_prefill_full_layer_active(void) {
            getenv("DS4_METAL_GLM_STREAMING_PREFILL_FULL_LAYER") != NULL;
 }
 
+/* Residency decided on the device instead of by a readback. The layer encodes
+ * against the cache's own address table and appends any assignment with no
+ * address to the block's miss list; nothing waits. Off by default because the
+ * miss path is a refusal here, not yet a resume, and a refusal is only cheap
+ * while the cache holds the block's working set.
+ * DS4_METAL_V41_BLOCK_RESIDENCY=1. */
+static int ds4_gpu_stream_block_residency_requested(void) {
+    static int checked, on;
+    if (!checked) {
+        checked = 1;
+        const char *e = getenv("DS4_METAL_V41_BLOCK_RESIDENCY");
+        on = e && e[0] && atoi(e) != 0;
+    }
+    return on;
+}
+
 static int ds4_gpu_stream_full_expert_addr_table_requested(void) {
     return g_ssd_streaming_mode &&
            getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
@@ -16164,6 +16208,17 @@ static int ds4_gpu_stream_expert_cache_addr_buffers(
 /* The per-expert buffers a full address table hands the GPU are never named by
  * a dispatch -- the kernel reaches them through the table -- so they are
  * declared resident once on the queue instead. */
+static uint64_t g_ds41_full_addr_batch_layers;
+static uint64_t g_ds41_resident_addr_batch_layers;
+
+uint64_t ds4_gpu_full_addr_batch_layers(void) {
+    return g_ds41_full_addr_batch_layers;
+}
+
+uint64_t ds4_gpu_resident_addr_batch_layers(void) {
+    return g_ds41_resident_addr_batch_layers;
+}
+
 static NSMutableArray<id<MTLBuffer>> *g_stream_full_expert_addr_buffers;
 static id<MTLResidencySet> g_stream_full_expert_residency_set API_AVAILABLE(macos(15.0));
 static int g_stream_full_expert_residency_on_queue;
@@ -16500,6 +16555,119 @@ static int ds4_gpu_encode_stream_expert_cache_validate(
     [enc setBuffer:down_addrs offset:0 atIndex:4];
     [enc setBuffer:status offset:0 atIndex:5];
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
+/* The block's miss list. One buffer for the whole verify block: every layer
+ * appends to it and nothing reads it until the block is decided, so no layer has
+ * to wait for the host. Sized for the worst case a block can produce - every
+ * (row, slot) missing - so a full list is a bug and not a working state. */
+enum {
+    DS4_METAL_MOE_BLOCK_MISS_HEADER = 4,
+    DS4_METAL_MOE_BLOCK_MISS_RECORD = 4,
+    /* The verifier's row cap (DS4_TP_BATCH_MAX_ROWS) times the slots a row.
+     * Stated here rather than included because this file does not depend on the
+     * TP header; the static assert in ds4.c is what keeps the two in step. */
+    DS4_METAL_MOE_BLOCK_MISS_ROWS = 32,
+    DS4_METAL_MOE_BLOCK_MISS_MAX =
+        DS4_METAL_MOE_BLOCK_MISS_ROWS * DS4_METAL_MAX_ROUTED_EXPERT_USED,
+};
+static id<MTLBuffer> g_moe_block_miss_buffer;
+/* A block that parked has to make progress on its next attempt, or the same
+ * miss repeats forever. One block on the readback path loads what was missing
+ * and populates the table, so the device path is stood down for exactly that
+ * long. Counted down by the per-block reset, not by the per-layer branch. */
+static uint32_t g_block_residency_suspend;
+
+void ds4_gpu_stream_block_residency_suspend(void) {
+    g_block_residency_suspend = 2;
+}
+
+static id<MTLBuffer> ds4_gpu_moe_block_miss_buffer(void) {
+    if (!g_device) return nil;
+    if (!g_moe_block_miss_buffer) {
+        const NSUInteger words = DS4_METAL_MOE_BLOCK_MISS_HEADER +
+            DS4_METAL_MOE_BLOCK_MISS_RECORD * DS4_METAL_MOE_BLOCK_MISS_MAX;
+        g_moe_block_miss_buffer =
+            [g_device newBufferWithLength:words * sizeof(uint32_t)
+                                  options:MTLResourceStorageModeShared];
+        if (!g_moe_block_miss_buffer) return nil;
+        g_moe_block_miss_buffer.label = @"ds4_moe_block_miss";
+        memset([g_moe_block_miss_buffer contents], 0,
+               words * sizeof(uint32_t));
+    }
+    return g_moe_block_miss_buffer;
+}
+
+void ds4_gpu_moe_block_miss_reset(void) {
+    if (g_block_residency_suspend) g_block_residency_suspend--;
+    id<MTLBuffer> b = ds4_gpu_moe_block_miss_buffer();
+    if (!b) return;
+    memset([b contents], 0, [b length]);
+}
+
+int ds4_gpu_moe_block_miss_read(uint32_t *records,
+                                uint32_t  capacity,
+                                uint32_t *count,
+                                uint32_t *parked_rows,
+                                uint32_t *invalid,
+                                uint32_t *dropped) {
+    id<MTLBuffer> b = g_moe_block_miss_buffer;
+    if (!count || !parked_rows || !invalid || !dropped) return 0;
+    if (!b) { *count = *parked_rows = *invalid = *dropped = 0; return 1; }
+    /* Read the host-visible copy of a shared buffer, which is only meaningful
+     * once the work that wrote it has completed. The caller owns that ordering:
+     * this is called after the block closes, never between layers. */
+    const uint32_t *w = (const uint32_t *)[b contents];
+    const uint32_t n = w[0];
+    *parked_rows = w[1];
+    *invalid = w[2];
+    *dropped = w[3];
+    *count = n;
+    if (!records) return 1;
+    const uint32_t take = n < capacity ? n : capacity;
+    for (uint32_t i = 0; i < take * DS4_METAL_MOE_BLOCK_MISS_RECORD; i++)
+        records[i] = w[DS4_METAL_MOE_BLOCK_MISS_HEADER + i];
+    return 1;
+}
+
+static int ds4_gpu_encode_moe_block_residency(
+        id<MTLCommandBuffer> cb,
+        uint32_t      layer,
+        uint32_t      n_total_expert,
+        uint32_t      n_expert,
+        uint32_t      n_rows,
+        id<MTLBuffer> selected,
+        NSUInteger    selected_off,
+        id<MTLBuffer> gate_addrs,
+        id<MTLBuffer> up_addrs,
+        id<MTLBuffer> down_addrs) {
+    id<MTLBuffer> out = ds4_gpu_moe_block_miss_buffer();
+    if (!cb || !out || !selected || !gate_addrs || !up_addrs || !down_addrs ||
+        !g_moe_block_residency_pipeline ||
+        n_total_expert == 0 || n_total_expert > 384 ||
+        n_expert == 0 || n_expert > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
+        n_rows == 0 || n_rows > DS4_METAL_MOE_BLOCK_MISS_ROWS) {
+        return 0;
+    }
+    const ds4_gpu_moe_block_residency_args args = {
+        .n_total_expert = n_total_expert,
+        .n_expert = n_expert,
+        .n_rows = n_rows,
+        .layer = layer,
+        .max_records = DS4_METAL_MOE_BLOCK_MISS_MAX,
+    };
+    const NSUInteger pairs = (NSUInteger)n_rows * n_expert;
+    id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_moe_block_residency_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:selected offset:selected_off atIndex:1];
+    [enc setBuffer:gate_addrs offset:0 atIndex:2];
+    [enc setBuffer:up_addrs offset:0 atIndex:3];
+    [enc setBuffer:down_addrs offset:0 atIndex:4];
+    [enc setBuffer:out offset:0 atIndex:5];
+    ds4_gpu_dispatch(enc, MTLSizeMake(pairs, 1, 1), MTLSizeMake(pairs, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
 }
@@ -47381,6 +47549,11 @@ int ds4_gpu_routed_moe_batch_tensor(
             *stream_resources[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { NULL };
         uint32_t stream_resource_count = 0;
         uint32_t stream_unique = 0;
+        /* Which entries the dispatch has to pin. A full per-layer table owns
+         * permanent buffers that are resident on the queue, so it pins nothing
+         * and passes none - that is what lets the layer skip the drain that
+         * released the pin. */
+        ds4_gpu_stream_expert_cache_entry * const *stream_entries_arg = stream_resources;
 
         const uint32_t pair_rows = n_tokens * n_expert;
         const uint64_t down_scratch_bytes = (uint64_t)pair_rows * out_dim * sizeof(float);
@@ -47431,7 +47604,33 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL;
-        const bool use_cached_batch = use_iq2_batch_selected_addr || use_iq2_cached_batch;
+        /* The same address-table kernels, with the whole layer's expert
+         * addresses in the table instead of the selected subset. Nothing has to
+         * be read back to build it, so the layer neither drains the queue to
+         * fetch the selected ids nor drains it again to release a cache pin:
+         * those two waits per layer are what serialised the verify block. */
+        const uint32_t full_addr_layers_batch = ds4_gpu_stream_full_expert_addr_layers();
+        const bool use_iq2_batch_full_addr =
+            use_iq2_batch_selected_addr &&
+            ds4_gpu_stream_full_expert_addr_table_requested() &&
+            g_tp_split_world == 1 &&
+            (full_addr_layers_batch == 0 || layer_index < full_addr_layers_batch);
+        /* Same kernels and the same per-layer table the cache already keeps,
+         * with the residency question answered where the answer is used. What
+         * this removes is not a dispatch but a wait: the readback below drains
+         * the queue once a layer, and a second drain releases the pin after. */
+        const bool use_iq2_batch_resident_addr =
+            use_iq2_batch_selected_addr &&
+            !use_iq2_batch_full_addr &&
+            ds4_gpu_stream_block_residency_requested() &&
+            g_block_residency_suspend == 0 &&
+            g_tp_split_world == 1 &&
+            g_moe_block_residency_pipeline != nil;
+        const bool use_cached_batch =
+            (use_iq2_batch_selected_addr &&
+             !use_iq2_batch_full_addr &&
+             !use_iq2_batch_resident_addr) ||
+            use_iq2_cached_batch;
 
         ds4_gpu_mul_mv_id_args gate_args =
             ds4_gpu_make_mul_mv_id_args(expert_in_dim, expert_mid_dim, n_total_expert,
@@ -47850,6 +48049,62 @@ int ds4_gpu_routed_moe_batch_tensor(
                                   "kernel_mul_mm_id_iq2_xxs_cached_f32", false);
             if (!gate_mm_pipeline || !down_mm_pipeline) return 0;
         }
+        if (use_iq2_batch_resident_addr) {
+            static bool said_resident_addr;
+            if (!said_resident_addr) { said_resident_addr = true;
+                fprintf(stderr, "ds4: V4.1 routed batch expert addresses: "
+                        "cache table, residency decided on the device\n"); }
+            if (!ds4_gpu_stream_expert_cache_addr_buffers(layer_index,
+                                                          &stream_gate_addr_buf,
+                                                          &stream_up_addr_buf,
+                                                          &stream_down_addr_buf)) {
+                fprintf(stderr,
+                        "ds4: Metal routed batch residency path has no address "
+                        "table for layer=%u\n", layer_index);
+                return 0;
+            }
+            /* Nothing to pin: an entry the table names is one the cache holds,
+             * and the block refuses if the device says otherwise. */
+            stream_entries_arg = NULL;
+            stream_resource_count = 1u;
+            stream_unique = n_total_expert;
+            g_ds41_resident_addr_batch_layers++;
+        }
+        if (use_iq2_batch_full_addr) {
+            /* An arm that skipped nothing is not an arm: say which address
+             * source the block path actually took. */
+            static bool said_full_addr_batch;
+            if (!said_full_addr_batch) { said_full_addr_batch = true;
+                fprintf(stderr, "ds4: V4.1 routed batch expert addresses: "
+                        "full per-layer table, no selected readback\n"); }
+            g_ds41_full_addr_batch_layers++;
+            ds4_gpu_stream_expert_cache_entry *full_entry = NULL;
+            if (!ds4_gpu_stream_full_expert_addr_table_prepare(model_map,
+                                                               model_size,
+                                                               layer_index,
+                                                               n_total_expert,
+                                                               gate_offset,
+                                                               up_offset,
+                                                               down_offset,
+                                                               gate_expert_bytes,
+                                                               down_expert_bytes,
+                                                               &stream_gate_addr_buf,
+                                                               &stream_up_addr_buf,
+                                                               &stream_down_addr_buf,
+                                                               &full_entry)) {
+                fprintf(stderr,
+                        "ds4: Metal routed batch full expert address table layer=%u "
+                        "could not be prepared\n",
+                        layer_index);
+                return 0;
+            }
+            /* The per-expert buffers are resident on the queue, not named by the
+             * dispatch, so one entry stands for the table. */
+            stream_entries_arg = NULL;
+            stream_resource_count = 1u;
+            stream_unique = n_total_expert;
+            (void)full_entry;
+        }
         if (use_cached_batch) {
             const int had_batch = g_batch_cb != nil;
             if (had_batch && ds4_gpu_end_commands() == 0) {
@@ -47979,7 +48234,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 fprintf(stderr, "ds4: Metal Q4 batch expert table residency set is not available\n");
                 return 0;
             }
-        } else if (use_cached_batch) {
+        } else if (use_cached_batch || use_iq2_batch_full_addr) {
             if (n_expert > 1 && (!expertsbuf ||
                 ds4_gpu_tensor_bytes(experts) < down_scratch_bytes)) {
                 if (!ds4_gpu_ensure_scratch_buffer(&g_moe_down_scratch_buffer,
@@ -48137,6 +48392,24 @@ int ds4_gpu_routed_moe_batch_tensor(
             (n_tokens <= 4u || v41_decode_batch || use_tp_mxfp4_static_batch) &&
             down_sum6_pipeline != nil;
         int ok = 0;
+        /* Before the dispatch that consumes the addresses, and in the same
+         * command buffer: the check is a dispatch, not a boundary. */
+        if (use_iq2_batch_resident_addr &&
+            !ds4_gpu_encode_moe_block_residency(cb,
+                                                layer_index,
+                                                n_total_expert,
+                                                n_expert,
+                                                n_tokens,
+                                                selectedbuf,
+                                                ds4_gpu_tensor_offset(selected),
+                                                stream_gate_addr_buf,
+                                                stream_up_addr_buf,
+                                                stream_down_addr_buf)) {
+            fprintf(stderr,
+                    "ds4: Metal routed batch residency check failed to encode "
+                    "layer=%u tokens=%u\n", layer_index, n_tokens);
+            return 0;
+        }
         if (use_iq2_batch_selected_addr) {
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
@@ -48157,7 +48430,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                 !stream_overflow_up;
             if (em_sel) {
                 ok = ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(cb, &gate_args, &act_args,
-                        stream_resources, stream_resource_count,
+                        stream_entries_arg, stream_resource_count,
                         stream_gate_addr_buf, stream_up_addr_buf,
                         xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
                         upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
@@ -48169,7 +48442,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
                     &gate_args,
                     &act_args,
-                    stream_resources,
+                    stream_entries_arg,
                     stream_resource_count,
                     stream_gate_addr_buf,
                     stream_up_addr_buf,
@@ -48572,7 +48845,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                         cb,
                         g_moe_mul_mv_addr_q2_k_sum6_pipeline,
                         &down_args,
-                        stream_resources,
+                        stream_entries_arg,
                         stream_resource_count,
                         stream_down_addr_buf,
                         midbuf,
