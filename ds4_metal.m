@@ -34771,6 +34771,74 @@ static int ds4_gpu_encode_moe_expert_worklist(
     return 1;
 }
 
+/* Expert-major against the address tables, which is the form that actually runs
+ * here: the pair encode below puts tokens x experts_used on z, so an expert two
+ * nodes both chose has its quantised weight read twice, and the distinct set is
+ * 2.8x smaller than the pair list at K = 32. */
+static int ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(
+        id<MTLCommandBuffer>        cb,
+        const ds4_gpu_mul_mv_id_args *args,
+        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
+        ds4_gpu_stream_expert_cache_entry * const *entries, uint32_t n_entries,
+        id<MTLBuffer> gate_addrs, id<MTLBuffer> up_addrs,
+        id<MTLBuffer> src1,   NSUInteger src1_off,
+        id<MTLBuffer> dst_a,  NSUInteger dst_a_off,
+        id<MTLBuffer> dst_b,  NSUInteger dst_b_off,
+        id<MTLBuffer> dst_mid, NSUInteger dst_mid_off,
+        id<MTLBuffer> ids,    NSUInteger ids_off,
+        id<MTLBuffer> weights, NSUInteger weights_off,
+        NSUInteger threadgroup_bytes) {
+    if (!cb || !args || !act || !gate_addrs || !up_addrs || !src1 || !dst_a ||
+        !dst_b || !dst_mid || !ids || !weights || args->ne00 <= 0 ||
+        args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0 || args->ne02 <= 0)
+        return 0;
+    if (args->ne02 > 384) return 0;
+    for (uint32_t i = 0; entries && i < n_entries; i++) {
+        if (!entries[i]) continue;
+        if (!entries[i]->gate_buffer || !entries[i]->up_buffer) return 0;
+    }
+    /* The same pin the pair encode takes: an expert stays put until the command
+     * completes, which is what makes the address in the table good at run time. */
+    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(entries, n_entries, 0))
+        return 0;
+    const uint32_t n_expert = (uint32_t)args->ne02;
+    const uint32_t pairs = (uint32_t)args->nei0 * (uint32_t)args->nei1;
+    if (!ds4_gpu_moe_em_reserve(n_expert, pairs)) return 0;
+    if (!ds4_gpu_encode_moe_expert_worklist(cb, (uint32_t)args->nei1,
+                                            (uint32_t)args->nei0, n_expert, pairs,
+                                            args->nbi1, ids, ids_off)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_pipeline("kernel_mul_mv_addr_iq2_xxs_em_swiglu_f32");
+    if (!pipeline) return 0;
+    const NSUInteger nsg = 2;
+    const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
+    const NSUInteger row_groups =
+        ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
+    const uint32_t max_rows = pairs;
+    id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) return 0;
+    (void)ds4_gpu_concurrent_section_barrier();
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:sizeof(*args) atIndex:0];
+    [enc setBytes:act  length:sizeof(*act)  atIndex:1];
+    [enc setBuffer:gate_addrs offset:0 atIndex:2];
+    [enc setBuffer:up_addrs   offset:0 atIndex:3];
+    [enc setBuffer:src1    offset:src1_off    atIndex:4];
+    [enc setBuffer:dst_a   offset:dst_a_off   atIndex:5];
+    [enc setBuffer:dst_b   offset:dst_b_off   atIndex:6];
+    [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
+    [enc setBuffer:ids     offset:ids_off     atIndex:8];
+    [enc setBuffer:weights offset:weights_off atIndex:9];
+    [enc setBuffer:g_moe_em_counts offset:0 atIndex:10];
+    [enc setBuffer:g_moe_em_lists  offset:0 atIndex:11];
+    [enc setBytes:&max_rows length:sizeof(max_rows) atIndex:12];
+    if (threadgroup_bytes) [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
+    ds4_gpu_dispatch(enc, MTLSizeMake(row_groups, 1, n_expert), MTLSizeMake(32, nsg, 1));
+    ds4_gpu_end_compute_encoder(cb, enc);
+    g_moe_em_dispatches++;
+    return 1;
+}
+
 static int ds4_gpu_encode_mul_mv_id_em_swiglu(
         id<MTLCommandBuffer>        cb,
         const ds4_gpu_mul_mv_id_args *args,
@@ -47980,6 +48048,22 @@ int ds4_gpu_routed_moe_batch_tensor(
                 .write_clamped = 0,
                 .clamp_value = clamp,
             };
+            /* This is the branch a streaming decode block actually reaches -
+             * use_iq2_batch_selected_addr comes before the cached-batch one, and
+             * wiring expert-major only into the later branch left it at zero
+             * dispatches twice. */
+            const bool em_sel = ds4_gpu_moe_expert_major_enabled() && n_tokens > 1 &&
+                                g_tp_split_world <= 1 && !stream_overflow_gate &&
+                                !stream_overflow_up;
+            if (em_sel) {
+                ok = ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(cb, &gate_args, &act_args,
+                        stream_resources, stream_resource_count,
+                        stream_gate_addr_buf, stream_up_addr_buf,
+                        xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                        upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+                        selectedbuf, ds4_gpu_tensor_offset(selected),
+                        weightsbuf, ds4_gpu_tensor_offset(weights), gate_smem);
+            } else
             ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
                     cb,
                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
@@ -48130,7 +48214,18 @@ int ds4_gpu_routed_moe_batch_tensor(
                 .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
                 .weight_stride = sizeof(float), .clamp_value = clamp,
             };
-            ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(cb,
+            const bool em = ds4_gpu_moe_expert_major_enabled() && n_tokens > 1 &&
+                            g_tp_split_world <= 1 && !stream_overflow_gate &&
+                            !stream_overflow_up;
+            ok = em ?
+                ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(cb, &gate_args, &act_args,
+                    stream_resources, stream_resource_count,
+                    stream_gate_addr_buf, stream_up_addr_buf,
+                    xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
+                    upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
+                    selectedbuf, ds4_gpu_tensor_offset(selected),
+                    weightsbuf, ds4_gpu_tensor_offset(weights), gate_smem) :
+                ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(cb,
                 g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline, &gate_args, &act_args,
                 stream_resources, stream_resource_count, stream_gate_addr_buf, stream_up_addr_buf,
                 xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),

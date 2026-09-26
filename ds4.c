@@ -85707,7 +85707,7 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
      * parity so a monotonic drift lands on both. DS4_V41_K_SWEEP_EM=1. */
     const bool em_ab = getenv("DS4_V41_K_SWEEP_EM") != NULL;
     struct { double block_ms, commit_ms, single_ms; long committed, blocks;
-             int checked; } acc[6][2][2];
+             uint64_t em_dispatches; int checked; } acc[6][2][2];
     memset(acc, 0, sizeof(acc));
     long regimes[4] = { seed->checkpoint.len, 1024, 0, 0 };
     long n_regimes = 2;
@@ -85834,6 +85834,7 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                 if (acc[ki][rg][arm].checked < 0) { ds4_session_free(s); s = NULL; continue; }
 
                 ds41_txn_counters_reset();
+                const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches();
                 const double t0 = now_sec();
                 long committed = 0, blocks = 0;
                 bool ok = true;
@@ -85858,6 +85859,8 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                 }
                 const double wall = (now_sec() - t0) * 1000.0;
                 if (ok && committed) {
+                    acc[ki][rg][arm].em_dispatches +=
+                        ds4_gpu_moe_expert_major_dispatches() - em0;
                     acc[ki][rg][arm].block_ms += wall;
                     acc[ki][rg][arm].commit_ms += g_ds41_txn_ms_commit;
                     acc[ki][rg][arm].committed += committed;
@@ -85900,9 +85903,23 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                     if (!acc[j][rg][0].blocks || !acc[j][rg][1].blocks) continue;
                     const double a0 = acc[j][rg][0].block_ms / (double)acc[j][rg][0].committed;
                     const double a1 = acc[j][rg][1].block_ms / (double)acc[j][rg][1].committed;
+                    /* The expected count, not merely a nonzero one: one dispatch a
+                     * layer for every block the arm ran, and zero on the arm that
+                     * did not ask for it. K = 1 is the negative control. */
+                    /* K = 1 goes through the single-row step, not the batch path, so
+                     * the expert-major encode is never reached and zero is right.
+                     * The first version of this expectation applied blocks x layers
+                     * to K = 1 as well and reported a mismatch against itself. */
+                    const uint64_t want1 = ks[j] < 2 ? 0u :
+                        (uint64_t)acc[j][rg][1].blocks * DS4_N_LAYER;
                     fprintf(stderr, "ds4:   K=%3ld expert-major %+.2f ms a token "
-                            "(%.2f -> %.2f), %llu dispatches\n", ks[j], a1 - a0, a0, a1,
-                            (unsigned long long)ds4_gpu_moe_expert_major_dispatches());
+                            "(%.2f -> %.2f), dispatches off/on %llu/%llu, expected "
+                            "0/%llu%s\n", ks[j], a1 - a0, a0, a1,
+                            (unsigned long long)acc[j][rg][0].em_dispatches,
+                            (unsigned long long)acc[j][rg][1].em_dispatches,
+                            (unsigned long long)want1,
+                            (acc[j][rg][0].em_dispatches == 0 &&
+                             acc[j][rg][1].em_dispatches == want1) ? "" : "  MISMATCH");
                 }
             fprintf(stderr, "ds4:    refused %llu, tag violations %llu, base writes %llu\n",
                     (unsigned long long)g_ds41_txn_refuse,
