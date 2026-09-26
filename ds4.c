@@ -40283,7 +40283,13 @@ typedef struct {
      * once per row. history[i] in the step is already a version per logical
      * position; parking it is what lets a commit of A take row A-1's rather
      * than the last row's. */
-    ds4_engram_history block_history[DS4_TP_BATCH_MAX_ROWS];
+    /* On the heap, not in the struct. ds41_graph_step_batch_logits keeps
+     * ds41_gpu_graph moe_rows[DS4_TP_BATCH_MAX_ROWS] on the stack, so anything
+     * sized by the row cap that lives *inside* this struct costs cap squared
+     * there. As an array here it overflowed a worker thread's stack the moment
+     * the cap went past eight - SIGBUS, subtype "thread stack size exceeded",
+     * inside __chkstk_darwin on the function's own entry probe. */
+    ds4_engram_history *block_history;
     uint32_t block_history_rows;
     /* Debug only, DS4_V41_TXN_TAGS=1. Per compressed row: which absolute
      * position produced it, which transaction wrote it, and whether that write
@@ -40359,6 +40365,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->index_cache[i]);
         ds4_gpu_tensor_free(g->block_carry_kv[i]);
         ds4_gpu_tensor_free(g->block_carry_score[i]);
+        if (i == 0) free(g->block_history);
         free(g->tag_pos[i]); free(g->tag_ipos[i]);
         free(g->tag_epoch[i]); free(g->tag_committed[i]);
         ds4_gpu_tensor_free(g->previous_kv[i]);
@@ -40485,6 +40492,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
+        if (i == 0 && !(g->block_history = calloc(DS4_TP_BATCH_MAX_ROWS,
+                                                  sizeof(*g->block_history)))) goto fail;
         if (getenv("DS4_V41_TXN_TAGS")) {
             g->tag_rows[i] = (uint32_t)cap;
             g->tag_pos[i] = malloc(cap * sizeof(*g->tag_pos[i]));
@@ -45992,6 +46001,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * and hash history distinct until the final row is published. */
     float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = prefill_rows > 1 ?
         malloc(prefill_rows * sizeof(*engram)) : NULL;
+    /* One graph per row for the per-row MoE, on the heap. These used to be a
+     * stack array inside the layer loop, which is cap copies of a struct that
+     * is itself a few kilobytes: at a cap of eight it fit a worker thread's
+     * stack and at sixteen it did not, arriving as SIGBUS with subtype "thread
+     * stack size exceeded" from this function's own entry probe. */
+    ds41_gpu_graph *moe_rows = NULL;
     ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *gathers[DS4_TP_BATCH_MAX_ROWS] = {0};
@@ -46702,8 +46717,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             if (batch_stream_experts) {
                 ok = ds41_moe_batch(g, model, l, il, rows, shared_owner, false);
             } else if (g->streaming) {
-                ds41_gpu_graph moe_rows[DS4_TP_BATCH_MAX_ROWS];
-                for (int i = 0; i < count; i++) {
+                if (!moe_rows && !(moe_rows = malloc((size_t)count * sizeof(*moe_rows))))
+                    ok = false;
+                for (int i = 0; ok && i < count; i++) {
                     moe_rows[i] = *graphs[i];
                     moe_rows[i].pos = positions[i];
 #define DS41_SESSION_MOE_ROW(name, width) moe_rows[i].name = g->rows_view[i].name;
@@ -46883,7 +46899,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             ok = ds4_gpu_tensor_copy(s->tp_logits_half ? s->tp_logits_half : s->logits,
                 0, batch_logits, (uint64_t)i * logits_bytes, logits_bytes);
         if (ok) ds41_logits_dump(s, positions[i], 1);
-        if (ok && block_txn && i < DS4_TP_BATCH_MAX_ROWS) {
+        if (ok && block_txn && s->block_history && i < DS4_TP_BATCH_MAX_ROWS) {
             s->block_history[i] = history[i];
             s->block_history_rows = (uint32_t)i + 1u;
         }
@@ -46912,6 +46928,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         ds4_gpu_tensor_free(gathers[i]);
     }
     free(engram);
+    free(moe_rows);
     return ok;
 }
 
@@ -80066,6 +80083,7 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w);
 static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
                                       const ds4_weights *w);
+static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weights *w);
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen);
@@ -83801,6 +83819,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             ds41_rowtile_check(&e->model, &e->weights);
             ds41_block_txn_test(s, &e->model, &e->weights);
             ds41_block_txn_chain_test(s, &e->model, &e->weights);
+            ds41_k_sweep(s, &e->model, &e->weights);
             ds41_oracle_block_bench(s, &e->model, &e->weights);
             ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
         }
@@ -84303,7 +84322,8 @@ int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
     /* The hash tail the accepted prefix names, not the one the last row left.
      * Row n-1's version is the state after n tokens, which is what a session
      * that had only ever seen those n would hold. */
-    if (n > 0 && (uint32_t)n <= s->ds41_graph.block_history_rows)
+    if (n > 0 && s->ds41_graph.block_history &&
+        (uint32_t)n <= s->ds41_graph.block_history_rows)
         s->ds41_graph.history = s->ds41_graph.block_history[n - 1];
     else if (n > 0 && s->ds41_graph.block_history_rows) {
         free(carry_before);
@@ -84834,7 +84854,7 @@ done:
  * Reachability is part of the answer: a boundary past the context cannot be
  * tested at this context and saying so is better than leaving it off the list. */
 static void ds41_block_txn_bounds(ds4_session *seed, const ds4_model *m,
-                                  const ds4_weights *w, long k, long cap) {
+                                  const ds4_weights *w, long k, long floor, long cap) {
     const long ctx = seed->ctx_size;
     const long swa = DS4_N_SWA;
     const long top = DS4_N_INDEXER_TOP_K;
@@ -84869,6 +84889,7 @@ static void ds41_block_txn_bounds(ds4_session *seed, const ds4_model *m,
      * and B - K being negative is a property of the sweep, not of the code under
      * test. The two reasons a boundary can be skipped are different and say so. */
     const long first_start = 1;
+    long planned = 0, ran = 0;
     for (size_t i = 0; i < sizeof(bounds) / sizeof(bounds[0]); i++) {
         const long b = bounds[i].at;
         if (b + k + 24 >= ctx) {
@@ -84886,14 +84907,254 @@ static void ds41_block_txn_bounds(ds4_session *seed, const ds4_model *m,
                     bounds[i].what, b, cap);
             continue;
         }
-        const long lo = b - k < first_start ? first_start : b - k;
-        fprintf(stderr, "ds4: boundary %s at %ld, starts %ld..%ld\n",
-                bounds[i].what, b, lo, b + k);
-        for (long start = lo; start <= b + k; start++) {
-            uint32_t a_mask = (1u << 0) | (1u << 1) | (1u << (k - 1)) | (1u << k);
-            if (b >= start && b - start <= k) a_mask |= 1u << (b - start);
-            ds41_block_txn_test_at(seed, m, w, start, a_mask);
+        if (b < floor) {
+            fprintf(stderr, "ds4:   boundary %s at %ld: below the floor %ld\n",
+                    bounds[i].what, b, floor);
+            continue;
         }
+        /* Several constants land on the same position - the indexer top-k with
+         * ratio 2 and the batch top-k with ratio 1 both fall on 1024. The test is
+         * the position, so it runs once and the names share it. */
+        bool already = false;
+        for (size_t q = 0; q < i; q++)
+            if (bounds[q].at == b && bounds[q].at + k + 24 < ctx &&
+                (!cap || bounds[q].at <= cap) && bounds[q].at >= floor)
+                already = true;
+        if (already) {
+            fprintf(stderr, "ds4:   boundary %s at %ld: same position as an earlier "
+                    "one, already covered\n", bounds[i].what, b);
+            continue;
+        }
+        const long lo = b - k < first_start ? first_start : b - k;
+        /* Every start around the cheap boundaries, five around the dear ones.
+         * A start of 2048 costs ten prefills of 2048 tokens, so seventeen of them
+         * is hours of prefill to re-test the same four transitions: the ends of
+         * the window, the two positions either side of the boundary, and the
+         * boundary itself. The A values narrow the same way - the ends, the first
+         * partial, and the one that lands the frontier on the boundary. */
+        const bool narrow = b > 256;
+        const long picks[5] = { lo, b - 1, b, b + 1, b + k };
+        const long n_picks = narrow ? 5 : b + k - lo + 1;
+        fprintf(stderr, "ds4: boundary %s at %ld, %s starts %ld..%ld\n",
+                bounds[i].what, b, narrow ? "five of the" : "every one of the",
+                lo, b + k);
+        for (long j = 0; j < n_picks; j++) {
+            const long start = narrow ? picks[j] : lo + j;
+            if (start < first_start) continue;
+            planned++;
+            uint32_t a_mask = (1u << 0) | (1u << 1) | (1u << (k - 1)) | (1u << k);
+            if (!narrow && b >= start && b - start <= k) a_mask |= 1u << (b - start);
+            ds41_block_txn_test_at(seed, m, w, start, a_mask);
+            ran++;
+        }
+    }
+    /* Every sweep so far was cut off by the harness's request timeout rather
+     * than finishing, and nothing said so - the log simply stopped. This line is
+     * the completion criterion: if it is missing, the sweep did not finish. */
+    fprintf(stderr, "ds4: boundary sweep finished: %ld of %ld starts\n", ran, planned);
+}
+
+/* The production K curve. DS4_V41_K_SWEEP=1.
+ *
+ * What it answers is one number a K: oracle throughput = K / T_block(K). The
+ * intercept and the slope are the point - a curve that flattens says the fixed
+ * cost has been paid and more rows are free, and a curve that keeps climbing
+ * says the verifier is still the thing to shorten.
+ *
+ * K = 1 is the production single step, because that is what one token goes
+ * through; verify_block refuses a single row, and a block of one would commit
+ * its candidate without verifying anything.
+ *
+ * Order is reversed every round and the rounds rotate, because cache warmth and
+ * the thermal state follow K: measured once ascending, the largest K always runs
+ * hottest. Allocation and the first touch of each arena are outside the timed
+ * region - one untimed block a K does that.
+ *
+ * Every K is checked, not just dispatched. K = 16 and 32 can reach kernel
+ * branches K = 8 never does, so each K compares all K rows against a reference
+ * session of single steps, element by element, before its time is recorded.
+ *
+ * DS4_V41_K_SWEEP_AT=a,b picks the regimes (default: the prompt end and 1024).
+ * DS4_V41_K_SWEEP_ROUNDS=n, default 2. */
+static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weights *w) {
+    if (!getenv("DS4_V41_K_SWEEP")) return;
+    static const long ks[] = { 1, 2, 4, 8, 16, 32 };
+    const long n_ks = (long)(sizeof(ks) / sizeof(ks[0]));
+    const char *r_e = getenv("DS4_V41_K_SWEEP_ROUNDS");
+    const long rounds = r_e && r_e[0] ? atol(r_e) : 2;
+    ds4_engine *e = seed->engine;
+    const int ctx = seed->ctx_size;
+
+    struct { double block_ms, commit_ms, single_ms; long committed, blocks;
+             int checked; } acc[6][2];
+    memset(acc, 0, sizeof(acc));
+    long regimes[4] = { seed->checkpoint.len, 1024, 0, 0 };
+    long n_regimes = 2;
+    if (getenv("DS4_V41_K_SWEEP_AT")) {
+        n_regimes = 0;
+        for (const char *p = getenv("DS4_V41_K_SWEEP_AT"); *p && n_regimes < 4; ) {
+            char *end = NULL;
+            const long v = strtol(p, &end, 10);
+            if (end == p) break;
+            regimes[n_regimes++] = v;
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+
+    for (long rg = 0; rg < n_regimes; rg++) {
+        const long at = regimes[rg];
+        if (at < 1 || at + 64 + 40 >= ctx) {
+            fprintf(stderr, "ds4: K sweep: regime %ld does not fit ctx %d\n", at, ctx);
+            continue;
+        }
+        int *padded = malloc((size_t)at * sizeof(int));
+        if (!padded) return;
+        for (long i = 0; i < at; i++)
+            padded[i] = seed->checkpoint.v[i % seed->checkpoint.len];
+        ds4_tokens prompt = { .v = padded, .len = (int)at, .cap = (int)at };
+
+        /* One oracle a regime, long enough for the widest K to fill whole blocks. */
+        enum { ORACLE = 96 };
+        int *oracle = malloc((size_t)(ORACLE + 1) * sizeof(int));
+        float *lg = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        float *lg2 = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        float *rowbuf = malloc((size_t)DS4_TP_BATCH_MAX_ROWS * DS4_N_VOCAB * sizeof(float));
+        int *cand = malloc((size_t)DS4_TP_BATCH_MAX_ROWS * sizeof(int));
+        int *acc_tok = malloc((size_t)DS4_TP_BATCH_MAX_ROWS * sizeof(int));
+        ds4_session *s = NULL, *ref = NULL;
+        char err[192];
+        if (!oracle || !lg || !lg2 || !rowbuf || !cand || !acc_tok) goto regime_done;
+        if (!ds41_txn_prefill(&ref, e, &prompt, ctx, "K sweep oracle")) goto regime_done;
+        oracle[0] = prompt.v[prompt.len - 1];
+        for (int i = 0; i < ORACLE; i++) {
+            if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg)) {
+                fprintf(stderr, "ds4: K sweep: the oracle stopped at %d\n", i);
+                goto regime_done;
+            }
+            oracle[i + 1] = sample_argmax(lg, DS4_N_VOCAB);
+        }
+        ds4_session_free(ref); ref = NULL;
+
+        for (long round = 0; round < rounds; round++) {
+            for (long j = 0; j < n_ks; j++) {
+                /* Reverse every other round, and rotate the start so no K keeps
+                 * the same neighbours across rounds. */
+                const long idx = round & 1 ? n_ks - 1 - j : j;
+                const long ki = (idx + round / 2) % n_ks;
+                const long k = ks[ki];
+                if (k > DS4_TP_BATCH_MAX_ROWS) continue;
+                long m_tokens = 64;
+                while (m_tokens % k) m_tokens--;
+                if (m_tokens < k || m_tokens + 2 > ORACLE) continue;
+
+                if (!ds41_txn_prefill(&s, e, &prompt, ctx, "K sweep")) goto regime_done;
+                /* Untimed: the first block at this K touches the arenas. */
+                if (k >= 2) {
+                    for (long i = 0; i < k; i++) cand[i] = oracle[i];
+                    (void)ds4_session_verify_block_ex(s, cand, (int)k, (int)k,
+                                                      acc_tok, err, sizeof(err));
+                    ds4_session_free(s); s = NULL;
+                    if (!ds41_txn_prefill(&s, e, &prompt, ctx, "K sweep")) goto regime_done;
+                }
+
+                /* All K rows against K single steps, element by element, before
+                 * this K's time counts for anything. */
+                if (k >= 2 && !acc[ki][rg].checked) {
+                    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+                    for (long i = 0; i < k; i++) graphs[i] = &s->ds41_graph;
+                    for (long i = 0; i < k; i++) cand[i] = oracle[i];
+                    const bool bok = ds4_gpu_begin_commands() != 0 &&
+                        ds41_graph_step_batch_logits(graphs, cand, (int)k, (uint32_t)k,
+                                                     m, w, rowbuf) &&
+                        ds4_gpu_end_commands() != 0;
+                    ds4_session_free(s); s = NULL;
+                    uint64_t differ = 0;
+                    if (bok && ds41_txn_prefill(&ref, e, &prompt, ctx, "K sweep ref")) {
+                        for (long i = 0; i < k; i++) {
+                            if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg2)) {
+                                differ = UINT64_MAX; break;
+                            }
+                            for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                                if (memcmp(&rowbuf[(size_t)i * DS4_N_VOCAB + v], &lg2[v],
+                                           sizeof(float)) != 0) differ++;
+                        }
+                        ds4_session_free(ref); ref = NULL;
+                    } else differ = UINT64_MAX;
+                    acc[ki][rg].checked = differ == 0 ? 1 : -1;
+                    if (differ)
+                        fprintf(stderr, "ds4: K sweep K=%ld at %ld: %llu logits differ "
+                                "from the single pass - its time is not recorded\n",
+                                k, at, (unsigned long long)differ);
+                    if (!ds41_txn_prefill(&s, e, &prompt, ctx, "K sweep")) goto regime_done;
+                } else if (k == 1) acc[ki][rg].checked = 1;
+                if (acc[ki][rg].checked < 0) { ds4_session_free(s); s = NULL; continue; }
+
+                ds41_txn_counters_reset();
+                const double t0 = now_sec();
+                long committed = 0, blocks = 0;
+                bool ok = true;
+                if (k == 1) {
+                    for (long i = 0; ok && i < m_tokens; i++) {
+                        ok = ds41_graph_step(&s->ds41_graph, m, w, oracle[i], lg);
+                        if (ok) { committed++; blocks++; }
+                    }
+                } else {
+                    for (long i = 0; ok && i + k <= m_tokens; i += k) {
+                        for (long q = 0; q < k; q++) cand[q] = oracle[i + q];
+                        const int n = ds4_session_verify_block_ex(s, cand, (int)k, (int)k,
+                                                                 acc_tok, err, sizeof(err));
+                        if (n != (int)k) {
+                            fprintf(stderr, "ds4: K sweep K=%ld at %ld: block %ld "
+                                    "committed %d of %ld (%s)\n", k, at, blocks, n,
+                                    k, n < 0 ? err : "short");
+                            ok = false; break;
+                        }
+                        committed += n; blocks++;
+                    }
+                }
+                const double wall = (now_sec() - t0) * 1000.0;
+                if (ok && committed) {
+                    acc[ki][rg].block_ms += wall;
+                    acc[ki][rg].commit_ms += g_ds41_txn_ms_commit;
+                    acc[ki][rg].committed += committed;
+                    acc[ki][rg].blocks += blocks;
+                }
+                ds4_session_free(s); s = NULL;
+            }
+        }
+
+        /* The single-step cost in this regime, for the width. */
+        if (ds41_txn_prefill(&s, e, &prompt, ctx, "K sweep single")) {
+            const double t0 = now_sec();
+            long n = 0;
+            for (long i = 0; i < 16; i++)
+                if (ds41_graph_step(&s->ds41_graph, m, w, oracle[i], lg)) n++;
+            const double single = n ? (now_sec() - t0) * 1000.0 / (double)n : 0.0;
+            ds4_session_free(s); s = NULL;
+            fprintf(stderr, "ds4: K sweep at position %ld, %ld rounds, single step "
+                    "%.2f ms\n", at, rounds, single);
+            fprintf(stderr, "ds4:    K   blocks  ms/block  ms/token   tok/s   width  "
+                    "commit ms  logits\n");
+            for (long j = 0; j < n_ks; j++) {
+                if (!acc[j][rg].blocks) continue;
+                const double per_block = acc[j][rg].block_ms / (double)acc[j][rg].blocks;
+                const double per_tok = acc[j][rg].block_ms / (double)acc[j][rg].committed;
+                fprintf(stderr, "ds4:  %3ld  %7ld  %8.2f  %8.2f  %6.2f  %6.2f  %9.2f  %s\n",
+                        ks[j], acc[j][rg].blocks, per_block, per_tok, 1000.0 / per_tok,
+                        single > 0.0 ? (double)ks[j] * single / per_block : 0.0,
+                        acc[j][rg].commit_ms / (double)acc[j][rg].blocks,
+                        acc[j][rg].checked > 0 ? "identical" : "NOT CHECKED");
+            }
+            fprintf(stderr, "ds4:    refused %llu, tag violations %llu, base writes %llu\n",
+                    (unsigned long long)g_ds41_txn_refuse,
+                    (unsigned long long)g_ds41_txn_base_write, 0ull);
+        }
+regime_done:
+        if (s) ds4_session_free(s);
+        if (ref) ds4_session_free(ref);
+        free(oracle); free(lg); free(lg2); free(rowbuf); free(cand); free(acc_tok);
+        free(padded);
+        memset(acc, 0, sizeof(acc));
     }
 }
 
@@ -84910,7 +85171,9 @@ static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
     const char *bounds = getenv("DS4_V41_BLOCK_TXN_TEST_BOUNDS");
     if (bounds && bounds[0] && atoi(bounds) != 0) {
         const char *cap_e = getenv("DS4_V41_BLOCK_TXN_TEST_BOUNDS_MAX");
-        ds41_block_txn_bounds(seed, m, w, 8, cap_e && cap_e[0] ? atol(cap_e) : 0);
+        const char *flr_e = getenv("DS4_V41_BLOCK_TXN_TEST_BOUNDS_MIN");
+        ds41_block_txn_bounds(seed, m, w, 8, flr_e && flr_e[0] ? atol(flr_e) : 0,
+                              cap_e && cap_e[0] ? atol(cap_e) : 0);
         return;
     }
     const char *list = getenv("DS4_V41_BLOCK_TXN_TEST_START");

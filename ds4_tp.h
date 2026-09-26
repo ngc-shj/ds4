@@ -30,8 +30,11 @@ enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
-    /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
-    DS4_TP_BATCH_MAX_ROWS = 8,
+    /* Max rows in a verify-block batch gate. Raised from 8 to sweep K past it:
+     * the block's delta arenas and the per-row gather slice scale with this, so
+     * 32 costs about 32 MiB of gather and 3 MiB of delta. The parked-version
+     * mask is 64 bits, so 64 is the next wall and it needs the shift handled. */
+    DS4_TP_BATCH_MAX_ROWS = 32,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
