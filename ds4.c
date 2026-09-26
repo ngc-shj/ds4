@@ -80847,6 +80847,7 @@ static void ds41_block_dag_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w);
 static void ds41_arena_layout_check(void);
 static void ds41_dag_stage_check(void);
+static void ds41_tree_accept_check(void);
 static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weights *w);
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
@@ -84586,6 +84587,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             ds41_block_txn_chain_test(s, &e->model, &e->weights);
             ds41_arena_layout_check();
             ds41_dag_stage_check();
+            ds41_tree_accept_check();
             ds41_block_dag_test(s, &e->model, &e->weights);
             ds41_k_sweep(s, &e->model, &e->weights);
             ds41_oracle_block_bench(s, &e->model, &e->weights);
@@ -86967,6 +86969,79 @@ static void ds41_arena_layout_check(void) {
  * downstream is unchanged - an offset or index error is exactly what this memcmp is
  * for, and it is checked across a ring wrap because that is where the modular step
  * is easy to get wrong. DS4_V41_DAG_STAGE_CHECK=1. */
+/* The host's statement of the tree accept, to check the kernel against: from
+ * node 0, the child whose token the parent's argmax picks, as deep as it goes. */
+static uint32_t ds41_tree_accept_ref(uint32_t n, const uint32_t *argmax, const int *token,
+                                     const uint32_t *parent, uint32_t max_depth,
+                                     uint32_t *path) {
+    uint32_t cur = 0, depth = 1;
+    path[0] = 0;
+    if (!max_depth) max_depth = n;
+    while (depth < max_depth) {
+        uint32_t next = UINT32_MAX;
+        for (uint32_t c = 1; c < n; c++)
+            if (parent[c] == cur && (uint32_t)token[c] == argmax[cur]) { next = c; break; }
+        if (next == UINT32_MAX) break;
+        path[depth++] = next;
+        cur = next;
+    }
+    return depth;
+}
+
+/* The tree accept against its host statement: branches taken at each depth, a
+ * stop at the root, a stop mid-branch, a depth cap, and a chain - which has to
+ * agree with the linear accept's count. DS4_V41_EXECUTOR_CHECK=1. */
+static void ds41_tree_accept_check(void) {
+    if (!getenv("DS4_V41_EXECUTOR_CHECK")) return;
+    enum { N = 7 };
+    /*        0
+     *      /   \
+     *     1     2        tokens 10, 11
+     *    / \   / \
+     *   3   4 5   6      tokens 20, 21, 30, 31 */
+    const uint32_t parent[N] = { DS41_DAG_ROOT, 0, 0, 1, 1, 2, 2 };
+    const int token[N] = { 5, 10, 11, 20, 21, 30, 31 };
+    const uint32_t chain_parent[N] = { DS41_DAG_ROOT, 0, 1, 2, 3, 4, 5 };
+    const int chain_token[N] = { 5, 10, 20, 30, 40, 50, 60 };
+    struct { const char *name; uint32_t argmax[N]; uint32_t max_depth; int chain; } cases[] = {
+        { "left then right",   { 10, 21, 0, 0, 7, 0, 0 }, 0, 0 },
+        { "right then stop",   { 11, 0, 99, 0, 0, 0, 0 }, 0, 0 },
+        { "stop at the root",  { 12, 0, 0, 0, 0, 0, 0 }, 0, 0 },
+        { "right, right",      { 11, 0, 31, 0, 0, 0, 3 }, 0, 0 },
+        { "capped at depth 2", { 10, 21, 0, 0, 7, 0, 0 }, 2, 0 },
+        { "chain of four",     { 10, 20, 30, 41, 0, 0, 0 }, 0, 1 },
+        { "whole chain",       { 10, 20, 30, 40, 50, 60, 9 }, 0, 1 },
+    };
+    ds4_gpu_tensor *am = ds4_gpu_tensor_alloc(N * sizeof(uint32_t));
+    ds4_gpu_tensor *tk = ds4_gpu_tensor_alloc(N * sizeof(int));
+    ds4_gpu_tensor *pa = ds4_gpu_tensor_alloc(N * sizeof(uint32_t));
+    ds4_gpu_tensor *rs = ds4_gpu_tensor_alloc((3u + 32u) * sizeof(uint32_t));
+    int pass = 0, total = 0;
+    for (size_t c = 0; am && tk && pa && rs && c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const uint32_t *par = cases[c].chain ? chain_parent : parent;
+        const int *tok = cases[c].chain ? chain_token : token;
+        uint32_t want_path[N], got[3u + 32u] = {0};
+        const uint32_t want = ds41_tree_accept_ref(N, cases[c].argmax, tok, par,
+                                                   cases[c].max_depth, want_path);
+        bool ok = ds4_gpu_tensor_write(am, 0, cases[c].argmax, sizeof(cases[c].argmax)) &&
+                  ds4_gpu_tensor_write(tk, 0, tok, N * sizeof(int)) &&
+                  ds4_gpu_tensor_write(pa, 0, par, N * sizeof(uint32_t)) &&
+                  ds4_gpu_begin_commands() &&
+                  ds4_gpu_dsv41_tree_accept_encode(am, tk, pa, rs, N, cases[c].max_depth) &&
+                  ds4_gpu_end_commands() &&
+                  ds4_gpu_tensor_read(rs, 0, got, sizeof(got));
+        bool same = ok && got[0] == want && got[1] == want_path[want - 1] &&
+                    got[2] == cases[c].argmax[want_path[want - 1]];
+        for (uint32_t d = 0; same && d < want; d++) same = got[3 + d] == want_path[d];
+        total++; pass += same;
+        fprintf(stderr, "ds4:   tree accept %-18s depth %u (want %u), node %u, next %u -> %s\n",
+                cases[c].name, got[0], want, got[1], got[2], same ? "PASS" : "FAIL");
+    }
+    fprintf(stderr, "ds4: tree accept: %d of %d cases match the host statement\n", pass, total);
+    ds4_gpu_tensor_free(am); ds4_gpu_tensor_free(tk);
+    ds4_gpu_tensor_free(pa); ds4_gpu_tensor_free(rs);
+}
+
 static void ds41_dag_stage_check(void) {
     if (!getenv("DS4_V41_DAG_STAGE_CHECK")) return;
     enum { CAP = 128u, ROW = 512u, DELTA_ROWS = 8u };

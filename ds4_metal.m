@@ -52829,6 +52829,36 @@ int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
  * storage its logits sit in is the next pass's MoE scratch, and accepts once at
  * the end over answers alone. The partials sit behind room for the largest
  * block, so a pass's partials never overlap another pass's answers. */
+int ds4_gpu_dsv41_tree_accept_encode(const ds4_gpu_tensor *argmax,
+                                     const ds4_gpu_tensor *tokens,
+                                     const ds4_gpu_tensor *parents,
+                                     ds4_gpu_tensor *result,
+                                     uint32_t node_count, uint32_t max_depth) {
+    if (!argmax || !tokens || !parents || !result || !node_count || node_count > 32u)
+        return 0;
+    if (ds4_gpu_tensor_bytes(result) < (3u + 32u) * sizeof(uint32_t)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline("kernel_dsv41_tree_accept");
+        if (!pipe) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<DS4Encoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        const uint32_t a[2] = { node_count, max_depth ? max_depth : node_count };
+        (void)ds4_gpu_concurrent_section_barrier();
+        [enc setComputePipelineState:pipe];
+        [enc setBytes:a length:sizeof(a) atIndex:0];
+        [enc setBuffer:ds4_gpu_tensor_buffer(argmax) offset:ds4_gpu_tensor_offset(argmax) atIndex:1];
+        [enc setBuffer:ds4_gpu_tensor_buffer(tokens) offset:ds4_gpu_tensor_offset(tokens) atIndex:2];
+        [enc setBuffer:ds4_gpu_tensor_buffer(parents) offset:ds4_gpu_tensor_offset(parents) atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(result) offset:ds4_gpu_tensor_offset(result) atIndex:4];
+        ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 tree accept");
+    }
+}
+
 int ds4_gpu_dsv41_block_accept_encode_ex(const ds4_gpu_tensor *logits,
                                          const ds4_gpu_tensor *tokens,
                                          ds4_gpu_tensor *argmax,

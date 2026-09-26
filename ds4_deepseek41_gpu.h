@@ -184,6 +184,14 @@ int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
                                      uint32_t cap);
 /* Argmax of `rows` logits rows into answers argmax_base.., then, when
  * accept_rows is non-zero, the accept over answers 0..accept_rows. */
+/* The candidate-tree accept: from node 0 (the pending token), follow the child
+ * whose token the parent's argmax picks. result: [0] depth, [1] deepest node,
+ * [2] next token, [3 + d] the path. */
+int ds4_gpu_dsv41_tree_accept_encode(const ds4_gpu_tensor *argmax,
+                                     const ds4_gpu_tensor *tokens,
+                                     const ds4_gpu_tensor *parents,
+                                     ds4_gpu_tensor *result,
+                                     uint32_t node_count, uint32_t max_depth);
 int ds4_gpu_dsv41_block_accept_encode_ex(const ds4_gpu_tensor *logits,
                                          const ds4_gpu_tensor *tokens,
                                          ds4_gpu_tensor *argmax,

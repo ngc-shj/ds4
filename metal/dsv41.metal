@@ -306,6 +306,46 @@ kernel void kernel_dsv41_block_publish(
         delta[(ulong)src * args.row_floats + col];
 }
 
+/* The accept for a candidate tree. Node 0 is the pending token - the one the
+ * session's last logits already chose - so it is accepted by construction, and
+ * every other node is accepted when its parent is and its token is the one the
+ * parent's logits pick. Siblings carry distinct tokens, so at most one child of
+ * an accepted node can match and the accepted set is a single root path: the
+ * deepest one the verifier's own argmaxes agree with.
+ *
+ * out: [0] accepted depth, [1] deepest accepted node, [2] token after it,
+ *      [3 + d] the node at depth d of the chosen path. */
+struct ds4_metal_args_dsv41_tree_accept {
+    uint32_t node_count;
+    uint32_t max_depth;
+};
+
+kernel void kernel_dsv41_tree_accept(
+        constant ds4_metal_args_dsv41_tree_accept &args,
+        device const uint32_t *argmax,
+        device const int32_t  *token,
+        device const uint32_t *parent,
+        device uint32_t *out,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid != 0 || args.node_count == 0u) return;
+    uint cur = 0u;
+    uint depth = 1u;
+    out[3] = 0u;
+    while (depth < args.max_depth) {
+        const uint want = argmax[cur];
+        uint next = 0xffffffffu;
+        for (uint c = 1u; c < args.node_count; c++)
+            if (parent[c] == cur && (uint)token[c] == want) { next = c; break; }
+        if (next == 0xffffffffu) break;
+        out[3u + depth] = next;
+        cur = next;
+        depth++;
+    }
+    out[0] = depth;
+    out[1] = cur;
+    out[2] = argmax[cur];
+}
+
 kernel void kernel_dsv41_block_accept(
         constant ds4_metal_args_dsv41_block_accept &args,
         device const uint32_t *argmax,
