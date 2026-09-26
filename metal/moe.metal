@@ -3999,6 +3999,230 @@ kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32(
     (void)tiitg;
 }
 
+struct ds4_metal_args_moe_worklist {
+    uint32_t n_tokens;
+    uint32_t n_used;
+    uint32_t n_expert;
+    uint32_t max_rows;
+    uint64_t nbi1;
+};
+
+/* Group the routed selection by expert, one thread an expert.
+ *
+ * Each thread walks the whole pair list once and keeps the pairs that chose it,
+ * so a list comes out in pair order. That ordering is not cosmetic: the
+ * expert-major matvec reduces each pair separately, and keeping the pairs in the
+ * order the pair-major kernel would have run them is what makes the two produce
+ * the same bytes. */
+kernel void kernel_dsv41_moe_expert_worklist(
+        constant ds4_metal_args_moe_worklist & args,
+        device const char *ids,
+        device uint32_t *counts,
+        device uint32_t *lists,
+        uint tid [[thread_position_in_grid]]) {
+    if (tid >= args.n_expert) return;
+    uint n = 0;
+    for (uint t = 0; t < args.n_tokens; t++) {
+        device const int32_t *row = (device const int32_t *)(ids + (uint64_t)t * args.nbi1);
+        for (uint s = 0; s < args.n_used; s++) {
+            if ((uint)row[s] != tid) continue;
+            if (n < args.max_rows) lists[tid * args.max_rows + n] = t * args.n_used + s;
+            n++;
+        }
+    }
+    counts[tid] = n > args.max_rows ? args.max_rows : n;
+}
+
+/* Expert-major gate and up with the swiglu, for IQ2_XXS routed experts held at
+ * per-expert addresses.
+ *
+ * The encode this replaces - ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu - puts
+ * tokens x experts_used on the grid's z axis, so an expert that two rows both
+ * chose has its 3 MiB of quantised weight read twice. Over the block's own
+ * selections the pair list is 2.8x larger than the set of distinct experts at
+ * K = 32, and the routed slope sits at 1.6x the read-everything bandwidth floor
+ * rather than near the union's, so those duplicate reads are not being absorbed.
+ *
+ * Here z is the expert and the threadgroup walks the pairs that chose it, in row
+ * blocks of DS4_MOE_EM_RB, dequantising each quantised block once and applying
+ * it to every pair in the block.
+ *
+ * The arithmetic is the pair path's element for element: the same ib32 = tiisg
+ * stride-32 walk, the same l then j order inside a block, the same simd_sum
+ * across the lanes, the same 0.25 scale after it. The sign is folded into the
+ * dequantised weight rather than applied to each product, which is exact because
+ * it is a multiplication by +-1. An expert with a zero address is skipped, as the
+ * pair path skips it, so a non-resident expert contributes nothing either way.
+ *
+ * The activation is re-read per pair from device memory rather than held in
+ * registers: it is 20 KiB against the expert's 3 MiB, and holding a block of
+ * them in yl[BR][32] is what sank the earlier attempt. */
+#define DS4_MOE_EM_RB 4
+kernel void kernel_mul_mv_addr_iq2_xxs_em_swiglu_f32(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const uint64_t * gate_addrs,
+        device const uint64_t * up_addrs,
+        device const char * src1,
+        device       char * dst_gate,
+        device       char * dst_up,
+        device       char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        device const uint32_t * counts,
+        device const uint32_t * lists,
+        constant uint32_t & max_rows,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    /* Two, not a function constant: the grid table staged below fills 256
+     * entries four at a thread, which needs exactly two simdgroups, and the
+     * pair path is dispatched with two as well. */
+    const short NSG = 2;
+    const uint expert = tgpig.z;
+    if (expert >= (uint)args.ne02 || expert >= 384u) return;
+    const uint n_here = counts[expert];
+    if (!n_here) return;
+    const uint64_t gate_addr = gate_addrs[expert];
+    const uint64_t up_addr = up_addrs[expert];
+    if (gate_addr == 0 || up_addr == 0) return;
+
+    const int nb = args.ne00 / QK_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_IQ2_XXS;
+    const int nb32 = nb * (QK_K / 32);
+
+    threadgroup uint64_t *svalues = (threadgroup uint64_t *)(shmem);
+    threadgroup uint8_t  *ssigns  = (threadgroup uint8_t *)(svalues + 256);
+    {
+        int nval = 4;
+        int pos = (32 * sgitg + tiisg) * nval;
+        for (int i = 0; i < nval; ++i) svalues[pos + i] = ds4_metal_iq2xxs_grid[pos + i];
+        nval = 2;
+        pos = (32 * sgitg + tiisg) * nval;
+        for (int i = 0; i < nval; ++i) ssigns[pos + i] = ds4_metal_ksigns_iq2xs[pos + i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device const block_iq2_xxs *xg0 =
+        (device const block_iq2_xxs *)(reinterpret_cast<device const char *>(gate_addr) +
+                                       (uint64_t)first_row * args.nb01);
+    device const block_iq2_xxs *xu0 =
+        (device const block_iq2_xxs *)(reinterpret_cast<device const char *>(up_addr) +
+                                       (uint64_t)first_row * args.nb01);
+
+    const int ix = tiisg;
+    const float c = act.clamp_value;
+
+    for (uint base = 0; base < n_here; base += DS4_MOE_EM_RB) {
+        const uint rb = min((uint)DS4_MOE_EM_RB, n_here - base);
+        uint pair_ix[DS4_MOE_EM_RB];
+        device const float *ybase[DS4_MOE_EM_RB];
+        for (uint r = 0; r < DS4_MOE_EM_RB; r++) {
+            const uint p = lists[expert * max_rows + base + (r < rb ? r : 0)];
+            pair_ix[r] = p;
+            const uint tok = p / (uint)args.nei0;
+            const uint slot = p % (uint)args.nei0;
+            const int64_t i11 = (int64_t)(slot % (uint)args.ne11);
+            ybase[r] = (device const float *)(src1 + i11 * args.nb11 + (int64_t)tok * args.nb12);
+        }
+
+        float sumg[N_R0_IQ2_XXS][DS4_MOE_EM_RB];
+        float sumu[N_R0_IQ2_XXS][DS4_MOE_EM_RB];
+        for (short row = 0; row < N_R0_IQ2_XXS; row++)
+            for (uint r = 0; r < DS4_MOE_EM_RB; r++) { sumg[row][r] = 0.f; sumu[row][r] = 0.f; }
+
+        for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+            const int ibl = ib32 / (QK_K / 32);
+            const int ib  = ib32 % (QK_K / 32);
+            device const uint16_t *qg = (xg0 + ibl)->qs + 4 * ib;
+            device const uint16_t *qu = (xu0 + ibl)->qs + 4 * ib;
+            device const half *dhg = &(xg0 + ibl)->d;
+            device const half *dhu = &(xu0 + ibl)->d;
+            const uint yoff = 32 * (uint)ib32;
+
+            for (short row = 0; row < N_R0_IQ2_XXS; row++) {
+                device const uint8_t *aux8g = (device const uint8_t *)qg;
+                device const uint8_t *aux8u = (device const uint8_t *)qu;
+                const uint32_t aux32g = qg[2] | (qg[3] << 16);
+                const uint32_t aux32u = qu[2] | (qu[3] << 16);
+                const float dg = (float)dhg[0] * (0.5f + (aux32g >> 28));
+                const float du = (float)dhu[0] * (0.5f + (aux32u >> 28));
+
+                float wg[32];
+                float wu[32];
+                for (short l = 0; l < 4; ++l) {
+                    const threadgroup uint8_t *gridg = (const threadgroup uint8_t *)(svalues + aux8g[l]);
+                    const threadgroup uint8_t *gridu = (const threadgroup uint8_t *)(svalues + aux8u[l]);
+                    const uint8_t signg = ssigns[(aux32g >> 7 * l) & 127];
+                    const uint8_t signu = ssigns[(aux32u >> 7 * l) & 127];
+                    for (short j = 0; j < 8; ++j) {
+                        wg[8 * l + j] = (float)gridg[j] * (signg & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                        wu[8 * l + j] = (float)gridu[j] * (signu & ds4_metal_kmask_iq2xs[j] ? -1.f : 1.f);
+                    }
+                }
+                for (uint r = 0; r < rb; r++) {
+                    device const float *y = ybase[r] + yoff;
+                    float sg = 0;
+                    float su = 0;
+                    for (short l = 0; l < 4; ++l)
+                        for (short j = 0; j < 8; ++j) {
+                            const float v = y[8 * l + j];
+                            sg += v * wg[8 * l + j];
+                            su += v * wu[8 * l + j];
+                        }
+                    sumg[row][r] += dg * sg;
+                    sumu[row][r] += du * su;
+                }
+
+                dhg += args.nb01 / 2;
+                dhu += args.nb01 / 2;
+                qg  += args.nb01 / 2;
+                qu  += args.nb01 / 2;
+            }
+        }
+
+        for (uint r = 0; r < rb; r++) {
+            const uint p = pair_ix[r];
+            const uint tok = p / (uint)args.nei0;
+            const uint slot = p % (uint)args.nei0;
+            /* The addr path's own convention: the slot indexes the output. */
+            device float *gate_f32 = (device float *)(dst_gate +
+                ((uint64_t)slot * args.ne0 + (uint64_t)tok * args.ne1 * args.ne0) * sizeof(float));
+            device float *up_f32 = (device float *)(dst_up +
+                ((uint64_t)slot * args.ne0 + (uint64_t)tok * args.ne1 * args.ne0) * sizeof(float));
+            device float *mid_f32 = (device float *)(dst_mid + (uint64_t)p * act.mid_row_stride);
+            device const float *route_w = (device const float *)(weights + (uint64_t)p * act.weight_stride);
+            const float route_weight = route_w[0];
+            float4 reduced_gate;
+            float4 reduced_up;
+            for (int row = 0; row < N_R0_IQ2_XXS; ++row) {
+                reduced_gate[row] = simd_sum(sumg[row][r]);
+                reduced_up[row] = simd_sum(sumu[row][r]);
+            }
+            if (tiisg < N_R0_IQ2_XXS && first_row + tiisg < args.ne0) {
+                const uint out_row = first_row + tiisg;
+                const float gate = reduced_gate[tiisg] * 0.25f;
+                const float up = reduced_up[tiisg] * 0.25f;
+                float g = gate;
+                float u = up;
+                if (c > 1.0e-6f) {
+                    g = min(g, c);
+                    u = clamp(u, -c, c);
+                }
+                gate_f32[out_row] = gate;
+                up_f32[out_row] = up;
+                const float silu = g / (1.0f + exp(-g));
+                mid_f32[out_row] = silu * u * route_weight;
+            }
+        }
+    }
+
+    (void)tiitg;
+    (void)ids;
+}
+
 kernel void kernel_mul_mv_id_iq2_xxs_pair_swiglu_pack2_overlap_f32(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,

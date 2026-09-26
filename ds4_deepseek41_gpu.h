@@ -82,6 +82,11 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
                            uint32_t width, uint32_t rows, float eps);
 /* Pool complete pairs and retain the last unpaired projection in previous_*.
  * start is the absolute token position, including earlier chunks. */
+/* Expert-major routed gate and up: -1 takes DS4_METAL_V41_MOE_EXPERT_MAJOR, 0
+ * and 1 force an arm so a harness can pair them inside one process. */
+void ds4_gpu_moe_expert_major_override(int mode);
+uint64_t ds4_gpu_moe_expert_major_dispatches(void);
+int ds4_gpu_moe_expert_major_enabled_host(void);
 int ds4_gpu_dsv41_pool2(ds4_gpu_tensor *out,
                       const ds4_gpu_tensor *kv, const ds4_gpu_tensor *scores,
                       ds4_gpu_tensor *previous_kv, ds4_gpu_tensor *previous_scores,

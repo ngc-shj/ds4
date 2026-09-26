@@ -41041,6 +41041,8 @@ enum {
  * which positions were parked and which nodes were. */
 _Static_assert(DS4_TP_BATCH_MAX_ROWS <= 64,
                "the parked-version bitmask in ds41_block_carry_commit is 64 bits wide");
+static uint64_t g_ds41_union_pairs, g_ds41_union_distinct, g_ds41_union_layers;
+
 static uint64_t g_ds41_fuse_sites;
 
 static void ds41_decode_path_report(void) {
@@ -41072,6 +41074,14 @@ static void ds41_decode_path_report(void) {
     /* refuse is the one that has to stay at zero: every count is a block whose
      * parked versions did not describe the positions the block says it ran, and
      * each of them refused rather than committing something plausible. */
+    if (g_ds41_union_layers)
+        fprintf(stderr, "ds4:   routed expert union over %llu layer-blocks: %llu pairs, "
+                "%llu distinct, %.2fx duplicate reads an expert-major operator would "
+                "remove\n", (unsigned long long)g_ds41_union_layers,
+                (unsigned long long)g_ds41_union_pairs,
+                (unsigned long long)g_ds41_union_distinct,
+                g_ds41_union_distinct ?
+                    (double)g_ds41_union_pairs / (double)g_ds41_union_distinct : 0.0);
     if (g_ds41_txn_carry_park || g_ds41_txn_refuse)
         fprintf(stderr, "ds4:   block transaction: %llu carry versions parked, "
                 "%llu published, %llu held at the committed value, %llu refused\n",
@@ -43275,6 +43285,38 @@ static bool ds41_moe_split_note(bool enabled, double *t0, uint32_t il,
     return ds4_gpu_begin_commands() != 0;
 }
 
+/* How much an expert-major routed operator could buy, before building one.
+ *
+ * The routed path is pair-major: every dispatch is sized n_tokens * n_expert,
+ * so an expert two rows both selected has its weights read twice. Grouping by
+ * expert removes exactly the duplicate reads and nothing else, so the ceiling on
+ * the whole idea is pairs / distinct. Measuring it first is the difference
+ * between an architecture and a dedupe of a hundred and ninety-two down to a
+ * hundred and eighty. DS4_V41_MOE_UNION=1. */
+static bool ds41_moe_union_note(ds41_prefill_row *b, uint32_t il, uint32_t count) {
+    if (!getenv("DS4_V41_MOE_UNION") || count < 2) return true;
+    (void)il;
+    int32_t ids[DS4_TP_BATCH_MAX_ROWS * DS4_MAX_EXPERT_USED];
+    const size_t n = (size_t)count * DS4_N_EXPERT_USED;
+    if (n > sizeof(ids) / sizeof(ids[0])) return true;
+    /* The selection is written inside the open command buffer, so it has to be
+     * closed before the host can see it - the same shape the split timer uses. */
+    if (!ds4_gpu_end_commands()) return false;
+    const int got = ds4_gpu_tensor_read(b->selected, 0, ids, n * sizeof(ids[0]));
+    if (!ds4_gpu_begin_commands()) return false;
+    if (!got) return true;
+    uint64_t distinct = 0;
+    for (size_t i = 0; i < n; i++) {
+        bool seen = false;
+        for (size_t j = 0; j < i && !seen; j++) if (ids[j] == ids[i]) seen = true;
+        if (!seen) distinct++;
+    }
+    g_ds41_union_pairs += n;
+    g_ds41_union_distinct += distinct;
+    g_ds41_union_layers++;
+    return true;
+}
+
 static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, uint32_t count,
                            bool shared_owner, bool force_resident) {
@@ -43299,6 +43341,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const bool shared_here_abl = !(shared_owner && g->tp_rank != (il & 1u));
     if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
         !ds41_route_batch(g, m, l, count) ||
+        !ds41_moe_union_note(b, il, count) ||
         !ds41_wread_note_route_batch(b, count) ||
         !ds41_moe_split_note(split_ms, &split_t0, il, count, "router")) return false;
     /* Seam SHARED: the shared expert's own arithmetic. The router above it runs
@@ -46212,6 +46255,30 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const char *attn_out_e = getenv("DS4_METAL_V41_BATCH_ATTN_OUT");
     const bool batch_attn_out = (!attn_out_e || !attn_out_e[0] || atoi(attn_out_e) != 0) &&
                                 g->tp_world == 1;
+    /* The configuration this block actually runs under, once a process. Every
+     * number taken from a K-row block has to be read against this line: the
+     * first K curve was measured with block_levels, block_attn_k,
+     * block_low_batch and batch_fuse all off, which sends attention back to a
+     * loop over the rows, and it was reported as a ceiling. */
+    {
+        static bool said_cfg;
+        if (ok && !said_cfg) {
+            said_cfg = true;
+            fprintf(stderr, "ds4: V4.1 K-block effective configuration: rows=%u "
+                    "exact_vocab=%d head_tile=%d dense_tile=%d block_kv=%d "
+                    "block_levels=%d block_attn_k=%d block_attn_raw=%d "
+                    "block_low_batch=%d block_attn=%d batch_fuse=%d "
+                    "batch_attn_out=%d batch_stream_experts=%d row_gather=%d "
+                    "moe_expert_major=%d block_txn=%d row_logits_readback=%d\n",
+                    rows, g_ds41_exact_vocab, g_ds41_exact_vocab ? 2 : 0, 4,
+                    block_kv ? 1 : 0, block_levels ? 1 : 0, block_attn_k ? 1 : 0,
+                    block_attn_raw ? 1 : 0, low_batch ? 1 : 0, block_attn ? 1 : 0,
+                    ds41_batch_fuse() ? 1 : 0, batch_attn_out ? 1 : 0,
+                    batch_stream_experts ? 1 : 0, row_gather ? 1 : 0,
+                    ds4_gpu_moe_expert_major_enabled_host(), block_txn ? 1 : 0,
+                    row_logits ? 1 : 0);
+        }
+    }
     /* attn_output_a is 1024 rows of 4096 Q8 per output group, and every row of
      * the block reads all of it. The default path still dispatches it per row
      * while the block path has had a batch entry point since BLOCK_LOW_BATCH,
@@ -84985,8 +85052,12 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
     ds4_engine *e = seed->engine;
     const int ctx = seed->ctx_size;
 
+    /* Two arms a K, paired inside this process: [K][regime][arm], arm 0 the
+     * routed path as it ships and arm 1 expert-major. Alternated by round
+     * parity so a monotonic drift lands on both. DS4_V41_K_SWEEP_EM=1. */
+    const bool em_ab = getenv("DS4_V41_K_SWEEP_EM") != NULL;
     struct { double block_ms, commit_ms, single_ms; long committed, blocks;
-             int checked; } acc[6][2];
+             int checked; } acc[6][2][2];
     memset(acc, 0, sizeof(acc));
     long regimes[4] = { seed->checkpoint.len, 1024, 0, 0 };
     long n_regimes = 2;
@@ -85043,6 +85114,10 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                 const long ki = (idx + round / 2) % n_ks;
                 const long k = ks[ki];
                 if (k > DS4_TP_BATCH_MAX_ROWS) continue;
+                for (int a2 = 0; a2 < (em_ab ? 2 : 1); a2++) {
+                /* ABBA: the arm order flips with the round. */
+                const int arm = em_ab ? ((round & 1) ? 1 - a2 : a2) : 0;
+                if (em_ab) ds4_gpu_moe_expert_major_override(arm);
                 long m_tokens = 64;
                 while (m_tokens % k) m_tokens--;
                 if (m_tokens < k || m_tokens + 2 > ORACLE) continue;
@@ -85059,7 +85134,7 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
 
                 /* All K rows against K single steps, element by element, before
                  * this K's time counts for anything. */
-                if (k >= 2 && !acc[ki][rg].checked) {
+                if (k >= 2 && !acc[ki][rg][arm].checked) {
                     ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
                     for (long i = 0; i < k; i++) graphs[i] = &s->ds41_graph;
                     for (long i = 0; i < k; i++) cand[i] = oracle[i];
@@ -85074,20 +85149,38 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                             if (!ds41_graph_step(&ref->ds41_graph, m, w, oracle[i], lg2)) {
                                 differ = UINT64_MAX; break;
                             }
+                            uint64_t row_bad = 0;
+                            long first = -1;
                             for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
                                 if (memcmp(&rowbuf[(size_t)i * DS4_N_VOCAB + v], &lg2[v],
-                                           sizeof(float)) != 0) differ++;
+                                           sizeof(float)) != 0) {
+                                    row_bad++;
+                                    if (first < 0) first = (long)v;
+                                }
+                            differ += row_bad;
+                            /* Which rows disagree and how, because "83% differ"
+                             * does not say whether the rows are wrong, stale or
+                             * simply in another order. */
+                            if (row_bad)
+                                fprintf(stderr, "ds4:   K=%ld row %ld: %llu of %u differ, "
+                                        "first at %ld: block %.8g vs single %.8g "
+                                        "(row argmax %d vs %d)\n", k, i,
+                                        (unsigned long long)row_bad, DS4_N_VOCAB, first,
+                                        rowbuf[(size_t)i * DS4_N_VOCAB + (first < 0 ? 0 : first)],
+                                        lg2[first < 0 ? 0 : first],
+                                        sample_argmax(rowbuf + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB),
+                                        sample_argmax(lg2, DS4_N_VOCAB));
                         }
                         ds4_session_free(ref); ref = NULL;
                     } else differ = UINT64_MAX;
-                    acc[ki][rg].checked = differ == 0 ? 1 : -1;
+                    acc[ki][rg][arm].checked = differ == 0 ? 1 : -1;
                     if (differ)
                         fprintf(stderr, "ds4: K sweep K=%ld at %ld: %llu logits differ "
                                 "from the single pass - its time is not recorded\n",
                                 k, at, (unsigned long long)differ);
                     if (!ds41_txn_prefill(&s, e, &prompt, ctx, "K sweep")) goto regime_done;
-                } else if (k == 1) acc[ki][rg].checked = 1;
-                if (acc[ki][rg].checked < 0) { ds4_session_free(s); s = NULL; continue; }
+                } else if (k == 1) acc[ki][rg][arm].checked = 1;
+                if (acc[ki][rg][arm].checked < 0) { ds4_session_free(s); s = NULL; continue; }
 
                 ds41_txn_counters_reset();
                 const double t0 = now_sec();
@@ -85114,14 +85207,16 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                 }
                 const double wall = (now_sec() - t0) * 1000.0;
                 if (ok && committed) {
-                    acc[ki][rg].block_ms += wall;
-                    acc[ki][rg].commit_ms += g_ds41_txn_ms_commit;
-                    acc[ki][rg].committed += committed;
-                    acc[ki][rg].blocks += blocks;
+                    acc[ki][rg][arm].block_ms += wall;
+                    acc[ki][rg][arm].commit_ms += g_ds41_txn_ms_commit;
+                    acc[ki][rg][arm].committed += committed;
+                    acc[ki][rg][arm].blocks += blocks;
                 }
                 ds4_session_free(s); s = NULL;
+                }
             }
         }
+        if (em_ab) ds4_gpu_moe_expert_major_override(-1);
 
         /* The single-step cost in this regime, for the width. */
         if (ds41_txn_prefill(&s, e, &prompt, ctx, "K sweep single")) {
@@ -85135,16 +85230,29 @@ static void ds41_k_sweep(ds4_session *seed, const ds4_model *m, const ds4_weight
                     "%.2f ms\n", at, rounds, single);
             fprintf(stderr, "ds4:    K   blocks  ms/block  ms/token   tok/s   width  "
                     "commit ms  logits\n");
-            for (long j = 0; j < n_ks; j++) {
-                if (!acc[j][rg].blocks) continue;
-                const double per_block = acc[j][rg].block_ms / (double)acc[j][rg].blocks;
-                const double per_tok = acc[j][rg].block_ms / (double)acc[j][rg].committed;
-                fprintf(stderr, "ds4:  %3ld  %7ld  %8.2f  %8.2f  %6.2f  %6.2f  %9.2f  %s\n",
-                        ks[j], acc[j][rg].blocks, per_block, per_tok, 1000.0 / per_tok,
-                        single > 0.0 ? (double)ks[j] * single / per_block : 0.0,
-                        acc[j][rg].commit_ms / (double)acc[j][rg].blocks,
-                        acc[j][rg].checked > 0 ? "identical" : "NOT CHECKED");
-            }
+            for (long j = 0; j < n_ks; j++)
+                for (int arm = 0; arm < (em_ab ? 2 : 1); arm++) {
+                    if (!acc[j][rg][arm].blocks) continue;
+                    const double per_block =
+                        acc[j][rg][arm].block_ms / (double)acc[j][rg][arm].blocks;
+                    const double per_tok =
+                        acc[j][rg][arm].block_ms / (double)acc[j][rg][arm].committed;
+                    fprintf(stderr, "ds4:  %3ld%-3s %7ld  %8.2f  %8.2f  %6.2f  %6.2f  "
+                            "%9.2f  %s\n", ks[j], em_ab ? (arm ? " EM" : " --") : "",
+                            acc[j][rg][arm].blocks, per_block, per_tok, 1000.0 / per_tok,
+                            single > 0.0 ? (double)ks[j] * single / per_block : 0.0,
+                            acc[j][rg][arm].commit_ms / (double)acc[j][rg][arm].blocks,
+                            acc[j][rg][arm].checked > 0 ? "identical" : "NOT CHECKED");
+                }
+            if (em_ab)
+                for (long j = 0; j < n_ks; j++) {
+                    if (!acc[j][rg][0].blocks || !acc[j][rg][1].blocks) continue;
+                    const double a0 = acc[j][rg][0].block_ms / (double)acc[j][rg][0].committed;
+                    const double a1 = acc[j][rg][1].block_ms / (double)acc[j][rg][1].committed;
+                    fprintf(stderr, "ds4:   K=%3ld expert-major %+.2f ms a token "
+                            "(%.2f -> %.2f), %llu dispatches\n", ks[j], a1 - a0, a0, a1,
+                            (unsigned long long)ds4_gpu_moe_expert_major_dispatches());
+                }
             fprintf(stderr, "ds4:    refused %llu, tag violations %llu, base writes %llu\n",
                     (unsigned long long)g_ds41_txn_refuse,
                     (unsigned long long)g_ds41_txn_base_write, 0ull);
