@@ -14323,6 +14323,11 @@ typedef struct {
     NSUInteger up_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     NSUInteger down_inners[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     ds4_gpu_stream_expert_pread_task tasks[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u];
+    /* The tasks split into the pieces the pool actually reads, alive until
+     * the pool has finished with them (ds4_gpu_stream_expert_split_pieces). */
+    ds4_gpu_stream_expert_pread_task pieces[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u * 16u];
+    uint32_t piece_owner[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED * 3u * 16u];
+    uint32_t n_pieces;
     double start_ms;
     double prepare_ms;
 } ds4_gpu_stream_expert_pending_load;
@@ -14669,7 +14674,85 @@ static void ds4_gpu_stream_expert_pread_pool_shutdown(void) {
     pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 }
 
+static int ds4_gpu_stream_expert_pread_tasks_raw(
+        ds4_gpu_stream_expert_pread_task *tasks,
+        uint32_t n_tasks,
+        uint64_t *total_bytes,
+        double *wall_ms);
+
+/* The reads split into pieces of at most 1 MiB before they reach the pool.
+ * An expert is three tensors, so it was three reads on three threads; most of
+ * a missed expert's pages are already in the page cache, where a read is a
+ * copy that scales with threads (one 9.49 MiB expert: 0.59 ms on one, 0.13 on
+ * three or more pieces a thread), so the pool's other threads were idle for
+ * the part of the load that is not the device. The bytes and where they land
+ * are the same; each task's outcome is the sum of its pieces'. */
+/* Split reads into pieces of at most 1 MiB for the pool, and fold the pieces'
+ * outcomes back into their tasks. Returns 0 when splitting would not add
+ * pieces or they do not fit, and the caller reads the tasks whole. */
+enum { DS4_STREAM_PIECE_BYTES = 1u << 20 };
+static uint32_t ds4_gpu_stream_expert_split_pieces(
+        const ds4_gpu_stream_expert_pread_task *tasks, uint32_t n_tasks,
+        ds4_gpu_stream_expert_pread_task *pieces, uint32_t *owner, uint32_t cap) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_tasks; i++)
+        n += (uint32_t)((tasks[i].len + DS4_STREAM_PIECE_BYTES - 1u) / DS4_STREAM_PIECE_BYTES);
+    if (n <= n_tasks || n > cap) return 0;
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        for (uint64_t off = 0; off < tasks[i].len; off += DS4_STREAM_PIECE_BYTES) {
+            pieces[k] = tasks[i];
+            pieces[k].offset = tasks[i].offset + off;
+            pieces[k].dst = tasks[i].dst + off;
+            pieces[k].len = tasks[i].len - off < DS4_STREAM_PIECE_BYTES ?
+                            tasks[i].len - off : DS4_STREAM_PIECE_BYTES;
+            pieces[k].read_bytes = 0;
+            pieces[k].ms = 0.0;
+            pieces[k].ok = 0;
+            owner[k++] = i;
+        }
+    }
+    return k;
+}
+
+static void ds4_gpu_stream_expert_fold_pieces(
+        ds4_gpu_stream_expert_pread_task *tasks, uint32_t n_tasks,
+        const ds4_gpu_stream_expert_pread_task *pieces, const uint32_t *owner, uint32_t n) {
+    for (uint32_t i = 0; i < n_tasks; i++) {
+        tasks[i].read_bytes = 0;
+        tasks[i].ms = 0.0;
+        tasks[i].ok = 1;
+    }
+    for (uint32_t j = 0; j < n; j++) {
+        ds4_gpu_stream_expert_pread_task *t = &tasks[owner[j]];
+        t->read_bytes += pieces[j].read_bytes;
+        if (pieces[j].ms > t->ms) t->ms = pieces[j].ms;
+        if (!pieces[j].ok) t->ok = 0;
+    }
+}
+
+/* Reads split into pieces before they reach the pool. An expert is three
+ * tensors, so it was three reads on three threads; a missed expert's pages
+ * that are already in the page cache copy at 78 GB/s on three or more threads
+ * against 17 on one (9.49 MiB: 0.13 against 0.59 ms), so the pool's other
+ * threads sat idle for the part of the load that is not the device. The bytes
+ * and where they land are the same. */
 static int ds4_gpu_stream_expert_pread_tasks(
+        ds4_gpu_stream_expert_pread_task *tasks,
+        uint32_t n_tasks,
+        uint64_t *total_bytes,
+        double *wall_ms) {
+    enum { MAX_PIECES = 512 };
+    ds4_gpu_stream_expert_pread_task pieces[MAX_PIECES];
+    uint32_t owner[MAX_PIECES];
+    const uint32_t k = ds4_gpu_stream_expert_split_pieces(tasks, n_tasks, pieces, owner, MAX_PIECES);
+    if (!k) return ds4_gpu_stream_expert_pread_tasks_raw(tasks, n_tasks, total_bytes, wall_ms);
+    const int ok = ds4_gpu_stream_expert_pread_tasks_raw(pieces, k, total_bytes, wall_ms);
+    ds4_gpu_stream_expert_fold_pieces(tasks, n_tasks, pieces, owner, k);
+    return ok;
+}
+
+static int ds4_gpu_stream_expert_pread_tasks_raw(
         ds4_gpu_stream_expert_pread_task *tasks,
         uint32_t n_tasks,
         uint64_t *total_bytes,
@@ -16069,6 +16152,10 @@ int ds4_gpu_gate_account_layer(const void *model_map, uint64_t model_size, uint3
         if (touched) (*touched)++;
     }
     ds4_gpu_stream_expert_cache_note_selected_hotness(layer, ids, n_sel);
+    /* The gated path never reads the ids back through the paths that record
+     * DS4_MOE_RECORD_SELECTED_HOTLIST; the route log it accounts here is the
+     * same selection. */
+    (void)ds4_gpu_moe_selected_hotlist_record(layer, ids, n_sel, n_total);
     ds4_gpu_stream_expert_cache_note_token(layer);
     ds4_gpu_stream_expert_cache_prune_layer(layer, n_total, n_sel, ids, n_sel);
     if (!ds4_gpu_repair_batch_enabled())
@@ -18488,6 +18575,10 @@ static int ds4_gpu_stream_expert_pending_load_finish(
     }
     const double elapsed_ms = ds4_gpu_now_ms() - start_ms;
     p->active = 0;
+    if (p->n_pieces)
+        ds4_gpu_stream_expert_fold_pieces(p->tasks, p->n_tasks, p->pieces, p->piece_owner,
+                                          p->n_pieces);
+    p->n_pieces = 0;
     const int ok = ds4_gpu_stream_expert_pending_load_install(p,
                                                               entries,
                                                               elapsed_ms);
@@ -18930,22 +19021,26 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         }
     }
 
+    p->n_pieces = ds4_gpu_stream_expert_split_pieces(
+            p->tasks, p->n_tasks, p->pieces, p->piece_owner,
+            (uint32_t)(sizeof(p->pieces) / sizeof(p->pieces[0])));
     const uint32_t n_workers =
-        ds4_gpu_stream_expert_pread_thread_count(p->n_tasks);
+        ds4_gpu_stream_expert_pread_thread_count(p->n_pieces ? p->n_pieces : p->n_tasks);
     p->start_ms = ds4_gpu_now_ms();
     if (load_timing) {
         p->prepare_ms = p->start_ms - load_prepare_t0;
     }
-    if (ds4_gpu_stream_expert_pread_pool_begin(p->tasks,
-                                               p->n_tasks,
+    if (ds4_gpu_stream_expert_pread_pool_begin(p->n_pieces ? p->pieces : p->tasks,
+                                               p->n_pieces ? p->n_pieces : p->n_tasks,
                                                n_workers)) {
         p->active = 1;
         if (ds4_gpu_stream_expert_pending_load_profile_enabled()) {
             fprintf(stderr,
-                    "ds4: Metal streaming expert early-load begin layer=%u experts=%u tensors=%u threads=%u\n",
+                    "ds4: Metal streaming expert early-load begin layer=%u experts=%u tensors=%u pieces=%u threads=%u\n",
                     layer,
                     p->n_loads,
                     p->n_tasks,
+                    p->n_pieces,
                     n_workers);
         }
         return 1;
@@ -56556,4 +56651,10 @@ int ds4_gpu_dsv41_hc_expand_tail_tensor(
         if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 HC expand and tail")) return 0;
     }
     return 1;
+}
+
+/* Seed an expert's route hotness, as if it had been selected `amount` times
+ * recently: a prewarmed entry should not be the first thing evicted. */
+void ds4_gpu_stream_expert_seed_hotness(uint32_t layer, uint32_t expert, uint32_t amount) {
+    ds4_gpu_stream_expert_cache_note_route_hotness(layer, expert, amount);
 }

@@ -442,6 +442,7 @@ void ds4_gpu_set_uce_override(int on);
 int ds4_gpu_uce_enabled(void);
 int ds4_gpu_router_take_validated(void);
 int ds4_gpu_router_fuse_level_get(void);
+void ds4_gpu_stream_expert_seed_hotness(uint32_t layer, uint32_t expert, uint32_t amount);
 int ds4_gpu_router_project_select_tensor(
         ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs,
         ds4_gpu_tensor *logits, const void *model_map, uint64_t model_size,

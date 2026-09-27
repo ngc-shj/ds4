@@ -1605,6 +1605,7 @@ static int ds4_expert_hotlist_sort_cmp(const void *a, const void *b) {
 
 #include "ds4_streaming_hotlist.inc"
 #include "ds4_streaming_hotlist_glm52.inc"
+#include "ds4_streaming_hotlist_v41.inc"
 
 static void ds4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
@@ -76467,6 +76468,67 @@ static void ds41_note_prefill_headroom(uint32_t budget,
     g_ds41_decode_budget = budget + (uint32_t)extra;
 }
 
+/* Fill the expert cache from the built-in V4.1 hotlist before the first
+ * decode, once a process, so the first few hundred tokens do not read their
+ * experts from the device one miss at a time. Off unless
+ * DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP names how many to load. Each
+ * loaded expert's hotness is seeded near the steady value its training
+ * frequency implies (the counter halves every sixteen tokens), so eviction
+ * does not take the prewarmed set first. */
+#define DS4_METAL_PREWARM_BATCH 6u
+static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
+    static int done;
+    if (done) return;
+    done = 1;
+    const char *cap_s = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
+    const uint32_t cap = cap_s && cap_s[0] ? (uint32_t)strtoul(cap_s, NULL, 10) : 0u;
+    if (cap == 0 || DS4_N_LAYER > 64u) return;
+    extern int ds4_gpu_expert_load_set(const void *model_map, uint64_t model_size, uint32_t layer,
+                                       const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                                       uint64_t gate_offset, uint64_t up_offset,
+                                       uint64_t down_offset, uint64_t gate_expert_bytes,
+                                       uint64_t down_expert_bytes, uint32_t missing_mask,
+                                       unsigned long long *bytes_loaded);
+    const uint32_t n_list = (uint32_t)(sizeof(ds4_v41_streaming_hotlist) /
+                                       sizeof(ds4_v41_streaming_hotlist[0]));
+    const uint32_t want = cap < n_list ? cap : n_list;
+    int32_t pend[64][DS4_METAL_PREWARM_BATCH];
+    uint32_t npend[64] = {0};
+    unsigned long long bytes = 0;
+    uint32_t loaded = 0, failed = 0;
+    const double t0 = now_sec();
+    for (uint32_t i = 0; i <= want; i++) {
+        const bool last = i == want;
+        const uint32_t il = last ? 0u : ds4_v41_streaming_hotlist[i].layer;
+        if (!last) {
+            if (il >= DS4_N_LAYER) continue;
+            pend[il][npend[il]++] = (int32_t)ds4_v41_streaming_hotlist[i].expert;
+            const uint32_t seed = (uint32_t)(32.0 * ds4_v41_streaming_hotlist[i].hits /
+                                             (double)DS4_V41_STREAMING_HOTLIST_TOKENS + 0.5);
+            ds4_gpu_stream_expert_seed_hotness(il, ds4_v41_streaming_hotlist[i].expert,
+                                               seed ? seed : 1u);
+        }
+        for (uint32_t l = last ? 0u : il; l < (last ? DS4_N_LAYER : il + 1u); l++) {
+            if (npend[l] == 0 || (!last && npend[l] < DS4_METAL_PREWARM_BATCH)) continue;
+            const ds4_layer_weights *lw = &w->layer[l];
+            uint64_t gate_row = 0, down_row = 0;
+            if (!tensor_nbytes(lw->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+                !tensor_nbytes(lw->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return;
+            if (ds4_gpu_expert_load_set(m->map, m->size, l, pend[l], npend[l], DS4_N_EXPERT,
+                                        lw->ffn_gate_exps->abs_offset, lw->ffn_up_exps->abs_offset,
+                                        lw->ffn_down_exps->abs_offset, gate_row * DS4_N_FF_EXP,
+                                        down_row * DS4_N_EMBD, (1u << npend[l]) - 1u, &bytes))
+                loaded += npend[l];
+            else
+                failed += npend[l];
+            npend[l] = 0;
+        }
+    }
+    fprintf(stderr, "ds4: expert cache prewarmed from the built-in V4.1 hotlist: %u experts "
+            "(%u failed), %.2f GiB in %.2f s\n", loaded, failed,
+            (double)bytes / (1024.0 * 1024.0 * 1024.0), now_sec() - t0);
+}
+
 static void ds41_lend_headroom_to_decode(void) {
     if (g_ds41_headroom_lent || g_ds41_decode_budget <= g_ds41_admitted_budget) return;
     ds4_gpu_move_streaming_expert_cache_budget(g_ds41_decode_budget);
@@ -83592,6 +83654,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             snprintf(err, errlen, "interrupted");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
+        ds41_expert_prewarm(&e->model, &e->weights);
         ds41_lend_headroom_to_decode();
         return 0;
     }
