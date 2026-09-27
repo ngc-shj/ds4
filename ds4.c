@@ -40473,6 +40473,11 @@ typedef struct {
     ds4_gpu_tensor *exec_parent;            /* the tree, for the device accept */
     ds4_gpu_tensor *exec_comp_positions;    /* pos + 1 - 2, for the ratio-2 rows */
     ds4_gpu_tensor *exec_engram_rows2;      /* layer 14's table, beside layer 1's */
+    /* The single step's layer-14 Engram rows, written with layer 1's at the
+     * step's start so no layer has to wait for the host to rewrite one shared
+     * buffer; engram_split says this step did. */
+    ds4_gpu_tensor *engram_rows14;
+    bool engram_split;
     ds4_gpu_tensor *exec_state;             /* scratch for reordering node rows */
     ds4_gpu_tensor *exec_perm;              /* the reordering, new row -> old row */
     ds4_gpu_tensor *exec_logits;            /* a vocabulary row a node */
@@ -40564,6 +40569,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     g->exec_parent = NULL;
     ds4_gpu_tensor_free(g->exec_comp_positions);
     ds4_gpu_tensor_free(g->exec_engram_rows2);
+    ds4_gpu_tensor_free(g->engram_rows14);
+    g->engram_rows14 = NULL;
     ds4_gpu_tensor_free(g->exec_state);
     ds4_gpu_tensor_free(g->exec_perm);
     ds4_gpu_tensor_free(g->exec_logits);
@@ -42207,12 +42214,9 @@ static int g_ds41_dag_override = -1;   /* the abenc A/B's arm */
  * so the form is confined to that graph: the batch and prefill paths share
  * these functions over many row graphs and would interleave it. */
 static const ds41_gpu_graph *g_ds41_dag_graph;
-/* The two Engram tables' rows, written once at the start of the step into two
- * buffers (layer 1's in g->engram_rows, layer 14's here) instead of into one
- * just before each layer. Nothing then has to drain at layer 13, and the
- * Engram layers can be encoded ahead like any other. */
-static bool g_ds41_engram_split;
-static ds4_gpu_tensor *g_ds41_engram_rows2;
+/* Steps that wrote both Engram tables' rows at their start (g->engram_split),
+ * and single steps that still drained at layer 13 for the shared buffer. */
+static unsigned long long g_ds41_engram_split_steps, g_ds41_layer13_drains;
 static bool ds41_dag_on_graph(const ds41_gpu_graph *g) {
     static int checked, enabled;
     if (!g || g != g_ds41_dag_graph) return false;
@@ -43869,8 +43873,8 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        const ds4_gpu_tensor *rows = g_ds41_engram_split && g == g_ds41_dag_graph && il == 14u ?
-            g_ds41_engram_rows2 : g->engram_rows;
+        const ds4_gpu_tensor *rows = g->engram_split && il == 14u ? g->engram_rows14
+                                                                  : g->engram_rows;
         if (!ds41_matmul(g->engram_kv, m, l->engram_kv, rows, true) ||
             !ds4_gpu_dsv41_engram_add(g->residual, g->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
@@ -45207,6 +45211,21 @@ static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp) {
                 "%.2f genuinely absent\n",
                 (double)(rep_res - last_res) / (double)dt,
                 (double)(rep_abs - last_abs) / (double)dt);
+        {
+            extern void ds4_gpu_stream_expert_repair_breakdown(double out[5]);
+            static double last_rb[5];
+            double rb[5];
+            ds4_gpu_stream_expert_repair_breakdown(rb);
+            fprintf(stderr,
+                    "ds4:   of the repair a token: readahead %.2f ms, slot preparation %.2f ms, "
+                    "reads %.2f ms, install %.2f ms, over %.2f loads\n",
+                    (rb[0] - last_rb[0]) / (double)dt, (rb[1] - last_rb[1]) / (double)dt,
+                    (rb[2] - last_rb[2]) / (double)dt, (rb[3] - last_rb[3]) / (double)dt,
+                    (rb[4] - last_rb[4]) / (double)dt);
+            for (int k = 0; k < 5; k++) last_rb[k] = rb[k];
+        }
+        fprintf(stderr, "ds4:   Engram rows written at step start in %llu steps; "
+                "layer-13 drains %llu\n", g_ds41_engram_split_steps, g_ds41_layer13_drains);
         fprintf(stderr,
                 "ds4:   residency a token: %.2f adds, %.2f removes, %.2f commits\n",
                 (double)(res_add - last_add) / (double)dt,
@@ -45230,7 +45249,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     g_ds41_dag_graph = g;
     const bool r = ds41_graph_step_inner(g, m, w, token, logits);
     g_ds41_dag_graph = NULL;
-    g_ds41_engram_split = false;
+    if (g) g->engram_split = false;
     /* Nothing owed may outlive the step it was made in. */
     g_ds41_mix_pending_attn = g_ds41_mix_pending_ffn = false;
     g_ds41_shared1.done = false;
@@ -45281,15 +45300,19 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
         if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS,
                                    g->rows[i])) return false;
     }
-    g_ds41_engram_split = false;
-    if (!ds41_image_at(g, g->pos) && ds41_dag_on_graph(g)) {
-        if (!g_ds41_engram_rows2 &&
-            !(g_ds41_engram_rows2 = ds4_gpu_tensor_alloc(ds4_gpu_tensor_bytes(g->engram_rows))))
+    /* Both Engram tables' rows into their own buffers, once, at the step's
+     * start (the package's single step, not under an ablation). */
+    g->engram_split = false;
+    if (!ds41_image_at(g, g->pos) && ds41_fuse_transition() == 2 &&
+        g_ds41_sabl_stage == 0 && !g_ds41_sabl_capture) {
+        if (!g->engram_rows14 &&
+            !(g->engram_rows14 = ds4_gpu_tensor_alloc(ds4_gpu_tensor_bytes(g->engram_rows))))
             return false;
         if (!ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[0], sizeof(g->rows[0])) ||
-            !ds4_gpu_tensor_write(g_ds41_engram_rows2, 0, g->rows[1], sizeof(g->rows[1])))
+            !ds4_gpu_tensor_write(g->engram_rows14, 0, g->rows[1], sizeof(g->rows[1])))
             return false;
-        g_ds41_engram_split = true;
+        g->engram_split = true;
+        g_ds41_engram_split_steps++;
     }
     const double v41_t1 = v41_prof ? now_sec() : 0.0;
     const float initial_pre[] = {1, 0, 0, 0};
@@ -45450,14 +45473,15 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
         /* Layers before the window run the ordinary way. */
         for (uint32_t il = 0; ok && il < gate_lo; il++) {
             const ds4_layer_weights *pl = &w->layer[il];
-            if (ds41_engram_layer(il) && !g_ds41_engram_split) {
+            if (ds41_engram_layer(il) && !g->engram_split) {
                 const uint32_t ei = il == 1 ? 0 : 1;
                 if (!ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[ei],
                                           sizeof(g->rows[ei]))) { ok = false; break; }
             }
             if (ok) ok = ds41_graph_layer(g, m, pl, il, token);
-            if (ok && il == 13u && !g_ds41_engram_split && !ds4_gpu_end_commands()) ok = false;
-            if (ok && il == 13u && !g_ds41_engram_split && !ds4_gpu_begin_commands()) ok = false;
+            if (ok && il == 13u && !g->engram_split) g_ds41_layer13_drains++;
+            if (ok && il == 13u && !g->engram_split && !ds4_gpu_end_commands()) ok = false;
+            if (ok && il == 13u && !g->engram_split && !ds4_gpu_begin_commands()) ok = false;
         }
         while (ok && start < gate_n) {
             if (++passes > 4u * gate_n + 8u) {
@@ -45508,7 +45532,7 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
                  * a gated segment has to do the same, and not doing it is what
                  * made two gated layers disagree with the baseline while one
                  * did not - layer 1 is the first layer that reads it. */
-                if (ds41_engram_layer(il) && !g_ds41_engram_split) {
+                if (ds41_engram_layer(il) && !g->engram_split) {
                     const uint32_t ei = il == 1 ? 0 : 1;
                     if (!ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[ei],
                                               sizeof(g->rows[ei]))) { ok = false; break; }
@@ -45717,7 +45741,7 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
                             il, sl->ffn_gate_exps->type,
                             sl->ffn_down_exps->type,
                             DS4_N_EXPERT_USED) != 0;
-                    if ((ds41_engram_layer(il) && !g_ds41_engram_split) || !resident_gated) {
+                    if ((ds41_engram_layer(il) && !g->engram_split) || !resident_gated) {
                         spec_end = il;
                         break;
                     }
@@ -45882,7 +45906,7 @@ spec_done:;
 #endif
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
-        if (ok && ds41_engram_layer(il) && !g_ds41_engram_split) {
+        if (ok && ds41_engram_layer(il) && !g->engram_split) {
             const uint32_t i = il == 1 ? 0 : 1;
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
@@ -45905,8 +45929,9 @@ spec_done:;
         /* TP gates already submit ordered, bounded command buffers. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || (il == 13 && !g_ds41_engram_split) ||
+        const bool drain = !queue_layers || (il == 13 && !g->engram_split) ||
                            il + 1u == DS4_N_LAYER;
+        if (il == 13 && !g->engram_split && queue_layers) g_ds41_layer13_drains++;
         if (drain && !ds4_gpu_end_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
@@ -76468,9 +76493,10 @@ static void ds41_note_prefill_headroom(uint32_t budget,
     g_ds41_decode_budget = budget + (uint32_t)extra;
 }
 
-/* Fill the expert cache from the built-in V4.1 hotlist before the first
- * decode, once a process, so the first few hundred tokens do not read their
- * experts from the device one miss at a time. Off unless
+/* Fill the expert cache from the built-in V4.1 hotlist once a process - at
+ * model load, or failing that at the end of the first prefill - so the first
+ * few hundred tokens do not read their experts from the device one miss at a
+ * time. Off unless
  * DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP names how many to load. Each
  * loaded expert's hotness is seeded near the steady value its training
  * frequency implies (the counter halves every sixteen tokens), so eviction
@@ -79883,6 +79909,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+        /* The prewarm needs nothing from a request: at load, it is part of
+         * starting the server rather than of anyone's first answer. Not
+         * before this point: until the backend has the model mapped and the
+         * static weights locked every load fails, and the failures cap the
+         * cache at what they managed to allocate. The call after the first
+         * prefill finds it done. */
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->ssd_streaming)
+            ds41_expert_prewarm(&e->model, &e->weights);
+#endif
     }
 #else
     if (graph_backend) {

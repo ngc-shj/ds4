@@ -780,6 +780,14 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+/* Where a miss's repair time goes, cumulative ms: readahead advice, slot
+ * preparation (buffer and mlock), the reads, and installing the entries. */
+static double g_rep_ra_ms, g_rep_prep_ms, g_rep_read_ms, g_rep_install_ms;
+static unsigned long long g_rep_loads;
+void ds4_gpu_stream_expert_repair_breakdown(double out[5]) {
+    out[0] = g_rep_ra_ms; out[1] = g_rep_prep_ms; out[2] = g_rep_read_ms;
+    out[3] = g_rep_install_ms; out[4] = (double)g_rep_loads;
+}
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -19046,6 +19054,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         return 1;
     }
 
+    p->n_pieces = 0;   /* the synchronous fallback splits for itself */
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
     if (!ds4_gpu_stream_expert_pread_tasks(p->tasks,
@@ -19230,13 +19239,13 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         }
     }
 
-    for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
-        const uint32_t slot = load_slots[load_i];
-        const uint32_t expert = (uint32_t)selected_ids[slot];
-        const int force_reuse =
-            cache_budget != 0 && reserved_entries >= cache_budget;
-
-        if (!gpu_copy_source) {
+    /* Every range is advised before any slot is prepared, so the disk has
+     * the whole batch queued while the host allocates. F_RDADVISE blocks
+     * while it queues (~0.1 ms a range); issuing from worker threads cut
+     * that wait in half but the preads grew by as much. */
+    if (!gpu_copy_source) {
+        for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
+            const uint32_t slot = load_slots[load_i];
             /* Before the readahead, not after it, and all three of the
              * expert's ranges: they are separate tensors at unrelated file
              * offsets, so one of them does not speak for the other two. */
@@ -19248,6 +19257,10 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                 ds4_gpu_note_miss_residency((const char *)model_map +
                         down_abs_offsets[slot], down_expert_bytes);
             }
+        }
+        const double ra_t0 = ds4_gpu_now_ms();
+        for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
+            const uint32_t slot = load_slots[load_i];
             ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
                                                   gate_expert_bytes);
             ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot],
@@ -19255,6 +19268,14 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             ds4_gpu_stream_expert_readahead_range(down_abs_offsets[slot],
                                                   down_expert_bytes);
         }
+        g_rep_ra_ms += ds4_gpu_now_ms() - ra_t0;
+    }
+
+    for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
+        const uint32_t slot = load_slots[load_i];
+        const uint32_t expert = (uint32_t)selected_ids[slot];
+        const int force_reuse =
+            cache_budget != 0 && reserved_entries >= cache_budget;
 
         if (!gpu_copy_source && ds4_gpu_stream_expert_zero_copy_enabled() &&
             ds4_gpu_stream_expert_nocopy_buffer(model_map, model_size,
@@ -19280,7 +19301,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             up_inners[load_i] = batch_reuse[load_i].up_inner;
             down_inners[load_i] = batch_reuse[load_i].down_inner;
         } else {
-            const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+            const double buffer_t0 = ds4_gpu_now_ms();
             const int prepared =
                 ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
                                                                  expert,
@@ -19296,6 +19317,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                                                                  &gate_inners[load_i],
                                                                  &up_inners[load_i],
                                                                  &down_inners[load_i]);
+            g_rep_prep_ms += ds4_gpu_now_ms() - buffer_t0;
             if (load_timing) {
                 ds4_gpu_stream_expert_timing_note_prepare_buffer(
                         ds4_gpu_now_ms() - buffer_t0);
@@ -19432,12 +19454,15 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         [blit endEncoding];
         g_batch_has_work = g_m3_cb_has_work = YES;
     } else {
+        const double rd_t0 = ds4_gpu_now_ms();
         ok = ds4_gpu_stream_expert_pread_tasks(tasks,
                                                n_tasks,
                                                &read_bytes,
                                                &read_ms);
+        g_rep_read_ms += ds4_gpu_now_ms() - rd_t0;
     }
     if (!ok) return 0;
+    const double inst_t0 = ds4_gpu_now_ms();
     if (load_timing) {
         load_t0 = ds4_gpu_now_ms();
     }
@@ -19488,6 +19513,8 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         if (!entry) return 0;
         entries[slot] = entry;
     }
+    g_rep_install_ms += ds4_gpu_now_ms() - inst_t0;
+    g_rep_loads += n_loads;
 
     for (uint32_t i = 0; i < n_selected; i++) {
         if ((missing_mask & (1u << i)) == 0 || entries[i]) continue;
