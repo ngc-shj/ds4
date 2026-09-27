@@ -155,6 +155,10 @@ typedef struct {
 @end
 
 static BOOL g_timeline_enabled;
+/* DS4_METAL_ENCODER_TIMELINE=enc:<path>: sample the encoders the engine opens
+ * anyway, never one a dispatch group - the encoder layout, and so the work
+ * the GPU is given, is the production one. */
+static BOOL g_timeline_encoders_only;
 static FILE *g_timeline_file;
 static pthread_mutex_t g_timeline_mutex = PTHREAD_MUTEX_INITIALIZER;
 static DS4TimelineBatch *g_timeline_batch;
@@ -272,6 +276,10 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
     probed = 1;
     const char *path = getenv("DS4_METAL_ENCODER_TIMELINE");
     if (!path || !path[0] || !device) return;
+    if (!strncmp(path, "enc:", 4)) {
+        g_timeline_encoders_only = YES;
+        path += 4;
+    }
     g_timeline_file = fopen(path, "a");
     if (!g_timeline_file) {
         fprintf(stderr, "ds4: cannot open encoder timeline %s\n", path);
@@ -1563,7 +1571,7 @@ static id<DS4Encoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
         if (g_timeline_enabled && g_timeline_batch) {
             /* Diagnostic: one timestamped pass per dispatch group. A
              * concurrent section keeps its single encoder. */
-            if (g_batch_enc && !g_batch_encoder_concurrent) {
+            if (g_batch_enc && !g_batch_encoder_concurrent && !g_timeline_encoders_only) {
                 [g_batch_enc endEncoding];
                 g_batch_enc = nil;
             }
@@ -10840,6 +10848,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
 
         ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
+        ds4_gpu_timeline_attach(g_batch_cb);
         g_batch_has_work = g_m3_cb_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
         if (!g_batch_cb) {
@@ -12337,6 +12346,7 @@ static int ds4_gpu_commit_and_wait_selected(uint64_t value, const char *label) {
         /* The caller keeps encoding this layer, so it needs a batch again. */
         ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
+        ds4_gpu_timeline_attach(g_batch_cb);
         g_batch_has_work = g_m3_cb_has_work = NO;
         if (!g_batch_cb) {
             (void)ds4_gpu_wait_pending_command_buffers(label ? label : "selected-id readback");
@@ -12421,6 +12431,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 
         ds4_gpu_ledger_origin("readback");
         g_batch_cb = ds4_gpu_new_command_buffer();
+        ds4_gpu_timeline_attach(g_batch_cb);
         g_batch_has_work = g_m3_cb_has_work = NO;
         if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
         if (!g_batch_cb) {
