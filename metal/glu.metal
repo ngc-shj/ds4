@@ -46,7 +46,14 @@ kernel void kernel_swiglu_flat_f32(
         device const char * src0,
         device const char * src1,
         device       char * dst,
-        uint i [[thread_position_in_grid]]) {
+        uint tg  [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    /* The grid index spelled through the threadgroup: the same i, but a
+     * kernel that names its threadgroup is not one the AGX driver re-shapes,
+     * and its indirect re-shaping (insertIndirectTGOptKernel) is where the
+     * gated decode faulted. */
+    const uint i = tg * ntg + tid;
     if (i >= (uint)args.ne0) return;
 
     device const float * src0_f32 = (device const float *) src0 + args.i00;

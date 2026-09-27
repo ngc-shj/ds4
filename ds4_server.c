@@ -13555,6 +13555,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
+    {
+        unsigned long long h[8];
+        ds4_engine_mtl4_health(h);
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: metal 4 at request start: %llu commits, %llu feedback, "
+                   "%llu errors, residency %llu entries %.1f MiB",
+                   h[0], h[1], h[2], h[3], (double)h[4] / 1048576.0);
+    }
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
@@ -13776,6 +13784,15 @@ decode_again:
     int next_decode_log = 50;
     const char *stop_detail = max_tokens == room ? "context limit" : "output limit";
     int stop_token = -1;
+    /* The emitted token ids, as a rolling FNV-1a hash with a checkpoint every
+     * 64 tokens: two runs that agree on every checkpoint emitted the same ids,
+     * and the first checkpoint that differs bounds where they parted. */
+    uint64_t id_hash = 1469598103934665603ull;
+    uint32_t id_marks[64];
+    int n_id_marks = 0;
+    /* The ids themselves, for a trace line an offline draft evaluation reads. */
+    int *gen_ids = max_tokens > 0 ? malloc((size_t)max_tokens * sizeof(int)) : NULL;
+    int n_gen_ids = 0;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
@@ -13908,6 +13925,13 @@ decode_again:
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
             kept++;
+            for (int b = 0; b < 4; b++) {
+                id_hash ^= (uint64_t)(((uint32_t)token >> (8 * b)) & 0xffu);
+                id_hash *= 1099511628211ull;
+            }
+            if (completion % 64 == 0 && n_id_marks < 64)
+                id_marks[n_id_marks++] = (uint32_t)(id_hash >> 32);
+            if (gen_ids && n_gen_ids < max_tokens) gen_ids[n_gen_ids++] = token;
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -14263,6 +14287,57 @@ decode_again:
     char *parsed_content = NULL;
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
+    {
+        char marks[64 * 9 + 1];
+        size_t at = 0;
+        marks[0] = '\0';
+        for (int i = 0; i < n_id_marks && at + 10 < sizeof(marks); i++)
+            at += (size_t)snprintf(marks + at, sizeof(marks) - at, "%s%08x", i ? "," : "",
+                                   id_marks[i]);
+        unsigned long long h[8];
+        ds4_engine_mtl4_health(h);
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: token ids: %d, hash %016llx, stop %s token %d, every 64: %s",
+                   completion, (unsigned long long)id_hash, stop_detail, stop_token,
+                   marks[0] ? marks : "-");
+        /* prompt ids | generated ids, the format bench/draft-eval.py reads. */
+        const int n_prompt = prompt_for_sync ? prompt_for_sync->len : 0;
+        const size_t cap = (size_t)(n_prompt + n_gen_ids + 2) * 12u + 32u;
+        char *trace = malloc(cap);
+        if (trace && gen_ids) {
+            size_t at2 = 0;
+            for (int i = 0; i < n_prompt; i++)
+                at2 += (size_t)snprintf(trace + at2, cap - at2, "%d ", prompt_for_sync->v[i]);
+            at2 += (size_t)snprintf(trace + at2, cap - at2, "|");
+            for (int i = 0; i < n_gen_ids; i++)
+                at2 += (size_t)snprintf(trace + at2, cap - at2, " %d", gen_ids[i]);
+            server_log(DS4_LOG_GENERATION, "ds4-server: token trace: %s", trace);
+        }
+        free(trace);
+        free(gen_ids);
+        /* At the request's end: what the Metal 4 backend has sent and heard
+         * back, and what it keeps resident - the steady value a request must
+         * return to. */
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: metal 4 at request end: %llu commits, %llu feedback, "
+                   "%llu errors, residency %llu entries %.1f MiB",
+                   h[0], h[1], h[2], h[3], (double)h[4] / 1048576.0);
+        unsigned long long rc[7];
+        ds4_engine_router_counts(rc);
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: router finalize so far: %llu fused, %llu generic, %llu fallback; "
+                   "compare %llu calls, mismatches %llu probs %llu ids %llu weights",
+                   rc[0], rc[1], rc[2], rc[6], rc[3], rc[4], rc[5]);
+        unsigned tc[16];
+        ds4_engine_transition_counts(tc);
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: transition compare words differing so far: mix %u split %u "
+                   "sum %u norm %u residual %u pre %u kv %u window %u low %u rows %u "
+                   "expand %u expand-sum %u expand-norm %u route-proj %u route-select %u, "
+                   "over %u comparisons",
+                   tc[0], tc[1], tc[2], tc[3], tc[4], tc[5], tc[6], tc[7], tc[8], tc[9],
+                   tc[10], tc[11], tc[12], tc[13], tc[14], tc[15]);
+    }
     bool recovered_tool_parse_failure = false;
     if (j->req.kind == REQ_CHAT) {
         bool parsed_ok = parse_generated_message_for_response_for_syntax(

@@ -87,6 +87,12 @@ API_AVAILABLE(macos(26.0))
 @property (nonatomic, strong) NSMutableArray *encoders;
 /* The event value that says this buffer is done. 0 while it is being encoded. */
 @property (nonatomic) uint64_t stamp;
+/* What this buffer reaches, resident for exactly as long as it is in flight:
+ * filled while it is encoded, committed with it, emptied once its feedback
+ * says it completed. */
+@property (nonatomic, strong) id<MTLResidencySet> resset;
+@property (nonatomic, strong) NSHashTable *resident;
+@property (nonatomic) unsigned long long resBytes;
 @end
 
 @implementation DS4MTL4Buffer
@@ -188,31 +194,24 @@ void ds4_gpu_mtl4_note_metal3_work(const char *what) {
 
 /* ---- residency --------------------------------------------------------- */
 
-/* Metal 4 tracks no residency implicitly. What the engine marks with
- * useResource, and every buffer it binds, is collected here. The set is
- * long-lived: it holds the model and the expert cache, which do not come and
- * go, so it is committed when it has grown rather than once a segment. */
-static id<MTLResidencySet> g_mtl4_residency;
-static NSMutableSet *g_mtl4_resident;
-static BOOL g_mtl4_resident_dirty;
+/* Metal 4 tracks no residency implicitly. What the engine binds or marks with
+ * useResource while a buffer is encoded goes into that buffer's own set - what
+ * Metal 3 does implicitly for a command buffer. The model and the expert cache
+ * live in the process-lifetime sets on the queue; everything else - a
+ * session's arena, a transient, a tensor freed since - is resident only while a
+ * buffer that uses it is in flight. A single long-lived set held a session's
+ * gigabytes past the session, and the next request's allocations did not fit. */
+static unsigned long long g_mtl4_res_adds, g_mtl4_res_releases, g_mtl4_res_peak;
 
+static void ds4_mtl4_mark_resident(id<MTLResource> r) API_AVAILABLE(macos(26.0));
 static void ds4_mtl4_mark_resident(id<MTLResource> r) {
-    if (!r) return;
-    if (!g_mtl4_resident) g_mtl4_resident = [NSMutableSet set];
-    if ([g_mtl4_resident containsObject:r]) return;
-    [g_mtl4_resident addObject:r];
-    if (!g_mtl4_residency) {
-        MTLResidencySetDescriptor *d = [MTLResidencySetDescriptor new];
-        NSError *err = nil;
-        g_mtl4_residency = [g_device newResidencySetWithDescriptor:d error:&err];
-        if (!g_mtl4_residency) {
-            fprintf(stderr, "ds4: Metal 4 residency set: %s\n",
-                    err.description.UTF8String);
-            return;
-        }
-    }
-    [g_mtl4_residency addAllocation:r];
-    g_mtl4_resident_dirty = YES;
+    DS4MTL4Buffer *b = g_mtl4_cur;
+    if (!r || !b || !b.resset) return;
+    if ([b.resident containsObject:r]) return;
+    [b.resident addObject:r];
+    [b.resset addAllocation:r];
+    b.resBytes += [r allocatedSize];
+    g_mtl4_res_adds++;
 }
 
 /* Residency sets the engine attaches to the Metal 3 queue. The Metal 4 queue
@@ -229,12 +228,18 @@ void ds4_gpu_queue_residency_added(id set) {
     if (@available(macOS 26.0, *)) { if (g_mtl4_queue) ds4_mtl4_attach_sets(); }
 }
 
+/* Sets attached to the Metal 4 queue, counted: a set the Metal 3 queue has and
+ * this one lacks makes what it holds unreadable here without a fault. */
+static unsigned long long g_mtl4_sets_attached;
+unsigned long long ds4_gpu_mtl4_sets_attached(void) { return g_mtl4_sets_attached; }
+
 static void ds4_mtl4_attach_sets(void) {
     static NSUInteger attached;
     if (!g_mtl4_queue) return;
     while (attached < g_mtl4_queue_sets.count) {
         [g_mtl4_queue addResidencySet:g_mtl4_queue_sets[attached]];
         attached++;
+        g_mtl4_sets_attached++;
     }
 }
 
@@ -392,15 +397,20 @@ static void ds4_mtl4_attach_sets(void) {
 
 /* ---- the pool ---------------------------------------------------------- */
 
-static int ds4_mtl4_on(void) {
-    static int checked, on;
+/* DS4_METAL_V41_MTL4: 1 is the Metal 4 backend, 2 also sends greedy decode
+ * through the verify executor. */
+static int ds4_mtl4_level(void) {
+    static int checked, level;
     if (!checked) {
         const char *e = getenv("DS4_METAL_V41_MTL4");
         checked = 1;
-        on = e && e[0] ? atoi(e) != 0 : 0;
+        level = e && e[0] ? atoi(e) : 0;
     }
-    return on;
+    return level;
 }
+
+static int ds4_mtl4_on(void) { return ds4_mtl4_level() != 0; }
+
 
 /* Whether a Metal 4 command buffer is open and taking the engine's work. */
 static int ds4_mtl4_open(void) {
@@ -441,7 +451,15 @@ static int ds4_mtl4_ready(void) {
         b.scratch = [g_device newBufferWithLength:DS4_MTL4_SCRATCH_BYTES
                                           options:MTLResourceStorageModeShared];
         b.encoders = [NSMutableArray array];
-        if (!b.allocator || !b.cb || !b.scratch) {
+        {
+            MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+            rd.label = @"ds4_mtl4_buffer";
+            NSError *rerr = nil;
+            b.resset = [g_device newResidencySetWithDescriptor:rd error:&rerr];
+            b.resident = [NSHashTable hashTableWithOptions:NSPointerFunctionsStrongMemory |
+                                                          NSPointerFunctionsObjectPointerPersonality];
+        }
+        if (!b.allocator || !b.cb || !b.scratch || !b.resset) {
             fprintf(stderr, "ds4: Metal 4 command pool unavailable\n");
             g_mtl4_queue = nil;
             g_mtl4_pool = nil;
@@ -454,17 +472,88 @@ static int ds4_mtl4_ready(void) {
     return 1;
 }
 
-/* Wait until every buffer committed up to `value` has completed. One queue in
- * order, so the newest stamp implies the rest. */
+/* A completed buffer lets go of what it held: emptied and committed now, not
+ * when the buffer is next reused, so a freed session is not held resident by
+ * a buffer that happens to sit idle in the pool. */
+static void ds4_mtl4_release_completed(void) API_AVAILABLE(macos(26.0));
+static void ds4_mtl4_release_completed(void) {
+    for (DS4MTL4Buffer *b in g_mtl4_pool) {
+        if (b == g_mtl4_cur || b.stamp == 0 || b.stamp > g_mtl4_done || !b.resident.count)
+            continue;
+        g_mtl4_res_releases += b.resident.count;
+        [b.resset removeAllAllocations];
+        [b.resset commit];
+        [b.resident removeAllObjects];
+        b.resBytes = 0;
+    }
+}
+
+/* The commit feedback, a slot a stamp. Without it a buffer the GPU failed - out
+ * of memory, a fault - completes like any other and the host reads what was
+ * left there. The event says a buffer finished, not that it succeeded, so a
+ * stamp counts as done only once its own feedback has arrived and said so;
+ * feedback that has not arrived is a failure, never a success. */
+#define DS4_MTL4_FB_RING 256u
+typedef struct {
+    _Atomic uint64_t stamp;     /* the stamp this slot last reported */
+    _Atomic int failed;
+} ds4_mtl4_fb_slot;
+static ds4_mtl4_fb_slot g_mtl4_fb[DS4_MTL4_FB_RING];
+static _Atomic unsigned long long g_mtl4_fb_received, g_mtl4_fb_errors;
+
+/* Test hook: the next feedback to arrive reports a failure. The GPU cannot be
+ * made to fail on demand, so this is where the host path after a real failure
+ * is exercised - the wait, end_commands, the executor, the request. */
+static _Atomic int g_mtl4_inject;
+void ds4_gpu_mtl4_inject_failure(void) { atomic_store(&g_mtl4_inject, 1); }
+
+static void ds4_mtl4_fb_note(uint64_t stamp, NSError *error) {
+    ds4_mtl4_fb_slot *slot = &g_mtl4_fb[stamp % DS4_MTL4_FB_RING];
+    if (!error && atomic_exchange(&g_mtl4_inject, 0))
+        error = [NSError errorWithDomain:@"ds4.injected" code:1
+                                userInfo:@{NSLocalizedDescriptionKey: @"injected failure"}];
+    if (error) {
+        fprintf(stderr, "ds4: Metal 4 command buffer %llu failed: %s\n",
+                (unsigned long long)stamp, error.description.UTF8String);
+        atomic_fetch_add(&g_mtl4_fb_errors, 1u);
+    }
+    atomic_store(&slot->failed, error ? 1 : 0);
+    atomic_store(&slot->stamp, stamp);       /* last: publishes `failed` */
+    atomic_fetch_add(&g_mtl4_fb_received, 1u);
+}
+
+/* Wait until every buffer committed up to `value` has completed and reported.
+ * Returns 0 if any of them failed, or if a report did not arrive; in the second
+ * case nothing is marked done, so a later wait looks again. */
 static int ds4_mtl4_wait_to(uint64_t value) {
     if (value <= g_mtl4_done) return 1;
+    if (value - g_mtl4_done > DS4_MTL4_FB_RING) {
+        fprintf(stderr, "ds4: Metal 4 wait spans %llu buffers, past the feedback ring\n",
+                (unsigned long long)(value - g_mtl4_done));
+        return 0;
+    }
     const BOOL ok = [g_mtl4_event waitUntilSignaledValue:value timeoutMS:600000];
     if (!ok) {
         fprintf(stderr, "ds4: Metal 4 command buffer timed out\n");
         return 0;
     }
+    int good = 1;
+    for (uint64_t st = g_mtl4_done + 1u; st <= value; st++) {
+        ds4_mtl4_fb_slot *slot = &g_mtl4_fb[st % DS4_MTL4_FB_RING];
+        /* The feedback is delivered on its own queue; the event can be seen
+         * first. */
+        for (int spin = 0; atomic_load(&slot->stamp) != st && spin < 500000; spin++)
+            usleep(10);
+        if (atomic_load(&slot->stamp) != st) {
+            fprintf(stderr, "ds4: Metal 4 command buffer %llu completed without feedback\n",
+                    (unsigned long long)st);
+            return 0;
+        }
+        if (atomic_load(&slot->failed)) good = 0;
+    }
     g_mtl4_done = value;
-    return 1;
+    if (@available(macOS 26.0, *)) ds4_mtl4_release_completed();
+    return good;
 }
 
 /* Everything committed and not yet waited for. */
@@ -530,14 +619,21 @@ static int ds4_mtl4_commit(void) {
          * encoding looked tidier and was empty - the scratch does not exist
          * until the first setBytes - so the buffer carrying every kernel's
          * constant arguments was never made resident. */
-        if (g_mtl4_residency && g_mtl4_resident_dirty) {
-            [g_mtl4_residency commit];
-            g_mtl4_resident_dirty = NO;
+        [b.resset commit];
+        [b.cb useResidencySet:b.resset];
+        {
+            unsigned long long held = 0;
+            for (DS4MTL4Buffer *p in g_mtl4_pool) held += p.resBytes;
+            if (held > g_mtl4_res_peak) g_mtl4_res_peak = held;
         }
-        if (g_mtl4_residency) [b.cb useResidencySet:g_mtl4_residency];
         [b.cb endCommandBuffer];
         id<MTL4CommandBuffer> one = b.cb;
-        [g_mtl4_queue commit:&one count:1];
+        const uint64_t stamp = g_mtl4_stamp + 1u;
+        MTL4CommitOptions *opts = [MTL4CommitOptions new];
+        [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+            ds4_mtl4_fb_note(stamp, fb.error);
+        }];
+        [g_mtl4_queue commit:&one count:1 options:opts];
         b.stamp = ++g_mtl4_stamp;
         g_mtl4_commits++;
         [g_mtl4_queue signalEvent:g_mtl4_event value:b.stamp];
@@ -676,12 +772,39 @@ void ds4_gpu_mtl4_region_begin(void) {
     }
 }
 
-void ds4_gpu_mtl4_region_end(void) {
+/* Whether the Metal 4 backend is on for this process: the verify executor runs
+ * only under it, so it asks rather than falling back to the Metal 3 path. */
+int ds4_gpu_mtl4_enabled(void) {
+    return ds4_mtl4_on() && ds4_mtl4_ready();
+}
+/* Production decode goes through the executor only when asked: at a commit
+ * depth of 1.1 a block it computes several nodes to advance about one token. */
+int ds4_gpu_mtl4_executor_enabled(void) { return ds4_mtl4_level() >= 2 && ds4_mtl4_ready(); }
+
+/* commits, feedback received, feedback errors, residency entries and bytes held
+ * by buffers in flight, adds, releases, peak bytes held. */
+void ds4_gpu_mtl4_health(unsigned long long out[8]) {
+    out[0] = g_mtl4_commits;
+    out[1] = atomic_load(&g_mtl4_fb_received);
+    out[2] = atomic_load(&g_mtl4_fb_errors);
+    unsigned long long entries = 0, bytes = 0;
+    if (@available(macOS 26.0, *))
+        for (DS4MTL4Buffer *b in g_mtl4_pool) { entries += b.resident.count; bytes += b.resBytes; }
+    out[3] = entries;
+    out[4] = bytes;
+    out[5] = g_mtl4_res_adds;
+    out[6] = g_mtl4_res_releases;
+    out[7] = g_mtl4_res_peak;
+}
+
+int ds4_gpu_mtl4_region_end(void) {
+    int ok = 1;
     if (@available(macOS 26.0, *)) {
-        if (g_mtl4_cur) { (void)ds4_mtl4_commit(); }
-        (void)ds4_mtl4_wait_all();
+        if (g_mtl4_cur && !ds4_mtl4_commit()) ok = 0;
+        if (!ds4_mtl4_wait_all()) ok = 0;
         g_mtl4_region = 0;
     }
+    return ok;
 }
 
 #endif  /* macOS 26 SDK */

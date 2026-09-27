@@ -23,6 +23,9 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
+int ds4_gpu_dsv41_quantize_store(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
+                                 ds4_v41_activation_format format,
+                                 ds4_gpu_tensor *store, uint64_t store_off);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 /* CUDA scalar Q8 shared expert. 1: queued; 0: unsupported, no work queued;
  * -1: failure. After 1, keep the input/output tensors alive and unchanged
@@ -184,6 +187,98 @@ int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
                                      uint32_t cap);
 /* Argmax of `rows` logits rows into answers argmax_base.., then, when
  * accept_rows is non-zero, the accept over answers 0..accept_rows. */
+/* Where a node's keys come from, when they are not one contiguous window: the
+ * committed ring below committed_rows, the node's own ancestor path in the
+ * delta above it. Passed to the KV stage and nowhere else. */
+typedef struct {
+    const ds4_gpu_tensor *delta;
+    const ds4_gpu_tensor *path;
+    uint32_t delta_row_floats;
+    uint32_t path_offset;
+    uint32_t path_length;
+    uint32_t sequence_rows;
+    uint32_t committed_rows;
+    uint32_t ring_cap;
+} ds4_gpu_kv_source_dag;
+
+int ds4_gpu_attention_decode_heads_phase_dag_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        const ds4_gpu_tensor *comp_kv, uint32_t n_comp, uint32_t n_head, uint32_t head_dim,
+        uint32_t slot, uint32_t slots, uint32_t slot_keys, int phase,
+        const ds4_gpu_kv_source_dag *dag);
+
+/* What the verify executor needs from the Metal 4 backend and the expert cache.
+ * The region owns the block from the embedding to the commit; the counts say
+ * whether anything leaked onto the Metal 3 buffer while it did. */
+int  ds4_gpu_mtl4_enabled(void);
+void ds4_gpu_mtl4_region_begin(void);
+int ds4_gpu_mtl4_region_end(void);
+void ds4_gpu_mtl4_health(unsigned long long out[8]);
+void ds4_gpu_mtl4_inject_failure(void);
+int ds4_gpu_mtl4_executor_enabled(void);
+unsigned long long ds4_gpu_mtl4_sets_attached(void);
+void ds4_gpu_mtl4_counts(unsigned long long *segments, unsigned long long *dispatches,
+                         unsigned long long *m3_work, unsigned long long *m3_sent,
+                         unsigned long long *m3_skipped);
+void ds4_gpu_stream_block_residency_force(int on);
+/* The abort gate the executor's residency check writes: grid allocated on
+ * demand, and the segment calls that make every dispatch between them go out
+ * indirect so a miss can switch the rest off. */
+int  ds4_gpu_gate_ensure(void);
+uint32_t ds4_gpu_gate_slots_used(void);
+uint32_t ds4_gpu_gate_disable_from(uint32_t slot);
+unsigned long long ds4_gpu_gate_ungatable(void);
+unsigned long long ds4_gpu_gate_direct_total(void);
+void ds4_gpu_gate_token_begin(void);
+uint32_t ds4_gpu_gate_segment_begin(void);
+void ds4_gpu_gate_segment_end(void);
+int  ds4_gpu_gate_repair(const void *model_map, uint64_t model_size, uint32_t layer,
+                         const int32_t *ids, uint32_t n_sel, uint32_t n_total,
+                         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+                         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+                         uint32_t missing_mask, unsigned long long *bytes_loaded);
+
+/* The verify executor's node-addressed kernels: an existing kernel's arithmetic
+ * with the row a value is read from given by the candidate tree. */
+int ds4_gpu_dsv41_pool2_pairs(ds4_gpu_tensor *out, const ds4_gpu_tensor *kv,
+                              const ds4_gpu_tensor *scores,
+                              const ds4_gpu_tensor *previous_kv,
+                              const ds4_gpu_tensor *previous_scores,
+                              const ds4_gpu_tensor *pair_a, const ds4_gpu_tensor *pair_b,
+                              const ds4_gpu_tensor *carry_kv,
+                              const ds4_gpu_tensor *carry_scores,
+                              uint32_t width, uint32_t pairs, uint32_t first, uint32_t row0);
+int ds4_gpu_dsv41_permute_rows(ds4_gpu_tensor *t, ds4_gpu_tensor *temp,
+                               const ds4_gpu_tensor *perm, uint32_t rows,
+                               uint32_t row_floats);
+int ds4_gpu_dsv41_gather_comp_dag(ds4_gpu_tensor *out, uint64_t out_off,
+                                  const ds4_gpu_tensor *ids, uint64_t ids_off,
+                                  const ds4_gpu_tensor *cache, const ds4_gpu_tensor *delta,
+                                  const ds4_gpu_tensor *path, uint32_t path_offset,
+                                  uint32_t base, uint32_t ratio, uint32_t committed,
+                                  uint32_t rows);
+int ds4_gpu_dsv41_indexer_score_dag(ds4_gpu_tensor *scores, uint64_t scores_off,
+                                    const ds4_gpu_tensor *q, uint64_t q_off,
+                                    const ds4_gpu_tensor *weights, uint64_t weights_off,
+                                    const ds4_gpu_tensor *cache, const ds4_gpu_tensor *delta,
+                                    const ds4_gpu_tensor *path, uint32_t path_offset,
+                                    uint32_t base, uint32_t ratio, uint32_t committed,
+                                    uint32_t rows, float scale);
+int ds4_gpu_dsv41_path_commit_comp(const ds4_gpu_tensor *tree,
+                                   const ds4_gpu_tensor *comp_delta,
+                                   const ds4_gpu_tensor *index_delta,
+                                   ds4_gpu_tensor *compressed, ds4_gpu_tensor *index_cache,
+                                   uint32_t base, uint32_t ratio, uint32_t max_depth);
+int ds4_gpu_dsv41_path_commit_carry(const ds4_gpu_tensor *tree,
+                                    const ds4_gpu_tensor *carry_kv,
+                                    const ds4_gpu_tensor *carry_score,
+                                    ds4_gpu_tensor *previous_kv,
+                                    ds4_gpu_tensor *previous_score, uint32_t base);
+int ds4_gpu_dsv41_path_logits(const ds4_gpu_tensor *tree, const ds4_gpu_tensor *logits,
+                              ds4_gpu_tensor *out, uint32_t row_floats);
+
 /* The candidate-tree accept: from node 0 (the pending token), follow the child
  * whose token the parent's argmax picks. result: [0] depth, [1] deepest node,
  * [2] next token, [3 + d] the path. */

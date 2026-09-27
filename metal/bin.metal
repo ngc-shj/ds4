@@ -201,7 +201,11 @@ kernel void kernel_add2_f32(
         device const float *a,
         device const float *b,
         device float *out,
-        uint i [[thread_position_in_grid]]) {
+        uint tg  [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint ntg [[threads_per_threadgroup]]) {
+    /* See kernel_swiglu_flat_f32: the same i, named through the threadgroup. */
+    const uint i = tg * ntg + tid;
     if (i >= args.n) return;
     const float v = a[i] + b[i];
     out[i] = args.bf16 ? ds4_round_bf16(v) : v;
@@ -213,7 +217,8 @@ kernel void kernel_add3_f32(
         device const float *b,
         device const float *c,
         device float *out,
-        uint i [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint i = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (i >= args.n) return;
     out[i] = a[i] + b[i] + c[i];
 }

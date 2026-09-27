@@ -533,8 +533,8 @@ kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
 // have independent weight ranges and output extents. Keep the standalone Q8_0
 // lane/block traversal and two-stage reduction verbatim for each bank; only
 // the activation load and threadgroup scheduling are shared.
-/* Two independent Q8_0 matvecs over the same input, as ONE dispatch whose z
- * extent carries the lanes.
+/* Two independent Q8_0 matvecs over the same input, as ONE dispatch whose x
+ * extent is the concatenation of the two exact standalone grids.
  *
  * kernel_mul_mv_q8_0_f32_pair below does something different and, for this
  * purpose, backwards: it keeps a single matmul's threadgroup grid and has each
@@ -2244,7 +2244,8 @@ kernel void kernel_q8_prefill_unpack(
         constant uint &n_blocks,
         device const block_q8_0 *src,
         device half4 *dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint block = gid / 8u;
     if (block >= n_blocks) return;
     const uint i = (gid % 8u) * 4u;

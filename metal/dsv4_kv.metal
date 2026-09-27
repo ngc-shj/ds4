@@ -549,7 +549,8 @@ kernel void kernel_dsv4_ratio4_shift_f32(
         constant ds4_metal_args_dsv4_ratio4_shift & args,
         device float * state_kv,
         device float * state_score,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint n = 4u * args.width;
     if (gid >= n) return;
 
@@ -569,7 +570,8 @@ kernel void kernel_dsv4_compressor_store_one(
         device const char  * ape,
         device       float * state_kv,
         device       float * state_score,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (gid >= args.width || args.width == 0 || args.ratio == 0) {
         return;
     }

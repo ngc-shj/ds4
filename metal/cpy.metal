@@ -66,7 +66,8 @@ kernel void kernel_cpy_contig_f32_f16_4(
         constant uint & n,
         device const float * src,
         device       half  * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint i = gid * 4u;
     if (i >= n) {
         return;
@@ -88,7 +89,8 @@ kernel void kernel_cpy_contig_f16_f32_4(
         constant uint & n,
         device const half  * src,
         device       float * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint i = gid * 4u;
     if (i >= n) {
         return;
@@ -112,7 +114,8 @@ kernel void kernel_cpy_contig_f16_f16_bits_4(
         constant uint & n,
         device const ushort * src,
         device       ushort * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint i = gid * 4u;
     if (i >= n) {
         return;
@@ -168,6 +171,7 @@ struct ds4_metal_args_flash_kv_stage_dag_f16 {
     uint committed_rows;   /* absolute keys below this live in the ring */
     uint n_comp;
     uint delta_row_vecs;   /* float4 per delta row; 128 for a 512-wide key */
+    uint comp_f32;         /* compressed rows are F32 and rounded here */
 };
 
 kernel void kernel_dsv4_flash_kv_stage_dag_f16(
@@ -177,7 +181,8 @@ kernel void kernel_dsv4_flash_kv_stage_dag_f16(
         device const uint * path,
         device const char * comp_src,
         device       char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     constexpr uint row_vecs = 128;
     const uint raw_vecs = args.visible_count * row_vecs;
     const uint n_keys = args.visible_count + args.n_comp;
@@ -207,6 +212,12 @@ kernel void kernel_dsv4_flash_kv_stage_dag_f16(
         return;
     }
     if (gid < total_vecs) {
+        if (args.comp_f32) {
+            device const packed_float4 *comp = (device const packed_float4 *)comp_src;
+            device packed_half4 *dst_half = (device packed_half4 *)dst;
+            dst_half[gid] = packed_half4(half4(float4(comp[gid - raw_vecs])));
+            return;
+        }
         device const packed_ushort4 *comp = (device const packed_ushort4 *)comp_src;
         device packed_ushort4 *dst_bits = (device packed_ushort4 *)dst;
         dst_bits[gid] = comp[gid - raw_vecs];
@@ -221,7 +232,8 @@ kernel void kernel_dsv4_flash_kv_stage_f16(
         device       char * dst,
         device const char * mask_src,
         device       char * pad_dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     constexpr uint row_vecs = 128;
     const uint raw_vecs = args.n_raw * row_vecs;
     const uint n_keys = args.n_raw + args.n_comp;
@@ -328,7 +340,8 @@ kernel void kernel_cpy_tile_rows_f16_f32(
         constant ds4_cpy_tile_rows_args & args,
         device const half  * src,
         device       float * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (gid >= args.n_total) return;
     const uint t = gid / args.width;
     const uint e = gid - t * args.width;
@@ -340,7 +353,8 @@ kernel void kernel_cpy_tile_rows_f32_f32(
         constant ds4_cpy_tile_rows_args & args,
         device const float * src,
         device       float * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (gid >= args.n_total) return;
     const uint t = gid / args.width;
     const uint e = gid - t * args.width;

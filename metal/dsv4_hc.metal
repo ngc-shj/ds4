@@ -60,6 +60,8 @@ struct ds4_metal_args_dsv4_hc_split_weighted_sum_norm {
     uint64_t nb_norm1;
     float    eps;
     float    norm_eps;
+    uint64_t bf16;
+    uint64_t external_weights;
 };
 
 struct ds4_metal_args_dsv4_hc_expand {
@@ -118,7 +120,8 @@ kernel void kernel_dsv4_hc_split_sinkhorn(
         device  const float * scale,
         device  const float * base,
         device        float * dst,
-        uint tid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if ((int64_t) tid >= args.n_rows) {
         return;
     }
@@ -621,7 +624,8 @@ kernel void kernel_dsv4_hc_expand(
         device  const char * comb,
         device  const char * block_add,
         device        char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const int64_t n_elem = args.n_embd * args.n_hc * args.n_tokens;
     if ((int64_t) gid >= n_elem) {
         return;
@@ -660,7 +664,11 @@ kernel void kernel_dsv4_hc_expand4(
         device  const char * comb,
         device  const char * block_add,
         device        char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]],
+        uint tid_ [[thread_position_in_threadgroup]],
+        uint ntg_ [[threads_per_threadgroup]]) {
+    /* Indexed through the threadgroup - see kernel_swiglu_flat_f32. */
+    const uint gid = tg_ * ntg_ + tid_;
     if (args.n_hc != 4) {
         return;
     }
@@ -1055,7 +1063,8 @@ kernel void kernel_dsv4_hc_weighted_sum(
         device  const char * x,
         device  const char * weights,
         device        char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const int64_t n_elem = args.n_embd * args.n_tokens;
     if ((int64_t) gid >= n_elem) {
         return;
@@ -1345,6 +1354,7 @@ static inline void ds4_hc_rms_norm_mix_cluster2_pre_norm_body(
         device       char  * collapse_dst,
         device const char  * norm_weight,
         device       char  * norm_dst,
+        device const float * collapse_weights,
         device atomic_uint * completion,
         threadgroup  char  * shmem,
         uint3  tgpig,
@@ -1462,13 +1472,17 @@ static inline void ds4_hc_rms_norm_mix_cluster2_pre_norm_body(
             const float4 pre_z =
                 *((device volatile const float4 *)mixes_f32) * hc_scale[0] +
                 *((device const float4 *)hc_base);
-            const float4 pre =
-                1.0f / (1.0f + exp(-pre_z)) + split_args.eps;
+            /* Use the same helper expression as the canonical V4.1 tail.
+             * Keeping a merely algebraically equivalent spelling here is not
+             * sufficient: fast-math may choose a different vector sequence. */
+            const float4 pre = ds4_hc_sigmoid(pre_z) + split_args.eps;
             *((device float4 *)out) = pre;
-            pre_shmem[0] = pre.x;
-            pre_shmem[1] = pre.y;
-            pre_shmem[2] = pre.z;
-            pre_shmem[3] = pre.w;
+            const float4 collapse_pre = split_args.external_weights
+                ? *((device const float4 *)collapse_weights) : pre;
+            pre_shmem[0] = collapse_pre.x;
+            pre_shmem[1] = collapse_pre.y;
+            pre_shmem[2] = collapse_pre.z;
+            pre_shmem[3] = collapse_pre.w;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1484,21 +1498,32 @@ static inline void ds4_hc_rms_norm_mix_cluster2_pre_norm_body(
         device const float4 *x3 = (device const float4 *)(
             x + 3 * split_args.nb_x1);
 
-        float4 v0 = 0.0f;
-        v0 += x0[i0] * pre_shmem[0];
-        v0 += x1[i0] * pre_shmem[1];
-        v0 += x2[i0] * pre_shmem[2];
-        v0 += x3[i0] * pre_shmem[3];
-        float sum0 = simd_sum(dot(v0, v0));
-
-        float4 v1 = 0.0f;
-        if (i1 < n4_collapse) {
-            v1 += x0[i1] * pre_shmem[0];
-            v1 += x1[i1] * pre_shmem[1];
-            v1 += x2[i1] * pre_shmem[2];
-            v1 += x3[i1] * pre_shmem[3];
+        device float4 *dst4 = (device float4 *)collapse_dst;
+        float sum0 = 0.0f;
+        for (uint i = i0; i < n4_collapse; i += 1024u) {
+            float4 v = 0.0f;
+            v += x0[i] * pre_shmem[0];
+            v += x1[i] * pre_shmem[1];
+            v += x2[i] * pre_shmem[2];
+            v += x3[i] * pre_shmem[3];
+            if (split_args.bf16) v = ds4_round_bf16(v);
+            dst4[i] = v;
+            sum0 += dot(v, v);
         }
-        float sum1 = simd_sum(dot(v1, v1));
+        sum0 = simd_sum(sum0);
+
+        float sum1 = 0.0f;
+        for (uint i = i1; i < n4_collapse; i += 1024u) {
+            float4 v = 0.0f;
+            v += x0[i] * pre_shmem[0];
+            v += x1[i] * pre_shmem[1];
+            v += x2[i] * pre_shmem[2];
+            v += x3[i] * pre_shmem[3];
+            if (split_args.bf16) v = ds4_round_bf16(v);
+            dst4[i] = v;
+            sum1 += dot(v, v);
+        }
+        sum1 = simd_sum(sum1);
         if (tiisg == 0) {
             sum_shmem[sgitg] = sum0;
             sum_shmem[sgitg + 16] = sum1;
@@ -1509,22 +1534,23 @@ static inline void ds4_hc_rms_norm_mix_cluster2_pre_norm_body(
         sumf = simd_sum(sumf);
         const float norm_arg =
             sumf / float(split_args.n_embd) + split_args.norm_eps;
-        const float norm_scale = rsqrt(norm_arg);
-        device float4 *dst4 = (device float4 *)collapse_dst;
+        /* Match kernel_dsv41_hc_tail statement for statement.  `rsqrt` is
+         * not bit-equivalent to 1/sqrt on Metal, and the canonical V4.1
+         * transition rounds the normalized result to bf16 before its next
+         * consumer. */
+        const float norm_scale = 1.0f/sqrt(norm_arg);
         device const float4 *w4 = (device const float4 *)norm_weight;
         device float4 *norm4 = (device float4 *)norm_dst;
-        dst4[i0] = v0;
-        norm4[i0] = (v0 * norm_scale) * w4[i0];
-        if (i1 < n4_collapse) {
-            dst4[i1] = v1;
-            norm4[i1] = (v1 * norm_scale) * w4[i1];
-        }
+        for (uint i = i0; i < n4_collapse; i += 1024u)
+            norm4[i] = ds4_round_bf16((dst4[i] * norm_scale) * w4[i]);
+        for (uint i = i1; i < n4_collapse; i += 1024u)
+            norm4[i] = ds4_round_bf16((dst4[i] * norm_scale) * w4[i]);
     } else if (tgpig.x == 1 && tid == 0) {
         device float *out = (device float *)split;
         const float4 post_z =
             *((device volatile const float4 *)(mixes_f32 + 4)) * hc_scale[1] +
             *((device const float4 *)(hc_base + 4));
-        *((device float4 *)(out + 4)) = 2.0f / (1.0f + exp(-post_z));
+        *((device float4 *)(out + 4)) = ds4_hc_twice_sigmoid(post_z);
     }
 
     // Groups 2..5 own exactly the comb range consumed by the
@@ -1567,12 +1593,13 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
         device       char  * collapse_dst,
         device const char  * norm_weight,
         device       char  * norm_dst,
+        device const float * collapse_weights,
         device atomic_uint * completion,
         threadgroup  char  * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, completion, shmem, tgpig, tiisg, sgitg);
+    ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, collapse_weights, completion, shmem, tgpig, tiisg, sgitg);
 }
 
 /* Decode-time fusion of the HC post/expand that follows a TP combine with the
@@ -1596,6 +1623,7 @@ kernel void kernel_dsv4_hc_expand4_rms_norm_mix_f16_cluster2_pre_norm(
         device       char  * collapse_dst,
         device const char  * norm_weight,
         device       char  * norm_dst,
+        device const float * collapse_weights,
         device atomic_uint * completion,
         device atomic_uint * barrier,
         device const char  * block_out,
@@ -1643,5 +1671,5 @@ kernel void kernel_dsv4_hc_expand4_rms_norm_mix_f16_cluster2_pre_norm(
                             thread_scope_device);
     }
     threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
-    ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, completion, shmem, tgpig, tiisg, sgitg);
+    ds4_hc_rms_norm_mix_cluster2_pre_norm_body(args, split_args, x, weight, dst, hc_scale, hc_base, split, collapse_dst, norm_weight, norm_dst, collapse_weights, completion, shmem, tgpig, tiisg, sgitg);
 }

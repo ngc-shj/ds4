@@ -502,7 +502,8 @@ kernel void kernel_dsv4_router_weights_one(
         device const char *probs,
         device const char *selected,
         device       char *weights,
-        uint tid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (tid >= 6) return;
 
     device const float *p = (device const float *)probs;
@@ -1537,14 +1538,16 @@ kernel void kernel_glm_attention_full(
 kernel void kernel_glm_fill_selected_range(
         constant ds4_metal_args_glm_fill_selected_range & args,
         device uint32_t *selected,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (gid < args.n_selected) selected[gid] = gid;
 }
 
 kernel void kernel_glm_fill_selected_range_batch(
         constant ds4_metal_args_glm_fill_selected_range_batch & args,
         device uint32_t *selected,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint total = args.n_tokens * args.n_selected;
     if (gid >= total || args.n_selected == 0u) return;
     const uint token = gid / args.n_selected;
@@ -1557,7 +1560,8 @@ kernel void kernel_glm53_expand_pool_selection(
         constant ds4_metal_args_glm53_expand_pool_selection &args,
         device const uint32_t *pool_selected,
         device       uint32_t *raw_selected,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint total = args.n_tokens * args.output_width;
     if (gid >= total || args.output_width == 0u || args.pool_size == 0u) return;
 
@@ -5185,7 +5189,10 @@ kernel void kernel_dsv4_router_transform_finalize_weights_one_simd(
         device const float4 *s = (device const float4 *)logits;
         device float4 *d = (device float4 *)probs;
         const float4 x = s[tid];
-        const float4 sp = select(log(1.0f + exp(x)), x, x > 20.0f);
+        const float4 ex = exp(x);
+        const float4 em = min(ex, 0.03125f);
+        const float4 poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        const float4 sp = select(select(log(1.0f + ex), poly, ex < 0.03125f), x, x > 20.0f);
         d[tid] = sqrt(sp);
     }
     threadgroup_barrier(mem_flags::mem_device);
@@ -5346,7 +5353,10 @@ kernel void kernel_dsv4_router_project_select_fused(
             (device volatile const float4 *)logits;
         device float4 *d = (device float4 *)probs;
         const float4 xv = s[tid];
-        const float4 sp = select(log(1.0f + exp(xv)), xv, xv > 20.0f);
+        const float4 ex = exp(xv);
+        const float4 em = min(ex, 0.03125f);
+        const float4 poly = em*(1.0f - em*(0.5f - em*(1.0f/3.0f - 0.25f*em)));
+        const float4 sp = select(select(log(1.0f + ex), poly, ex < 0.03125f), xv, xv > 20.0f);
         d[tid] = sqrt(sp);
     }
     threadgroup_barrier(mem_flags::mem_device);
@@ -5434,7 +5444,8 @@ kernel void kernel_dsv4_topk_mask(
         constant ds4_metal_args_dsv4_topk_mask & args,
         device const char * topk,
         device       char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const int64_t n = args.ne0 * args.ne1;
     if ((int64_t) gid >= n) {
         return;
@@ -5454,7 +5465,8 @@ kernel void kernel_dsv4_topk_mask_scatter(
         constant ds4_metal_args_dsv4_topk_mask & args,
         device const char * topk,
         device       char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const int64_t n = args.ne00 * args.ne01;
     if ((int64_t) gid >= n) {
         return;
@@ -6760,7 +6772,8 @@ kernel void kernel_dsv4_indexer_weighted_sum(
         device const char * scores,
         device const char * weights,
         device       char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const int64_t n = args.ne0 * args.ne1;
     if ((int64_t) gid >= n) {
         return;
@@ -6787,7 +6800,8 @@ kernel void kernel_dsv4_compressor_score_ape_f32(
         device const float *score,
         device const float *ape,
         device       float *dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint64_t total = (uint64_t)args.n_tokens * args.width;
     if ((uint64_t)gid >= total) return;
 
@@ -6802,7 +6816,8 @@ kernel void kernel_dsv4_compressor_score_ape_f16(
         device const float *score,
         device const half  *ape,
         device       float *dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint64_t total = (uint64_t)args.n_tokens * args.width;
     if ((uint64_t)gid >= total) return;
 
@@ -6820,7 +6835,8 @@ kernel void kernel_dsv4_softmax_pool(
         device const char * kv,
         device const char * score,
         device       char * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const int64_t n = args.ne0 * args.ne1;
     if ((int64_t) gid >= n) {
         return;
@@ -6858,7 +6874,8 @@ kernel void kernel_dsv4_softmax_pool(
 kernel void kernel_dsv4_tp_keepalive(
         device float * out,
         constant uint & iters,
-        uint tid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     float a = out[tid];
     const float b = 1.000001f;
     for (uint i = 0; i < iters; i++) {
@@ -6875,7 +6892,8 @@ kernel void kernel_dsv4_tp_keepalive(
 kernel void kernel_dsv4_tp_flag_set(
         device atomic_uint & flag,
         constant uint & value,
-        uint tid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (tid == 0) {
         atomic_store_explicit(&flag, value, memory_order_relaxed);
     }
@@ -7012,7 +7030,8 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
         device const float * state_kv,
         device const float * state_score,
         device       float * dst,
-        uint gid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint gid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     const uint64_t n = (uint64_t)args.head_dim * args.n_comp;
     if ((uint64_t)gid >= n || args.head_dim == 0u) {
         return;

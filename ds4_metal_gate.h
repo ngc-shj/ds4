@@ -50,6 +50,7 @@ void ds4_gpu_gate_layer_begin(uint32_t il);
 int  ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
                                   uint32_t n_sel, uint32_t n_total);   /* in ds4_metal.m */
 uint32_t ds4_gpu_gate_slots_used(void);
+uint32_t ds4_gpu_gate_disable_from(uint32_t slot);  /* host-side abort of encoded slots */
 int  ds4_gpu_gate_read_miss(uint32_t slot, uint32_t *layer, uint32_t *mask,
                             int32_t *ids, uint32_t *n);
 int  ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n);
@@ -326,13 +327,39 @@ static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
     return 1;
 }
 
+/* The host's own abort: every slot from `slot` up to the cursor, encoded but not
+ * yet sent, becomes an empty grid. A transaction whose encoding failed halfway
+ * sends its buffer with the publishing dispatches in it switched off, which is
+ * what the device does to the same dispatches after a miss. */
+uint32_t ds4_gpu_gate_disable_from(uint32_t slot) {
+    uint32_t end = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
+    if (end > DS4_GATE_MAX_SLOTS) end = DS4_GATE_MAX_SLOTS;
+    if (!g_gate_grid || slot >= end) return 0;
+    uint32_t *grid = (uint32_t *)[g_gate_grid contents];
+    memset(grid + 3u * slot, 0, (size_t)(end - slot) * 3u * sizeof(uint32_t));
+    return end - slot;
+}
+
 /* The gate itself: every dispatch on the decode path comes through here, so
  * it is a call the code makes rather than a method the runtime was rewritten
  * behind. With the gate off this is one message; with it on, the dispatch
  * takes a slot in the grid table and goes out indirect, so the layer that
  * aborts can zero the rest. */
+/* Every dispatch the engine encodes, and every gate validation: what an
+ * ablation arm actually removed, counted rather than assumed. */
+static _Atomic unsigned long long g_ds4_dispatches_encoded, g_ds4_gate_validates;
+void ds4_gpu_encode_counts(unsigned long long *dispatches, unsigned long long *validates,
+                           unsigned long long *m3_commits) {
+    extern unsigned long long g_ds4_m3_commits;
+    if (dispatches) *dispatches = atomic_load(&g_ds4_dispatches_encoded);
+    if (validates) *validates = atomic_load(&g_ds4_gate_validates);
+    if (m3_commits) *m3_commits = g_ds4_m3_commits;
+}
+
 static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {
     NSUInteger off = 0;
+    atomic_fetch_add(&g_ds4_dispatches_encoded, 1u);
+    ds4_uce_order(enc);
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
         !atomic_load_explicit(&g_gate_armed, memory_order_relaxed) &&
         ds4_gate_direct_prefix_on()) {
@@ -364,6 +391,7 @@ static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {
  * already bounds-checking - so one arriving here while a segment is gated is
  * counted and named rather than left running after an abort. */
 static void ds4_gpu_dispatch_threads(id<DS4Encoder> enc, MTLSize th, MTLSize tpt) {
+    ds4_uce_order(enc);
     /* One of these ahead of the buffer's first validate is certain to run, so
      * it is not something the gate failed to switch off. */
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&

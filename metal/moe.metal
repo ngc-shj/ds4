@@ -2521,7 +2521,8 @@ void dequantize_mxfp4_half_scale(
 kernel void kernel_test_mxfp4_down_half_lut(
         device ushort *legacy [[buffer(0)]],
         device ushort *lut [[buffer(1)]],
-        uint tid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (tid >= 4096u) {
         return;
     }
@@ -2675,6 +2676,8 @@ struct ds4_metal_moe_block_residency_args {
     uint32_t n_rows;       /* rows in the block */
     uint32_t layer;
     uint32_t max_records;
+    uint32_t gate_from;    /* the first gated dispatch behind this one */
+    uint32_t gate_to;      /* 0: no gate, record only */
 };
 
 struct ds4_metal_stream_expert_split_args {
@@ -4029,7 +4032,8 @@ kernel void kernel_dsv41_moe_expert_worklist(
         device const char *ids,
         device uint32_t *counts,
         device uint32_t *lists,
-        uint tid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (tid >= args.n_expert) return;
     uint n = 0;
     for (uint t = 0; t < args.n_tokens; t++) {
@@ -4869,7 +4873,8 @@ kernel void kernel_stream_expert_cache_validate(
         device const uint64_t * up_addrs,
         device const uint64_t * down_addrs,
         device uint32_t * status,
-        uint tid [[thread_position_in_grid]]) {
+        uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (tid != 0) return;
 
     uint32_t miss_mask = 0;
@@ -4923,62 +4928,73 @@ kernel void kernel_dsv41_moe_block_residency(
         device const uint64_t * up_addrs,
         device const uint64_t * down_addrs,
         device atomic_uint * out,
-        uint tid [[thread_position_in_grid]]) {
+        device uint * grid,
+        uint tid [[thread_position_in_threadgroup]],
+        uint tsz [[threads_per_threadgroup]]) {
+    /* One threadgroup walks every (row, slot), so that whether anything missed
+     * is one flag the whole group can act on: a miss switches off every
+     * dispatch encoded behind this one - the rest of the block, the head, the
+     * accept and the commit - by zeroing their indirect arguments. A layer that
+     * missed then leaves every row exactly at its routed stage, nothing
+     * behind it has run, and nothing has been committed. */
+    threadgroup atomic_uint missed;
+    if (tid == 0) atomic_store_explicit(&missed, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint32_t pairs = args.n_rows * args.n_expert;
-    if (tid >= pairs) return;
-
-    const uint32_t row = tid / args.n_expert;
-    const uint32_t slot = tid % args.n_expert;
     device const int32_t *selected = (device const int32_t *)ids;
-    const int32_t expert = selected[tid];
-
-    if (expert < 0 || (uint32_t)expert >= args.n_total_expert || (uint32_t)expert >= 384) {
-        atomic_fetch_add_explicit(&out[2], 1u, memory_order_relaxed);
-        atomic_fetch_or_explicit(&out[1], 1u << min(row, 31u), memory_order_relaxed);
-        uint32_t unset = 0u;
-        (void)atomic_compare_exchange_weak_explicit(&out[4 + min(row, 31u)], &unset,
-                                                    args.layer + 1u,
-                                                    memory_order_relaxed,
-                                                    memory_order_relaxed);
-        return;
+    for (uint32_t pr = tid; pr < pairs; pr += tsz) {
+        const uint32_t row = pr / args.n_expert;
+        const uint32_t slot = pr % args.n_expert;
+        const int32_t expert = selected[pr];
+        const uint32_t row_bit = 1u << min(row, 31u);
+        if (expert < 0 || (uint32_t)expert >= args.n_total_expert || (uint32_t)expert >= 384) {
+            atomic_fetch_add_explicit(&out[2], 1u, memory_order_relaxed);
+            atomic_fetch_or_explicit(&out[1], row_bit, memory_order_relaxed);
+            uint32_t unset = 0u;
+            while (!atomic_compare_exchange_weak_explicit(&out[4 + min(row, 31u)], &unset,
+                                                          args.layer + 1u,
+                                                          memory_order_relaxed,
+                                                          memory_order_relaxed) &&
+                   unset == 0u) {}
+            atomic_store_explicit(&missed, 1u, memory_order_relaxed);
+            continue;
+        }
+        const uint32_t e = (uint32_t)expert;
+        if (gate_addrs[e] != 0 && up_addrs[e] != 0 && down_addrs[e] != 0) continue;
+        atomic_store_explicit(&missed, 1u, memory_order_relaxed);
+        atomic_fetch_or_explicit(&out[1], row_bit, memory_order_relaxed);
+        /* The layer this row parks at, claimed once; every slot of that layer
+         * still records - six slots shared by several rows are released
+         * together - and no later layer records anything, because a later
+         * layer does not run. */
+        const uint32_t mine = args.layer + 1u;
+        uint32_t seen = 0u;
+        /* Weak: a spurious failure leaves seen at 0, which is "try again", not
+         * "someone else claimed it" - read that way it dropped records. */
+        while (!atomic_compare_exchange_weak_explicit(&out[4 + min(row, 31u)], &seen, mine,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed) &&
+               seen == 0u) {}
+        if (seen != 0u && seen != mine) continue;
+        const uint32_t at = atomic_fetch_add_explicit(&out[0], 1u, memory_order_relaxed);
+        if (at >= args.max_records) {
+            atomic_fetch_add_explicit(&out[3], 1u, memory_order_relaxed);
+            continue;
+        }
+        device atomic_uint *rec = &out[36 + 4u * at];
+        atomic_store_explicit(&rec[0], args.layer, memory_order_relaxed);
+        atomic_store_explicit(&rec[1], row, memory_order_relaxed);
+        atomic_store_explicit(&rec[2], slot, memory_order_relaxed);
+        atomic_store_explicit(&rec[3], e, memory_order_relaxed);
     }
-
-    const uint32_t e = (uint32_t)expert;
-    if (gate_addrs[e] != 0 && up_addrs[e] != 0 && down_addrs[e] != 0) return;
-
-    /* A row that has already parked contributes nothing the model would, so the
-     * layers after it route on a hidden state that is not the model's and select
-     * experts nobody asked for. Recording those as misses is what turned one
-     * eviction at layer 17 into 90 assignments over 22 layers. The row stops
-     * being counted at its first miss; the rows beside it carry on. */
-    const uint32_t row_bit = 1u << min(row, 31u);
-    atomic_fetch_or_explicit(&out[1], row_bit, memory_order_relaxed);
-
-    /* The layer this row parks at, claimed once. Every slot of that layer still
-     * records - six slots shared by eight rows have to be released together -
-     * and the layers after it record nothing, because a row that contributes
-     * zero routes the rest of the stack on a hidden state that is not the
-     * model's and would otherwise report experts nobody asked for. */
-    const uint32_t mine = args.layer + 1u;
-    uint32_t seen = 0u;
-    if (!atomic_compare_exchange_weak_explicit(&out[4 + min(row, 31u)], &seen, mine,
-                                               memory_order_relaxed,
-                                               memory_order_relaxed) &&
-        seen != mine) {
-        return;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!args.gate_to || atomic_load_explicit(&missed, memory_order_relaxed) == 0u) return;
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint32_t i = args.gate_from + tid; i < args.gate_to; i += tsz) {
+        grid[3u * i + 0u] = 0u;
+        grid[3u * i + 1u] = 0u;
+        grid[3u * i + 2u] = 0u;
     }
-
-    const uint32_t slot_index =
-        atomic_fetch_add_explicit(&out[0], 1u, memory_order_relaxed);
-    if (slot_index >= args.max_records) {
-        atomic_fetch_add_explicit(&out[3], 1u, memory_order_relaxed);
-        return;
-    }
-    device atomic_uint *rec = &out[36 + 4u * slot_index];
-    atomic_store_explicit(&rec[0], args.layer, memory_order_relaxed);
-    atomic_store_explicit(&rec[1], row, memory_order_relaxed);
-    atomic_store_explicit(&rec[2], slot, memory_order_relaxed);
-    atomic_store_explicit(&rec[3], e, memory_order_relaxed);
 }
 
 kernel void kernel_mul_mv_id_q4_K_pair_f32(
@@ -9727,7 +9743,8 @@ kernel void kernel_attn_out_low_mpp_direct_rhs(
 
 kernel void kernel_moe_packed_offsets(
         constant uint &experts, device const uint *counts,
-        device uint *offsets, uint tid [[thread_position_in_grid]]) {
+        device uint *offsets, uint tg_ [[threadgroup_position_in_grid]], uint tid_ [[thread_position_in_threadgroup]], uint ntg_ [[threads_per_threadgroup]]) {
+    const uint tid = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
     if (tid) return;
     uint row = 0;
     for (uint e = 0; e < experts; e++) {

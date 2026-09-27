@@ -597,6 +597,14 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+/* Metal 4 commits, feedback received, feedback errors, residency entries and
+ * bytes held by buffers in flight, adds, releases, peak bytes; zeros without
+ * the Metal 4 backend. */
+void ds4_engine_mtl4_health(unsigned long long out[8]);
+/* Router finalize: fused calls, generic calls, fallbacks, then compare-mode
+ * mismatches in probabilities, ids and weights, and compare calls. */
+void ds4_engine_router_counts(unsigned long long out[7]);
+void ds4_engine_transition_counts(unsigned out[16]);
 bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 

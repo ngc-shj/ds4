@@ -410,6 +410,47 @@ int ds4_gpu_routed_sweep_encode(
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t which);
+void ds4_gpu_stream_expert_read_counts(uint64_t *bytes, uint64_t *failures);
+void ds4_gpu_router_finalize_counts(unsigned long long out[7]);
+void ds4_gpu_router_request_validate(int layer);
+int ds4_gpu_dsv41_hc_tail_tensor(
+        ds4_gpu_tensor *split, ds4_gpu_tensor *sum_out, ds4_gpu_tensor *norm_out,
+        const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *weights, uint64_t weights_off,
+        const void *model_map, uint64_t model_size, uint64_t scale_offset,
+        uint64_t base_offset, uint64_t norm_weight_offset, uint32_t n_embd,
+        uint32_t n_hc, uint32_t sinkhorn_iters, float hc_eps, float norm_eps);
+int ds4_gpu_dsv41_hc_expand_tail_tensor(
+        ds4_gpu_tensor *after_hc, ds4_gpu_tensor *sum_out, ds4_gpu_tensor *norm_out,
+        const ds4_gpu_tensor *block, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, const void *model_map, uint64_t model_size,
+        uint64_t norm_weight_offset, uint32_t n_embd, uint32_t n_hc, float norm_eps);
+int ds4_gpu_dsv41_hc_expand_pre_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split,
+        ds4_gpu_tensor *pre, uint32_t n_embd, uint32_t n_hc);
+int ds4_gpu_dsv41_words_compare(const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+                                uint32_t n_words, uint32_t slot);
+int ds4_gpu_attention_output_low_q8_round_tensor(
+        ds4_gpu_tensor *low, const void *model_map, uint64_t model_size,
+        uint64_t out_a_offset, uint64_t group_dim, uint64_t rank,
+        uint32_t n_groups, const ds4_gpu_tensor *heads);
+int ds4_gpu_dsv41_compare_row(const ds4_gpu_tensor *a, uint64_t a_off,
+                              const ds4_gpu_tensor *b, uint32_t n_words, uint32_t slot);
+void ds4_gpu_dsv41_compare_counts(uint32_t out[16]);
+void ds4_gpu_set_uce_override(int on);
+int ds4_gpu_uce_enabled(void);
+int ds4_gpu_router_take_validated(void);
+int ds4_gpu_router_fuse_level_get(void);
+int ds4_gpu_router_project_select_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs,
+        ds4_gpu_tensor *logits, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t in_dim, const ds4_gpu_tensor *x,
+        uint64_t bias_offset, uint32_t n_expert, uint32_t n_used, float scale,
+        int validate);
+extern int g_router_finalize_override;
+void ds4_gpu_encode_counts(unsigned long long *dispatches, unsigned long long *validates,
+                           unsigned long long *m3_commits);
 void ds4_gpu_stream_expert_cache_counters(uint64_t *hits,
                                           uint64_t *misses,
                                           uint64_t *evictions,
@@ -3294,6 +3335,7 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         ds4_gpu_tensor       *norm_out,
         ds4_gpu_tensor       *split,
         const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *collapse_weights,
         const void           *model_map,
         uint64_t              model_size,
         uint64_t              mix_weight_offset,
@@ -3307,7 +3349,8 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         uint32_t              sinkhorn_iters,
         float                 eps,
         float                 hc_eps,
-        float                 norm_eps);
+        float                 norm_eps,
+        int                   round_bf16);
 int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         ds4_gpu_tensor       *mix,
         ds4_gpu_tensor       *out,
