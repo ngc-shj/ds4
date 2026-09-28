@@ -356,10 +356,51 @@ void ds4_gpu_encode_counts(unsigned long long *dispatches, unsigned long long *v
     if (m3_commits) *m3_commits = g_ds4_m3_commits;
 }
 
+/* Dispatches behind an expert-ready wait (ds4_metal.m). Their grids live in
+ * g_ready_grid, zero when encoded; the host copies the real ones in from the
+ * shadow only when the repair succeeded, before it signals the wait. A failed
+ * repair still signals - the buffer must finish - and the work behind the
+ * wait then runs on an empty grid instead of on a half-built address table. */
+enum { DS4_READY_GRID_MAX = 64 };
+static id<MTLBuffer> g_ready_grid;
+static uint32_t g_ready_grid_shadow[DS4_READY_GRID_MAX * 3];
+static uint32_t g_ready_grid_n;
+/* Per thread: only the thread encoding the continuation is behind its wait.
+ * The queue keepalive dispatches from a thread of its own into its own
+ * buffer, and with this global it once took a ready grid slot. */
+static __thread int g_ready_gating;
+static unsigned long long g_ready_grid_overflow;
+static void *g_ready_grid_caller[DS4_READY_GRID_MAX][2];
+
+/* Dispatches encoded by the calling thread, for a count that another
+ * thread's keepalive cannot land in. */
+static __thread unsigned long long g_ds4_thread_dispatches;
+unsigned long long ds4_gpu_thread_dispatches(void) { return g_ds4_thread_dispatches; }
+
 static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {
     NSUInteger off = 0;
     atomic_fetch_add(&g_ds4_dispatches_encoded, 1u);
+    g_ds4_thread_dispatches++;
     ds4_uce_order(enc);
+    if (g_ready_gating) {
+        if (g_ready_grid && g_ready_grid_n < DS4_READY_GRID_MAX) {
+            const uint32_t i = g_ready_grid_n++;
+            uint32_t *grid = (uint32_t *)[g_ready_grid contents] + 3u * i;
+            g_ready_grid_shadow[3u * i + 0] = (uint32_t)tg.width;
+            g_ready_grid_shadow[3u * i + 1] = (uint32_t)tg.height;
+            g_ready_grid_shadow[3u * i + 2] = (uint32_t)tg.depth;
+            grid[0] = grid[1] = grid[2] = 0;
+            g_ready_grid_caller[i][0] = __builtin_return_address(0);
+            g_ready_grid_caller[i][1] = __builtin_extract_return_addr(__builtin_return_address(0));
+            [enc dispatchThreadgroupsWithIndirectBuffer:g_ready_grid
+                                   indirectBufferOffset:(NSUInteger)i * 3u * sizeof(uint32_t)
+                                  threadsPerThreadgroup:tpt];
+            return;
+        }
+        /* No room: the caller sees the overflow and fails the continuation
+         * rather than letting an ungated dispatch through. */
+        g_ready_grid_overflow++;
+    }
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
         !atomic_load_explicit(&g_gate_armed, memory_order_relaxed) &&
         ds4_gate_direct_prefix_on()) {
