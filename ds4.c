@@ -41865,6 +41865,7 @@ static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
  *
  * DS4_METAL_V41_HEAD_BENCH=<laps> runs it once, on the first batched head.
  */
+extern void ds4_gpu_timeline_host_event(const char *fmt, ...);
 extern double ds4_gpu_take_span_ms(void);
 extern unsigned long long g_ds4_head_rows2_dispatches, g_ds4_head_rows4_dispatches;
 
@@ -44642,7 +44643,8 @@ static void ds41_gate_trace(ds41_gpu_graph *g, uint32_t il, const char *where) {
     static int want = -2;
     if (want == -2) {
         const char *env = getenv("DS4_METAL_V41_GATE_TRACE");
-        want = env && env[0] ? atoi(env) : -1;
+        /* "t:<path>" is the host-event trace (ds4_metal.m), not a layer. */
+        want = env && env[0] >= '0' && env[0] <= '9' ? atoi(env) : -1;
     }
     if (want < 0 || (uint32_t)want != il) return;
     static uint32_t seen;
@@ -45707,6 +45709,15 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
              * segment's, now that the slot cursor runs on across a token
              * instead of rewinding between segments. */
             if (!ds4_gpu_flush_commands()) { ok = false; break; }
+            static int trace_rev_written;
+            if (!trace_rev_written) {
+                trace_rev_written = 1;
+#ifdef DS4_GIT_REV
+                ds4_gpu_timeline_host_event("V %s", DS4_GIT_REV);
+#endif
+            }
+            ds4_gpu_timeline_host_event("S %d %u %u %u", token, start, chunk_end,
+                                        resume_from_moe);
             const double seg_t2 = now_sec();
             /* Encode the next segment into the buffer flush_commands just
              * opened, while the one before it runs. This happens on every
@@ -45819,6 +45830,8 @@ spec_done:;
             }
             ds4_gpu_gate_census_settle(bad);
             g_gate_aborts++;
+            ds4_gpu_timeline_host_event("A %d %u %u %u %d %d %d %d %d %d", token, bad, mask, n_sel,
+                                        ids[0], ids[1], ids[2], ids[3], ids[4], ids[5]);
             g_gate_after += ds4_gpu_gate_slots_encoded_after_abort(seg_slot);
             /* The gate's own guarantee, read back after completion: a slot
              * behind the aborting layer that is still live is a dispatch it
@@ -45835,6 +45848,7 @@ spec_done:;
                                      gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
                                      mask, &g_gate_bytes)) { ok = false; break; }
             g_gt_repair_ms += (now_sec() - gt_rep0) * 1000.0;
+            ds4_gpu_timeline_host_event("R %d %u", token, bad);
             start = bad;
             resume_from_moe = 1;
         }

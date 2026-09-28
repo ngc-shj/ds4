@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#include <mach/mach_time.h>
 #import <Metal/Metal.h>
 #include <execinfo.h>
 
@@ -159,6 +160,13 @@ static BOOL g_timeline_enabled;
  * anyway, never one a dispatch group - the encoder layout, and so the work
  * the GPU is given, is the production one. */
 static BOOL g_timeline_encoders_only;
+/* The clock GPUStartTime/GPUEndTime are in, as ns, so host events written to
+ * the timeline line up with its command buffers. */
+static uint64_t ds4_gpu_host_ns(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    return mach_absolute_time() * tb.numer / tb.denom;
+}
 static FILE *g_timeline_file;
 static pthread_mutex_t g_timeline_mutex = PTHREAD_MUTEX_INITIALIZER;
 static DS4TimelineBatch *g_timeline_batch;
@@ -166,6 +174,49 @@ static uint64_t g_timeline_seq;
 static NSMutableDictionary<NSNumber *, NSString *> *g_timeline_pso_names;
 static id<MTLCounterSet> g_timeline_counter_set;
 static BOOL g_timeline_encoder_hooked;
+
+/* A host event on the encoder timeline: "H <ns> <text>", the ns on the same
+ * clock as the command buffers' GPU times. Nothing when the timeline is off. */
+/* The gate cannot run beside the timeline (both hook the encoder), so
+ * DS4_METAL_V41_GATE_TRACE=t:<path> sends the same host events, plus each
+ * waited command buffer's GPU span ("C"), to a file of their own. */
+static FILE *ds4_gpu_host_trace_file(void) {
+    static int opened;
+    static FILE *fp;
+    if (!opened) {
+        opened = 1;
+        const char *env = getenv("DS4_METAL_V41_GATE_TRACE");
+        if (env && !strncmp(env, "t:", 2) && env[2]) {
+            fp = fopen(env + 2, "w");
+            if (!fp) {
+                fprintf(stderr, "ds4: cannot open host trace %s\n", env + 2);
+            } else {
+                /* Schema version, then every DS4_ setting in effect, so a
+                 * trace says what produced it. The binary's revision follows
+                 * as the first event ("V"), written by ds4.c. */
+                extern char **environ;
+                fprintf(fp, "# ds4 host trace v1 pid=%d\n", (int)getpid());
+                for (char **e = environ; e && *e; e++)
+                    if (!strncmp(*e, "DS4_", 4)) fprintf(fp, "# env %s\n", *e);
+            }
+        }
+    }
+    return fp ? fp : g_timeline_file;
+}
+
+void ds4_gpu_timeline_host_event(const char *fmt, ...) {
+    FILE *fp = ds4_gpu_host_trace_file();
+    if (!fp) return;
+    const uint64_t t = ds4_gpu_host_ns();
+    va_list ap;
+    va_start(ap, fmt);
+    pthread_mutex_lock(&g_timeline_mutex);
+    fprintf(fp, "H %llu ", (unsigned long long)t);
+    vfprintf(fp, fmt, ap);
+    fputc('\n', fp);
+    pthread_mutex_unlock(&g_timeline_mutex);
+    va_end(ap);
+}
 
 static void ds4_gpu_timeline_note_pso_name(id pso, NSString *name) {
     if (!g_timeline_enabled || !pso || !name) return;
@@ -1652,6 +1703,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     if (cb.GPUEndTime > cb.GPUStartTime) {
         g_gpu_span_accum_ms += (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
         g_gpu_span_cbs++;
+        ds4_gpu_timeline_host_event("C %.0f %.0f", cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9);
     }
     ds4_stage_resolve();
     if (getenv("DS4_METAL_CB_TIMES")) {
@@ -14285,6 +14337,8 @@ typedef struct {
     /* What the read is, for a failure to name: layer, expert, which of the
      * three tensors (0 gate, 1 up, 2 down), and how many experts it holds. */
     uint32_t layer, expert, part, n_expert;
+    /* Host clock (mach, ns) around the read, for the encoder timeline. */
+    uint64_t t0_ns, t1_ns;
 } ds4_gpu_stream_expert_pread_task;
 
 /* A read that came back short, with everything needed to tell EOF, a range
@@ -14465,11 +14519,13 @@ static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
+        task->t0_ns = ds4_gpu_host_ns();
         task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
                                                     task->len,
                                                     task->dst,
                                                     &task->read_bytes,
                                                     &task->ms);
+        task->t1_ns = ds4_gpu_host_ns();
         if (!task->ok) ds4_gpu_stream_expert_pread_report(task);
     }
     return NULL;
@@ -14525,11 +14581,13 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                 &g_stream_expert_pread_pool_tasks[task_index];
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
+            task->t0_ns = ds4_gpu_host_ns();
             task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
                                                         task->len,
                                                         task->dst,
                                                         &task->read_bytes,
                                                         &task->ms);
+            task->t1_ns = ds4_gpu_host_ns();
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
         }
@@ -14730,9 +14788,13 @@ static void ds4_gpu_stream_expert_fold_pieces(
         tasks[i].read_bytes = 0;
         tasks[i].ms = 0.0;
         tasks[i].ok = 1;
+        tasks[i].t0_ns = UINT64_MAX;
+        tasks[i].t1_ns = 0;
     }
     for (uint32_t j = 0; j < n; j++) {
         ds4_gpu_stream_expert_pread_task *t = &tasks[owner[j]];
+        if (pieces[j].t0_ns < t->t0_ns) t->t0_ns = pieces[j].t0_ns;
+        if (pieces[j].t1_ns > t->t1_ns) t->t1_ns = pieces[j].t1_ns;
         t->read_bytes += pieces[j].read_bytes;
         if (pieces[j].ms > t->ms) t->ms = pieces[j].ms;
         if (!pieces[j].ok) t->ok = 0;
@@ -19091,6 +19153,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         uint32_t       missing_mask,
         int            gpu_copy_source,
         ds4_gpu_stream_expert_cache_entry **entries) {
+    uint64_t tl_ra0 = 0, tl_rd0 = 0, tl_rd1 = 0;
     if (!g_ssd_streaming_mode ||
         !model_map ||
         !selected_ids ||
@@ -19259,6 +19322,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             }
         }
         const double ra_t0 = ds4_gpu_now_ms();
+        if (ds4_gpu_host_trace_file()) tl_ra0 = ds4_gpu_host_ns();
         for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
             const uint32_t slot = load_slots[load_i];
             ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
@@ -19455,11 +19519,13 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         g_batch_has_work = g_m3_cb_has_work = YES;
     } else {
         const double rd_t0 = ds4_gpu_now_ms();
+        if (ds4_gpu_host_trace_file()) tl_rd0 = ds4_gpu_host_ns();
         ok = ds4_gpu_stream_expert_pread_tasks(tasks,
                                                n_tasks,
                                                &read_bytes,
                                                &read_ms);
         g_rep_read_ms += ds4_gpu_now_ms() - rd_t0;
+        if (ds4_gpu_host_trace_file()) tl_rd1 = ds4_gpu_host_ns();
     }
     if (!ok) return 0;
     const double inst_t0 = ds4_gpu_now_ms();
@@ -19515,6 +19581,26 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
     }
     g_rep_install_ms += ds4_gpu_now_ms() - inst_t0;
     g_rep_loads += n_loads;
+    if (ds4_gpu_host_trace_file() && !gpu_copy_source) {
+        /* P: the repair's phases; X: each expert's reads, first byte to last,
+         * with the route slot it fills. */
+        ds4_gpu_timeline_host_event("P %u %u %llu %llu %llu", layer, n_loads,
+                                    (unsigned long long)tl_ra0,
+                                    (unsigned long long)tl_rd0,
+                                    (unsigned long long)tl_rd1);
+        for (uint32_t load_i = 0; load_i < n_loads && 3u * load_i + 2u < n_tasks; load_i++) {
+            uint64_t t0 = UINT64_MAX, t1 = 0;
+            for (uint32_t k = 0; k < 3u; k++) {
+                const ds4_gpu_stream_expert_pread_task *t = &tasks[3u * load_i + k];
+                if (t->t0_ns < t0) t0 = t->t0_ns;
+                if (t->t1_ns > t1) t1 = t->t1_ns;
+            }
+            ds4_gpu_timeline_host_event("X %u %d %u %llu %llu", layer,
+                                        (int)selected_ids[load_slots[load_i]],
+                                        load_slots[load_i],
+                                        (unsigned long long)t0, (unsigned long long)t1);
+        }
+    }
 
     for (uint32_t i = 0; i < n_selected; i++) {
         if ((missing_mask & (1u << i)) == 0 || entries[i]) continue;
