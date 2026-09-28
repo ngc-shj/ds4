@@ -43729,144 +43729,6 @@ static bool ds41_moe_experts_overlapped(ds41_gpu_graph *g, const ds4_model *m,
                        (uint64_t)DS4_N_EMBD * sizeof(float));
 }
 
-/* The continuation of an aborted layer, issued before its reads are done.
- *
- * `missing` is the validator's mask of slots whose experts are being read.
- * Everything that does not need them runs first - the shared expert, the
- * routed gate/up of the resident lanes, and the routed down of the slots
- * before the first missing one, which stores each lane's running sums instead
- * of finishing. The buffer then waits on the ready event; after it come the
- * gate/up of the missing lanes and the rest of the down, which picks the sums
- * up and finishes with the same simd_sum. Every lane adds the same values in
- * the same order as ds41_moe_experts_overlapped, so the result is the same
- * bits; `verify` recomputes the down with the one-part kernel and keeps copies
- * of both for the host to compare. */
-extern void ds4_gpu_gated_down_part(uint32_t slot_begin, uint32_t slot_end,
-                                    uint32_t load, uint32_t store);
-extern void ds4_gpu_gated_down_whole(void);
-extern uint64_t ds4_gpu_ready_wait_encode(void);
-extern int ds4_gpu_ready_gating_end(unsigned expected);
-extern void ds4_gpu_encode_counts(unsigned long long *dispatches, unsigned long long *validates,
-                                  unsigned long long *m3_commits);
-extern unsigned long long ds4_gpu_thread_dispatches(void);
-static ds4_gpu_tensor *g_ds41_ready_check[2];
-/* Continuations issued ahead of their reads, how many were checked against
- * the one-part down and how many of those differed, and the host time spent
- * joining the repair after the commit. */
-static unsigned long long g_ready_used, g_ready_checked, g_ready_differ;
-/* What the ready continuations should have encoded beyond the one-part MoE:
- * behind the waits, the missing lanes' gate/up and the rest of the down (and
- * the check's down); ahead of them, the down prefix when the first missing
- * slot is not slot 0. */
-static unsigned long long g_ready_expect_behind, g_ready_expect_extra;
-/* The routed dispatches each continuation actually encoded, counted around
- * its own calls and held against what its missing mask says they must be;
- * and continuations entered with no missing slot (an all-resident layer). */
-static unsigned long long g_ready_routed_seen, g_ready_routed_expect, g_ready_routed_mismatch,
-                          g_ready_all_resident;
-/* =5: per-arm token walls and the per-block differences, by block order. */
-static double g_ready_arm_ms[2], g_ready_blk_sum[2], g_ready_blk_sq[2];
-static unsigned long long g_ready_arm_n[2], g_ready_blk_n[2];
-/* =5 workload by arm, so a wall difference can be told from a work one. */
-static unsigned long long g_ready_arm_aborts[2], g_ready_arm_missing[2], g_ready_arm_resident[2],
-                          g_ready_arm_eligible[2], g_ready_arm_first[2][6], g_ready_arm_bytes[2];
-static double g_ready_arm_rep_ms[2];
-/* =5 standard error from 64-token windows: misses and the cache state carry
- * from token to token, so neighbouring blocks are not independent. */
-static double g_ready_win_sum, g_ready_win_sq;
-static unsigned long long g_ready_win_n;
-extern int ds4_gpu_ready_wait_supported(void);
-static double g_ready_join_ms;
-
-static bool ds41_moe_experts_ready(ds41_gpu_graph *g, const ds4_model *m,
-                                   const ds4_layer_weights *l, uint32_t il,
-                                   uint32_t missing, bool verify, uint64_t *wait_value) {
-    if ((missing & 0x3fu) == 0) {
-        g_ready_all_resident++;
-        return false;
-    }
-    const uint32_t resident = 0x3fu & ~missing;
-    const uint32_t first = (uint32_t)__builtin_ctz(missing);
-    const unsigned expect_extra = (resident != 0 ? 1u : 0u) + (first > 0 ? 1u : 0u) +
-                                  (verify ? 1u : 0u);
-    const unsigned expect_behind = verify ? 3u : 2u;
-    g_ready_expect_extra += expect_extra;
-    g_ready_expect_behind += expect_behind;
-    /* Routed dispatches this continuation must encode: gate/up once for the
-     * missing lanes and once more for the resident ones if there are any;
-     * the down once to finish, once more for a prefix, once more for the
-     * check. */
-    const unsigned expect_routed = 1u + (resident != 0 ? 1u : 0u) +
-                                   1u + (first > 0 ? 1u : 0u) + (verify ? 1u : 0u);
-    unsigned long long routed_n = 0, rd0 = 0, rd1 = 0;
-#define DS41_READY_COUNT(call) (rd0 = ds4_gpu_thread_dispatches(), ok_c = (call), \
-                                rd1 = ds4_gpu_thread_dispatches(), routed_n += rd1 - rd0, ok_c)
-    bool ok_c;
-    bool late1[2] = { false, false }, late3[2] = { false, false };
-    const bool pre1 = g_ds41_shared1.done && g_ds41_shared1.il == il &&
-                      g_ds41_shared1.pos == g->pos;
-    if (pre1) { late1[0] = g_ds41_shared1.late[0]; late1[1] = g_ds41_shared1.late[1]; }
-    g_ds41_shared1.done = false;
-
-    const bool s1 = !pre1 && ds4_gpu_begin_concurrent_section() != 0;
-    bool ok = (resident == 0 ||
-               DS41_READY_COUNT(ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, resident, 0u))) &&
-              (pre1 || ds41_moe_shared_stage(g, m, l, 1, late1));
-    if (s1) ds4_gpu_end_concurrent_section();
-    ok = ok && ds41_moe_shared_round(g, l, 1, late1) &&
-               ds41_moe_shared_stage(g, m, l, 2, NULL);
-    const bool s2 = ok && ds4_gpu_begin_concurrent_section() != 0;
-    if (ok && first > 0) {
-        ds4_gpu_gated_down_part(0u, first, 0u, 1u);
-        ok = DS41_READY_COUNT(ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u));
-        ds4_gpu_gated_down_whole();
-    }
-    ok = ok && ds41_moe_shared_stage(g, m, l, 3, late3);
-    if (s2) ds4_gpu_end_concurrent_section();
-    ok = ok && ds41_moe_shared_round(g, l, 3, late3);
-
-    /* Beyond the one-part MoE: the resident lanes' gate/up is split from the
-     * missing lanes' only when there are resident lanes, and the down gets a
-     * prefix only when the first missing slot is not slot 0. All six missing
-     * adds nothing but the check's down. */
-    const uint64_t v = ok ? ds4_gpu_ready_wait_encode() : 0;
-    if (!v) ok = false;
-    *wait_value = v;
-
-    ok = ok && DS41_READY_COUNT(ds41_moe_experts_level(g, l, il, 1u, NULL, 0u, NULL, missing, 0u));
-    if (ok) {
-        ds4_gpu_gated_down_part(first, 6u, first > 0 ? 1u : 0u, 0u);
-        ok = DS41_READY_COUNT(ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u));
-        ds4_gpu_gated_down_whole();
-    }
-    if (ok && verify) {
-        /* The check's copies are blits, which no grid can switch off; on a
-         * failed repair they copy what the empty dispatches left. */
-        const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-        for (int k = 0; k < 2 && ok; k++)
-            if (!g_ds41_ready_check[k] &&
-                !(g_ds41_ready_check[k] = ds4_gpu_tensor_alloc(bytes))) ok = false;
-        /* The split result aside, the one-part kernel over the same inputs
-         * into routed, and that aside too: the layer goes on with the
-         * shipping kernel's bits either way. */
-        ok = ok && ds4_gpu_tensor_copy(g_ds41_ready_check[0], 0, g->routed, 0, bytes) &&
-             DS41_READY_COUNT(ds41_moe_experts_level(g, l, il, 2u, NULL, 0u, NULL, 0x3fu, 0u)) &&
-             ds4_gpu_tensor_copy(g_ds41_ready_check[1], 0, g->routed, 0, bytes);
-    }
-    if (v && !ds4_gpu_ready_gating_end(expect_behind)) ok = false;
-#undef DS41_READY_COUNT
-    if (ok) {
-        g_ready_routed_seen += routed_n;
-        g_ready_routed_expect += expect_routed;
-        if (routed_n != expect_routed) g_ready_routed_mismatch++;
-    }
-    return ok &&
-        ds41_sabl_seam(DS41_SABL_ROUTED, &g_ds41_sabl_routed[il], g->routed,
-                       (uint64_t)DS4_N_EMBD * sizeof(float)) &&
-        ds41_sabl_seam(DS41_SABL_SHARED, &g_ds41_sabl_shared[il], g->shared,
-                       (uint64_t)DS4_N_EMBD * sizeof(float));
-}
-
 static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
@@ -45366,69 +45228,6 @@ static int ds4_gate_report_cache(unsigned long long tokens, FILE *route_fp) {
         }
         fprintf(stderr, "ds4:   Engram rows written at step start in %llu steps; "
                 "layer-13 drains %llu\n", g_ds41_engram_split_steps, g_ds41_layer13_drains);
-        {
-            extern void ds4_gpu_encode_counts(unsigned long long *dispatches,
-                                              unsigned long long *validates,
-                                              unsigned long long *m3_commits);
-            unsigned long long all_disp = 0;
-            ds4_gpu_encode_counts(&all_disp, NULL, NULL);
-            fprintf(stderr, "ds4:   dispatches encoded %llu\n", all_disp);
-        }
-        if (g_ready_used) {
-            extern void ds4_gpu_ready_counters(unsigned long long out[6]);
-            extern void ds4_gpu_encode_counts(unsigned long long *dispatches,
-                                              unsigned long long *validates,
-                                              unsigned long long *m3_commits);
-            unsigned long long rc3[6], disp = 0;
-            ds4_gpu_ready_counters(rc3);
-            ds4_gpu_encode_counts(&disp, NULL, NULL);
-            fprintf(stderr, "ds4:   continuations issued ahead of their reads %llu; split downs "
-                    "checked %llu, differing %llu; %.2f ms joining the repair; selected "
-                    "evicted in flight %llu, addresses zero at release %llu, moved before "
-                    "completion %llu\n",
-                    g_ready_used, g_ready_checked, g_ready_differ, g_ready_join_ms,
-                    rc3[0], rc3[1], rc3[2]);
-            fprintf(stderr, "ds4:   ready waits %llu; dispatches behind them %llu (expected "
-                    "%llu); grids reused in flight %llu; routed dispatches %llu (expected "
-                    "%llu from the masks, continuations that differed %llu); extra over "
-                    "one-part expected %llu; ready entered on an all-resident layer %llu; "
-                    "dispatches encoded %llu\n",
-                    rc3[3], rc3[4], g_ready_expect_behind, rc3[5], g_ready_routed_seen,
-                    g_ready_routed_expect, g_ready_routed_mismatch, g_ready_expect_extra,
-                    g_ready_all_resident, disp);
-            for (int o = 0; o < 2 && (g_ready_arm_n[0] || g_ready_arm_n[1]); o++) {
-                const double n = (double)g_ready_blk_n[o];
-                const double mean = n ? g_ready_blk_sum[o] / n : 0.0;
-                const double sd = n > 1 ? sqrt((g_ready_blk_sq[o] - n * mean * mean) / (n - 1)) : 0.0;
-                (void)sd;
-                fprintf(stderr, "ds4:   interleaved %s blocks: ready minus repair-first "
-                        "%+.3f ms a token over %llu four-token blocks\n",
-                        o ? "B-A-A-B" : "A-B-B-A", mean, g_ready_blk_n[o]);
-            }
-            if (g_ready_win_n > 1) {
-                const double n = (double)g_ready_win_n, mean = g_ready_win_sum / n;
-                const double sd = sqrt((g_ready_win_sq - n * mean * mean) / (n - 1));
-                fprintf(stderr, "ds4:   interleaved 64-token windows: ready minus repair-first "
-                        "%+.3f ms a token, se %.3f over %llu windows\n", mean, sd / sqrt(n),
-                        g_ready_win_n);
-            }
-            for (int a = 0; a < 2 && (g_ready_arm_n[0] || g_ready_arm_n[1]); a++)
-                fprintf(stderr, "ds4:   interleaved %s work: %llu aborts, %llu eligible, "
-                        "%llu missing and %llu resident slots, first miss at slot 0-5 "
-                        "%llu/%llu/%llu/%llu/%llu/%llu, %.1f MiB and %.1f ms of repair\n",
-                        a ? "ready       " : "repair-first", g_ready_arm_aborts[a],
-                        g_ready_arm_eligible[a], g_ready_arm_missing[a], g_ready_arm_resident[a],
-                        g_ready_arm_first[a][0], g_ready_arm_first[a][1], g_ready_arm_first[a][2],
-                        g_ready_arm_first[a][3], g_ready_arm_first[a][4], g_ready_arm_first[a][5],
-                        (double)g_ready_arm_bytes[a] / 1048576.0, g_ready_arm_rep_ms[a]);
-            if (g_ready_arm_n[0] || g_ready_arm_n[1])
-                fprintf(stderr, "ds4:   interleaved arms: repair-first %.3f ms a token over "
-                        "%llu, ready %.3f over %llu\n",
-                        g_ready_arm_n[0] ? g_ready_arm_ms[0] / g_ready_arm_n[0] : 0.0,
-                        g_ready_arm_n[0],
-                        g_ready_arm_n[1] ? g_ready_arm_ms[1] / g_ready_arm_n[1] : 0.0,
-                        g_ready_arm_n[1]);
-        }
         fprintf(stderr,
                 "ds4:   residency a token: %.2f adds, %.2f removes, %.2f commits\n",
                 (double)(res_add - last_add) / (double)dt,
@@ -45598,21 +45397,8 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
     static int gate_ahead_env = -1;
     if (gate_ahead_env < 0) {
         const char *e = getenv("DS4_METAL_V41_GATE_ENCODE_AHEAD");
-        gate_ahead_env = e && e[0] ? atoi(e) : 0;
+        gate_ahead_env = e && e[0] && atoi(e) != 0;
     }
-    /* =2 also issues an abort's continuation before its reads are done
-     * (ds41_moe_experts_ready); =3 does that and checks each split down
-     * against the one-part kernel; =4 injects a repair failure. =5 is the
-     * paired measurement: the two schedules alternate token by token in one
-     * process, A-B-B-A and B-A-A-B blocks in turn, so the machine's drift is
-     * the same for both and each token keeps its own misses. */
-    const bool ready_interleave = gate_ahead_env == 5;
-    static const int ready_pattern[2][4] = { { 0, 1, 1, 0 }, { 1, 0, 0, 1 } };
-    const int ready_arm = ready_interleave ?
-        ready_pattern[(g_gate_tokens >> 2) & 1ull][g_gate_tokens & 3ull] : -1;
-    const int ready_mode = ready_interleave ? ready_arm :
-                           gate_ahead_env >= 2 ? gate_ahead_env - 1 : 0;
-
 #define ds41_gate_encode_ahead() (gate_ahead_env != 0)
     /* One token's wall, cut into parts that do not overlap, inside one run.
      * Subtracting figures from different runs is how the last residual was
@@ -45642,11 +45428,6 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
         ds4_gpu_mtl4_region_begin();
         uint32_t start = gate_lo;
         int resume_from_moe = 0;
-        /* An abort whose continuation goes out before its reads are in: the
-         * missing mask, and whether the repair is still running. */
-        uint32_t ready_mask = 0;
-        bool ready_pending = false;
-        uint64_t ready_value = 0;
         /* Which shape each layer was issued in. A continuation re-runs the
          * routed stage and nothing else, so it has to re-run the same shape:
          * deciding again could issue the shared expert twice, or not at all,
@@ -45876,12 +45657,8 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
                                 ds4_gpu_gate_encode_validate(g->selected, il,
                                        DS4_N_EXPERT_USED, DS4_N_EXPERT) != 0);
                 }
-                const bool ready_here = resuming && ready_mask != 0 && use_overlap;
                 if (ok) ok = (ds41_sabl_skip(DS41_SABL_MOE) ||
-                              ((ready_here ?
-                                  ds41_moe_experts_ready(g, m, gl, il, ready_mask,
-                                                         ready_mode == 2, &ready_value) :
-                                use_overlap ?
+                              ((use_overlap ?
                                   ds41_moe_experts_overlapped(g, m, gl, il, l1_mask) :
                                   ds41_moe_experts_row(g, m, gl, il)) &&
                                ds41_sabl_finish(g, il))) &&
@@ -45931,37 +45708,7 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
              * every slot behind the aborting layer - including the next
              * segment's, now that the slot cursor runs on across a token
              * instead of rewinding between segments. */
-            const bool flushed = ds4_gpu_flush_commands();
-            if (ready_pending) {
-                /* The continuation is on the GPU and waiting for these reads:
-                 * join the repair, then release it whatever happened - a
-                 * failed repair still has to let the buffer finish. */
-                extern int ds4_gpu_gate_repair_join(unsigned long long *bytes_loaded, double *repair_ms);
-                extern void ds4_gpu_ready_signal(uint64_t v, int ready);
-                const double j0 = now_sec();
-                const unsigned long long jb0 = g_gate_bytes;
-                double rep_ms = 0.0;
-                int rc = ds4_gpu_gate_repair_join(&g_gate_bytes, &rep_ms);
-                if (ready_arm >= 0) {
-                    g_ready_arm_rep_ms[ready_arm] += rep_ms;
-                    g_ready_arm_bytes[ready_arm] += g_gate_bytes - jb0;
-                }
-                /* =4 fails the hundredth one after its repair, to prove the
-                 * work behind the wait is switched off and the session is
-                 * failed rather than answered. */
-                if (ready_mode == 3 && g_ready_used == 100u) {
-                    rc = 0;
-                    fprintf(stderr, "ds4: injected expert-ready repair failure\n");
-                }
-                ds4_gpu_ready_signal(ready_value, rc != 0 && flushed);
-                g_ready_join_ms += (now_sec() - j0) * 1000.0;
-                ds4_gpu_timeline_host_event("R %d %u", token, start);
-                ready_pending = false;
-                ready_mask = 0;
-                ready_value = 0;
-                if (!rc) { ok = false; break; }
-            }
-            if (!flushed) { ok = false; break; }
+            if (!ds4_gpu_flush_commands()) { ok = false; break; }
             static int trace_rev_written;
             if (!trace_rev_written) {
                 trace_rev_written = 1;
@@ -46048,22 +45795,7 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
 spec_done:;
             const double seg_t2b = now_sec();
             if (ok && !ds4_gpu_wait_committed()) ok = false;
-            {
-                extern void ds4_gpu_ready_window_end(void);
-                ds4_gpu_ready_window_end();
-            }
             if (!ok) break;
-            if (ready_mode == 2 && g_ds41_ready_check[0] && g_ready_used > g_ready_checked) {
-                const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-                static float *a, *b;
-                if (!a) a = xmalloc(bytes);
-                if (!b) b = xmalloc(bytes);
-                if (ds4_gpu_tensor_read(g_ds41_ready_check[0], 0, a, bytes) &&
-                    ds4_gpu_tensor_read(g_ds41_ready_check[1], 0, b, bytes)) {
-                    g_ready_checked = g_ready_used;
-                    if (memcmp(a, b, bytes) != 0) g_ready_differ++;
-                }
-            }
             const double seg_t3 = now_sec();
             g_gate_encode_ms += (seg_t1 - seg_t0) * 1000.0;
             /* The speculative encoding is host time spent underneath the GPU,
@@ -46109,73 +45841,16 @@ spec_done:;
             const ds4_layer_weights *bl = &w->layer[bad];
             uint64_t gate_row = 0, down_row = 0;
             if (!tensor_nbytes(bl->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
-                !tensor_nbytes(bl->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) {
-                ok = false;
-                break;
-            }
-            /* The expert-ready continuation needs the overlapped shape for
-             * this layer, a plain six-lane route and a missing mask; any
-             * other abort is repaired before its continuation, as before. */
-            extern int ds4_gpu_ready_wait_supported(void);
-            const bool ready_ok = ready_mode && ds4_gpu_ready_wait_supported() &&
-                                  bad < 64u && seg_overlap[bad] == 1u &&
-                                  n_sel == 6u && mask != 0 && (mask & ~0x3fu) == 0 &&
-                                  !(((spec_filled >> bad) & 1ull) && ds41_spec_resume());
-            if (ready_arm >= 0) {
-                const int a = ready_arm;
-                const uint32_t miss6 = mask & 0x3fu;
-                g_ready_arm_aborts[a]++;
-                g_ready_arm_missing[a] += (unsigned long long)__builtin_popcount(miss6);
-                g_ready_arm_resident[a] += 6ull - (unsigned long long)__builtin_popcount(miss6);
-                if (miss6) g_ready_arm_first[a][__builtin_ctz(miss6)]++;
-                /* Eligible under the ready rule, whichever arm this token has. */
-                if (ds4_gpu_ready_wait_supported() && bad < 64u && seg_overlap[bad] == 1u &&
-                    n_sel == 6u && mask != 0 && (mask & ~0x3fu) == 0)
-                    g_ready_arm_eligible[a]++;
-            }
-            if (ready_ok) {
-                extern int ds4_gpu_gate_repair_async(const void *model_map, uint64_t model_size,
-                        uint32_t layer, const int32_t *ids, uint32_t n_sel, uint32_t n_total,
-                        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-                        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
-                        uint32_t missing_mask);
-                if (!ds4_gpu_gate_repair_async(m->map, m->size, bad, ids, n_sel, DS4_N_EXPERT,
-                                               bl->ffn_gate_exps->abs_offset,
-                                               bl->ffn_up_exps->abs_offset,
-                                               bl->ffn_down_exps->abs_offset,
-                                               gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
-                                               mask)) { ok = false; break; }
-                ready_mask = mask;
-                ready_pending = true;
-                g_ready_used++;
-            } else {
-                const double r0 = now_sec();
-                const unsigned long long rb0 = g_gate_bytes;
-                if (!ds4_gpu_gate_repair(m->map, m->size, bad, ids, n_sel, DS4_N_EXPERT,
-                                         bl->ffn_gate_exps->abs_offset, bl->ffn_up_exps->abs_offset,
-                                         bl->ffn_down_exps->abs_offset,
-                                         gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
-                                         mask, &g_gate_bytes)) { ok = false; break; }
-                if (ready_arm >= 0) {
-                    g_ready_arm_rep_ms[ready_arm] += (now_sec() - r0) * 1000.0;
-                    g_ready_arm_bytes[ready_arm] += g_gate_bytes - rb0;
-                }
-                ds4_gpu_timeline_host_event("R %d %u", token, bad);
-            }
+                !tensor_nbytes(bl->ffn_down_exps->type, DS4_N_FF_EXP, &down_row) ||
+                !ds4_gpu_gate_repair(m->map, m->size, bad, ids, n_sel, DS4_N_EXPERT,
+                                     bl->ffn_gate_exps->abs_offset, bl->ffn_up_exps->abs_offset,
+                                     bl->ffn_down_exps->abs_offset,
+                                     gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                                     mask, &g_gate_bytes)) { ok = false; break; }
             g_gt_repair_ms += (now_sec() - gt_rep0) * 1000.0;
+            ds4_gpu_timeline_host_event("R %d %u", token, bad);
             start = bad;
             resume_from_moe = 1;
-        }
-        if (ready_pending) {
-            /* Left the loop with a repair still running: nothing waits on
-             * the event unless a continuation was committed, but the worker
-             * must be finished before anything else touches the cache. */
-            extern int ds4_gpu_gate_repair_join(unsigned long long *bytes_loaded, double *repair_ms);
-            extern void ds4_gpu_ready_signal(uint64_t v, int ready);
-            (void)ds4_gpu_gate_repair_join(&g_gate_bytes, NULL);
-            ds4_gpu_ready_signal(ready_value, 0);
-            ready_pending = false;
-            ok = false;
         }
         if (!ds4_gpu_mtl4_region_end()) ok = false;
         if (ok && ds4_gpu_gate_ungatable() != 0 &&
@@ -46299,38 +45974,6 @@ spec_done:;
     if (gate_n > gate_lo) {
         g_gt_tail_ms += (now_sec() - gt_tail0) * 1000.0;
         g_gt_wall_ms += (now_sec() - gt_token0) * 1000.0;
-        if (ready_interleave && ok) {
-            /* One block is four consecutive tokens, two of each arm; its
-             * difference is what the pairing buys. */
-            static double blk[2];
-            const double tok_ms = (now_sec() - gt_token0) * 1000.0;
-            const unsigned long long t = g_gate_tokens - 1ull;
-            blk[ready_arm] += tok_ms;
-            g_ready_arm_ms[ready_arm] += tok_ms;
-            g_ready_arm_n[ready_arm]++;
-            static double win_ms[2];
-            static unsigned long long win_n[2];
-            win_ms[ready_arm] += tok_ms;
-            win_n[ready_arm]++;
-            if ((t & 63ull) == 63ull) {
-                if (win_n[0] && win_n[1]) {
-                    const double d = win_ms[1] / win_n[1] - win_ms[0] / win_n[0];
-                    g_ready_win_sum += d;
-                    g_ready_win_sq += d * d;
-                    g_ready_win_n++;
-                }
-                win_ms[0] = win_ms[1] = 0.0;
-                win_n[0] = win_n[1] = 0;
-            }
-            if ((t & 3ull) == 3ull) {
-                const int order = (int)((t >> 2) & 1ull);
-                const double d = (blk[1] - blk[0]) / 2.0;
-                g_ready_blk_sum[order] += d;
-                g_ready_blk_sq[order] += d * d;
-                g_ready_blk_n[order]++;
-                blk[0] = blk[1] = 0.0;
-            }
-        }
         /* Every figure below covers the same 64 tokens. The report used to run
          * before this line, so the cache window held the token whose wall had
          * not been added yet, and the aborts and command buffers were running
