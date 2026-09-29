@@ -243,7 +243,7 @@ int main(int argc, char **argv) {
     ds4_gpu_backend_report("test", 0);
     ds4_engine_close(engine);
     reopened(&opt, "Explain how a modern CPU executes an instruction, from fetch "
-             "to retire, in as much detail as you can.", ref, steps < 128 ? steps : 128);
+             "to retire, in as much detail as you can.", ref, steps);
     free(ref);
     printf("%s\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;
