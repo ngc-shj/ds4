@@ -1,5 +1,14 @@
 /*
- * The Metal 4 backend: a token's segments as command buffers on one queue.
+ * The Metal 4 backend: every command batch as command buffers on one queue.
+ *
+ * Selected with the process's backend (g_backend == 4), it carries the whole
+ * request - prefill, the embedding, the gated layers, the ungated tail, the
+ * head - and the Metal 3 queue carries nothing. The batch the engine opens
+ * with ds4_gpu_begin_commands is a buffer from the pool below, and the
+ * engine's batch identity (g_batch_cb) is that buffer object, so a Metal 3
+ * call made on it by mistake stops with an unrecognised selector instead of
+ * running somewhere unordered. What follows was written when this backend
+ * owned only the gated region, and still holds for every segment.
  *
  * This is not the earlier shim, and the difference is the submission, not the
  * encoding. That one left Metal 3 owning the token and handed single segments
@@ -85,6 +94,9 @@ API_AVAILABLE(macos(26.0))
 @property (nonatomic) NSUInteger scratchUsed;
 /* Encoders opened into this buffer, held until it completes. */
 @property (nonatomic, strong) NSMutableArray *encoders;
+/* Whether anything has been encoded since it was begun. A buffer with
+ * nothing in it is not sent: it stays open and takes the next batch. */
+@property (nonatomic) BOOL used;
 /* The event value that says this buffer is done. 0 while it is being encoded. */
 @property (nonatomic) uint64_t stamp;
 /* What this buffer reaches, resident for exactly as long as it is in flight:
@@ -126,26 +138,10 @@ static NSMutableArray *g_mtl4_pool;          /* DS4MTL4Buffer, all of them */
 static DS4MTL4Encoder *g_mtl4_enc API_AVAILABLE(macos(26.0));
 static DS4MTL4Buffer *g_mtl4_cur API_AVAILABLE(macos(26.0));
 static id<MTLSharedEvent> g_mtl4_event;
-/* The Metal 3 -> Metal 4 edge at the region entry. A token arrives with the
- * embedding already in the batch buffer and the Metal 4 queue has no ordering
- * against it, so something has to express the dependency. A host wait does,
- * and costs the whole of that buffer's execution before the first segment can
- * even be encoded; an event costs nothing on the host - Metal 3 signals it at
- * the end of the buffer and the Metal 4 queue waits for it, leaving the CPU
- * free to encode the first segment while the embedding is still running.
- * DS4_METAL_V41_MTL4_SEAM_WAIT=1 puts the host wait back, as the control. */
-static id<MTLSharedEvent> g_mtl4_seam_event;
-static uint64_t g_mtl4_seam_stamp;
-
-static int ds4_mtl4_seam_wait(void) {
-    static int checked, on;
-    if (!checked) {
-        const char *e = getenv("DS4_METAL_V41_MTL4_SEAM_WAIT");
-        checked = 1;
-        on = e && e[0] ? atoi(e) != 0 : 0;
-    }
-    return on;
-}
+/* Defined with the Metal 3 wait below; the GPU's own span of what a wait
+ * covered, from each buffer's feedback, goes into the same accumulator. */
+static double g_gpu_span_accum_ms;
+static uint64_t g_gpu_span_cbs;
 static uint64_t g_mtl4_stamp;                /* last value handed to a commit */
 static uint64_t g_mtl4_done;                 /* last value waited for */
 static int g_mtl4_region;                    /* inside the gated region */
@@ -204,14 +200,34 @@ void ds4_gpu_mtl4_note_metal3_work(const char *what) {
 static unsigned long long g_mtl4_res_adds, g_mtl4_res_releases, g_mtl4_res_peak;
 
 static void ds4_mtl4_mark_resident(id<MTLResource> r) API_AVAILABLE(macos(26.0));
+/* The open buffer's generation, and a direct-mapped memo of which resources
+ * were marked in it. The engine binds the same few hundred buffers thousands
+ * of times a token; a hash-table probe and three message sends for each of
+ * those binds was host encode time the Metal 3 encoder does not spend. A hit
+ * is exact: the entry is written only after the mark, and the buffer holds
+ * every resource it marked until it completes, so an address in the memo
+ * cannot be reused by another object within the same generation. A miss just
+ * falls through to the table. */
+static uint32_t g_mtl4_gen;
+#define DS4_MTL4_MARK_MEMO 4096u
+static struct { const void *res; uint32_t gen; } g_mtl4_mark_memo[DS4_MTL4_MARK_MEMO];
+
 static void ds4_mtl4_mark_resident(id<MTLResource> r) {
+    if (!r) return;
+    const void *key = (__bridge const void *)r;
+    const uintptr_t k = (uintptr_t)key;
+    const uint32_t slot = (uint32_t)((k >> 4) ^ (k >> 16)) & (DS4_MTL4_MARK_MEMO - 1u);
+    if (g_mtl4_mark_memo[slot].res == key && g_mtl4_mark_memo[slot].gen == g_mtl4_gen) return;
     DS4MTL4Buffer *b = g_mtl4_cur;
-    if (!r || !b || !b.resset) return;
-    if ([b.resident containsObject:r]) return;
-    [b.resident addObject:r];
-    [b.resset addAllocation:r];
-    b.resBytes += [r allocatedSize];
-    g_mtl4_res_adds++;
+    if (!b || !b.resset) return;
+    if (![b.resident containsObject:r]) {
+        [b.resident addObject:r];
+        [b.resset addAllocation:r];
+        b.resBytes += [r allocatedSize];
+        g_mtl4_res_adds++;
+    }
+    g_mtl4_mark_memo[slot].res = key;
+    g_mtl4_mark_memo[slot].gen = g_mtl4_gen;
 }
 
 /* Residency sets the engine attaches to the Metal 3 queue. The Metal 4 queue
@@ -219,6 +235,8 @@ static void ds4_mtl4_mark_resident(id<MTLResource> r) {
  * reached by raw address from the masked kernels - nothing else declares them.
  * A segment without these faults in AGX on its first dispatch. */
 static NSMutableArray *g_mtl4_queue_sets;
+/* How many of g_mtl4_queue_sets, from the front, the queue holds. */
+static NSUInteger g_mtl4_sets_attached_n;
 API_AVAILABLE(macos(26.0)) static void ds4_mtl4_attach_sets(void);
 
 void ds4_gpu_queue_residency_added(id set) {
@@ -228,17 +246,32 @@ void ds4_gpu_queue_residency_added(id set) {
     if (@available(macOS 26.0, *)) { if (g_mtl4_queue) ds4_mtl4_attach_sets(); }
 }
 
+/* The Metal 3 side dropped a set - a model released, an expert table freed.
+ * The Metal 4 queue lets go of it too, or it would hold what the set covers
+ * resident for the life of the process. */
+void ds4_gpu_queue_residency_removed(id set) {
+    if (!set || !g_mtl4_queue_sets) return;
+    const NSUInteger i = [g_mtl4_queue_sets indexOfObject:set];
+    if (i == NSNotFound) return;
+    if (@available(macOS 26.0, *)) {
+        if (g_mtl4_queue && i < g_mtl4_sets_attached_n) {
+            [g_mtl4_queue removeResidencySet:set];
+            g_mtl4_sets_attached_n--;
+        }
+    }
+    [g_mtl4_queue_sets removeObjectAtIndex:i];
+}
+
 /* Sets attached to the Metal 4 queue, counted: a set the Metal 3 queue has and
  * this one lacks makes what it holds unreadable here without a fault. */
 static unsigned long long g_mtl4_sets_attached;
 unsigned long long ds4_gpu_mtl4_sets_attached(void) { return g_mtl4_sets_attached; }
 
 static void ds4_mtl4_attach_sets(void) {
-    static NSUInteger attached;
     if (!g_mtl4_queue) return;
-    while (attached < g_mtl4_queue_sets.count) {
-        [g_mtl4_queue addResidencySet:g_mtl4_queue_sets[attached]];
-        attached++;
+    while (g_mtl4_sets_attached_n < g_mtl4_queue_sets.count) {
+        [g_mtl4_queue addResidencySet:g_mtl4_queue_sets[g_mtl4_sets_attached_n]];
+        g_mtl4_sets_attached_n++;
         g_mtl4_sets_attached++;
     }
 }
@@ -246,7 +279,7 @@ static void ds4_mtl4_attach_sets(void) {
 @implementation DS4MTL4Encoder
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
-    [self.enc setComputePipelineState:state];
+    [_enc setComputePipelineState:state];
 }
 
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
@@ -257,9 +290,9 @@ static void ds4_mtl4_attach_sets(void) {
     }
     /* setBuffer:nil clears the slot in Metal 3; skipping the call would leave
      * whatever the slot held. */
-    if (!buffer) { [self.table setAddress:0 atIndex:index]; return; }
+    if (!buffer) { [_table setAddress:0 atIndex:index]; return; }
     ds4_mtl4_mark_resident(buffer);
-    [self.table setAddress:buffer.gpuAddress + offset atIndex:index];
+    [_table setAddress:buffer.gpuAddress + offset atIndex:index];
 }
 
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
@@ -268,7 +301,7 @@ static void ds4_mtl4_attach_sets(void) {
                 (unsigned long)index, DS4_MTL4_MAX_BINDINGS);
         abort();
     }
-    DS4MTL4Buffer *b = self.owner;
+    DS4MTL4Buffer *b = g_mtl4_cur;
     id<MTLBuffer> s = b.scratch;
     const NSUInteger off = (b.scratchUsed + DS4_MTL4_SCRATCH_ALIGN - 1u) &
                            ~(NSUInteger)(DS4_MTL4_SCRATCH_ALIGN - 1u);
@@ -284,11 +317,11 @@ static void ds4_mtl4_attach_sets(void) {
      * declares it, and a buffer that is not resident reads as whatever the
      * page holds. */
     ds4_mtl4_mark_resident(s);
-    [self.table setAddress:s.gpuAddress + off atIndex:index];
+    [_table setAddress:s.gpuAddress + off atIndex:index];
 }
 
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index {
-    [self.enc setThreadgroupMemoryLength:length atIndex:index];
+    [_enc setThreadgroupMemoryLength:length atIndex:index];
 }
 
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage {
@@ -318,7 +351,7 @@ static void ds4_mtl4_attach_sets(void) {
  * the DAG, one edge at a time, against a byte comparison. */
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
     (void)scope;
-    [self.enc barrierAfterEncoderStages:MTLStageAll
+    [_enc barrierAfterEncoderStages:MTLStageAll
                     beforeEncoderStages:MTLStageAll
                       visibilityOptions:ds4_mtl4_visibility()];
 }
@@ -330,8 +363,8 @@ static void ds4_mtl4_attach_sets(void) {
 
 - (void)dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt {
     g_mtl4_dispatches++;
-    [self.enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
-    if (self.barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [_enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer
@@ -339,15 +372,15 @@ static void ds4_mtl4_attach_sets(void) {
                          threadsPerThreadgroup:(MTLSize)tpt {
     ds4_mtl4_mark_resident(indirectBuffer);
     g_mtl4_dispatches++;
-    [self.enc dispatchThreadgroupsWithIndirectBuffer:indirectBuffer.gpuAddress + offset
+    [_enc dispatchThreadgroupsWithIndirectBuffer:indirectBuffer.gpuAddress + offset
                                threadsPerThreadgroup:tpt];
-    if (self.barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt {
     g_mtl4_dispatches++;
-    [self.enc dispatchThreads:threads threadsPerThreadgroup:tpt];
-    if (self.barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [_enc dispatchThreads:threads threadsPerThreadgroup:tpt];
+    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 - (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)soff
@@ -359,10 +392,10 @@ static void ds4_mtl4_attach_sets(void) {
      * the commands of an encoder concurrently. The engine issues this where
      * Metal 3 gave it a whole encoder boundary, so it is ordered on both
      * sides here. */
-    if (self.barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
-    [self.enc copyFromBuffer:src sourceOffset:soff
+    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [_enc copyFromBuffer:src sourceOffset:soff
                     toBuffer:dst destinationOffset:doff size:size];
-    if (self.barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 - (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
@@ -383,15 +416,15 @@ static void ds4_mtl4_attach_sets(void) {
      * the next encoder in the buffer reads what this one produced - neither
      * edge is a dispatch-to-dispatch edge inside one encoder, which is why
      * rearranging those never moved the answer. */
-    [self.enc barrierAfterStages:MTLStageAll
+    [_enc barrierAfterStages:MTLStageAll
                beforeQueueStages:MTLStageAll
                visibilityOptions:ds4_mtl4_visibility()];
-    [self.enc endEncoding];
+    [_enc endEncoding];
 }
 
 - (MTLDispatchType)dispatchType { return MTLDispatchTypeConcurrent; }
-- (NSString *)label { return self.enc.label; }
-- (void)setLabel:(NSString *)label { self.enc.label = label; }
+- (NSString *)label { return _enc.label; }
+- (void)setLabel:(NSString *)label { _enc.label = label; }
 
 @end
 
@@ -409,7 +442,7 @@ static int ds4_mtl4_level(void) {
     return level;
 }
 
-static int ds4_mtl4_on(void) { return ds4_mtl4_level() != 0; }
+static int ds4_mtl4_on(void) { return g_backend == 4; }
 
 
 /* Whether a Metal 4 command buffer is open and taking the engine's work. */
@@ -497,6 +530,7 @@ static void ds4_mtl4_release_completed(void) {
 typedef struct {
     _Atomic uint64_t stamp;     /* the stamp this slot last reported */
     _Atomic int failed;
+    double gpu_ms;              /* GPUEndTime - GPUStartTime, published by stamp */
 } ds4_mtl4_fb_slot;
 static ds4_mtl4_fb_slot g_mtl4_fb[DS4_MTL4_FB_RING];
 static _Atomic unsigned long long g_mtl4_fb_received, g_mtl4_fb_errors;
@@ -507,8 +541,9 @@ static _Atomic unsigned long long g_mtl4_fb_received, g_mtl4_fb_errors;
 static _Atomic int g_mtl4_inject;
 void ds4_gpu_mtl4_inject_failure(void) { atomic_store(&g_mtl4_inject, 1); }
 
-static void ds4_mtl4_fb_note(uint64_t stamp, NSError *error) {
+static void ds4_mtl4_fb_note(uint64_t stamp, NSError *error, double gpu_ms) {
     ds4_mtl4_fb_slot *slot = &g_mtl4_fb[stamp % DS4_MTL4_FB_RING];
+    slot->gpu_ms = gpu_ms > 0.0 ? gpu_ms : 0.0;
     if (!error && atomic_exchange(&g_mtl4_inject, 0))
         error = [NSError errorWithDomain:@"ds4.injected" code:1
                                 userInfo:@{NSLocalizedDescriptionKey: @"injected failure"}];
@@ -526,12 +561,18 @@ static void ds4_mtl4_fb_note(uint64_t stamp, NSError *error) {
  * Returns 0 if any of them failed, or if a report did not arrive; in the second
  * case nothing is marked done, so a later wait looks again. */
 static int ds4_mtl4_wait_to(uint64_t value) {
-    if (value <= g_mtl4_done) return 1;
+    if (value <= g_mtl4_done) {
+        if (!g_mtl4_encode_error) return 1;
+        fprintf(stderr, "ds4: Metal 4 batch was short of commands it was given; failing it\n");
+        g_mtl4_encode_error = 0;
+        return 0;
+    }
     if (value - g_mtl4_done > DS4_MTL4_FB_RING) {
         fprintf(stderr, "ds4: Metal 4 wait spans %llu buffers, past the feedback ring\n",
                 (unsigned long long)(value - g_mtl4_done));
         return 0;
     }
+    DS4_M4_NOTE("wait", DS4_BK_WAIT);
     const BOOL ok = [g_mtl4_event waitUntilSignaledValue:value timeoutMS:600000];
     if (!ok) {
         fprintf(stderr, "ds4: Metal 4 command buffer timed out\n");
@@ -541,17 +582,36 @@ static int ds4_mtl4_wait_to(uint64_t value) {
     for (uint64_t st = g_mtl4_done + 1u; st <= value; st++) {
         ds4_mtl4_fb_slot *slot = &g_mtl4_fb[st % DS4_MTL4_FB_RING];
         /* The feedback is delivered on its own queue; the event can be seen
-         * first. */
-        for (int spin = 0; atomic_load(&slot->stamp) != st && spin < 500000; spin++)
-            usleep(10);
+         * first. It follows within microseconds, and a usleep(10) here slept
+         * tens of them per segment - about seventeen times a token - so the
+         * first few milliseconds are spun rather than slept. */
+        if (atomic_load(&slot->stamp) != st) {
+            const uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            uint64_t t = t0;
+            while (atomic_load(&slot->stamp) != st && t - t0 < 5000000ull) {
+                __builtin_arm_yield();
+                t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+            }
+            for (int nap = 0; atomic_load(&slot->stamp) != st && nap < 500000; nap++)
+                usleep(10);
+            g_mtl4_fb_late++;
+            g_mtl4_fb_late_ns += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0;
+        }
         if (atomic_load(&slot->stamp) != st) {
             fprintf(stderr, "ds4: Metal 4 command buffer %llu completed without feedback\n",
                     (unsigned long long)st);
             return 0;
         }
         if (atomic_load(&slot->failed)) good = 0;
+        g_gpu_span_accum_ms += slot->gpu_ms;
+        g_gpu_span_cbs++;
     }
     g_mtl4_done = value;
+    if (g_mtl4_encode_error) {
+        fprintf(stderr, "ds4: Metal 4 batch was short of commands it was given; failing it\n");
+        g_mtl4_encode_error = 0;
+        good = 0;
+    }
     if (@available(macOS 26.0, *)) ds4_mtl4_release_completed();
     return good;
 }
@@ -579,7 +639,7 @@ static DS4MTL4Buffer *ds4_mtl4_take(void) {
 
 static int ds4_mtl4_begin(void) {
     if (@available(macOS 26.0, *)) {
-        if (!g_mtl4_region || !ds4_mtl4_on()) return 0;
+        if (!ds4_mtl4_on()) return 0;
         if (g_mtl4_cur) return 1;
         if (!ds4_mtl4_ready()) return 0;
         DS4MTL4Buffer *b = ds4_mtl4_take();
@@ -588,8 +648,11 @@ static int ds4_mtl4_begin(void) {
         [b.cb beginCommandBufferWithAllocator:b.allocator];
         b.scratchUsed = 0;
         b.stamp = 0;
+        b.used = NO;
         [b.encoders removeAllObjects];
         g_mtl4_cur = b;
+        /* 0 is never a live generation, so a zeroed memo entry never hits. */
+        if (++g_mtl4_gen == 0) ++g_mtl4_gen;
         /* Proof the path ran, not that it was asked for. Byte identity from a
          * backend that silently fell back is byte identity from the backend it
          * fell back to. */
@@ -631,8 +694,9 @@ static int ds4_mtl4_commit(void) {
         const uint64_t stamp = g_mtl4_stamp + 1u;
         MTL4CommitOptions *opts = [MTL4CommitOptions new];
         [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
-            ds4_mtl4_fb_note(stamp, fb.error);
+            ds4_mtl4_fb_note(stamp, fb.error, (fb.GPUEndTime - fb.GPUStartTime) * 1000.0);
         }];
+        DS4_M4_NOTE("segment", DS4_BK_COMMIT);
         [g_mtl4_queue commit:&one count:1 options:opts];
         b.stamp = ++g_mtl4_stamp;
         g_mtl4_commits++;
@@ -665,6 +729,7 @@ static void ds4_mtl4_discard(void) {
         [b.cb beginCommandBufferWithAllocator:b.allocator];
         b.scratchUsed = 0;
         b.stamp = 0;
+        b.used = NO;
     }
 }
 
@@ -679,8 +744,10 @@ static id<DS4Encoder> ds4_mtl4_encoder(void) {
     id<MTL4ComputeCommandEncoder> e = [g_mtl4_cur.cb computeCommandEncoder];
     if (!e) {
         fprintf(stderr, "ds4: Metal 4 encoder unavailable\n");
+        g_mtl4_encode_error = 1;
         return nil;
     }
+    g_mtl4_cur.used = YES;
     [e setArgumentTable:g_mtl4_table];
     /* Metal 3 serialises one compute encoder after another; Metal 4 does not,
      * and an encoder opened after another in the same buffer runs beside it
@@ -727,6 +794,10 @@ static int ds4_mtl4_copy(id<MTLBuffer> src, NSUInteger soff,
     if (!g_mtl4_cur) return 0;
     id<DS4Encoder> e = ds4_mtl4_encoder();
     if (!e) return 0;
+    if (!src || !dst) {
+        g_mtl4_encode_error = 1;
+        return 0;
+    }
     [(DS4MTL4Encoder *)e copyFromBuffer:src sourceOffset:soff
                                toBuffer:dst destinationOffset:doff size:size];
     return 1;
@@ -734,42 +805,12 @@ static int ds4_mtl4_copy(id<MTLBuffer> src, NSUInteger soff,
 
 /* ---- what the engine calls --------------------------------------------- */
 
-/* The gated region is where this backend owns the token. Outside it the
- * ordinary Metal 3 path runs, and the boundary is a drain the engine already
- * performs, so the two never hold work at the same time. */
+/* The gated region is a span of the token the engine marks; with the whole
+ * batch already on this backend there is no seam to drain at its edges, so
+ * entering it only says so. */
 void ds4_gpu_mtl4_region_begin(void) {
     if (!ds4_mtl4_on()) return;
-    if (@available(macOS 26.0, *)) {
-        /* A token reaches here with a batch already open and work in it - the
-         * embedding and everything ahead of the gated region. Opening a Metal
-         * 4 buffer over the top of that would put the region's first segment
-         * on a queue that has no ordering against it, and the Metal 3 buffer
-         * is committed after, so its work would land after the segment that
-         * reads it. Drain first: this is the seam between the two backends,
-         * and it is a wait, not a barrier, because nothing else orders two
-         * queues. */
-        if (!ds4_mtl4_ready()) return;
-        if (g_batch_cb && g_batch_has_work && ds4_mtl4_seam_wait()) {
-            if (!ds4_gpu_flush_commands()) return;
-            if (!ds4_gpu_wait_committed()) return;
-        } else if (g_batch_cb && g_batch_has_work) {
-            if (!g_mtl4_seam_event) {
-                g_mtl4_seam_event = [g_device newSharedEvent];
-                if (!g_mtl4_seam_event) return;
-            }
-            ds4_gpu_close_batch_encoder();
-            [g_batch_cb encodeSignalEvent:g_mtl4_seam_event
-                                    value:++g_mtl4_seam_stamp];
-            g_m3_cb_has_work = YES;
-            if (!ds4_gpu_flush_commands()) return;
-            /* Applies to everything committed to this queue after it, which
-             * is every segment of the region. */
-            [g_mtl4_queue waitForEvent:g_mtl4_seam_event value:g_mtl4_seam_stamp];
-        }
-        ds4_gpu_close_batch_encoder();
-        g_mtl4_region = 1;
-        (void)ds4_mtl4_begin();
-    }
+    g_mtl4_region = 1;
 }
 
 /* Whether the Metal 4 backend is on for this process: the verify executor runs
@@ -797,14 +838,98 @@ void ds4_gpu_mtl4_health(unsigned long long out[8]) {
     out[7] = g_mtl4_res_peak;
 }
 
+/* Leaving the region waits for what the region committed and leaves the open
+ * batch open: the token goes on encoding into it, as it does on Metal 3,
+ * where the region's edge is not a drain either. */
 int ds4_gpu_mtl4_region_end(void) {
-    int ok = 1;
+    if (!ds4_mtl4_on()) return 1;
+    g_mtl4_region = 0;
+    return ds4_mtl4_wait_all();
+}
+
+/* ---- the batch, for ds4_metal.m's begin/flush/end ---------------------- */
+
+/* The buffer the engine's batch is: what g_batch_cb holds under this backend. */
+static id ds4_mtl4_batch_identity(void) {
+    if (@available(macOS 26.0, *)) return g_mtl4_cur;
+    return nil;
+}
+
+/* Whether the open buffer has anything in it. */
+static int ds4_mtl4_cur_used(void) {
+    if (@available(macOS 26.0, *)) return g_mtl4_cur && g_mtl4_cur.used;
+    return 0;
+}
+
+/* Send the open buffer if it has work, and open the next one. Returns 0 if a
+ * buffer could not be had; the commit itself reports through its feedback. */
+static int ds4_mtl4_rotate(void) {
     if (@available(macOS 26.0, *)) {
-        if (g_mtl4_cur && !ds4_mtl4_commit()) ok = 0;
-        if (!ds4_mtl4_wait_all()) ok = 0;
-        g_mtl4_region = 0;
+        if (ds4_mtl4_cur_used() && !ds4_mtl4_commit()) return 0;
+        return ds4_mtl4_begin();
     }
-    return ok;
+    return 0;
+}
+
+/* The stamp everything encoded so far will have completed by, once the open
+ * buffer is sent: what a "signal here" means on a queue whose buffers are
+ * the unit of completion. */
+static uint64_t ds4_mtl4_last_stamp(void) { return g_mtl4_stamp; }
+
+/* ---- the queue keepalive ----------------------------------------------- */
+
+/* The keepalive exists because a queue left idle for about three seconds
+ * loses the process's GPU mappings and the next buffer on it starts 600-800
+ * ms late, and work on other queues does not prevent it. With this backend
+ * selected the queue doing the work is this one, so the keepalive's kernel
+ * goes here. It runs on its own thread, so it has its own allocator, buffer,
+ * table and residency, and its own event: nothing it does touches the
+ * engine's pool or stamps. Returns 0 if it could not submit. */
+int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
+                            id<MTLBuffer> args) API_AVAILABLE(macos(26.0));
+int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
+                            id<MTLBuffer> args) {
+    static id<MTL4CommandAllocator> alloc;
+    static id<MTL4CommandBuffer> cb;
+    static id<MTL4ArgumentTable> table;
+    static id<MTLResidencySet> res;
+    static id<MTLSharedEvent> ev;
+    static uint64_t sent;
+    id<MTL4CommandQueue> q = g_mtl4_queue;
+    if (!q || !pipeline || !scratch || !args) return 0;
+    if (!alloc) {
+        alloc = [g_device newCommandAllocator];
+        cb = [g_device newCommandBuffer];
+        MTL4ArgumentTableDescriptor *d = [MTL4ArgumentTableDescriptor new];
+        d.maxBufferBindCount = 2;
+        d.initializeBindings = YES;
+        table = [g_device newArgumentTableWithDescriptor:d error:nil];
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+        rd.label = @"ds4_mtl4_keepalive";
+        res = [g_device newResidencySetWithDescriptor:rd error:nil];
+        ev = [g_device newSharedEvent];
+        if (!alloc || !cb || !table || !res || !ev) { alloc = nil; return 0; }
+        [res addAllocation:scratch];
+        [res addAllocation:args];
+        [res commit];
+    }
+    /* The allocator is reset only once the previous kernel has run. */
+    if (sent && ![ev waitUntilSignaledValue:sent timeoutMS:10000]) return 0;
+    [alloc reset];
+    [cb beginCommandBufferWithAllocator:alloc];
+    [cb useResidencySet:res];
+    id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setArgumentTable:table];
+    [e setComputePipelineState:pipeline];
+    [table setAddress:scratch.gpuAddress atIndex:0];
+    [table setAddress:args.gpuAddress atIndex:1];
+    [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+    [cb endCommandBuffer];
+    id<MTL4CommandBuffer> one = cb;
+    [q commit:&one count:1];
+    [q signalEvent:ev value:++sent];
+    return 1;
 }
 
 #endif  /* macOS 26 SDK */

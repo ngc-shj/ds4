@@ -244,6 +244,12 @@ tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
 
+tests/test_deepseek41_backend.o: tests/test_deepseek41_backend.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_deepseek41_backend: tests/test_deepseek41_backend.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1068,7 +1074,7 @@ clean:
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
-	rm -f tests/test_deepseek41_metal
+	rm -f tests/test_deepseek41_metal tests/test_deepseek41_backend
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows
 	rm -f tests/test_cuda_reductions

@@ -14300,6 +14300,9 @@ decode_again:
                    "ds4-server: token ids: %d, hash %016llx, stop %s token %d, every 64: %s",
                    completion, (unsigned long long)id_hash, stop_detail, stop_token,
                    marks[0] ? marks : "-");
+        /* Everything since the previous request's report: this request's
+         * prefill, decode and teardown, by backend and site. */
+        ds4_engine_backend_report("request", (unsigned long long)completion);
         /* prompt ids | generated ids, the format bench/draft-eval.py reads. */
         const int n_prompt = prompt_for_sync ? prompt_for_sync->len : 0;
         const size_t cap = (size_t)(n_prompt + n_gen_ids + 2) * 12u + 32u;

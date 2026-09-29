@@ -70289,6 +70289,14 @@ void ds4_engine_mtl4_health(unsigned long long out[8]) {
 #endif
 }
 
+void ds4_engine_backend_report(const char *tag, unsigned long long tokens) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    ds4_gpu_backend_report(tag, tokens);
+#else
+    (void)tag; (void)tokens;
+#endif
+}
+
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && ds4_model_is_qwen4()) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend != DS4_BACKEND_CPU ? 2 : 0;

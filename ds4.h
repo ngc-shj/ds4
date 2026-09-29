@@ -601,6 +601,7 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e);
  * bytes held by buffers in flight, adds, releases, peak bytes; zeros without
  * the Metal 4 backend. */
 void ds4_engine_mtl4_health(unsigned long long out[8]);
+void ds4_engine_backend_report(const char *tag, unsigned long long tokens);
 /* Router finalize: fused calls, generic calls, fallbacks, then compare-mode
  * mismatches in probabilities, ids and weights, and compare calls. */
 void ds4_engine_router_counts(unsigned long long out[7]);
