@@ -10306,7 +10306,14 @@ int ds4_gpu_flush_commands(void) {
          * logical batch advances either way, which is what the expert cache's
          * in-flight sequence is keyed on. */
         int ok = 0;
+        const uint64_t batch_seq = g_stream_expert_cache_batch_seq;
+        const uint64_t stamp_before = g_mtl4_stamp;
         if (@available(macOS 26.0, *)) ok = ds4_mtl4_rotate();
+        /* Which logical batch each stamp carried, so a wait that stops short
+         * of the newest buffer completes the expert cache's in-flight marks
+         * up to that buffer and no further. */
+        if (g_mtl4_stamp != stamp_before)
+            g_mtl4_stamp_seq[g_mtl4_stamp % DS4_MTL4_FB_RING] = batch_seq;
         g_batch_has_work = g_m3_cb_has_work = NO;
         ds4_gpu_stream_expert_cache_note_batch_committed();
         ds4_gpu_ledger_origin("flush");
@@ -10346,6 +10353,31 @@ int ds4_gpu_flush_commands(void) {
         return 0;
     }
     return 1;
+}
+
+/* A point in what has been committed, and a wait for everything up to it and
+ * nothing after. The gated decode commits the next segment before it looks at
+ * the current one's result, and then waits for the current one only; waiting
+ * for everything would put the host round trip back between the two. Under
+ * Metal 3 there is no such point and the wait covers everything. */
+int ds4_gpu_commit_ahead_supported(void) { return g_backend == 4; }
+
+uint64_t ds4_gpu_commit_mark(void) {
+    return g_backend == 4 ? g_mtl4_stamp : 0;
+}
+
+int ds4_gpu_wait_mark(uint64_t mark) {
+    if (g_backend != 4 || mark == 0) return ds4_gpu_wait_committed();
+    ds4_note_boundary("wait mark", __builtin_return_address(0));
+    int ok = 1;
+    if (@available(macOS 26.0, *)) ok = ds4_mtl4_wait_to(mark);
+    const uint64_t seq = g_mtl4_stamp_seq[mark % DS4_MTL4_FB_RING];
+    if (seq > g_stream_expert_cache_done_seq) g_stream_expert_cache_done_seq = seq;
+    if (!ok) {
+        ds4_gpu_invalidate_completion_counters();
+        ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
+    }
+    return ok;
 }
 
 /* Encode-ahead needs the two halves of end_commands apart: commit the segment
@@ -16856,6 +16888,43 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     /* The grid table is written here and read as indirect arguments by the
      * dispatches after it. Ordering that on having watched it work a hundred
      * times is not a guarantee; this is the one Metal documents. */
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    return 1;
+}
+
+/* The first thing a commit-ahead segment does: re-apply the abort of the
+ * segment ahead of it, after the host's writes to this segment's grid entries
+ * (see kernel_dsv41_gate_reassert). It is itself plain - it is what does the
+ * switching off - and a barrier orders everything after it. */
+static id<MTLComputePipelineState> g_gate_reassert_pso;
+int ds4_gpu_gate_encode_reassert(uint32_t prev_slot) {
+    if (!g_gate_layers || !g_batch_cb || !g_gate_grid || !g_gate_miss) return 0;
+    if (!g_gate_range) {
+        g_gate_range = [g_device newBufferWithLength:DS4_GATE_MISS_SLOTS * 2u * sizeof(uint32_t)
+                                             options:MTLResourceStorageModeShared];
+        if (!g_gate_range) return 0;
+        memset([g_gate_range contents], 0, DS4_GATE_MISS_SLOTS * 2u * sizeof(uint32_t));
+        g_gate_range.label = @"ds4_gate_range";
+    }
+    if (!g_gate_reassert_pso) {
+        g_gate_reassert_pso = ds4_gpu_get_pipeline("kernel_dsv41_gate_reassert");
+        if (!g_gate_reassert_pso) {
+            fprintf(stderr, "ds4: abort gate has no reassert pipeline\n");
+            return 0;
+        }
+    }
+    id<DS4Encoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    if (!enc) return 0;
+    [enc setComputePipelineState:g_gate_reassert_pso];
+    [enc setBuffer:g_gate_miss
+            offset:(NSUInteger)(prev_slot % DS4_GATE_MISS_SLOTS) * DS4_GATE_MISS_WORDS * sizeof(uint32_t)
+           atIndex:0];
+    [enc setBuffer:g_gate_grid offset:0 atIndex:1];
+    [enc setBuffer:g_gate_range
+            offset:(NSUInteger)(ds4_gpu_gate_encode_slot() % DS4_GATE_MISS_SLOTS) * 2u * sizeof(uint32_t)
+           atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     ds4_gpu_end_compute_encoder(g_batch_cb, enc);
     return 1;

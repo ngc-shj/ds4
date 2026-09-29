@@ -62,6 +62,8 @@ unsigned long long ds4_gpu_gate_direct_total(void); /* prefix dispatches left pl
 int  ds4_gpu_gate_armed(void);       /* a validate has been encoded in this buffer */
 void ds4_gpu_gate_arm(void);
 unsigned long long ds4_gpu_gate_slots_left_live(uint32_t slot);  /* gate failures */
+unsigned long long ds4_gpu_gate_segment_live(uint32_t slot);  /* live slots in one segment */
+int  ds4_gpu_gate_encode_reassert(uint32_t prev_slot);  /* in ds4_metal.m */
 void ds4_gpu_gate_print_ungatable(void);
 void ds4_gpu_gate_print_sites(unsigned long long tokens);
 void ds4_gpu_gate_census_settle(uint32_t aborted_layer);  /* after the buffer completes */
@@ -82,6 +84,10 @@ static _Atomic int g_gate_active;             /* dispatches are being gated now 
 static uint32_t g_gate_seg_seq;
 static uint32_t g_gate_encode_slot;
 static uint32_t g_gate_seg_slot_base[DS4_GATE_MISS_SLOTS];
+static uint32_t g_gate_seg_slot_end[DS4_GATE_MISS_SLOTS];
+/* {first, one past last} slot of each miss slot's segment, for the GPU:
+ * written by the host at segment_end, before the segment is committed. */
+static id<MTLBuffer> g_gate_range;
 /* Nothing in a command buffer can have aborted before the first validate in
  * it: the miss record is cleared on the host before the buffer is built, the
  * previous buffer has already completed, and the validate kernel is the only
@@ -508,8 +514,29 @@ void ds4_gpu_gate_segment_end(void) {
      * too large, which is the average segment's position in the token. */
     const uint32_t now = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
     const uint32_t base = g_gate_seg_slot_base[g_gate_encode_slot % DS4_GATE_MISS_SLOTS];
+    g_gate_seg_slot_end[g_gate_encode_slot % DS4_GATE_MISS_SLOTS] = now;
+    if (g_gate_range) {
+        uint32_t *r = (uint32_t *)[g_gate_range contents] +
+                      2u * (g_gate_encode_slot % DS4_GATE_MISS_SLOTS);
+        r[0] = base;
+        r[1] = now;
+    }
     atomic_fetch_add_explicit(&g_gate_slots_total, now > base ? now - base : 0u,
                               memory_order_relaxed);
+}
+
+/* Every slot one segment took that is still live, read after it completed. A
+ * segment committed behind one that aborted must have been switched off whole
+ * by that abort; anything left here ran on inputs the abort had invalidated. */
+unsigned long long ds4_gpu_gate_segment_live(uint32_t slot) {
+    if (!g_gate_layers || !g_gate_grid) return 0;
+    const uint32_t base = g_gate_seg_slot_base[slot % DS4_GATE_MISS_SLOTS];
+    const uint32_t end = g_gate_seg_slot_end[slot % DS4_GATE_MISS_SLOTS];
+    const uint32_t *grid = (const uint32_t *)[g_gate_grid contents];
+    unsigned long long live = 0;
+    for (uint32_t i = base; i < end && i < DS4_GATE_MAX_SLOTS; i++)
+        if (grid[3u * i] | grid[3u * i + 1u] | grid[3u * i + 2u]) live++;
+    return live;
 }
 
 unsigned long long ds4_gpu_gate_slots_total(void) {

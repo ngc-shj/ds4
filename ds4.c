@@ -45443,6 +45443,22 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
          * encode rather than all of it. */
         bool prepared = false;
         uint32_t prep_slot = 0, prep_start = 0, prep_end = 0;
+        /* Commit-ahead: the prepared segment is committed as soon as it is
+         * encoded, and the pass waits for the segment before it only. The
+         * GPU then goes from one segment to the next without waiting for the
+         * host to read a miss word, which cost about 0.9 ms a token of the
+         * GPU standing idle. It is safe because the prepared segment is gated
+         * from its first dispatch: if the segment ahead of it aborts, that
+         * abort's validate zeroes every slot of this one, which is checked
+         * after the fact. Metal 4 only - it needs a wait that stops short of
+         * the newest buffer. */
+        extern uint64_t ds4_gpu_commit_mark(void);
+        extern int ds4_gpu_wait_mark(uint64_t mark);
+        extern int ds4_gpu_commit_ahead_supported(void);
+        extern void ds4_gpu_gate_arm(void);
+        extern unsigned long long ds4_gpu_gate_segment_live(uint32_t slot);
+        const bool commit_ahead = ds41_gate_encode_ahead() && ds4_gpu_commit_ahead_supported();
+        uint64_t prep_mark = 0;
         /* One token's recorded routes, written once. Writing a layer's slice
          * as the layer is encoded would put a host store to a shared buffer
          * under a segment that may still be reading it.
@@ -45704,6 +45720,9 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
              * segment's, now that the slot cursor runs on across a token
              * instead of rewinding between segments. */
             if (!ds4_gpu_flush_commands()) { ok = false; break; }
+            /* The point this segment was committed at: this pass's flush, or
+             * the previous pass's commit-ahead if the segment was adopted. */
+            const uint64_t seg_mark = adopt && commit_ahead ? prep_mark : ds4_gpu_commit_mark();
             static int trace_rev_written;
             if (!trace_rev_written) {
                 trace_rev_written = 1;
@@ -45754,6 +45773,13 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
                 }
                 if (spec_end <= spec_start) goto spec_done;
                 spec_slot = ds4_gpu_gate_segment_begin();
+                /* Gated from its first dispatch, since it will run before the
+                 * host knows whether the segment ahead of it aborted. */
+                if (commit_ahead) {
+                    extern int ds4_gpu_gate_encode_reassert(uint32_t prev_slot);
+                    ds4_gpu_gate_arm();
+                    if (!ds4_gpu_gate_encode_reassert(seg_slot)) ok = false;
+                }
                 for (uint32_t il = spec_start; ok && il < spec_end; il++) {
                     ds4_gpu_gate_layer_begin(il);
                     const ds4_layer_weights *sl = &w->layer[il];
@@ -45785,11 +45811,16 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
                     prep_slot = spec_slot;
                     prep_start = spec_start;
                     prep_end = spec_end;
+                    if (commit_ahead) {
+                        if (!ds4_gpu_flush_commands()) ok = false;
+                        prep_mark = ds4_gpu_commit_mark();
+                    }
                 }
             }
 spec_done:;
             const double seg_t2b = now_sec();
-            if (ok && !ds4_gpu_wait_committed()) ok = false;
+            if (ok && !(commit_ahead && prepared ? ds4_gpu_wait_mark(seg_mark)
+                                                 : ds4_gpu_wait_committed())) ok = false;
             if (!ok) break;
             const double seg_t3 = now_sec();
             g_gate_encode_ms += (seg_t1 - seg_t0) * 1000.0;
@@ -45817,9 +45848,15 @@ spec_done:;
             }
             if (prepared) {
                 /* This segment aborted, so what was encoded after it is wrong.
-                 * It was never committed, so dropping it costs nothing. */
+                 * Without commit-ahead it was never committed and is dropped.
+                 * With it, it has run, switched off by this abort: wait for
+                 * it, and count any of its slots still live as a gate failure
+                 * - that would be work done on invalidated inputs. */
                 g_gate_ahead_dropped++;
-                if (!ds4_gpu_discard_commands()) { ok = false; break; }
+                if (commit_ahead) {
+                    if (!ds4_gpu_wait_committed()) { ok = false; break; }
+                    g_gate_live += ds4_gpu_gate_segment_live(prep_slot);
+                } else if (!ds4_gpu_discard_commands()) { ok = false; break; }
                 ds4_gpu_gate_segment_rewind(prep_slot);
                 prepared = false;
             }

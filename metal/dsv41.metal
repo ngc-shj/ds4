@@ -728,6 +728,27 @@ kernel void kernel_dsv41_indexer_scores_packed(
 }
 #endif
 
+/* A segment committed before the host has read the segment ahead of it.
+ * The host wrote this segment's grid entries while that segment was running,
+ * so an abort there may have zeroed them and then seen them written again.
+ * This runs first in the segment, after the one ahead has completed: if that
+ * one aborted, every slot this segment took is switched off again. range[0]
+ * and range[1] are the segment's first and one-past-last slot, written by the
+ * host before the commit. */
+kernel void kernel_dsv41_gate_reassert(
+        device const uint *prev_miss [[buffer(0)]],
+        device uint       *grid      [[buffer(1)]],
+        device const uint *range     [[buffer(2)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint tsz [[threads_per_threadgroup]]) {
+    if (prev_miss[0] == 0u) return;
+    for (uint i = range[0] + tid; i < range[1]; i += tsz) {
+        grid[3u * i + 0u] = 0u;
+        grid[3u * i + 1u] = 0u;
+        grid[3u * i + 2u] = 0u;
+    }
+}
+
 /* ---- Abort gate -----------------------------------------------------------
  * A layer's routed experts can only run if every selected expert has an
  * address in this layer's table. Deciding that on the host costs a command

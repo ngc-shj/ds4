@@ -575,6 +575,8 @@ typedef struct {
     double gpu_ms;              /* GPUEndTime - GPUStartTime, published by stamp */
 } ds4_mtl4_fb_slot;
 static ds4_mtl4_fb_slot g_mtl4_fb[DS4_MTL4_FB_RING];
+/* The expert cache's logical batch sequence each stamp carried. */
+static uint64_t g_mtl4_stamp_seq[DS4_MTL4_FB_RING];
 static _Atomic unsigned long long g_mtl4_fb_received, g_mtl4_fb_errors;
 
 /* Test hook: the next feedback to arrive reports a failure. The GPU cannot be
