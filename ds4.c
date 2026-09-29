@@ -79462,10 +79462,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
 #if defined(__APPLE__) && defined(DS4_HAS_DEEPSEEK41_GPU)
-        /* V4.1 runs on the Metal 4 backend only, chosen before anything is
-         * encoded. */
+        /* Single-host V4.1 runs on the Metal 4 backend only, chosen before
+         * anything is encoded. Network tensor parallelism is a separate
+         * two-host configuration whose gates have no Metal 4 form yet; it
+         * keeps the Metal 3 batch it was built and tested on. */
         if (e->backend == DS4_BACKEND_METAL &&
-            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !ds4_gpu_use_metal4()) {
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+            opt->tp.role == DS4_TP_NONE && !ds4_gpu_use_metal4()) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
