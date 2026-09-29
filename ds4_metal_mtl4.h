@@ -572,9 +572,11 @@ static void ds4_mtl4_release_completed(void) {
 typedef struct {
     _Atomic uint64_t stamp;     /* the stamp this slot last reported */
     _Atomic int failed;
-    double gpu_ms;              /* GPUEndTime - GPUStartTime, published by stamp */
+    double gpu_start, gpu_end;  /* the buffer's GPU span, published by stamp */
 } ds4_mtl4_fb_slot;
 static ds4_mtl4_fb_slot g_mtl4_fb[DS4_MTL4_FB_RING];
+/* Where the GPU spans already counted end. */
+static double g_mtl4_span_last_end;
 /* The expert cache's logical batch sequence each stamp carried. */
 static uint64_t g_mtl4_stamp_seq[DS4_MTL4_FB_RING];
 static _Atomic unsigned long long g_mtl4_fb_received, g_mtl4_fb_errors;
@@ -585,9 +587,10 @@ static _Atomic unsigned long long g_mtl4_fb_received, g_mtl4_fb_errors;
 static _Atomic int g_mtl4_inject;
 void ds4_gpu_mtl4_inject_failure(void) { atomic_store(&g_mtl4_inject, 1); }
 
-static void ds4_mtl4_fb_note(uint64_t stamp, NSError *error, double gpu_ms) {
+static void ds4_mtl4_fb_note(uint64_t stamp, NSError *error, double gpu_start, double gpu_end) {
     ds4_mtl4_fb_slot *slot = &g_mtl4_fb[stamp % DS4_MTL4_FB_RING];
-    slot->gpu_ms = gpu_ms > 0.0 ? gpu_ms : 0.0;
+    slot->gpu_start = gpu_start;
+    slot->gpu_end = gpu_end;
     if (!error && atomic_exchange(&g_mtl4_inject, 0))
         error = [NSError errorWithDomain:@"ds4.injected" code:1
                                 userInfo:@{NSLocalizedDescriptionKey: @"injected failure"}];
@@ -650,7 +653,16 @@ static int ds4_mtl4_wait_to(uint64_t value) {
             return 0;
         }
         if (atomic_load(&slot->failed)) good = 0;
-        g_gpu_span_accum_ms += slot->gpu_ms;
+        /* The union of the buffers' spans, not their sum: with the next
+         * segment committed before the current one is read, one buffer's
+         * span starts while the previous one is still running, and adding
+         * both counted the overlap twice. Stamps are waited in order. */
+        if (slot->gpu_end > g_mtl4_span_last_end) {
+            const double from = slot->gpu_start > g_mtl4_span_last_end ? slot->gpu_start
+                                                                       : g_mtl4_span_last_end;
+            g_gpu_span_accum_ms += (slot->gpu_end - from) * 1000.0;
+            g_mtl4_span_last_end = slot->gpu_end;
+        }
         g_gpu_span_cbs++;
     }
     g_mtl4_done = value;
@@ -741,7 +753,7 @@ static int ds4_mtl4_commit(void) {
         const uint64_t stamp = g_mtl4_stamp + 1u;
         MTL4CommitOptions *opts = [MTL4CommitOptions new];
         [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
-            ds4_mtl4_fb_note(stamp, fb.error, (fb.GPUEndTime - fb.GPUStartTime) * 1000.0);
+            ds4_mtl4_fb_note(stamp, fb.error, fb.GPUStartTime, fb.GPUEndTime);
         }];
         DS4_M4_NOTE("segment", DS4_BK_COMMIT);
         [g_mtl4_queue commit:&one count:1 options:opts];

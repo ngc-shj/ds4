@@ -46042,7 +46042,8 @@ spec_done:;
                 "ds4:   one token, exclusive, same window: entry %.2f + encode %.2f "
                 "+ commit-to-done %.2f + repair-load %.2f + accounting %.2f + tail %.2f "
                 "= %.2f of a %.2f ms wall, residual %.2f\n"
-                "ds4:   of the commit-to-done: GPU running %.2f ms, GPU not running %.2f ms\n"
+                "ds4:   GPU busy %.2f ms of the token's wall (the union of its buffers' "
+                "spans), idle %.2f ms\n"
                 "ds4:   %.1f gated dispatches a token, %.1f of them behind an abort; "
                 "%.1f sent plain ahead of a buffer's first validate\n"
                 "ds4:   encode-ahead: %.2f segments used, %.2f dropped, %.2f ms a token "
@@ -46071,8 +46072,13 @@ spec_done:;
                  (g_gate_encode_ms - w_encode) - (g_gate_wait_ms - w_wait) -
                  (g_gt_repair_ms - w_repair) - (g_gt_account_ms - w_account) -
                  (g_gt_tail_ms - w_tail)) / dt,
+                /* With the next segment committed before the current one is
+                 * read, a buffer's GPU span begins inside an earlier pass, so
+                 * GPU time can no longer be taken out of one pass's
+                 * commit-to-done. The whole token is the unit: the union of
+                 * every buffer's span against the token's wall. */
                 (g_gt_gpu_ms - w_gpu) / dt,
-                ((g_gate_wait_ms - w_wait) - (g_gt_gpu_ms - w_gpu)) / dt,
+                ((g_gt_wall_ms - w_wall) - (g_gt_gpu_ms - w_gpu)) / dt,
                 (double)(ds4_gpu_gate_slots_total() - w_slots) / dt,
                 (double)(g_gate_after - w_after) / dt,
                 (double)(ds4_gpu_gate_direct_total() - w_direct) / dt,
