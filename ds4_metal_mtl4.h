@@ -121,7 +121,10 @@ API_AVAILABLE(macos(26.0))
  * says otherwise, which is the opposite default from the backend this
  * replaces. Phase 1 puts the Metal 3 order back, explicitly. */
 @property (nonatomic) BOOL barrierEveryDispatch;
+/* The engine ended its section: what it encodes next is ordered after it. */
 @property (nonatomic) BOOL ended;
+/* The Metal 4 encoder itself has ended; only the buffer's commit does that. */
+@property (nonatomic) BOOL finished;
 /* Metal 4 encodes a buffer copy into the compute encoder. Metal 3 needs a
  * blit encoder for it, which means closing the compute one - a pipeline
  * flush the engine pays several times a token. This is not on DS4Encoder:
@@ -250,6 +253,35 @@ static void ds4_mtl4_attach_sets(void) {
     }
 }
 
+/* The shape of what this backend submits, counted by kind so a token can be
+ * priced by structure: how many encoders it opens and of which kind, every
+ * barrier by the reason it was inserted, the argument-table traffic, and the
+ * host's waits and how long they took. Plain counters. */
+enum {
+    DS4_M4S_ENC_SERIAL = 0,     /* encoders opened serial */
+    DS4_M4S_ENC_CONCURRENT,     /* encoders opened for a concurrent section */
+    DS4_M4S_BAR_DISPATCH,       /* barrier after a dispatch in a serial encoder */
+    DS4_M4S_BAR_COPY,           /* barriers either side of a copy */
+    DS4_M4S_BAR_ENGINE,         /* the engine's own memoryBarrier calls */
+    DS4_M4S_BAR_OPEN,           /* queue-stage barrier opening an encoder */
+    DS4_M4S_BAR_END,            /* queue-facing barrier ending an encoder */
+    DS4_M4S_TABLE_CLEAR,        /* whole-table clears (31 slots each) */
+    DS4_M4S_SET_ADDRESS,        /* setBuffer bindings */
+    DS4_M4S_SET_BYTES,          /* setBytes bindings */
+    DS4_M4S_BYTES_COPIED,       /* bytes copied into the constant scratch */
+    DS4_M4S_DISPATCH,
+    DS4_M4S_COPY,
+    DS4_M4S_WAIT_CALLS,         /* waits that actually blocked */
+    DS4_M4S_WAIT_NS,            /* host time blocked in them */
+    DS4_M4S_BAR_SECTION,        /* in-encoder barrier where a section ended */
+    DS4_M4S_KINDS
+};
+static unsigned long long g_m4s[DS4_M4S_KINDS];
+void ds4_gpu_mtl4_structure(unsigned long long out[DS4_M4S_KINDS]);
+void ds4_gpu_mtl4_structure(unsigned long long out[DS4_M4S_KINDS]) {
+    for (int i = 0; i < DS4_M4S_KINDS; i++) out[i] = g_m4s[i];
+}
+
 @implementation DS4MTL4Encoder
 
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
@@ -264,6 +296,7 @@ static void ds4_mtl4_attach_sets(void) {
     }
     /* setBuffer:nil clears the slot in Metal 3; skipping the call would leave
      * whatever the slot held. */
+    g_m4s[DS4_M4S_SET_ADDRESS]++;
     if (!buffer) { [_table setAddress:0 atIndex:index]; return; }
     ds4_mtl4_mark_resident(buffer);
     [_table setAddress:buffer.gpuAddress + offset atIndex:index];
@@ -285,6 +318,8 @@ static void ds4_mtl4_attach_sets(void) {
                 (unsigned long)off, (unsigned long)length);
         abort();
     }
+    g_m4s[DS4_M4S_SET_BYTES]++;
+    g_m4s[DS4_M4S_BYTES_COPIED] += length;
     memcpy((char *)[s contents] + off, bytes, length);
     b.scratchUsed = off + length;
     /* The scratch carries every kernel's constant arguments. Nothing else
@@ -323,22 +358,28 @@ static void ds4_mtl4_attach_sets(void) {
  * barriers inside the encoder are rearranged, because the edge that is
  * missing was never a dispatch-to-dispatch edge. Narrowing the mask is for
  * the DAG, one edge at a time, against a byte comparison. */
-- (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
-    (void)scope;
+- (void)barrierFor:(int)kind {
+    g_m4s[kind]++;
     [_enc barrierAfterEncoderStages:MTLStageAll
                     beforeEncoderStages:MTLStageAll
                       visibilityOptions:ds4_mtl4_visibility()];
 }
 
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
+    (void)scope;
+    [self barrierFor:DS4_M4S_BAR_ENGINE];
+}
+
 - (void)memoryBarrierWithResources:(const id<MTLResource> *)resources count:(NSUInteger)count {
     for (NSUInteger i = 0; i < count; i++) ds4_mtl4_mark_resident(resources[i]);
-    [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [self barrierFor:DS4_M4S_BAR_ENGINE];
 }
 
 - (void)dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt {
     g_mtl4_dispatches++;
+    g_m4s[DS4_M4S_DISPATCH]++;
     [_enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
-    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (_barrierEveryDispatch) [self barrierFor:DS4_M4S_BAR_DISPATCH];
 }
 
 - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer
@@ -346,15 +387,17 @@ static void ds4_mtl4_attach_sets(void) {
                          threadsPerThreadgroup:(MTLSize)tpt {
     ds4_mtl4_mark_resident(indirectBuffer);
     g_mtl4_dispatches++;
+    g_m4s[DS4_M4S_DISPATCH]++;
     [_enc dispatchThreadgroupsWithIndirectBuffer:indirectBuffer.gpuAddress + offset
                                threadsPerThreadgroup:tpt];
-    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (_barrierEveryDispatch) [self barrierFor:DS4_M4S_BAR_DISPATCH];
 }
 
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt {
     g_mtl4_dispatches++;
+    g_m4s[DS4_M4S_DISPATCH]++;
     [_enc dispatchThreads:threads threadsPerThreadgroup:tpt];
-    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (_barrierEveryDispatch) [self barrierFor:DS4_M4S_BAR_DISPATCH];
 }
 
 - (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)soff
@@ -366,10 +409,11 @@ static void ds4_mtl4_attach_sets(void) {
      * the commands of an encoder concurrently. The engine issues this where
      * Metal 3 gave it a whole encoder boundary, so it is ordered on both
      * sides here. */
-    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    g_m4s[DS4_M4S_COPY]++;
+    if (_barrierEveryDispatch) [self barrierFor:DS4_M4S_BAR_COPY];
     [_enc copyFromBuffer:src sourceOffset:soff
                     toBuffer:dst destinationOffset:doff size:size];
-    if (_barrierEveryDispatch) [self memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    if (_barrierEveryDispatch) [self barrierFor:DS4_M4S_BAR_COPY];
 }
 
 - (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
@@ -380,20 +424,49 @@ static void ds4_mtl4_attach_sets(void) {
     (void)sampleBuffer; (void)sampleIndex; (void)barrier;
 }
 
+/* The engine ends its encoder at every section: a concurrent section and the
+ * serial run after it, twice a layer. On Metal 3 that is a new encoder, and a
+ * new Metal 4 encoder has to be ordered against the queue - a queue-stage
+ * barrier to open it and another to end it, which wait on everything the GPU
+ * holds, earlier buffers included. Measured, those two barriers at about two
+ * hundred sections a token were ~6.5 ms of GPU time. Inside one buffer the
+ * only order that section boundary needs is "what came before, before what
+ * comes after", which one barrier inside the encoder says. So the engine's
+ * end marks the section, and the next section opens with that barrier on the
+ * same encoder. */
 - (void)endEncoding {
-    if (self.ended) return;
     self.ended = YES;
-    /* Flush what this encoder wrote out to the coherence point before it
-     * ends. Metal 3 does this at the end of a command buffer; Metal 4 says
-     * only what you ask it to say. The host reads the gate's miss and route
-     * words straight out of shared buffers once the buffer has completed, and
-     * the next encoder in the buffer reads what this one produced - neither
-     * edge is a dispatch-to-dispatch edge inside one encoder, which is why
-     * rearranging those never moved the answer. */
+}
+
+/* The real end, when the buffer is committed or dropped. Flush what this
+ * encoder wrote out to the coherence point: the host reads the gate's miss
+ * and route words straight out of shared buffers once the buffer has
+ * completed, and the next buffer's first encoder reads what this one
+ * produced. */
+- (void)finishEncoding {
+    if (self.finished) return;
+    self.finished = YES;
+    self.ended = YES;
+    g_m4s[DS4_M4S_BAR_END]++;
     [_enc barrierAfterStages:MTLStageAll
                beforeQueueStages:MTLStageAll
                visibilityOptions:ds4_mtl4_visibility()];
     [_enc endEncoding];
+}
+
+/* A new section on the same encoder: everything encoded so far completes and
+ * is visible before anything encoded next starts, and the bindings start
+ * clear, as they do for a fresh Metal 3 encoder. */
+- (void)beginSectionSerial:(BOOL)serial {
+    g_m4s[DS4_M4S_BAR_SECTION]++;
+    [_enc barrierAfterEncoderStages:MTLStageAll
+                beforeEncoderStages:MTLStageAll
+                  visibilityOptions:ds4_mtl4_visibility()];
+    g_m4s[DS4_M4S_TABLE_CLEAR]++;
+    for (NSUInteger i = 0; i < DS4_MTL4_MAX_BINDINGS; i++) [_table setAddress:0 atIndex:i];
+    self.barrierEveryDispatch = serial;
+    g_m4s[serial ? DS4_M4S_ENC_SERIAL : DS4_M4S_ENC_CONCURRENT]++;
+    self.ended = NO;
 }
 
 - (MTLDispatchType)dispatchType { return MTLDispatchTypeConcurrent; }
@@ -542,7 +615,10 @@ static int ds4_mtl4_wait_to(uint64_t value) {
         return 0;
     }
     DS4_M4_NOTE("wait", DS4_BK_WAIT);
+    const uint64_t w0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     const BOOL ok = [g_mtl4_event waitUntilSignaledValue:value timeoutMS:600000];
+    g_m4s[DS4_M4S_WAIT_CALLS]++;
+    g_m4s[DS4_M4S_WAIT_NS] += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - w0;
     if (!ok) {
         fprintf(stderr, "ds4: Metal 4 command buffer timed out\n");
         return 0;
@@ -634,7 +710,7 @@ static int ds4_mtl4_begin(void) {
 API_AVAILABLE(macos(26.0))
 static void ds4_mtl4_close_encoder(void) {
     if (!g_mtl4_enc) return;
-    [g_mtl4_enc endEncoding];
+    [g_mtl4_enc finishEncoding];
     /* Held until the buffer completes: the GPU reads its bindings through
      * objects this owns. */
     [g_mtl4_cur.encoders addObject:g_mtl4_enc];
@@ -702,6 +778,18 @@ static void ds4_mtl4_discard(void) {
     }
 }
 
+/* DS4_METAL_V41_MTL4_SERIAL=1 puts a barrier after every dispatch in a
+ * concurrent section too, which is the control. */
+static int ds4_mtl4_serial(void) {
+    static int checked, serial;
+    if (!checked) {
+        const char *e = getenv("DS4_METAL_V41_MTL4_SERIAL");
+        checked = 1;
+        serial = e && e[0] ? atoi(e) != 0 : 0;
+    }
+    return serial;
+}
+
 API_AVAILABLE(macos(26.0))
 static id<DS4Encoder> ds4_mtl4_encoder(void) {
     if (!g_mtl4_cur) return nil;
@@ -709,6 +797,10 @@ static id<DS4Encoder> ds4_mtl4_encoder(void) {
      * concurrent section does it twice a layer - so an encoder that has been
      * ended must not be handed back. */
     if (g_mtl4_enc && !g_mtl4_enc.ended) return (id<DS4Encoder>)g_mtl4_enc;
+    if (g_mtl4_enc && !g_mtl4_enc.finished) {
+        [g_mtl4_enc beginSectionSerial:ds4_mtl4_serial() || !g_batch_encoder_concurrent];
+        return (id<DS4Encoder>)g_mtl4_enc;
+    }
     if (g_mtl4_enc) ds4_mtl4_close_encoder();
     id<MTL4ComputeCommandEncoder> e = [g_mtl4_cur.cb computeCommandEncoder];
     if (!e) {
@@ -723,6 +815,8 @@ static id<DS4Encoder> ds4_mtl4_encoder(void) {
      * unless told otherwise. This is what the queue-stage barrier is for: it
      * orders against work outside this encoder, which is the previous
      * encoder's. Without it the answer came out wrong rather than late. */
+    g_m4s[DS4_M4S_BAR_OPEN]++;
+    g_m4s[DS4_M4S_TABLE_CLEAR]++;
     [e barrierAfterQueueStages:MTLStageAll
                   beforeStages:MTLStageAll
              visibilityOptions:ds4_mtl4_visibility()];
@@ -744,13 +838,8 @@ static id<DS4Encoder> ds4_mtl4_encoder(void) {
      *
      * DS4_METAL_V41_MTL4_SERIAL=1 puts it back, which is the control. */
     {
-        static int checked, serial;
-        if (!checked) {
-            const char *e = getenv("DS4_METAL_V41_MTL4_SERIAL");
-            checked = 1;
-            serial = e && e[0] ? atoi(e) != 0 : 0;
-        }
-        g_mtl4_enc.barrierEveryDispatch = serial || !g_batch_encoder_concurrent;
+        g_mtl4_enc.barrierEveryDispatch = ds4_mtl4_serial() || !g_batch_encoder_concurrent;
+        g_m4s[g_mtl4_enc.barrierEveryDispatch ? DS4_M4S_ENC_SERIAL : DS4_M4S_ENC_CONCURRENT]++;
     }
     return (id<DS4Encoder>)g_mtl4_enc;
 }

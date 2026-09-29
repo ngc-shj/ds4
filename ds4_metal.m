@@ -188,6 +188,7 @@ static void ds4_bk_note(int mtl4, const char *site, int kind) {
 
 /* One line a backend a site that moved since the last call, then the totals.
  * `tag` names the window. */
+static void ds4_report_boundaries(const char *tag);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
     unsigned long long tot[2][DS4_BK_KINDS] = {{0}};
@@ -220,6 +221,7 @@ void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
     fprintf(stderr, "; Metal 3 fallback %llu; site table overflow %llu\n",
             g_bk_m3_fallback - fb_seen, g_bk_site_overflow);
     fb_seen = g_bk_m3_fallback;
+    ds4_report_boundaries(tag);
     static unsigned long long late_seen, late_ns_seen;
     fprintf(stderr, "ds4: backend %s Metal 4 feedback after completion: %llu waits, %.3f ms\n",
             tag, g_mtl4_fb_late - late_seen, (double)(g_mtl4_fb_late_ns - late_ns_seen) / 1e6);
@@ -243,6 +245,27 @@ static int ds4_gpu_metal3_only(const char *what) {
 
 unsigned long long ds4_gpu_backend_m3_fallback(void);
 unsigned long long ds4_gpu_backend_m3_fallback(void) { return g_bk_m3_fallback; }
+
+/* Batch boundaries by the engine call site that asked for them - a flush, an
+ * end, a wait - so each can be classed by whether the host really needs the
+ * GPU's result there. Addresses are image-relative; atos names them. */
+#define DS4_BOUND_SITES 48u
+static struct { const char *kind; uintptr_t pc; unsigned long long n, seen; } g_bounds[DS4_BOUND_SITES];
+static void ds4_note_boundary(const char *kind, const void *ret) {
+    const uintptr_t pc = (uintptr_t)ret - (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+    for (unsigned i = 0; i < DS4_BOUND_SITES; i++) {
+        if (!g_bounds[i].kind) { g_bounds[i].kind = kind; g_bounds[i].pc = pc; }
+        if (g_bounds[i].pc == pc && g_bounds[i].kind == kind) { g_bounds[i].n++; return; }
+    }
+}
+static void ds4_report_boundaries(const char *tag) {
+    for (unsigned i = 0; i < DS4_BOUND_SITES && g_bounds[i].kind; i++) {
+        const unsigned long long d = g_bounds[i].n - g_bounds[i].seen;
+        g_bounds[i].seen = g_bounds[i].n;
+        if (d) fprintf(stderr, "ds4: backend %s boundary %-14s pc 0x%llx %llu\n", tag,
+                       g_bounds[i].kind, (unsigned long long)g_bounds[i].pc, d);
+    }
+}
 
 /* ---- Encoder timeline diagnostic (DS4_METAL_ENCODER_TIMELINE=<file>) ----
  * Gives every batch dispatch group its own compute pass with stage-boundary
@@ -10272,6 +10295,7 @@ int ds4_gpu_flush_encoder(void) {
 
 int ds4_gpu_flush_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    ds4_note_boundary("flush", __builtin_return_address(0));
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
 
@@ -10328,6 +10352,7 @@ int ds4_gpu_flush_commands(void) {
  * and carry on encoding the next one into a fresh buffer, then wait for the
  * committed one only. flush_commands already does the first half. */
 int ds4_gpu_wait_committed(void) {
+    ds4_note_boundary("wait", __builtin_return_address(0));
     return ds4_gpu_wait_pending_command_buffers("command batch");
 }
 
@@ -12630,6 +12655,7 @@ static void ds4_gpu_note_host_layer_done(void) {
 /* Signal after the router's dispatch and keep the batch open: whatever is
  * encoded next runs while the host wakes up and reads the ids. */
 static uint64_t ds4_gpu_encode_selected_signal(void) {
+    ds4_note_boundary("selected", __builtin_return_address(0));
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
@@ -12852,6 +12878,7 @@ static int ds4_gpu_mtl4_end_batch(const char *label) {
 
 int ds4_gpu_end_commands(void) {
     g_ds41_zc_end_commands++;
+    ds4_note_boundary("end", __builtin_return_address(0));
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         return 0;
