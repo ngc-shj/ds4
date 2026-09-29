@@ -155,6 +155,41 @@ static void injected(ds4_engine *e, const char *text, const int *ref, int nref) 
     ds4_tokens_free(&prompt);
 }
 
+/* An engine opened after another was closed in the same process: it must
+ * choose its backend again and give the same answer, with nothing carried
+ * over from the engine before it. */
+static void reopened(const ds4_engine_options *opt, const char *text, const int *ref, int nref) {
+    ds4_engine *e = NULL;
+    CHECK(ds4_engine_open(&e, opt) == 0, "reopen: engine open");
+    if (!e) return;
+    ds4_tokens prompt = {0};
+    chat_prompt(e, text, &prompt);
+    char err[256];
+    ds4_session *s = NULL;
+    CHECK(ds4_session_create(&s, e, 8192) == 0, "reopen: session create");
+    CHECK(ds4_session_sync(s, &prompt, err, sizeof(err)) == 0, "reopen: prefill: %s", err);
+    int agree = 0;
+    for (int i = 0; i < nref; i++) {
+        const int tok = ds4_session_argmax(s);
+        if (tok != ref[i]) break;
+        agree++;
+        if (ds4_session_eval(s, tok, err, sizeof(err)) != 0) break;
+    }
+    printf("reopen     an engine opened after the first closed matches the reference for "
+           "%d of %d tokens\n", agree, nref);
+    CHECK(agree == nref, "reopen: differs from the reference");
+    unsigned long long h[8];
+    ds4_gpu_mtl4_health(h);
+    CHECK(h[0] == h[1], "reopen: commits and feedback received differ");
+    CHECK(ds4_gpu_backend_m3_fallback() == 0, "reopen: Metal 3 work");
+    ds4_session_free(s);
+    ds4_tokens_free(&prompt);
+    ds4_engine_close(e);
+    ds4_gpu_mtl4_health(h);
+    printf("closed     after the second close: residency held %llu entries\n", h[3]);
+    CHECK(h[3] == 0, "residency held after close");
+}
+
 static char *read_prefix(const char *path, size_t bytes) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -206,8 +241,10 @@ int main(int argc, char **argv) {
     CHECK(h[0] == h[1], "commits and feedback received differ");
     CHECK(ds4_gpu_backend_m3_fallback() == 0, "Metal 3 work over the whole run");
     ds4_gpu_backend_report("test", 0);
-    free(ref);
     ds4_engine_close(engine);
+    reopened(&opt, "Explain how a modern CPU executes an instruction, from fetch "
+             "to retire, in as much detail as you can.", ref, steps < 128 ? steps : 128);
+    free(ref);
     printf("%s\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;
 }

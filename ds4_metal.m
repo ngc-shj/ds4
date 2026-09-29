@@ -13294,6 +13294,12 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache = nil;
         g_transient_buffers = nil;
         g_pending_cbs = nil;
+        if (@available(macOS 26.0, *)) {
+            if (!ds4_mtl4_shutdown())
+                fprintf(stderr, "ds4: Metal 4 work failed while shutting down\n");
+        }
+        /* The next engine chooses its own backend. */
+        g_backend = 3;
         g_library = nil;
         g_queue = nil;
         g_device = nil;

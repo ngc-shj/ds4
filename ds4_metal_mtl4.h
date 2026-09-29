@@ -846,14 +846,21 @@ static uint64_t ds4_mtl4_last_stamp(void) { return g_mtl4_stamp; }
  * engine's pool or stamps. Returns 0 if it could not submit. */
 int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
                             id<MTLBuffer> args) API_AVAILABLE(macos(26.0));
+static id<MTL4CommandAllocator> g_mtl4_ka_alloc API_AVAILABLE(macos(26.0));
+static id<MTL4CommandBuffer> g_mtl4_ka_cb API_AVAILABLE(macos(26.0));
+static id<MTL4ArgumentTable> g_mtl4_ka_table API_AVAILABLE(macos(26.0));
+static id<MTLResidencySet> g_mtl4_ka_res;
+static id<MTLSharedEvent> g_mtl4_ka_event;
+static uint64_t g_mtl4_ka_sent;
+
 int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
                             id<MTLBuffer> args) {
-    static id<MTL4CommandAllocator> alloc;
-    static id<MTL4CommandBuffer> cb;
-    static id<MTL4ArgumentTable> table;
-    static id<MTLResidencySet> res;
-    static id<MTLSharedEvent> ev;
-    static uint64_t sent;
+#define alloc g_mtl4_ka_alloc
+#define cb g_mtl4_ka_cb
+#define table g_mtl4_ka_table
+#define res g_mtl4_ka_res
+#define ev g_mtl4_ka_event
+#define sent g_mtl4_ka_sent
     id<MTL4CommandQueue> q = g_mtl4_queue;
     if (!q || !pipeline || !scratch || !args) return 0;
     if (!alloc) {
@@ -889,6 +896,64 @@ int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> 
     [q commit:&one count:1];
     [q signalEvent:ev value:++sent];
     return 1;
+#undef alloc
+#undef cb
+#undef table
+#undef res
+#undef ev
+#undef sent
+}
+
+/* ---- teardown ----------------------------------------------------------- */
+
+/* What ds4_gpu_cleanup has to undo on this side, so an engine opened after it
+ * starts from nothing: everything sent is waited for, every buffer lets go of
+ * what it held, the queue lets go of the process sets, and the queue, table,
+ * pool, event and the keepalive's objects are dropped - they belong to the
+ * device being released. Stamps stay monotonic across engines, so a feedback
+ * slot left from the last one can never read as the next one's. The keepalive
+ * thread has been stopped before this runs. Returns 0 if a wait failed; the
+ * teardown happens either way. */
+static int ds4_mtl4_shutdown(void) {
+    int ok = 1;
+    if (@available(macOS 26.0, *)) {
+        if (g_mtl4_cur) {
+            ds4_mtl4_close_encoder();
+            if (g_mtl4_cur.used) { if (!ds4_mtl4_commit()) ok = 0; }
+            else {
+                [g_mtl4_cur.cb endCommandBuffer];
+                g_mtl4_cur = nil;
+            }
+        }
+        if (g_mtl4_queue && !ds4_mtl4_wait_all()) ok = 0;
+        for (DS4MTL4Buffer *b in g_mtl4_pool) {
+            [b.resset removeAllAllocations];
+            [b.resset commit];
+            [b.resident removeAllObjects];
+            b.resBytes = 0;
+        }
+        if (g_mtl4_queue) {
+            for (NSUInteger i = 0; i < g_mtl4_sets_attached_n; i++)
+                [g_mtl4_queue removeResidencySet:g_mtl4_queue_sets[i]];
+        }
+        g_mtl4_sets_attached_n = 0;
+        [g_mtl4_queue_sets removeAllObjects];
+        g_mtl4_enc = nil;
+        g_mtl4_cur = nil;
+        g_mtl4_pool = nil;
+        g_mtl4_table = nil;
+        g_mtl4_queue = nil;
+        g_mtl4_event = nil;
+        g_mtl4_ka_alloc = nil;
+        g_mtl4_ka_cb = nil;
+        g_mtl4_ka_table = nil;
+        g_mtl4_ka_res = nil;
+        g_mtl4_ka_event = nil;
+        g_mtl4_ka_sent = 0;
+        memset(g_mtl4_mark_memo, 0, sizeof(g_mtl4_mark_memo));
+        g_mtl4_encode_error = 0;
+    }
+    return ok;
 }
 
 #endif  /* macOS 26 SDK */
