@@ -1,17 +1,18 @@
-/* Metal 3 against Metal 4, in one process, on the real model.
+/* The V4.1 Metal 4 backend on the real model, in one process.
  *
  *   test_deepseek41_backend <model.gguf> [story.txt]
  *
  * Run with the production environment (bench/m4prod.sh's), so the gated
  * decode, the expert cache and its repairs are the ones the server runs.
  *
- * Two sessions take the same prompt, one on each backend, and step together:
- * the backend is switched between evaluations, with nothing in flight, and
- * after every evaluation the two sessions' logits are compared whole with
- * memcmp. Argmax agreeing is not the check - a logit can move without moving
- * the argmax. The cases cover a short prompt decoded past the raw KV ring and
- * the compression boundaries, and a long prompt whose prefill crosses the
- * prefill chunk.
+ * Two sessions take the same prompt and step together, one evaluation each in
+ * turn, and after every evaluation their logits are compared whole with
+ * memcmp: two sessions sharing the process's scratch, expert cache and queue
+ * must not see each other. Each case prints the hash of its token ids, which
+ * the harness compares with the hashes the Metal 3 oracle produced before it
+ * was removed (bench/m4inproc.sh). The cases cover a short prompt decoded past
+ * the raw KV ring and the compression boundaries, and a long prompt whose
+ * prefill crosses the prefill chunk.
  *
  * Then the failure path: a Metal 4 command buffer reported failed must fail
  * the evaluation that owned it, and a fresh session straight after must give
@@ -24,8 +25,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-int ds4_gpu_set_backend(int backend);
-int ds4_gpu_backend(void);
 void ds4_gpu_mtl4_inject_failure(void);
 unsigned long long ds4_gpu_backend_m3_fallback(void);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
@@ -36,13 +35,6 @@ static int g_failures;
 #define CHECK(cond, ...) do { \
     if (!(cond)) { fprintf(stderr, "FAIL: " __VA_ARGS__); fputc('\n', stderr); g_failures++; } \
 } while (0)
-
-static void use_backend(int b) {
-    if (!ds4_gpu_set_backend(b)) {
-        fprintf(stderr, "FATAL: could not switch to Metal %d\n", b);
-        exit(2);
-    }
-}
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     const unsigned char *c = p;
@@ -63,7 +55,7 @@ static int same_logits(ds4_session *a, ds4_session *b, float *la, float *lb, int
     return na == vocab && nb == vocab && memcmp(la, lb, (size_t)vocab * sizeof(float)) == 0;
 }
 
-/* One prompt, both backends in step. Writes the Metal 3 token ids to ref. */
+/* One prompt, two sessions in step. Writes the first session's token ids to ref. */
 static void paired(ds4_engine *e, const char *name, const char *text, int steps,
                    int vocab, int *ref) {
     ds4_tokens prompt = {0};
@@ -75,10 +67,8 @@ static void paired(ds4_engine *e, const char *name, const char *text, int steps,
     if (!a || !b) return;
     float *la = malloc((size_t)vocab * sizeof(float));
     float *lb = malloc((size_t)vocab * sizeof(float));
-    use_backend(3);
-    CHECK(ds4_session_sync(a, &prompt, err, sizeof(err)) == 0, "%s: M3 prefill: %s", name, err);
-    use_backend(4);
-    CHECK(ds4_session_sync(b, &prompt, err, sizeof(err)) == 0, "%s: M4 prefill: %s", name, err);
+    CHECK(ds4_session_sync(a, &prompt, err, sizeof(err)) == 0, "%s: prefill A: %s", name, err);
+    CHECK(ds4_session_sync(b, &prompt, err, sizeof(err)) == 0, "%s: prefill B: %s", name, err);
     int diff_steps = 0, first_diff = -1, token_diff = -1;
     if (!same_logits(a, b, la, lb, vocab)) { diff_steps++; first_diff = 0; }
     uint64_t ha = 1469598103934665603ull, hb = ha;
@@ -89,14 +79,12 @@ static void paired(ds4_engine *e, const char *name, const char *text, int steps,
         ha = fnv(ha, &ta, sizeof(ta));
         hb = fnv(hb, &tb, sizeof(tb));
         if (ta != tb && token_diff < 0) token_diff = n;
-        use_backend(3);
-        if (ds4_session_eval(a, ta, err, sizeof(err)) != 0) {
-            CHECK(0, "%s: M3 eval at %d: %s", name, n, err);
+            if (ds4_session_eval(a, ta, err, sizeof(err)) != 0) {
+            CHECK(0, "%s: eval A at %d: %s", name, n, err);
             break;
         }
-        use_backend(4);
-        if (ds4_session_eval(b, tb, err, sizeof(err)) != 0) {
-            CHECK(0, "%s: M4 eval at %d: %s", name, n, err);
+            if (ds4_session_eval(b, tb, err, sizeof(err)) != 0) {
+            CHECK(0, "%s: eval B at %d: %s", name, n, err);
             break;
         }
         if (!same_logits(a, b, la, lb, vocab)) {
@@ -108,7 +96,7 @@ static void paired(ds4_engine *e, const char *name, const char *text, int steps,
            "(first %d), tokens first differ at %d, ids %016llx / %016llx\n",
            name, prompt.len, n, diff_steps, n + 1, first_diff, token_diff,
            (unsigned long long)ha, (unsigned long long)hb);
-    CHECK(diff_steps == 0 && token_diff < 0 && ha == hb, "%s: backends disagree", name);
+    CHECK(diff_steps == 0 && token_diff < 0 && ha == hb, "%s: sessions disagree", name);
     free(la); free(lb);
     ds4_session_free(a);
     ds4_session_free(b);
@@ -120,7 +108,6 @@ static void injected(ds4_engine *e, const char *text, const int *ref, int nref) 
     ds4_tokens prompt = {0};
     chat_prompt(e, text, &prompt);
     char err[256];
-    use_backend(4);
     const unsigned long long fb0 = ds4_gpu_backend_m3_fallback();
     ds4_session *c = NULL;
     CHECK(ds4_session_create(&c, e, 8192) == 0, "inject: session create");
@@ -158,7 +145,7 @@ static void injected(ds4_engine *e, const char *text, const int *ref, int nref) 
         agree++;
         if (ds4_session_eval(d, tok, err, sizeof(err)) != 0) break;
     }
-    printf("after      a fresh Metal 4 session matches the Metal 3 reference for %d of %d tokens\n",
+    printf("after      a fresh session matches the reference for %d of %d tokens\n",
            agree, nref);
     CHECK(agree == nref, "after: fresh session differs from the reference");
     ds4_session_free(d);
@@ -217,6 +204,7 @@ int main(int argc, char **argv) {
            h[0], h[1], h[2], h[3], (double)h[4] / 1048576.0, (double)h[7] / 1048576.0,
            h[5], h[6]);
     CHECK(h[0] == h[1], "commits and feedback received differ");
+    CHECK(ds4_gpu_backend_m3_fallback() == 0, "Metal 3 work over the whole run");
     ds4_gpu_backend_report("test", 0);
     free(ref);
     ds4_engine_close(engine);

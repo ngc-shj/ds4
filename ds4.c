@@ -45361,16 +45361,12 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
     extern unsigned long long ds4_gpu_gate_slots_total(void);
     extern unsigned long long ds4_gpu_gate_direct_total(void);
     extern void ds4_gpu_gate_census_settle(uint32_t aborted_layer);
-    /* The Metal 4 backend owns the gated region, and nothing else: the
-     * boundary is a drain the graph already performs, so the two backends
-     * never hold work at the same time. */
-    extern void ds4_gpu_mtl4_region_begin(void);
+    /* V4.1 runs on the Metal 4 backend; the end of the gated region waits for
+     * what the region committed. */
     extern int ds4_gpu_mtl4_region_end(void);
     extern void ds4_gpu_mtl4_counts(unsigned long long *segments,
                                     unsigned long long *dispatches,
-                                    unsigned long long *m3_work,
-                                    unsigned long long *m3_sent,
-                                    unsigned long long *m3_skipped);
+                                    unsigned long long *m3_fallback);
     extern int ds4_gpu_wait_committed(void);
     extern int ds4_gpu_discard_commands(void);
     extern void ds4_gpu_gate_segment_rewind(uint32_t slot);
@@ -45425,7 +45421,6 @@ static bool ds41_graph_step_inner(ds41_gpu_graph *g, const ds4_model *m,
     uint32_t gate_done = 0;
     if (gate_n > gate_lo) {
         ds4_gpu_gate_token_begin();
-        ds4_gpu_mtl4_region_begin();
         uint32_t start = gate_lo;
         int resume_from_moe = 0;
         /* Which shape each layer was issued in. A continuation re-runs the
@@ -46057,27 +46052,20 @@ spec_done:;
                 (double)(spec_cmp - w_spec_cmp) / dt,
                 (double)(spec_diff - w_spec_diff) / dt,
                 (double)(spec_far - w_spec_far) / dt);
-        /* Proof the Metal 4 path ran, and that the Metal 3 buffer stayed out
-         * of the region while it did. Byte identity from a backend that
-         * quietly declined is byte identity from the backend it declined to. */
+        /* Proof the Metal 4 path ran, and that nothing fell back to Metal 3
+         * while it did. Byte identity from a backend that quietly declined is
+         * byte identity from the backend it declined to. */
         {
-            static unsigned long long w_m4_seg, w_m4_disp, w_m3_sent, w_m3_skip;
-            unsigned long long m4_seg = 0, m4_disp = 0, m4_m3 = 0,
-                               m3_sent = 0, m3_skip = 0;
-            ds4_gpu_mtl4_counts(&m4_seg, &m4_disp, &m4_m3, &m3_sent, &m3_skip);
-            if (m4_seg || m4_m3)
-                fprintf(stderr,
-                        "ds4:   Metal 4: %.2f command buffers sent, %.1f dispatches "
-                        "a token; Metal 3: %.2f sent, %.2f empty ones not sent; "
-                        "%llu pieces of Metal 3 work inside a segment\n",
-                        (double)(m4_seg - w_m4_seg) / dt,
-                        (double)(m4_disp - w_m4_disp) / dt,
-                        (double)(m3_sent - w_m3_sent) / dt,
-                        (double)(m3_skip - w_m3_skip) / dt, m4_m3);
+            static unsigned long long w_m4_seg, w_m4_disp;
+            unsigned long long m4_seg = 0, m4_disp = 0, m3_fallback = 0;
+            ds4_gpu_mtl4_counts(&m4_seg, &m4_disp, &m3_fallback);
+            fprintf(stderr,
+                    "ds4:   Metal 4: %.2f command buffers sent, %.1f dispatches a token; "
+                    "%llu pieces of Metal 3 work so far\n",
+                    (double)(m4_seg - w_m4_seg) / dt,
+                    (double)(m4_disp - w_m4_disp) / dt, m3_fallback);
             w_m4_seg = m4_seg;
             w_m4_disp = m4_disp;
-            w_m3_sent = m3_sent;
-            w_m3_skip = m3_skip;
         }
             w_sec_att = sec_att; w_sec_open = sec_open;
             w_spec_cmp = spec_cmp; w_spec_diff = spec_diff; w_spec_far = spec_far;
@@ -79473,6 +79461,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+#if defined(__APPLE__) && defined(DS4_HAS_DEEPSEEK41_GPU)
+        /* V4.1 runs on the Metal 4 backend only, chosen before anything is
+         * encoded. */
+        if (e->backend == DS4_BACKEND_METAL &&
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !ds4_gpu_use_metal4()) {
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
@@ -87016,7 +87014,7 @@ static int ds41_mtl4_verify_executor(ds4_session *s, const ds41_candidate_dag *d
     bool ok = ds41_exec_plan(&x, dag);
     unsigned long long m3_before = 0, m3_after = 0;
     uint64_t zc_before[8] = {0}, zc_after[8] = {0};
-    ds4_gpu_mtl4_counts(NULL, NULL, &m3_before, NULL, NULL);
+    ds4_gpu_mtl4_counts(NULL, NULL, &m3_before);
     ds4_gpu_zero_conditions(zc_before);
     ds4_gpu_stream_block_residency_force(1);
     uint32_t tree[3u + DS41_EXEC_MAX_NODES] = {0};
@@ -87040,7 +87038,6 @@ static int ds41_mtl4_verify_executor(ds4_session *s, const ds41_candidate_dag *d
         uint64_t zr_open[8], zr_close[8];
         ds4_gpu_zero_conditions(zr_open);
         ds4_gpu_gate_token_begin();
-        ds4_gpu_mtl4_region_begin();
         (void)ds4_gpu_gate_segment_begin();
         if (!ds4_gpu_commands_active()) ok = ds4_gpu_begin_commands() != 0;
         ds4_gpu_moe_block_miss_reset();
@@ -87207,7 +87204,7 @@ static int ds41_mtl4_verify_executor(ds4_session *s, const ds41_candidate_dag *d
     }
     ds4_gpu_stream_block_residency_force(0);
     (void)done_rows;
-    ds4_gpu_mtl4_counts(NULL, NULL, &m3_after, NULL, NULL);
+    ds4_gpu_mtl4_counts(NULL, NULL, &m3_after);
     ds4_gpu_zero_conditions(zc_after);
     g_ds41_exec_m3_leaks += m3_after - m3_before;
     for (int i = 0; i < 8; i++) g_ds41_zc_block[i] += zc_after[i] - zc_before[i];

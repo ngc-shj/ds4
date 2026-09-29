@@ -451,7 +451,7 @@ int ds4_gpu_router_project_select_tensor(
         int validate);
 extern int g_router_finalize_override;
 void ds4_gpu_encode_counts(unsigned long long *dispatches, unsigned long long *validates,
-                           unsigned long long *m3_commits);
+                           unsigned long long *commits);
 void ds4_gpu_stream_expert_cache_counters(uint64_t *hits,
                                           uint64_t *misses,
                                           uint64_t *evictions,

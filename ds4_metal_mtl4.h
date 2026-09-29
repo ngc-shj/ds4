@@ -144,48 +144,22 @@ static double g_gpu_span_accum_ms;
 static uint64_t g_gpu_span_cbs;
 static uint64_t g_mtl4_stamp;                /* last value handed to a commit */
 static uint64_t g_mtl4_done;                 /* last value waited for */
-static int g_mtl4_region;                    /* inside the gated region */
 
-static unsigned long long g_mtl4_dispatches, g_mtl4_segments, g_mtl4_copies_m3;
+static unsigned long long g_mtl4_dispatches, g_mtl4_segments;
 /* Buffers actually sent, against segments begun: the two differ by the ones
  * an abort discards, and reporting begins as though they were submissions is
  * how a submission count stops being one. */
 static unsigned long long g_mtl4_commits;
-extern unsigned long long g_ds4_m3_commits, g_ds4_m3_skipped;
+unsigned long long ds4_gpu_backend_m3_fallback(void);
 
-/* Counted rather than assumed: work the engine puts in the Metal 3 batch
- * buffer while a Metal 4 buffer is open runs after it, not in place. The
- * design says there is none; this is what says so about a run. */
-void ds4_gpu_mtl4_note_metal3_work(const char *what);
-static int ds4_mtl4_open(void);
-
+/* Buffers sent and dispatches encoded on this backend, and Metal 3 work noted
+ * while it was selected - which is the number that has to be zero. */
 void ds4_gpu_mtl4_counts(unsigned long long *segments,
                          unsigned long long *dispatches,
-                         unsigned long long *m3_work,
-                         unsigned long long *m3_sent,
-                         unsigned long long *m3_skipped) {
+                         unsigned long long *m3_fallback) {
     if (segments) *segments = g_mtl4_commits;
     if (dispatches) *dispatches = g_mtl4_dispatches;
-    if (m3_work) *m3_work = g_mtl4_copies_m3;
-    if (m3_sent) *m3_sent = g_ds4_m3_commits;
-    if (m3_skipped) *m3_skipped = g_ds4_m3_skipped;
-}
-
-void ds4_gpu_mtl4_note_metal3_work(const char *what) {
-    if (@available(macOS 26.0, *)) {
-        if (!ds4_mtl4_open()) return;
-        g_mtl4_copies_m3++;
-        /* Said once a site: the whole point is which of them it is. */
-        enum { SITES = 8 };
-        static const char *seen[SITES];
-        static unsigned n_seen;
-        const char *name = what ? what : "(unlabelled)";
-        for (unsigned i = 0; i < n_seen; i++)
-            if (seen[i] == name || strcmp(seen[i], name) == 0) return;
-        if (n_seen < SITES) seen[n_seen++] = name;
-        fprintf(stderr, "ds4: Metal 3 work \"%s\" encoded inside a Metal 4 segment; "
-                        "it runs after that segment, not in place\n", name);
-    }
+    if (m3_fallback) *m3_fallback = ds4_gpu_backend_m3_fallback();
 }
 
 /* ---- residency --------------------------------------------------------- */
@@ -430,8 +404,8 @@ static void ds4_mtl4_attach_sets(void) {
 
 /* ---- the pool ---------------------------------------------------------- */
 
-/* DS4_METAL_V41_MTL4: 1 is the Metal 4 backend, 2 also sends greedy decode
- * through the verify executor. */
+/* DS4_METAL_V41_MTL4=2 sends greedy decode through the verify executor. The
+ * backend itself is not chosen here: V4.1 always runs on Metal 4. */
 static int ds4_mtl4_level(void) {
     static int checked, level;
     if (!checked) {
@@ -445,11 +419,6 @@ static int ds4_mtl4_level(void) {
 static int ds4_mtl4_on(void) { return g_backend == 4; }
 
 
-/* Whether a Metal 4 command buffer is open and taking the engine's work. */
-static int ds4_mtl4_open(void) {
-    if (@available(macOS 26.0, *)) return g_mtl4_cur != nil;
-    return 0;
-}
 
 static int ds4_mtl4_ready(void) API_AVAILABLE(macos(26.0));
 static int ds4_mtl4_ready(void) {
@@ -805,14 +774,6 @@ static int ds4_mtl4_copy(id<MTLBuffer> src, NSUInteger soff,
 
 /* ---- what the engine calls --------------------------------------------- */
 
-/* The gated region is a span of the token the engine marks; with the whole
- * batch already on this backend there is no seam to drain at its edges, so
- * entering it only says so. */
-void ds4_gpu_mtl4_region_begin(void) {
-    if (!ds4_mtl4_on()) return;
-    g_mtl4_region = 1;
-}
-
 /* Whether the Metal 4 backend is on for this process: the verify executor runs
  * only under it, so it asks rather than falling back to the Metal 3 path. */
 int ds4_gpu_mtl4_enabled(void) {
@@ -838,12 +799,10 @@ void ds4_gpu_mtl4_health(unsigned long long out[8]) {
     out[7] = g_mtl4_res_peak;
 }
 
-/* Leaving the region waits for what the region committed and leaves the open
- * batch open: the token goes on encoding into it, as it does on Metal 3,
- * where the region's edge is not a drain either. */
+/* The end of the gated region waits for what the region committed and leaves
+ * the open batch open: the token goes on encoding into it. */
 int ds4_gpu_mtl4_region_end(void) {
     if (!ds4_mtl4_on()) return 1;
-    g_mtl4_region = 0;
     return ds4_mtl4_wait_all();
 }
 

@@ -349,11 +349,13 @@ uint32_t ds4_gpu_gate_disable_from(uint32_t slot) {
  * ablation arm actually removed, counted rather than assumed. */
 static _Atomic unsigned long long g_ds4_dispatches_encoded, g_ds4_gate_validates;
 void ds4_gpu_encode_counts(unsigned long long *dispatches, unsigned long long *validates,
-                           unsigned long long *m3_commits) {
-    extern unsigned long long g_ds4_m3_commits;
+                           unsigned long long *commits) {
+    extern void ds4_gpu_mtl4_counts(unsigned long long *segments,
+                                    unsigned long long *dispatches,
+                                    unsigned long long *m3_fallback);
     if (dispatches) *dispatches = atomic_load(&g_ds4_dispatches_encoded);
     if (validates) *validates = atomic_load(&g_ds4_gate_validates);
-    if (m3_commits) *m3_commits = g_ds4_m3_commits;
+    if (commits) ds4_gpu_mtl4_counts(commits, NULL, NULL);
 }
 
 static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {

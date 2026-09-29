@@ -213,19 +213,16 @@ int ds4_gpu_attention_decode_heads_phase_dag_tensor(
  * The region owns the block from the embedding to the commit; the counts say
  * whether anything leaked onto the Metal 3 buffer while it did. */
 int  ds4_gpu_mtl4_enabled(void);
-void ds4_gpu_mtl4_region_begin(void);
 int ds4_gpu_mtl4_region_end(void);
 void ds4_gpu_mtl4_health(unsigned long long out[8]);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
-int ds4_gpu_set_backend(int backend);
-int ds4_gpu_backend(void);
+int ds4_gpu_use_metal4(void);
 unsigned long long ds4_gpu_backend_m3_fallback(void);
 void ds4_gpu_mtl4_inject_failure(void);
 int ds4_gpu_mtl4_executor_enabled(void);
 unsigned long long ds4_gpu_mtl4_sets_attached(void);
 void ds4_gpu_mtl4_counts(unsigned long long *segments, unsigned long long *dispatches,
-                         unsigned long long *m3_work, unsigned long long *m3_sent,
-                         unsigned long long *m3_skipped);
+                         unsigned long long *m3_fallback);
 void ds4_gpu_stream_block_residency_force(int on);
 /* The abort gate the executor's residency check writes: grid allocated on
  * demand, and the segment calls that make every dispatch between them go out

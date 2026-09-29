@@ -124,7 +124,6 @@ static BOOL g_batch_has_work;
 static BOOL g_m3_cb_has_work;
 /* Whether the encoder the engine is holding belongs to the Metal 4 backend. */
 static BOOL g_batch_enc_is_mtl4;
-unsigned long long g_ds4_m3_commits, g_ds4_m3_skipped;
 
 /* ---- what each backend actually did, by site ---------------------------
  * A backend is "the production path" only if a run says so. Every place that
@@ -580,10 +579,8 @@ static id<DS4Encoder> ds4_gpu_timeline_new_encoder(
     ds4_gpu_timeline_hook_encoder(enc);
     return enc;
 }
-/* Defined by the Metal 4 backend below, declared here because the two call
- * sites that matter - a blit into the batch buffer, a residency set attached
- * to the Metal 3 queue - are above it. */
-void ds4_gpu_mtl4_note_metal3_work(const char *what);
+/* Defined by the Metal 4 backend below: the residency sets the engine
+ * attaches to and drops from the Metal 3 queue, mirrored on the Metal 4 one. */
 void ds4_gpu_queue_residency_added(id set);
 void ds4_gpu_queue_residency_removed(id set);
 
@@ -600,7 +597,6 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
     }
     DS4_M3_NOTE(label ? label : "(unlabelled)", DS4_BK_BLIT);
     if (cb == g_batch_cb) {
-        ds4_gpu_mtl4_note_metal3_work(label);
         g_m3_cb_has_work = YES;
     }
     DS4TimelineBatch *b = g_timeline_batch;
@@ -1780,19 +1776,23 @@ static id<DS4Encoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
             }
             if (g_batch_enc) { g_m3_cb_has_work = YES; return g_batch_enc; }
         }
-        if (!g_batch_enc) {
+        if (!g_batch_enc && g_backend == 4) {
             id<DS4Encoder> m4 = nil;
             if (@available(macOS 26.0, *)) m4 = ds4_mtl4_encoder();
-            if (!m4 && g_backend == 4) {
+            if (!m4) {
                 /* The batch is a Metal 4 buffer: there is no Metal 3 encoder
                  * to fall back to, and a nil one would drop the op silently.
                  * The wait for this batch reports it. */
                 g_mtl4_encode_error = 1;
                 return nil;
             }
-            g_batch_enc_is_mtl4 = m4 != nil;
-            const bool uce = !m4 && ds4_gpu_uce_on();
-            g_batch_enc = ds4_enc_trace_wrap(m4 ? m4 : (id<DS4Encoder>)(g_batch_encoder_concurrent || uce
+            g_batch_enc_is_mtl4 = YES;
+            g_batch_enc = ds4_enc_trace_wrap(m4);
+            g_uce_enc = nil;
+        } else if (!g_batch_enc) {
+            const bool uce = ds4_gpu_uce_on();
+            g_batch_enc_is_mtl4 = NO;
+            g_batch_enc = ds4_enc_trace_wrap((id<DS4Encoder>)(g_batch_encoder_concurrent || uce
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder]));
             g_uce_enc = uce ? g_batch_enc : nil;
@@ -9815,50 +9815,34 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        /* The backend is chosen once, here, and said. Metal 4 that cannot be
-         * had is an error, not a quiet Metal 3: a run that asked for one
-         * backend and measured the other has measured nothing. */
-        g_backend = 3;
-        if (ds4_mtl4_level() != 0) {
-            int ready = 0;
-            if (@available(macOS 26.0, *)) {
-                g_backend = 4;
-                ready = ds4_mtl4_ready();
-            }
-            if (!ready || g_timeline_enabled) {
-                fprintf(stderr, "ds4: the Metal 4 backend was selected and is %s\n",
-                        ready ? "incompatible with the encoder timeline" : "unavailable");
-                g_backend = 3;
-                g_queue = nil;
-                g_device = nil;
-                return 0;
-            }
-        }
-        fprintf(stderr, "ds4: Metal backend: Metal %d\n", g_backend);
         g_initialized = 1;
     }
 
     return 1;
 }
 
-/* Switch the backend between batches, with nothing in flight: what a test
- * that compares the two inside one process needs. Production picks one at
- * init and keeps it. */
-int ds4_gpu_set_backend(int backend) {
-    if (backend != 3 && backend != 4) return 0;
+/* DeepSeek V4.1 runs on the Metal 4 backend, and only there. The engine asks
+ * for it once the model is known and before any work is encoded; other models
+ * keep the Metal 3 batch. Metal 4 that cannot be had is an error, not a quiet
+ * Metal 3. */
+int ds4_gpu_use_metal4(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (g_batch_cb) return 0;
-    if (!ds4_gpu_wait_pending_command_buffers("backend switch")) return 0;
-    if (backend == 4) {
-        int ready = 0;
-        if (@available(macOS 26.0, *)) ready = ds4_mtl4_ready();
-        if (!ready) return 0;
+    if (g_backend == 4) return 1;
+    if (g_batch_cb || [g_pending_cbs count] != 0) {
+        fprintf(stderr, "ds4: Metal 4 was selected with Metal 3 work in flight\n");
+        return 0;
     }
-    g_backend = backend;
+    int ready = 0;
+    if (@available(macOS 26.0, *)) ready = ds4_mtl4_ready();
+    if (!ready || g_timeline_enabled) {
+        fprintf(stderr, "ds4: the Metal 4 backend is %s\n",
+                ready ? "incompatible with the encoder timeline" : "unavailable");
+        return 0;
+    }
+    g_backend = 4;
+    fprintf(stderr, "ds4: Metal backend: Metal 4\n");
     return 1;
 }
-
-int ds4_gpu_backend(void) { return g_backend; }
 
 int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
                                      uint16_t *lut_bits) {
@@ -10115,15 +10099,15 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                       ds4_enc_trace_buf_id(d.buffer),
                       (unsigned long)(d.offset + dst_offset),
                       (unsigned long long)bytes);
-        if (@available(macOS 26.0, *)) {
-            if (ds4_mtl4_copy(s.buffer, (NSUInteger)(s.offset + src_offset),
-                              d.buffer, (NSUInteger)(d.offset + dst_offset),
-                              (NSUInteger)bytes)) {
-                DS4_M4_NOTE("tensor_copy", DS4_BK_BLIT);
-                return 1;
-            }
-        }
         if (g_backend == 4) {
+            if (@available(macOS 26.0, *)) {
+                if (ds4_mtl4_copy(s.buffer, (NSUInteger)(s.offset + src_offset),
+                                  d.buffer, (NSUInteger)(d.offset + dst_offset),
+                                  (NSUInteger)bytes)) {
+                    DS4_M4_NOTE("tensor_copy", DS4_BK_BLIT);
+                    return 1;
+                }
+            }
             fprintf(stderr, "ds4: Metal 4 tensor copy could not be encoded\n");
             g_mtl4_encode_error = 1;
             return 0;
@@ -10275,7 +10259,6 @@ int ds4_gpu_begin_commands(void) {
     g_batch_has_work = g_m3_cb_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
     ds4_gpu_timeline_attach(g_batch_cb);
-    if (@available(macOS 26.0, *)) (void)ds4_mtl4_begin();
     return g_batch_cb != nil;
 }
 
@@ -10312,27 +10295,16 @@ int ds4_gpu_flush_commands(void) {
         ds4_gpu_stream_expert_cache_note_batch_created();
         return 1;
     }
-    /* The segment's work is in the Metal 4 buffer when this backend is on, so
-     * that is what goes out. It is committed and not waited for: the engine
-     * encodes the next segment into a fresh buffer before it asks for this
-     * one's result. */
-    int mtl4_committed = 0;
-    if (@available(macOS 26.0, *)) mtl4_committed = ds4_mtl4_commit();
-    /* An empty Metal 3 buffer is not submitted. With the Metal 4 backend
-     * holding the region it is empty at every segment boundary, and
-     * committing it anyway was a submission and a wait a segment for a buffer
-     * with nothing in it. The buffer stays open and keeps its identity; what
-     * advances either way is the logical batch, which is what the expert
-     * cache's in-flight sequence is keyed on and what the wait completes. */
+    /* An empty buffer is not submitted: it stays open and keeps its
+     * identity. What advances either way is the logical batch, which is what
+     * the expert cache's in-flight sequence is keyed on and what the wait
+     * completes. */
     if (g_m3_cb_has_work) {
         id<MTLCommandBuffer> cb = g_batch_cb;
         g_batch_cb = nil;
         DS4_M3_NOTE("flush", DS4_BK_COMMIT);
         [cb commit];
         [g_pending_cbs addObject:cb];
-        g_ds4_m3_commits++;
-    } else {
-        g_ds4_m3_skipped++;
     }
     g_batch_has_work = g_m3_cb_has_work = NO;
     ds4_gpu_stream_expert_cache_note_batch_committed();
@@ -10344,7 +10316,6 @@ int ds4_gpu_flush_commands(void) {
     }
     g_batch_has_work = g_m3_cb_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
-    if (mtl4_committed) { if (@available(macOS 26.0, *)) (void)ds4_mtl4_begin(); }
     if (!g_batch_cb) {
         (void)ds4_gpu_wait_pending_command_buffers("command batch");
         [g_transient_buffers removeAllObjects];
@@ -10368,10 +10339,12 @@ int ds4_gpu_discard_commands(void) {
     if (!g_batch_cb) return 1;
     ds4_gpu_parallel_ffn_reset_state(YES);
     ds4_gpu_close_batch_encoder();
-    if (@available(macOS 26.0, *)) ds4_mtl4_discard();
-    /* A dropped buffer took its commands with it, including any it could not
-     * encode; that is not a failure of anything that runs. */
-    if (g_backend == 4) g_mtl4_encode_error = 0;
+    if (g_backend == 4) {
+        if (@available(macOS 26.0, *)) ds4_mtl4_discard();
+        /* A dropped buffer took its commands with it, including any it could
+         * not encode; that is not a failure of anything that runs. */
+        g_mtl4_encode_error = 0;
+    }
     g_batch_cb = nil;
     g_batch_has_work = g_m3_cb_has_work = NO;
     g_stream_expert_cache_batch_seq = 0;
@@ -11108,7 +11081,6 @@ int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
 
         ds4_gpu_close_batch_encoder();
         const uint64_t value = ++g_selected_readback_event_value;
-        ds4_gpu_mtl4_note_metal3_work("selected readback signal");
         DS4_M3_NOTE("signal_selected_readback_ready", DS4_BK_SIGNAL);
         [g_batch_cb encodeSignalEvent:g_selected_readback_event value:value];
         g_m3_cb_has_work = YES;
@@ -12684,7 +12656,6 @@ static uint64_t ds4_gpu_encode_selected_signal(void) {
         }
         ds4_gpu_close_batch_encoder();
         const uint64_t value = ++g_selected_readback_event_value;
-        ds4_gpu_mtl4_note_metal3_work("selected readback signal");
         DS4_M3_NOTE("encode_selected_signal", DS4_BK_SIGNAL);
         [g_batch_cb encodeSignalEvent:g_selected_readback_event value:value];
         g_m3_cb_has_work = YES;
@@ -12888,10 +12859,6 @@ int ds4_gpu_end_commands(void) {
     ds4_gpu_parallel_ffn_reset_state(YES);
     ds4_gpu_close_batch_encoder();
     if (g_backend == 4) return ds4_gpu_mtl4_end_batch("command batch");
-    int mtl4_ok = 1;
-    if (@available(macOS 26.0, *)) {
-        if (ds4_mtl4_commit()) mtl4_ok = ds4_mtl4_wait_all();
-    }
     id<MTLCommandBuffer> cb = g_batch_cb;
     const BOOL m3_work = g_m3_cb_has_work;
     g_batch_cb = nil;
@@ -12900,7 +12867,7 @@ int ds4_gpu_end_commands(void) {
     g_stream_expert_cache_batch_seq = 0;
     const int m3_ok = ds4_gpu_finish_command_buffer(cb, 1, m3_work ? "command batch" :
                                                          "command batch (empty)");
-    return m3_ok && mtl4_ok;
+    return m3_ok;
 }
 
 static int ds4_gpu_flash_attn_stage_profile_boundary(
@@ -16524,7 +16491,6 @@ static uint64_t ds4_gpu_encode_resident_service_wait(void) {
         }
         ds4_gpu_close_batch_encoder();
         const uint64_t value = ++g_resident_service_value;
-        ds4_gpu_mtl4_note_metal3_work("resident service wait");
         DS4_M3_NOTE("resident_service_wait", DS4_BK_EVWAIT);
         [g_batch_cb encodeWaitForEvent:g_resident_service_event value:value];
         g_m3_cb_has_work = YES;
@@ -45575,7 +45541,6 @@ static int ds4_gpu_routed_moe_one_resident(
     if (!no_blit) ds4_gpu_close_batch_encoder();
     if (!no_blit) {
         if (g_backend == 4) return ds4_gpu_metal3_only("resident layer service");
-        ds4_gpu_mtl4_note_metal3_work("resident selected copy");
         id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
         if (!blit) DS4_RESIDENT_DECLINE("no blit encoder");
         [blit copyFromBuffer:selbuf
