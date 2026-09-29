@@ -73,6 +73,52 @@ On a DGX Spark, add `--cuda`; see the [Spark guide](DGX_SPARK.md#deepseek-v41-fl
 with 0 disabling thinking. `/think 25` changes it in the CLI or native agent.
 `--think` selects 75 and `--think-max` selects 100.
 
+### Faster Q2 decode on a 128 GB Mac
+
+This branch adds a gated decode path for Q2 with SSD streaming on one Metal
+Mac. It is off by default; this is the configuration that was measured:
+
+```sh
+env DS4_METAL_V41_DECODE_QUEUE=1 DS4_METAL_IQ2_SELECTED_SHARED_EVENT=1 \
+    DS4_METAL_STREAM_SPLIT_MIN_MISSING=1 \
+    DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP=8192 \
+    DS4_METAL_V41_DECODE_LEND_HEADROOM=1 \
+    DS4_METAL_V41_ABORT_GATE=40 DS4_METAL_V41_ABORT_GATE_SEG=3 \
+    DS4_METAL_V41_EXPERT_RESIDENCY_SET=1 DS4_METAL_V41_FFN_OVERLAP=1 \
+    DS4_METAL_V41_ROUTER_FUSE_TRANSFORM=5 DS4_METAL_V41_FUSE_BF16=2 \
+    DS4_METAL_V41_HC_COMPOUND=1 DS4_METAL_V41_GATE_ENCODE_AHEAD=1 \
+  ./ds4-server -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+    --ssd-streaming --ctx 8192 --ssd-streaming-cache-experts 10268 \
+    --host 127.0.0.1 --port 8017
+```
+
+The same variables work with `ds4` and `ds4-agent`. On a 128 GB M5 Max this
+decodes at about 24.1 tok/s averaged over 2048 tokens, against 12.7 tok/s
+with the defaults. The generated text and token ids were identical to the
+default path on every prompt checked, up to 2048 tokens. The first few dozen
+tokens of a new prompt are slower while the expert cache fills.
+
+`--ssd-streaming-cache-experts 10268` asks for more than fits; it is clamped
+to the working-set budget (8941 experts on this machine), and lending the
+prefill reserve raises decode to 9709. On a Mac with different memory, drop
+that option and keep the automatic budget.
+
+| Variable | What it does |
+| --- | --- |
+| `DS4_METAL_V41_ABORT_GATE=40` | The GPU checks each of the first 40 layers' selected experts against the cache and stops on a miss, instead of the CPU reading the route back every layer |
+| `DS4_METAL_V41_ABORT_GATE_SEG=3` | At most 3 layers in one gated segment |
+| `DS4_METAL_V41_GATE_ENCODE_AHEAD=1` | Encodes the next segment while the GPU runs the current one |
+| `DS4_METAL_V41_DECODE_QUEUE=1` | Queues the decode layers of a token as tensor-parallel decode does |
+| `DS4_METAL_V41_FFN_OVERLAP=1` | Runs the shared and routed experts concurrently |
+| `DS4_METAL_V41_ROUTER_FUSE_TRANSFORM=5` | Router projection, top-6 selection and the gate's check in one dispatch |
+| `DS4_METAL_V41_FUSE_BF16=2` | Producers round to BF16 themselves, and layer transitions are fused |
+| `DS4_METAL_V41_HC_COMPOUND=1` | Merges the hyper-connection steps between layers |
+| `DS4_METAL_V41_EXPERT_RESIDENCY_SET=1` | Keeps the cached experts in a Metal residency set |
+| `DS4_METAL_IQ2_SELECTED_SHARED_EVENT=1` | Synchronises selected-expert slots with a shared event |
+| `DS4_METAL_STREAM_SPLIT_MIN_MISSING=1` | Splits the routed pass from one missing expert (default 3) |
+| `DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP=8192` | Prewarms the cache at load with the 8192 hottest experts |
+| `DS4_METAL_V41_DECODE_LEND_HEADROOM=1` | Lends the prefill reserve to the decode cache, taken back before each prompt |
+
 For two 128 GB Macs or Sparks, follow the [TP/RDMA setup](DISTRIBUTED.md), passing this
 GGUF with `-m` on both ranks and omitting `--ssd-streaming`. Each rank holds
 about 81 GiB of main weights, plus context and runtime buffers. Both machines

@@ -170,7 +170,8 @@ Q2 runs with SSD streaming on one 128 GB Mac or Spark, or resident across two
 Macs or two Sparks using RDMA. Q4 needs SSD streaming or a 512 GB Mac.
 Engram tables remain on disk in every mode, so use a fast
 local SSD. See the [model guide](docs/MODELS.md#deepseek-v41-flash) for downloads
-and setup.
+and setup, and [faster Q2 decode](docs/MODELS.md#faster-q2-decode-on-a-128-gb-mac)
+for the gated decode path of this branch on one 128 GB Mac.
 
 With the matching encoder passed as `--vision FILE`, use `/read image.png`
 in the CLI or `view_image` in the native agent.
