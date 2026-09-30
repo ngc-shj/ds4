@@ -32,6 +32,10 @@ void ds4_gpu_mtl4_counts(unsigned long long *segments, unsigned long long *dispa
                          unsigned long long *m3_fallback);
 void ds4_gpu_mtl4_structure(unsigned long long out[16]);
 int ds4_gpu_warm_command_queue(void);
+unsigned long long ds4_gpu_full_addr_table_uses(void);
+unsigned long long ds4_gpu_full_addr_table_asks_m4(void);
+void ds4_gpu_stream_expert_cache_counters(uint64_t *hits, uint64_t *misses, uint64_t *evictions,
+                                          uint32_t *entries, uint32_t *budget);
 int ds4_gpu_test_warm_model_views(void);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
 void ds4_gpu_mtl4_health(unsigned long long out[8]);
@@ -244,6 +248,7 @@ int main(int argc, char **argv) {
            warmq, m3c[1] - m3b[1], m3c[0] - m3b[0]);
     CHECK(warmq == 0 && m3c[1] - m3b[1] == 1 && m3c[0] == m3b[0], "refusal not counted exactly once");
     int *ref = calloc((size_t)steps, sizeof(int));
+    uint64_t hits = 0, misses = 0;
 
     paired(engine, "short", "Explain how a modern CPU executes an instruction, from fetch "
            "to retire, in as much detail as you can.", steps, vocab, ref);
@@ -269,6 +274,9 @@ int main(int argc, char **argv) {
     CHECK(h[0] == h[1], "commits and feedback received differ");
     CHECK(ds4_gpu_backend_m3_fallback() == 0, "Metal 3 work over the whole run");
     ds4_gpu_backend_report("test", 0);
+    /* Read while the first engine's cache still exists: closing it clears
+     * the cache and may clear what it counted. */
+    ds4_gpu_stream_expert_cache_counters(&hits, &misses, NULL, NULL, NULL);
     ds4_engine_close(engine);
     reopened(&opt, "Explain how a modern CPU executes an instruction, from fetch "
              "to retire, in as much detail as you can.", ref, steps);
@@ -276,11 +284,32 @@ int main(int argc, char **argv) {
     unsigned long long m3f[4];
     ds4_gpu_backend_m3_after_selection(m3f);
     printf("m3api      Metal 3 command execution after Metal 4 selection: %llu; refused %llu "
-           "(the one deliberate); Metal 3 queues created before selection %llu, after %llu\n",
+           "(the deliberate one, and one for the full address table if asked); Metal 3 queues "
+           "created before selection %llu, after %llu\n",
            m3f[0], m3f[1], m3f[2], m3f[3]);
     /* One Metal 3 queue is made at each engine's init, before the model says
      * which backend it needs: two engines were opened here. */
-    CHECK(m3f[0] == 0 && m3f[1] == 1 && m3f[2] == 2 && m3f[3] == 0,
+    /* The full expert address table, under Metal 4, is refused the first
+     * time a path asks for it, and the ordinary path runs instead. The
+     * environment says whether it may be asked for (SSD streaming - this test
+     * always streams - ENABLE set, DISABLE not); only the paths that consult
+     * it ever ask, and the single-row decode does not. So the refusal is
+     * expected exactly when it was asked, never more than once, and the table
+     * is never used either way. */
+    const int full_enabled = getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
+                             getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL;
+    const unsigned long long full_asks = ds4_gpu_full_addr_table_asks_m4();
+    const int full_asked = full_asks > 0;
+    CHECK(full_enabled || !full_asked, "the full address table was asked for with it disabled");
+    const unsigned long long want_refused = 1u + (full_asked ? 1u : 0u);
+    const unsigned long long full_uses = ds4_gpu_full_addr_table_uses();
+    printf("fulltable  enabled %s, asked %llu times under Metal 4; full expert address table "
+           "uses %llu; expert cache hits %llu, misses %llu\n", full_enabled ? "yes" : "no",
+           full_asks, full_uses,
+           (unsigned long long)hits, (unsigned long long)misses);
+    CHECK(full_uses == 0, "the full expert address table was used under Metal 4");
+    CHECK(hits + misses > 0, "the ordinary expert-cache path did not engage");
+    CHECK(m3f[0] == 0 && m3f[1] == want_refused && m3f[2] == 2 && m3f[3] == 0,
           "Metal 3 after selection, or queue counts not as expected");
     printf("%s\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;

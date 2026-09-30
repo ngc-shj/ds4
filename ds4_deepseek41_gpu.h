@@ -219,6 +219,8 @@ void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
 int ds4_gpu_use_metal4(void);
 unsigned long long ds4_gpu_backend_m3_fallback(void);
 void ds4_gpu_backend_m3_after_selection(unsigned long long out[4]);
+unsigned long long ds4_gpu_full_addr_table_uses(void);
+unsigned long long ds4_gpu_full_addr_table_asks_m4(void);
 int ds4_gpu_test_warm_model_views(void);
 void ds4_gpu_mtl4_inject_failure(void);
 int ds4_gpu_mtl4_executor_enabled(void);

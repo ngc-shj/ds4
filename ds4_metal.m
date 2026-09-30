@@ -190,6 +190,12 @@ static void ds4_bk_note(int mtl4, const char *site, int kind) {
 /* One line a backend a site that moved since the last call, then the totals.
  * `tag` names the window. */
 static void ds4_report_boundaries(const char *tag);
+/* Times the full expert address table was actually prepared for a layer, and
+ * times a path asked for it while Metal 4 was selected. Only some paths ever
+ * ask - the native batch does, the gated single-row decode does not - so
+ * whether a request is refused depends on the path, not on the environment
+ * alone. */
+static _Atomic unsigned long long g_full_addr_table_uses, g_full_addr_table_asks_m4;
 void ds4_gpu_backend_m3_after_selection(unsigned long long out[4]);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
@@ -233,8 +239,11 @@ void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
         unsigned long long a[4];
         ds4_gpu_backend_m3_after_selection(a);
         fprintf(stderr, "ds4: backend %s Metal 3 command execution after Metal 4 selection: %llu "
-                "(refused %llu); Metal 3 queues created before selection %llu, after %llu\n",
-                tag, a[0], a[1], a[2], a[3]);
+                "(refused %llu); Metal 3 queues created before selection %llu, after %llu; "
+                "full expert address table uses %llu, asked under Metal 4 %llu\n",
+                tag, a[0], a[1], a[2], a[3],
+                (unsigned long long)atomic_load(&g_full_addr_table_uses),
+                (unsigned long long)atomic_load(&g_full_addr_table_asks_m4));
     }
     fprintf(stderr, "ds4: backend %s background: keepalive M3 %llu M4 %llu, pacer M3 %llu M4 %llu "
             "(cumulative)\n",
@@ -248,10 +257,10 @@ void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
  * V4 graph's readback overlap, the resident-layer service. None is on the V4.1
  * production path; under the Metal 4 backend each refuses rather than
  * submitting to a queue nothing else is ordered against. */
-static unsigned long long g_bk_m3_refusals;
+static _Atomic unsigned long long g_bk_m3_refusals;
 static int ds4_gpu_metal3_only(const char *what) {
     fprintf(stderr, "ds4: %s is Metal 3 only and the Metal 4 backend is selected\n", what);
-    g_bk_m3_refusals++;
+    atomic_fetch_add(&g_bk_m3_refusals, 1u);
     return 0;
 }
 
@@ -16256,10 +16265,28 @@ static int ds4_gpu_stream_block_residency_requested(void) {
 }
 
 static int ds4_gpu_stream_full_expert_addr_table_requested(void) {
-    return g_ssd_streaming_mode &&
+    const int asked = g_ssd_streaming_mode &&
            getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
            getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL;
+    /* The full table has no Metal 4 form: its prewire is a Metal 3 blit and
+     * its residency set was only ever put on the Metal 3 queue, so under
+     * Metal 4 its experts would be read through raw addresses with nothing
+     * making them resident - plausible numbers, wrong answer. Refusing only
+     * the prewire and carrying on is how that happened. The whole feature is
+     * off here, once, and the ordinary path runs. */
+    if (asked && g_backend == 4) {
+        atomic_fetch_add(&g_full_addr_table_asks_m4, 1u);
+        static _Atomic int said;
+        if (!atomic_exchange(&said, 1)) (void)ds4_gpu_metal3_only("full expert address table");
+        return 0;
+    }
+    return asked;
 }
+
+unsigned long long ds4_gpu_full_addr_table_uses(void);
+unsigned long long ds4_gpu_full_addr_table_uses(void) { return g_full_addr_table_uses; }
+unsigned long long ds4_gpu_full_addr_table_asks_m4(void);
+unsigned long long ds4_gpu_full_addr_table_asks_m4(void) { return g_full_addr_table_asks_m4; }
 
 /* A layer whose address table holds every expert never needs the host to fix it
  * up, so it can skip the per-layer readback entirely.  The pages of the experts
@@ -17185,6 +17212,7 @@ static int ds4_gpu_stream_full_expert_addr_table_prepare(
         id<MTLBuffer> *down_addrs,
         ds4_gpu_stream_expert_cache_entry **entry_out) {
     if (!ds4_gpu_stream_full_expert_addr_table_requested()) return 0;
+    atomic_fetch_add(&g_full_addr_table_uses, 1u);
     if (!model_map || model_size == 0 ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_total_expert == 0 ||
