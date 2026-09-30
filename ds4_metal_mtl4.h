@@ -860,7 +860,7 @@ static void ds4_m4_encode_part(DS4M4Ctx *c, unsigned part, uint32_t from, uint32
  * then a part per DS4_MTL4_PART_MIN up to DS4_MTL4_PARTS, cut only where the
  * graph has a barrier. ds4_gpu_test_mtl4_parts forces a count regardless of
  * size, so a test can put every context through the split. */
-static unsigned g_mtl4_parts_max = 1u;
+static unsigned g_mtl4_parts_max = DS4_MTL4_PARTS;
 static unsigned g_mtl4_parts_forced;
 void ds4_gpu_test_mtl4_parts(unsigned parts);
 void ds4_gpu_test_mtl4_parts(unsigned parts) {
