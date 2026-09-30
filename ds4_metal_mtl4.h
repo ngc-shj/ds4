@@ -428,25 +428,29 @@ void ds4_gpu_mtl4_structure(unsigned long long out[16]) {
 }
 unsigned long long ds4_gpu_mtl4_fences(void) { return g_m4s[DS4_M4S_FENCES]; }
 
-/* The call sites whose bindings still carry no length, most used first. */
+/* The call sites whose bindings still carry no length, most used first,
+ * counted since the process started. */
 void ds4_gpu_mtl4_coarse_report(FILE *f, unsigned max_lines);
 void ds4_gpu_mtl4_coarse_report(FILE *f, unsigned max_lines) {
-    unsigned shown = 0;
     unsigned long long total = 0, sites = 0;
     for (unsigned i = 0; i < DS4_M4_CENSUS_LINES; i++)
         if (g_m4_coarse_line[i]) { total += g_m4_coarse_line[i]; sites++; }
     fprintf(f, "ds4: Metal 4 bindings with no stated length: %llu at %llu call sites\n",
             total, sites);
-    while (shown < max_lines) {
+    if (!sites) return;
+    unsigned long long *left = malloc(sizeof(g_m4_coarse_line));
+    if (!left) return;
+    memcpy(left, g_m4_coarse_line, sizeof(g_m4_coarse_line));
+    for (unsigned shown = 0; shown < max_lines; shown++) {
         unsigned best = 0;
         unsigned long long n = 0;
         for (unsigned i = 0; i < DS4_M4_CENSUS_LINES; i++)
-            if (g_m4_coarse_line[i] > n) { n = g_m4_coarse_line[i]; best = i; }
+            if (left[i] > n) { n = left[i]; best = i; }
         if (!n) break;
         fprintf(f, "ds4:   ds4_metal.m:%u %llu\n", best, n);
-        g_m4_coarse_line[best] = 0;
-        shown++;
+        left[best] = 0;
     }
+    free(left);
 }
 
 /* ---- recording ------------------------------------------------------------ */
@@ -663,8 +667,11 @@ static void ds4_m4_dispatch(DS4Enc *e, int kind, MTLSize a, MTLSize b,
             if (ds4_m4_readonly(bb)) continue;
             const void *buf = (__bridge const void *)bb;
             uint64_t hi = bb.length;
-            if (e->len[i]) {
-                hi = e->off[i] + e->len[i];
+            NSUInteger len = e->len[i];
+            /* No length from the call site: the tensor that starts there. */
+            if (!len) len = ds4_extent_at(buf, e->off[i]);
+            if (len) {
+                hi = e->off[i] + len;
             } else {
                 g_m4s[DS4_M4S_COARSE]++;
                 if (e->line[i] < DS4_M4_CENSUS_LINES) g_m4_coarse_line[e->line[i]]++;
@@ -849,21 +856,24 @@ static void ds4_m4_encode_part(DS4M4Ctx *c, unsigned part, uint32_t from, uint32
     [cb endCommandBuffer];
 }
 
-/* How many parts a graph may be cut into. 1 until the split has been shown
- * to give the same answer; ds4_gpu_test_mtl4_parts overrides it. */
+/* How many parts a graph is cut into: none below DS4_MTL4_PART_MIN nodes,
+ * then a part per DS4_MTL4_PART_MIN up to DS4_MTL4_PARTS, cut only where the
+ * graph has a barrier. ds4_gpu_test_mtl4_parts forces a count regardless of
+ * size, so a test can put every context through the split. */
 static unsigned g_mtl4_parts_max = 1u;
+static unsigned g_mtl4_parts_forced;
 void ds4_gpu_test_mtl4_parts(unsigned parts);
 void ds4_gpu_test_mtl4_parts(unsigned parts) {
-    g_mtl4_parts_max = parts < 1u ? 1u : (parts > DS4_MTL4_PARTS ? DS4_MTL4_PARTS : parts);
+    g_mtl4_parts_forced = parts > DS4_MTL4_PARTS ? DS4_MTL4_PARTS : parts;
 }
 
-/* Where the graph is cut: at barriers, into parts of at least
- * DS4_MTL4_PART_MIN nodes. Returns the number of parts; bounds[p] is where
+/* Where the graph is cut. Returns the number of parts; bounds[p] is where
  * part p starts, bounds[parts] the end. */
 API_AVAILABLE(macos(26.0))
 static unsigned ds4_m4_split(DS4M4Ctx *c, uint32_t bounds[DS4_MTL4_PARTS + 1u]) {
     unsigned want = c->n_nodes / DS4_MTL4_PART_MIN;
     if (want > g_mtl4_parts_max) want = g_mtl4_parts_max;
+    if (g_mtl4_parts_forced) want = g_mtl4_parts_forced;
     if (want < 1u) want = 1u;
     bounds[0] = 0;
     unsigned parts = 1;

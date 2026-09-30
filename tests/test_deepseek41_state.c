@@ -1,6 +1,10 @@
 /* What a V4.1 build computes, reduced to hashes that two builds can compare.
  *
- *   test_deepseek41_state <model.gguf> [story.txt]
+ *   test_deepseek41_state <model.gguf> [story.txt [parts]]
+ *
+ * With `parts`, every Metal 4 context is encoded in that many command buffers
+ * (where its graph has that many barriers to cut at) and submitted together:
+ * the hashes must not move.
  *
  * Run with the production environment. For each case it prints the hash of the
  * token ids, the hash of every logit of every evaluation (the prefill's and
@@ -182,8 +186,15 @@ static char *read_prefix(const char *path, size_t max) {
     return b;
 }
 
+void ds4_gpu_test_mtl4_parts(unsigned parts) __attribute__((weak));
+
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [story.txt]\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s model.gguf [story.txt [parts]]\n", argv[0]); return 2; }
+    if (argc > 3) {
+        if (!ds4_gpu_test_mtl4_parts) { fprintf(stderr, "this build cannot split contexts\n"); return 2; }
+        ds4_gpu_test_mtl4_parts((unsigned)atoi(argv[3]));
+        printf("parts %s\n", argv[3]);
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
     ds4_engine *engine = NULL;
     ds4_engine_options opt = {
