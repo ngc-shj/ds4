@@ -1666,6 +1666,65 @@ static int ds4_gpu_tensor_live_remove_locked(const void *ptr) {
     }
 }
 
+/* Where every live tensor and view begins in its buffer, and how many bytes
+ * it spans. A binding that starts exactly where a tensor starts reaches that
+ * tensor: the Metal 4 context takes its range from here when the call site
+ * stated none (ds4_m4_buf). Several tensors starting at one place give the
+ * widest of them. Kept under g_tensor_mu with the live-handle table. */
+typedef struct ds4_extent {
+    const void *buf;
+    uint64_t off, bytes;
+    uint32_t count;
+    struct ds4_extent *next;
+} ds4_extent;
+#define DS4_EXTENT_BUCKETS 16384u
+static ds4_extent *g_extents[DS4_EXTENT_BUCKETS];
+
+static uint32_t ds4_extent_bucket(const void *buf, uint64_t off) {
+    uint64_t x = (uint64_t)(uintptr_t)buf ^ (off * 0x9e3779b97f4a7c15ULL);
+    x ^= x >> 29; x *= 0xbf58476d1ce4e5b9ULL; x ^= x >> 32;
+    return (uint32_t)x & (DS4_EXTENT_BUCKETS - 1u);
+}
+
+static void ds4_extent_add_locked(const void *buf, uint64_t off, uint64_t bytes) {
+    if (!buf || !bytes) return;
+    ds4_extent **head = &g_extents[ds4_extent_bucket(buf, off)];
+    for (ds4_extent *e = *head; e; e = e->next)
+        if (e->buf == buf && e->off == off && e->bytes == bytes) { e->count++; return; }
+    ds4_extent *e = malloc(sizeof(*e));
+    if (!e) return;
+    e->buf = buf; e->off = off; e->bytes = bytes; e->count = 1; e->next = *head;
+    *head = e;
+}
+
+static void ds4_extent_remove_locked(const void *buf, uint64_t off, uint64_t bytes) {
+    if (!buf || !bytes) return;
+    ds4_extent **p = &g_extents[ds4_extent_bucket(buf, off)];
+    for (; *p; p = &(*p)->next) {
+        ds4_extent *e = *p;
+        if (e->buf != buf || e->off != off || e->bytes != bytes) continue;
+        if (--e->count == 0) { *p = e->next; free(e); }
+        return;
+    }
+}
+
+/* The widest live tensor starting at `off` in `buf`; 0 if none does. */
+static NSUInteger ds4_extent_at(const void *buf, NSUInteger off) {
+    uint64_t best = 0;
+    pthread_mutex_lock(&g_tensor_mu);
+    for (ds4_extent *e = g_extents[ds4_extent_bucket(buf, off)]; e; e = e->next)
+        if (e->buf == buf && e->off == off && e->bytes > best) best = e->bytes;
+    pthread_mutex_unlock(&g_tensor_mu);
+    return (NSUInteger)best;
+}
+
+static void ds4_extent_reset_locked(void) {
+    for (uint32_t i = 0; i < DS4_EXTENT_BUCKETS; i++) {
+        for (ds4_extent *e = g_extents[i]; e;) { ds4_extent *n = e->next; free(e); e = n; }
+        g_extents[i] = NULL;
+    }
+}
+
 static int ds4_gpu_tensor_track_alloc_locked(
         const void *ptr,
         uint64_t bytes,
@@ -1706,6 +1765,7 @@ static int ds4_gpu_tensor_prepare_free(
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     const uint8_t obj_owner = obj.owner;
     const uint64_t obj_bytes = obj.bytes;
+    ds4_extent_remove_locked((__bridge const void *)obj.buffer, obj.offset, obj_bytes);
     if (obj_owner) {
         if (obj_bytes <= g_tensor_alloc_live_bytes) {
             g_tensor_alloc_live_bytes -= obj_bytes;
@@ -1728,6 +1788,7 @@ static void ds4_gpu_tensor_tracking_reset(void) {
                 "ds4: Metal cleanup discarded %zu live tensor handles\n",
                 g_tensor_live_count);
     }
+    ds4_extent_reset_locked();
     free(g_tensor_live_slots);
     g_tensor_live_slots = NULL;
     g_tensor_live_cap = 0;
@@ -1748,6 +1809,16 @@ static NSUInteger ds4_gpu_tensor_offset(const ds4_gpu_tensor *tensor) {
     if (!tensor) return 0;
     const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
     return (NSUInteger)obj.offset;
+}
+
+/* The bytes a binding at `offset` into a tensor's buffer can reach within
+ * that tensor: to the tensor's end. 0 - no stated length - if the offset is
+ * not inside it. */
+static NSUInteger ds4_tensor_tail(const ds4_gpu_tensor *tensor, NSUInteger offset) {
+    if (!tensor) return 0;
+    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+    const uint64_t end = obj.offset + obj.bytes;
+    return offset >= obj.offset && offset < end ? (NSUInteger)(end - offset) : 0;
 }
 
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
@@ -6607,6 +6678,22 @@ static int ds4_gpu_encode_mul_mm_id(
         id<MTLBuffer>               ids,
         NSUInteger                  ids_off);
 
+/* The id map's layout in g_moe_id_map_buffer: per-expert counts, then the
+ * expert-major row ids, then the tile work list with its 8-byte header.
+ * Returns the total; *ids_at and *work_at are where the second and third
+ * parts start. */
+static NSUInteger ds4_moe_id_map_layout(int32_t experts, int32_t used, int32_t tokens,
+                                        NSUInteger *ids_at, NSUInteger *work_at) {
+    const NSUInteger tpe_bytes = (NSUInteger)experts * sizeof(int32_t);
+    const NSUInteger hids_bytes = (NSUInteger)experts * (NSUInteger)tokens * sizeof(int32_t);
+    const NSUInteger work_offset = (tpe_bytes + hids_bytes + 7u) & ~7u;
+    const uint64_t pair_rows = (uint64_t)(uint32_t)used * (uint32_t)tokens;
+    const uint64_t work_cap = (pair_rows + 31u * (uint32_t)experts + 31u) / 32u;
+    if (ids_at) *ids_at = tpe_bytes;
+    if (work_at) *work_at = work_offset;
+    return work_offset + 8u + (NSUInteger)work_cap * 2u * sizeof(uint32_t);
+}
+
 static int ds4_gpu_encode_mul_mm_id_map(
         DS4Cmd *       cb,
         id<MTLComputePipelineState> map_pipeline,
@@ -10004,6 +10091,7 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
                 bytes,
                 &live_snap,
                 &peak_snap);
+        if (tracked) ds4_extent_add_locked((__bridge const void *)tensor.buffer, 0, bytes);
         pthread_mutex_unlock(&g_tensor_mu);
         if (!tracked) {
             fprintf(stderr, "ds4: failed to track Metal tensor allocation\n");
@@ -10082,6 +10170,7 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
         view.owner = 0;
         pthread_mutex_lock(&g_tensor_mu);
         const int tracked = ds4_gpu_tensor_track_view_locked((__bridge const void *)view);
+        if (tracked) ds4_extent_add_locked((__bridge const void *)view.buffer, absolute_offset, bytes);
         pthread_mutex_unlock(&g_tensor_mu);
         if (!tracked) {
             fprintf(stderr, "ds4: failed to track Metal tensor view\n");
@@ -12071,8 +12160,8 @@ int ds4_gpu_add_tensor_tp_flag(
     DS4Enc *enc = ds4_gpu_compute_encoder(g_batch_cmd);
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &n, sizeof(n), 0);
-    ds4_enc_buf(enc, abuf, ds4_gpu_tensor_offset(a), 1);
-    ds4_enc_buf(enc, bbuf, ds4_gpu_tensor_offset(b), 2);
+    ds4_enc_buf_n(enc, abuf, ds4_gpu_tensor_offset(a), ds4_tensor_tail(a, ds4_gpu_tensor_offset(a)), 1);
+    ds4_enc_buf_n(enc, bbuf, ds4_gpu_tensor_offset(b), ds4_tensor_tail(b, ds4_gpu_tensor_offset(b)), 2);
     ds4_enc_buf(enc, g_tp_slab_buffer, ds4_gpu_tensor_offset(out), 3);
     ds4_enc_buf(enc, g_tp_slab_buffer, (NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)slot * 4u), 4);
     ds4_enc_buf(enc, g_tp_check_buffer, (NSUInteger)slot * 4u, 5);
@@ -14066,7 +14155,7 @@ int ds4_gpu_embed_token_hc_tensor(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
         ds4_enc_bytes(enc, &token_i32, sizeof(token_i32), 2);
-        ds4_enc_buf(enc, g_embed_rows_buffer, 0, 3);
+        ds4_enc_buf_n(enc, g_embed_rows_buffer, 0, row_bytes, 3);
         ds4_gpu_dispatch(enc, MTLSizeMake(nw0, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -16800,16 +16889,16 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     ds4_enc_buf(enc, table_gate, 0, 1);
     ds4_enc_buf(enc, table_up, 0, 2);
     ds4_enc_buf(enc, table_down, 0, 3);
-    ds4_enc_buf(enc, g_gate_grid, 0, 4);
+    ds4_enc_buf_n(enc, g_gate_grid, 0, (g_gate_grid).length, 4);
     /* The segment being encoded owns one miss word of the ring; the one before
      * it may still be running and writing its own. */
-    ds4_enc_buf(enc, g_gate_miss, (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t), 5);
+    ds4_enc_buf_n(enc, g_gate_miss, (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t), DS4_GATE_MISS_WORDS * sizeof(uint32_t), 5);
     ds4_enc_bytes(enc, &layer, sizeof(layer), 6);
     ds4_enc_bytes(enc, &n_sel, sizeof(n_sel), 7);
     ds4_enc_bytes(enc, &gate_from, sizeof(gate_from), 8);
     ds4_enc_bytes(enc, &n_slots, sizeof(n_slots), 9);
     ds4_enc_bytes(enc, &n_total, sizeof(n_total), 10);
-    ds4_enc_buf(enc, g_gate_route, 0, 11);
+    ds4_enc_buf_n(enc, g_gate_route, 0, (g_gate_route).length, 11);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     /* Everything encoded from here on can be switched off by this validate or
      * by one behind it, so from here on the dispatches go out indirect. */
@@ -16846,9 +16935,9 @@ int ds4_gpu_gate_encode_reassert(uint32_t prev_slot) {
     DS4Enc *enc = ds4_gpu_compute_encoder(g_batch_cmd);
     if (!enc) return 0;
     ds4_enc_pso(enc, g_gate_reassert_pso);
-    ds4_enc_buf(enc, g_gate_miss, (NSUInteger)(prev_slot % DS4_GATE_MISS_SLOTS) * DS4_GATE_MISS_WORDS * sizeof(uint32_t), 0);
-    ds4_enc_buf(enc, g_gate_grid, 0, 1);
-    ds4_enc_buf(enc, g_gate_range, (NSUInteger)(ds4_gpu_gate_encode_slot() % DS4_GATE_MISS_SLOTS) * 2u * sizeof(uint32_t), 2);
+    ds4_enc_buf_n(enc, g_gate_miss, (NSUInteger)(prev_slot % DS4_GATE_MISS_SLOTS) * DS4_GATE_MISS_WORDS * sizeof(uint32_t), DS4_GATE_MISS_WORDS * sizeof(uint32_t), 0);
+    ds4_enc_buf_n(enc, g_gate_grid, 0, (g_gate_grid).length, 1);
+    ds4_enc_buf_n(enc, g_gate_range, (NSUInteger)(ds4_gpu_gate_encode_slot() % DS4_GATE_MISS_SLOTS) * 2u * sizeof(uint32_t), 2u * sizeof(uint32_t), 2);
     ds4_enc_dispatch_raw(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     ds4_enc_barrier_scope(enc, MTLBarrierScopeBuffers);
     ds4_gpu_end_compute_encoder(g_batch_cmd, enc);
@@ -17262,9 +17351,9 @@ static int ds4_gpu_encode_stream_expert_cache_validate(
     ds4_enc_pso(enc, g_moe_stream_expert_cache_validate_pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     ds4_enc_buf(enc, selected, selected_off, 1);
-    ds4_enc_buf(enc, gate_addrs, 0, 2);
-    ds4_enc_buf(enc, up_addrs, 0, 3);
-    ds4_enc_buf(enc, down_addrs, 0, 4);
+    ds4_enc_buf_n(enc, gate_addrs, 0, (gate_addrs).length, 2);
+    ds4_enc_buf_n(enc, up_addrs, 0, (up_addrs).length, 3);
+    ds4_enc_buf_n(enc, down_addrs, 0, (down_addrs).length, 4);
     ds4_enc_buf(enc, status, 0, 5);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -17420,9 +17509,9 @@ static int ds4_gpu_encode_moe_block_residency(
     ds4_enc_pso(enc, g_moe_block_residency_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
     ds4_enc_buf(enc, selected, selected_off, 1);
-    ds4_enc_buf(enc, gate_addrs, 0, 2);
-    ds4_enc_buf(enc, up_addrs, 0, 3);
-    ds4_enc_buf(enc, down_addrs, 0, 4);
+    ds4_enc_buf_n(enc, gate_addrs, 0, (gate_addrs).length, 2);
+    ds4_enc_buf_n(enc, up_addrs, 0, (up_addrs).length, 3);
+    ds4_enc_buf_n(enc, down_addrs, 0, (down_addrs).length, 4);
     ds4_enc_buf(enc, out, 0, 5);
     ds4_enc_buf(enc, gated ? g_gate_grid : out, 0, 6);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
@@ -21717,10 +21806,10 @@ int ds4_gpu_indexer_score_one_tensor(
             DS4Enc *enc = ds4_gpu_compute_encoder(cb);
             ds4_enc_pso(enc, direct_pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
-            ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-            ds4_enc_buf(enc, wbuf, ds4_gpu_tensor_offset(weights), 2);
-            ds4_enc_buf(enc, compbuf, ds4_gpu_tensor_offset(index_comp), 3);
-            ds4_enc_buf(enc, scorebuf, ds4_gpu_tensor_offset(scores), 4);
+            ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+            ds4_enc_buf_n(enc, wbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 2);
+            ds4_enc_buf_n(enc, compbuf, ds4_gpu_tensor_offset(index_comp), ds4_tensor_tail(index_comp, ds4_gpu_tensor_offset(index_comp)), 3);
+            ds4_enc_buf_n(enc, scorebuf, ds4_gpu_tensor_offset(scores), ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores)), 4);
             ds4_enc_tgmem(enc, (128u + 4u) * sizeof(float), 0);
             ds4_gpu_dispatch(enc, MTLSizeMake(n_comp, 1, 1), MTLSizeMake(32, 4, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -21770,8 +21859,8 @@ int ds4_gpu_indexer_score_one_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, dot_pipeline);
         ds4_enc_bytes(enc, &dot_args, sizeof(dot_args), 0);
-        ds4_enc_buf(enc, compbuf, ds4_gpu_tensor_offset(index_comp), 1);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 2);
+        ds4_enc_buf_n(enc, compbuf, ds4_gpu_tensor_offset(index_comp), ds4_tensor_tail(index_comp, ds4_gpu_tensor_offset(index_comp)), 1);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 2);
         ds4_enc_buf(enc, g_indexer_head_scores_buffer, 0, 3);
         if (dot_dispatch.smem) {
             ds4_enc_tgmem(enc, dot_dispatch.smem, 0);
@@ -21783,8 +21872,8 @@ int ds4_gpu_indexer_score_one_tensor(
         ds4_enc_pso(enc, g_dsv4_indexer_weighted_sum_pipeline);
         ds4_enc_bytes(enc, &sum_args, sizeof(sum_args), 0);
         ds4_enc_buf(enc, g_indexer_head_scores_buffer, 0, 1);
-        ds4_enc_buf(enc, wbuf, ds4_gpu_tensor_offset(weights), 2);
-        ds4_enc_buf(enc, scorebuf, ds4_gpu_tensor_offset(scores), 3);
+        ds4_enc_buf_n(enc, wbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 2);
+        ds4_enc_buf_n(enc, scorebuf, ds4_gpu_tensor_offset(scores), ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores)), 3);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n_comp + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21867,10 +21956,10 @@ static int ds4_gpu_indexer_scores_batch_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, wbuf, ds4_gpu_tensor_offset(weights), 2);
-        ds4_enc_buf(enc, compbuf, ds4_gpu_tensor_offset(index_comp), 3);
-        ds4_enc_buf(enc, scorebuf, ds4_gpu_tensor_offset(scores), 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, wbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 2);
+        ds4_enc_buf_n(enc, compbuf, ds4_gpu_tensor_offset(index_comp), ds4_tensor_tail(index_comp, ds4_gpu_tensor_offset(index_comp)), 3);
+        ds4_enc_buf_n(enc, scorebuf, ds4_gpu_tensor_offset(scores), ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores)), 4);
         if (use_nax) {
             const NSUInteger q_shared = 2u * 32u * 32u;
             const NSUInteger k_shared = 32u * 128u;
@@ -22049,8 +22138,9 @@ static int ds4_gpu_indexer_topk_tensor_impl_strided(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, sort_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, scorebuf, ds4_gpu_tensor_offset(scores) + score_off_bytes, 1);
-        ds4_enc_buf(enc, one_pass ? selbuf : g_indexer_topk_buffer, one_pass ? ds4_gpu_tensor_offset(selected) : cur_off, 2);
+        ds4_enc_buf_n(enc, scorebuf, ds4_gpu_tensor_offset(scores) + score_off_bytes, ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores) + score_off_bytes), 1);
+        ds4_enc_buf_n(enc, one_pass ? selbuf : g_indexer_topk_buffer, one_pass ? ds4_gpu_tensor_offset(selected) : cur_off,
+                      one_pass ? ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)) : (NSUInteger)scratch_row_bytes * n_tokens, 2);
         ds4_enc_tgmem(enc, smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1), MTLSizeMake((NSUInteger)nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -22089,9 +22179,10 @@ static int ds4_gpu_indexer_topk_tensor_impl_strided(
             enc = ds4_gpu_compute_encoder(cb);
             ds4_enc_pso(enc, merge_pipeline);
             ds4_enc_bytes(enc, &merge_args, sizeof(merge_args), 0);
-            ds4_enc_buf(enc, scorebuf, ds4_gpu_tensor_offset(scores) + score_off_bytes, 1);
-            ds4_enc_buf(enc, g_indexer_topk_buffer, cur_off, 2);
-            ds4_enc_buf(enc, final_merge ? selbuf : g_indexer_topk_buffer, final_merge ? ds4_gpu_tensor_offset(selected) : next_off, 3);
+            ds4_enc_buf_n(enc, scorebuf, ds4_gpu_tensor_offset(scores) + score_off_bytes, ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores) + score_off_bytes), 1);
+            ds4_enc_buf_n(enc, g_indexer_topk_buffer, cur_off, (NSUInteger)scratch_row_bytes * n_tokens, 2);
+            ds4_enc_buf_n(enc, final_merge ? selbuf : g_indexer_topk_buffer, final_merge ? ds4_gpu_tensor_offset(selected) : next_off,
+                          final_merge ? ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)) : (NSUInteger)scratch_row_bytes * n_tokens, 3);
             ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1), MTLSizeMake(merge_threads, 1, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -22203,16 +22294,16 @@ int ds4_gpu_dsv4_topk_mask_rows(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_topk_mask_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, topkbuf, ds4_gpu_tensor_offset(topk), 1);
-        ds4_enc_buf(enc, maskbuf, ds4_gpu_tensor_offset(mask), 2);
+        ds4_enc_buf_n(enc, topkbuf, ds4_gpu_tensor_offset(topk), ds4_tensor_tail(topk, ds4_gpu_tensor_offset(topk)), 1);
+        ds4_enc_buf_n(enc, maskbuf, ds4_gpu_tensor_offset(mask), ds4_tensor_tail(mask, ds4_gpu_tensor_offset(mask)), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake((((NSUInteger)n_comp * n_tokens) + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
         enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_topk_mask_scatter_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, topkbuf, ds4_gpu_tensor_offset(topk), 1);
-        ds4_enc_buf(enc, maskbuf, ds4_gpu_tensor_offset(mask), 2);
+        ds4_enc_buf_n(enc, topkbuf, ds4_gpu_tensor_offset(topk), ds4_tensor_tail(topk, ds4_gpu_tensor_offset(topk)), 1);
+        ds4_enc_buf_n(enc, maskbuf, ds4_gpu_tensor_offset(mask), ds4_tensor_tail(mask, ds4_gpu_tensor_offset(mask)), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake((((NSUInteger)top_k * n_tokens) + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -22303,8 +22394,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                     ds4_enc_pso(enc, mpp_pipeline);
                     ds4_enc_bytes(enc, &args, sizeof(args), 0);
                     ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-                    ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-                    ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+                    ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+                    ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
                     ds4_enc_tgmem(enc, 2u * 64u * 32u * sizeof(uint16_t), 0);
                     ds4_gpu_dispatch(enc, MTLSizeMake(1u, ((NSUInteger)out_dim + 63u) / 64u, 1u), MTLSizeMake(128, 1, 1));
                     ds4_gpu_end_compute_encoder(cb, enc);
@@ -22331,8 +22422,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -22363,8 +22454,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg, ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg, 1), MTLSizeMake(32, (NSUInteger)nsg, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -22421,8 +22512,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 ds4_enc_pso(enc, pipeline);
                 ds4_enc_bytes(enc, &args, sizeof(args), 0);
                 ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-                ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-                ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+                ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+                ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
                 ds4_enc_tgmem(enc, 2u * 64u * 32u * sizeof(uint16_t), 0);
                 ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)(nax_rows / nax_tile_n), (NSUInteger)out_dim / 64u, 1), MTLSizeMake(128, 1, 1));
                 ds4_gpu_end_compute_encoder(cb, enc);
@@ -22482,10 +22573,12 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, mat_weights, mat_offset, 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x) +
-                       (NSUInteger)(generic_row0 * in_dim * sizeof(float)), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out) +
-                       (NSUInteger)(generic_row0 * out_dim * sizeof(float)), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x) +
+                       (NSUInteger)(generic_row0 * in_dim * sizeof(float)), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x) +
+                       (NSUInteger)(generic_row0 * in_dim * sizeof(float))), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out) +
+                       (NSUInteger)(generic_row0 * out_dim * sizeof(float)), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out) +
+                       (NSUInteger)(generic_row0 * out_dim * sizeof(float))), 3);
         ds4_enc_tgmem(enc, (bc_out ? 8192u : 6144u), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)generic_rows + 31u) / 32u, ((NSUInteger)out_dim + 63u) / 64u, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -22677,8 +22770,8 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, dispatch.smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) / (NSUInteger)dispatch.nr0, (NSUInteger)n_rows, 1), MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -22875,11 +22968,11 @@ int ds4_gpu_iq2_pair_br_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, wg, gate_inner, 1);
-        ds4_enc_buf(enc, wu, up_inner, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, gbuf, ds4_gpu_tensor_offset(dst_gate), 4);
-        ds4_enc_buf(enc, ubuf, ds4_gpu_tensor_offset(dst_up), 5);
+        ds4_enc_buf_n(enc, wg, gate_inner, ds4_tensor_tail(w_gate, gate_inner), 1);
+        ds4_enc_buf_n(enc, wu, up_inner, ds4_tensor_tail(w_up, up_inner), 2);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, gbuf, ds4_gpu_tensor_offset(dst_gate), ds4_tensor_tail(dst_gate, ds4_gpu_tensor_offset(dst_gate)), 4);
+        ds4_enc_buf_n(enc, ubuf, ds4_gpu_tensor_offset(dst_up), ds4_tensor_tail(dst_up, ds4_gpu_tensor_offset(dst_up)), 5);
         ds4_enc_tgmem(enc, (256u * 8u + 128u), 0);
         ds4_gpu_dispatch(enc,
             MTLSizeMake((NSUInteger)((out_dim + nsg * nr0 - 1u) / (nsg * nr0)),
@@ -22970,8 +23063,8 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, dispatch.smem, 0);
         ds4_gpu_dispatch(enc,
             MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) / (NSUInteger)dispatch.nr0,
@@ -23171,8 +23264,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 ds4_enc_pso(enc, pipeline);
                 ds4_enc_bytes(enc, &args, sizeof(args), 0);
                 ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-                ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-                ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+                ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+                ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
                 ds4_enc_tgmem(enc, 32, 0);
                 ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, (NSUInteger)n_tok, 1), MTLSizeMake(32, (NSUInteger)nsg, 1));
                 ds4_gpu_end_compute_encoder(cb, enc);
@@ -23199,8 +23292,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 ds4_enc_pso(enc, pipeline);
                 ds4_enc_bytes(enc, &args, sizeof(args), 0);
                 ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-                ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-                ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+                ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+                ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
                 ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg, ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg, 1), MTLSizeMake(32, (NSUInteger)nsg, 1));
                 ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -23230,8 +23323,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 ds4_enc_pso(enc, pipeline);
                 ds4_enc_bytes(enc, &args, sizeof(args), 0);
                 ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-                ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-                ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+                ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+                ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
                 ds4_enc_tgmem(enc, 2u * 64u * 32u * sizeof(uint16_t), 0);
                 ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)(n_tok / nax_tile_n), (NSUInteger)out_dim / 64u, 1), MTLSizeMake(128, 1, 1));
                 ds4_gpu_end_compute_encoder(cb, enc);
@@ -23255,8 +23348,8 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, (bc_out ? 8192u : 6144u), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u, ((NSUInteger)out_dim + 63u) / 64u, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -23417,8 +23510,8 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
         const NSUInteger x_base = ds4_gpu_tensor_offset(x);
         const NSUInteger out_base = ds4_gpu_tensor_offset(out);
         for (uint64_t t = 0; t < n_tok; t++) {
-            ds4_enc_buf(enc, xbuf, x_base + (NSUInteger)(t * x_row_bytes), 2);
-            ds4_enc_buf(enc, outbuf, out_base + (NSUInteger)(t * out_row_bytes), 3);
+            ds4_enc_buf_n(enc, xbuf, x_base + (NSUInteger)(t * x_row_bytes), ds4_tensor_tail(x, x_base + (NSUInteger)(t * x_row_bytes)), 2);
+            ds4_enc_buf_n(enc, outbuf, out_base + (NSUInteger)(t * out_row_bytes), ds4_tensor_tail(out, out_base + (NSUInteger)(t * out_row_bytes)), 3);
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
         }
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -23538,9 +23631,9 @@ static int ds4_gpu_matmul_q8_0_pair_impl(
         ds4_enc_bytes(enc, &args1, sizeof(args1), 1);
         ds4_enc_buf(enc, weight0buf, (NSUInteger)inner0, 2);
         ds4_enc_buf(enc, weight1buf, (NSUInteger)inner1, 3);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 4);
-        ds4_enc_buf(enc, out0buf, ds4_gpu_tensor_offset(out0), 5);
-        ds4_enc_buf(enc, out1buf, ds4_gpu_tensor_offset(out1), 6);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 4);
+        ds4_enc_buf_n(enc, out0buf, ds4_gpu_tensor_offset(out0), ds4_tensor_tail(out0, ds4_gpu_tensor_offset(out0)), 5);
+        ds4_enc_buf_n(enc, out1buf, ds4_gpu_tensor_offset(out1), ds4_tensor_tail(out1, ds4_gpu_tensor_offset(out1)), 6);
         /* The pair form has one threadgroup do both matrices and needs both
          * reductions; a lane threadgroup does one, and reserving twice the
          * threadgroup memory it uses only costs occupancy. */
@@ -23714,14 +23807,14 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, gate_wbuf, (NSUInteger)gate_inner, 1);
         ds4_enc_buf(enc, up_wbuf, (NSUInteger)up_inner, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
         ds4_enc_buf(enc, gatebuf, (store_gate_up ?
                                        ds4_gpu_tensor_offset(gate) :
                                        ds4_gpu_tensor_offset(mid)), 4);
         ds4_enc_buf(enc, upbuf, (store_gate_up ?
                                      ds4_gpu_tensor_offset(up) :
                                      ds4_gpu_tensor_offset(mid)), 5);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 6);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 6);
         ds4_enc_bytes(enc, &clamp, sizeof(clamp), 7);
         ds4_enc_tgmem(enc, 2u * mv_dispatch.smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
@@ -23820,11 +23913,11 @@ int ds4_gpu_router_shared_gate_up_q8_0_tensor(
         ds4_enc_buf(enc, router_wbuf, (NSUInteger)router_inner, 2);
         ds4_enc_buf(enc, gate_wbuf, (NSUInteger)gate_inner, 3);
         ds4_enc_buf(enc, up_wbuf, (NSUInteger)up_inner, 4);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 5);
-        ds4_enc_buf(enc, rbuf, ds4_gpu_tensor_offset(router_logits), 6);
-        ds4_enc_buf(enc, gatebuf, ds4_gpu_tensor_offset(gate), 7);
-        ds4_enc_buf(enc, upbuf, ds4_gpu_tensor_offset(up), 8);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 9);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 5);
+        ds4_enc_buf_n(enc, rbuf, ds4_gpu_tensor_offset(router_logits), ds4_tensor_tail(router_logits, ds4_gpu_tensor_offset(router_logits)), 6);
+        ds4_enc_buf_n(enc, gatebuf, ds4_gpu_tensor_offset(gate), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate)), 7);
+        ds4_enc_buf_n(enc, upbuf, ds4_gpu_tensor_offset(up), ds4_tensor_tail(up, ds4_gpu_tensor_offset(up)), 8);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 9);
         ds4_enc_bytes(enc, &clamp, sizeof(clamp), 10);
         ds4_enc_tgmem(enc, 256u * sizeof(float), 0);
         const NSUInteger router_tgs = ((NSUInteger)router_out_dim + 1u) / 2u;
@@ -23926,17 +24019,17 @@ int ds4_gpu_router_project_select_fused_tensor(
         ds4_enc_bytes(enc, &rargs, sizeof(rargs), 0);
         ds4_enc_bytes(enc, &select_args, sizeof(select_args), 1);
         ds4_enc_buf(enc, routerbuf, (NSUInteger)router_inner, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, logitsbuf, ds4_gpu_tensor_offset(router_logits), 4);
-        ds4_enc_buf(enc, probsbuf, ds4_gpu_tensor_offset(probs), 5);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, logitsbuf, ds4_gpu_tensor_offset(router_logits), ds4_tensor_tail(router_logits, ds4_gpu_tensor_offset(router_logits)), 4);
+        ds4_enc_buf_n(enc, probsbuf, ds4_gpu_tensor_offset(probs), ds4_tensor_tail(probs, ds4_gpu_tensor_offset(probs)), 5);
         if (has_bias) {
             ds4_enc_buf(enc, biasbuf, (NSUInteger)bias_inner, 6);
         } else {
             ds4_enc_bytes(enc, &zero_f32, sizeof(zero_f32), 6);
         }
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 7);
-        ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 8);
-        ds4_enc_buf(enc, completion, 0, 9);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 7);
+        ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 8);
+        ds4_enc_buf_n(enc, completion, 0, completion.length, 9);
         ds4_enc_tgmem(enc, 1024u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(128, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -24116,10 +24209,10 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, gate_wbuf, (NSUInteger)gate_inner, 1);
         ds4_enc_buf(enc, up_wbuf, (NSUInteger)up_inner, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, gatebuf, ds4_gpu_tensor_offset(gate), 4);
-        ds4_enc_buf(enc, upbuf, ds4_gpu_tensor_offset(up), 5);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 6);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, gatebuf, ds4_gpu_tensor_offset(gate), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate)), 4);
+        ds4_enc_buf_n(enc, upbuf, ds4_gpu_tensor_offset(up), ds4_tensor_tail(up, ds4_gpu_tensor_offset(up)), 5);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 6);
         ds4_enc_bytes(enc, &clamp, sizeof(clamp), 7);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg, ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg, 1), MTLSizeMake(32, (NSUInteger)nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -24232,10 +24325,10 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, gate_wbuf, (NSUInteger)gate_inner, 1);
         ds4_enc_buf(enc, up_wbuf, (NSUInteger)up_inner, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, gatebuf, ds4_gpu_tensor_offset(gate), 4);
-        ds4_enc_buf(enc, upbuf, ds4_gpu_tensor_offset(up), 5);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 6);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, gatebuf, ds4_gpu_tensor_offset(gate), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate)), 4);
+        ds4_enc_buf_n(enc, upbuf, ds4_gpu_tensor_offset(up), ds4_tensor_tail(up, ds4_gpu_tensor_offset(up)), 5);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 6);
         ds4_enc_bytes(enc, &clamp, sizeof(clamp), 7);
         ds4_enc_tgmem(enc, 2u * mv_dispatch.smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake( ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, (NSUInteger)n_tok, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
@@ -24324,8 +24417,8 @@ static int ds4_gpu_matmul_f16_tensor_impl(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             if (mv_dispatch.smem) {
                 ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
             }
@@ -24354,8 +24447,8 @@ static int ds4_gpu_matmul_f16_tensor_impl(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg, ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg, 1), MTLSizeMake(32, (NSUInteger)nsg, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -24393,8 +24486,8 @@ static int ds4_gpu_matmul_f16_tensor_impl(
                 ds4_enc_pso(enc, pipeline);
                 ds4_enc_bytes(enc, &args, sizeof(args), 0);
                 ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-                ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-                ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+                ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+                ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
                 ds4_enc_tgmem(enc, 2u * 64u * 32u * sizeof(uint16_t), 0);
                 ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)(n_tok / nax_tile_n), (NSUInteger)out_dim / 64u, 1), MTLSizeMake(128, 1, 1));
                 ds4_gpu_end_compute_encoder(cb, enc);
@@ -24419,8 +24512,8 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, (bc_out ? 8192u : 6144u), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u, ((NSUInteger)out_dim + 63u) / 64u, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -24527,9 +24620,9 @@ int ds4_gpu_matmul_f16_pair_tensor(
         ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
         ds4_enc_buf(enc, wabuf, (NSUInteger)inner_a, 1);
         ds4_enc_buf(enc, wbbuf, (NSUInteger)inner_b, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, outabuf, ds4_gpu_tensor_offset(out_a), 4);
-        ds4_enc_buf(enc, outbbuf, ds4_gpu_tensor_offset(out_b), 5);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, outabuf, ds4_gpu_tensor_offset(out_a), ds4_tensor_tail(out_a, ds4_gpu_tensor_offset(out_a)), 4);
+        ds4_enc_buf_n(enc, outbbuf, ds4_gpu_tensor_offset(out_b), ds4_tensor_tail(out_b, ds4_gpu_tensor_offset(out_b)), 5);
         if (mv_dispatch.smem) {
             ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
         }
@@ -24651,12 +24744,12 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         ds4_enc_bytes(enc, &store_args, sizeof(store_args), 1);
         ds4_enc_buf(enc, weightkvbuf, (NSUInteger)weight_kv_inner, 2);
         ds4_enc_buf(enc, weightscorebuf, (NSUInteger)weight_score_inner, 3);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 4);
-        ds4_enc_buf(enc, outkvbuf, ds4_gpu_tensor_offset(out_kv), 5);
-        ds4_enc_buf(enc, outscorebuf, ds4_gpu_tensor_offset(out_score), 6);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 4);
+        ds4_enc_buf_n(enc, outkvbuf, ds4_gpu_tensor_offset(out_kv), ds4_tensor_tail(out_kv, ds4_gpu_tensor_offset(out_kv)), 5);
+        ds4_enc_buf_n(enc, outscorebuf, ds4_gpu_tensor_offset(out_score), ds4_tensor_tail(out_score, ds4_gpu_tensor_offset(out_score)), 6);
         ds4_enc_buf(enc, apebuf, (NSUInteger)ape_inner, 7);
-        ds4_enc_buf(enc, statekvbuf, ds4_gpu_tensor_offset(state_kv), 8);
-        ds4_enc_buf(enc, statescbuf, ds4_gpu_tensor_offset(state_score), 9);
+        ds4_enc_buf_n(enc, statekvbuf, ds4_gpu_tensor_offset(state_kv), ds4_tensor_tail(state_kv, ds4_gpu_tensor_offset(state_kv)), 8);
+        ds4_enc_buf_n(enc, statescbuf, ds4_gpu_tensor_offset(state_score), ds4_tensor_tail(state_score, ds4_gpu_tensor_offset(state_score)), 9);
         if (mv_dispatch.smem) {
             ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
         }
@@ -24797,17 +24890,17 @@ int ds4_gpu_matmul_f16_quad_compressor_store_tensor(
         ds4_enc_buf(enc, w0scbuf, (NSUInteger)w0sc_inner, 4);
         ds4_enc_buf(enc, w1kvbuf, (NSUInteger)w1kv_inner, 5);
         ds4_enc_buf(enc, w1scbuf, (NSUInteger)w1sc_inner, 6);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 7);
-        ds4_enc_buf(enc, out0kvbuf, ds4_gpu_tensor_offset(out0_kv), 8);
-        ds4_enc_buf(enc, out0scbuf, ds4_gpu_tensor_offset(out0_score), 9);
-        ds4_enc_buf(enc, out1kvbuf, (NSUInteger)ds4_gpu_tensor_offset(out1_kv), 10);
-        ds4_enc_buf(enc, out1scbuf, (NSUInteger)ds4_gpu_tensor_offset(out1_score), 11);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 7);
+        ds4_enc_buf_n(enc, out0kvbuf, ds4_gpu_tensor_offset(out0_kv), ds4_tensor_tail(out0_kv, ds4_gpu_tensor_offset(out0_kv)), 8);
+        ds4_enc_buf_n(enc, out0scbuf, ds4_gpu_tensor_offset(out0_score), ds4_tensor_tail(out0_score, ds4_gpu_tensor_offset(out0_score)), 9);
+        ds4_enc_buf_n(enc, out1kvbuf, (NSUInteger)ds4_gpu_tensor_offset(out1_kv), ds4_tensor_tail(out1_kv, (NSUInteger)ds4_gpu_tensor_offset(out1_kv)), 10);
+        ds4_enc_buf_n(enc, out1scbuf, (NSUInteger)ds4_gpu_tensor_offset(out1_score), ds4_tensor_tail(out1_score, (NSUInteger)ds4_gpu_tensor_offset(out1_score)), 11);
         ds4_enc_buf(enc, ape0buf, (NSUInteger)ape0_inner, 12);
         ds4_enc_buf(enc, ape1buf, (NSUInteger)ape1_inner, 13);
-        ds4_enc_buf(enc, state0kvbuf, ds4_gpu_tensor_offset(state0_kv), 14);
-        ds4_enc_buf(enc, state0scbuf, ds4_gpu_tensor_offset(state0_score), 15);
-        ds4_enc_buf(enc, state1kvbuf, ds4_gpu_tensor_offset(state1_kv), 16);
-        ds4_enc_buf(enc, state1scbuf, ds4_gpu_tensor_offset(state1_score), 17);
+        ds4_enc_buf_n(enc, state0kvbuf, ds4_gpu_tensor_offset(state0_kv), ds4_tensor_tail(state0_kv, ds4_gpu_tensor_offset(state0_kv)), 14);
+        ds4_enc_buf_n(enc, state0scbuf, ds4_gpu_tensor_offset(state0_score), ds4_tensor_tail(state0_score, ds4_gpu_tensor_offset(state0_score)), 15);
+        ds4_enc_buf_n(enc, state1kvbuf, ds4_gpu_tensor_offset(state1_kv), ds4_tensor_tail(state1_kv, ds4_gpu_tensor_offset(state1_kv)), 16);
+        ds4_enc_buf_n(enc, state1scbuf, ds4_gpu_tensor_offset(state1_score), ds4_tensor_tail(state1_score, ds4_gpu_tensor_offset(state1_score)), 17);
         ds4_enc_tgmem(enc, 32u * 2u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake( ((NSUInteger)width0 + (NSUInteger)width1 + 1u) / 2u, 1, 1), MTLSizeMake(32, 8, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -24915,17 +25008,19 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &fin_args, sizeof(fin_args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(attn_stage), ds4_gpu_tensor_offset(attn_stage), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(attn_stage), ds4_gpu_tensor_offset(attn_stage), ds4_tensor_tail(attn_stage, ds4_gpu_tensor_offset(attn_stage)), 1);
         ds4_enc_buf(enc, anbuf, (NSUInteger)attn_norm_inner, 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(attn_cache), ds4_gpu_tensor_offset(attn_cache) +
-                        (NSUInteger)attn_comp_row * 512u * sizeof(uint16_t), 3);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(index_cache), ds4_gpu_tensor_offset(index_cache) +
-                        (NSUInteger)index_comp_row * 128u * sizeof(float), 4);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(attn_cache), ds4_gpu_tensor_offset(attn_cache) +
+                        (NSUInteger)attn_comp_row * 512u * sizeof(uint16_t), ds4_tensor_tail(attn_cache, ds4_gpu_tensor_offset(attn_cache) +
+                        (NSUInteger)attn_comp_row * 512u * sizeof(uint16_t)), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(index_cache), ds4_gpu_tensor_offset(index_cache) +
+                        (NSUInteger)index_comp_row * 128u * sizeof(float), ds4_tensor_tail(index_cache, ds4_gpu_tensor_offset(index_cache) +
+                        (NSUInteger)index_comp_row * 128u * sizeof(float)), 4);
         ds4_enc_buf(enc, inbuf, (NSUInteger)index_norm_inner, 5);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(attn_state_kv), ds4_gpu_tensor_offset(attn_state_kv), 6);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(attn_state_score), ds4_gpu_tensor_offset(attn_state_score), 7);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(index_state_kv), ds4_gpu_tensor_offset(index_state_kv), 8);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(index_state_score), ds4_gpu_tensor_offset(index_state_score), 9);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(attn_state_kv), ds4_gpu_tensor_offset(attn_state_kv), ds4_tensor_tail(attn_state_kv, ds4_gpu_tensor_offset(attn_state_kv)), 6);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(attn_state_score), ds4_gpu_tensor_offset(attn_state_score), ds4_tensor_tail(attn_state_score, ds4_gpu_tensor_offset(attn_state_score)), 7);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(index_state_kv), ds4_gpu_tensor_offset(index_state_kv), ds4_tensor_tail(index_state_kv, ds4_gpu_tensor_offset(index_state_kv)), 8);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(index_state_score), ds4_gpu_tensor_offset(index_state_score), ds4_tensor_tail(index_state_score, ds4_gpu_tensor_offset(index_state_score)), 9);
         ds4_enc_tgmem(enc, 256u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(2u + (4u * 1024u + 4u * 256u + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -25091,19 +25186,19 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
         ds4_enc_buf(enc, w0scbuf, (NSUInteger)w0sc_inner, 9);
         ds4_enc_buf(enc, w1kvbuf, (NSUInteger)w1kv_inner, 10);
         ds4_enc_buf(enc, w1scbuf, (NSUInteger)w1sc_inner, 11);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 12);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(qr), ds4_gpu_tensor_offset(qr), 13);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(kv_raw), ds4_gpu_tensor_offset(kv_raw), 14);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out0_kv), ds4_gpu_tensor_offset(out0_kv), 15);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out0_score), ds4_gpu_tensor_offset(out0_score), 16);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out1_kv), ds4_gpu_tensor_offset(out1_kv), 17);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out1_score), ds4_gpu_tensor_offset(out1_score), 18);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 12);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(qr), ds4_gpu_tensor_offset(qr), ds4_tensor_tail(qr, ds4_gpu_tensor_offset(qr)), 13);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(kv_raw), ds4_gpu_tensor_offset(kv_raw), ds4_tensor_tail(kv_raw, ds4_gpu_tensor_offset(kv_raw)), 14);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out0_kv), ds4_gpu_tensor_offset(out0_kv), ds4_tensor_tail(out0_kv, ds4_gpu_tensor_offset(out0_kv)), 15);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out0_score), ds4_gpu_tensor_offset(out0_score), ds4_tensor_tail(out0_score, ds4_gpu_tensor_offset(out0_score)), 16);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out1_kv), ds4_gpu_tensor_offset(out1_kv), ds4_tensor_tail(out1_kv, ds4_gpu_tensor_offset(out1_kv)), 17);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out1_score), ds4_gpu_tensor_offset(out1_score), ds4_tensor_tail(out1_score, ds4_gpu_tensor_offset(out1_score)), 18);
         ds4_enc_buf(enc, ape0buf, (NSUInteger)ape0_inner, 19);
         ds4_enc_buf(enc, ape1buf, (NSUInteger)ape1_inner, 20);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(state0_kv), ds4_gpu_tensor_offset(state0_kv), 21);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(state0_score), ds4_gpu_tensor_offset(state0_score), 22);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(state1_kv), ds4_gpu_tensor_offset(state1_kv), 23);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(state1_score), ds4_gpu_tensor_offset(state1_score), 24);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(state0_kv), ds4_gpu_tensor_offset(state0_kv), ds4_tensor_tail(state0_kv, ds4_gpu_tensor_offset(state0_kv)), 21);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(state0_score), ds4_gpu_tensor_offset(state0_score), ds4_tensor_tail(state0_score, ds4_gpu_tensor_offset(state0_score)), 22);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(state1_kv), ds4_gpu_tensor_offset(state1_kv), ds4_tensor_tail(state1_kv, ds4_gpu_tensor_offset(state1_kv)), 23);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(state1_score), ds4_gpu_tensor_offset(state1_score), ds4_tensor_tail(state1_score, ds4_gpu_tensor_offset(state1_score)), 24);
         ds4_enc_tgmem(enc, 2u * 2u * 2u * 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake( (NSUInteger)(pair_vtgs + 1u) / 2u + ((NSUInteger)width0 + (NSUInteger)width1 + 1u) / 2u, 1, 1), MTLSizeMake(32, 8, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -25198,8 +25293,8 @@ static int ds4_gpu_matmul_f32_round_tensor(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             if (mv_dispatch.smem) {
                 ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
             }
@@ -25228,8 +25323,8 @@ static int ds4_gpu_matmul_f32_round_tensor(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             ds4_enc_tgmem(enc, 12288u, 0);
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n_tok + 31u)/32u, (NSUInteger)out_dim/64u, 1), MTLSizeMake(128, 1, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -25254,8 +25349,8 @@ static int ds4_gpu_matmul_f32_round_tensor(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg, ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg, 1), MTLSizeMake(32, (NSUInteger)nsg, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25277,8 +25372,8 @@ static int ds4_gpu_matmul_f32_round_tensor(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
             ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 1);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             if (mv_dispatch.smem) {
                 ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
             }
@@ -25435,10 +25530,10 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_rms_norm_plain_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 4);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -25561,8 +25656,8 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, scale_pipeline);
         ds4_enc_bytes(enc, &norm_args, sizeof(norm_args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
-        ds4_enc_buf(enc, scalebuf, ds4_gpu_tensor_offset(scale_scratch), 2);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+        ds4_enc_buf_n(enc, scalebuf, ds4_gpu_tensor_offset(scale_scratch), ds4_tensor_tail(scale_scratch, ds4_gpu_tensor_offset(scale_scratch)), 2);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_rows, 1, 1), MTLSizeMake( ds4_gpu_rms_norm_threads(in_dim), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -25573,9 +25668,9 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
         ds4_enc_pso(enc, mm_pipeline);
         ds4_enc_bytes(enc, &mm_args, sizeof(mm_args), 0);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)weight_inner, 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
-        ds4_enc_buf(enc, scalebuf, ds4_gpu_tensor_offset(scale_scratch), 4);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
+        ds4_enc_buf_n(enc, scalebuf, ds4_gpu_tensor_offset(scale_scratch), ds4_tensor_tail(scale_scratch, ds4_gpu_tensor_offset(scale_scratch)), 4);
         ds4_enc_tgmem(enc, (bc_out ? 8192u : 6144u), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake( ((NSUInteger)n_rows + 31u) / 32u, ((NSUInteger)out_dim + 63u) / 64u, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -25662,10 +25757,10 @@ static int ds4_gpu_rms_norm_weight_rows_round(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         const NSUInteger in_off = (NSUInteger)(g_rms_norm_rows_in_off * sizeof(float));
         const NSUInteger out_off = (NSUInteger)(g_rms_norm_rows_out_off * sizeof(float));
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x) + in_off, 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x) + in_off, ds4_tensor_tail(x, ds4_gpu_tensor_offset(x) + in_off), 1);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x) + in_off, 3);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out) + out_off, 4);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x) + in_off, ds4_tensor_tail(x, ds4_gpu_tensor_offset(x) + in_off), 3);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out) + out_off, ds4_tensor_tail(out, ds4_gpu_tensor_offset(out) + out_off), 4);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -25766,11 +25861,11 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_add_rms_norm_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, abuf, ds4_gpu_tensor_offset(a), 1);
-        ds4_enc_buf(enc, bbuf, ds4_gpu_tensor_offset(b), 2);
+        ds4_enc_buf_n(enc, abuf, ds4_gpu_tensor_offset(a), ds4_tensor_tail(a, ds4_gpu_tensor_offset(a)), 1);
+        ds4_enc_buf_n(enc, bbuf, ds4_gpu_tensor_offset(b), ds4_tensor_tail(b, ds4_gpu_tensor_offset(b)), 2);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 3);
-        ds4_enc_buf(enc, sumbuf, ds4_gpu_tensor_offset(sum_out), 4);
-        ds4_enc_buf(enc, normbuf, ds4_gpu_tensor_offset(norm_out), 5);
+        ds4_enc_buf_n(enc, sumbuf, ds4_gpu_tensor_offset(sum_out), ds4_tensor_tail(sum_out, ds4_gpu_tensor_offset(sum_out)), 4);
+        ds4_enc_buf_n(enc, normbuf, ds4_gpu_tensor_offset(norm_out), ds4_tensor_tail(norm_out, ds4_gpu_tensor_offset(norm_out)), 5);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -25850,12 +25945,12 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_qkv_rms_norm_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
         ds4_enc_buf(enc, q_wbuf, (NSUInteger)q_inner_offset, 2);
-        ds4_enc_buf(enc, qoutbuf, ds4_gpu_tensor_offset(q_out), 3);
-        ds4_enc_buf(enc, kvbuf, ds4_gpu_tensor_offset(kv), 4);
+        ds4_enc_buf_n(enc, qoutbuf, ds4_gpu_tensor_offset(q_out), ds4_tensor_tail(q_out, ds4_gpu_tensor_offset(q_out)), 3);
+        ds4_enc_buf_n(enc, kvbuf, ds4_gpu_tensor_offset(kv), ds4_tensor_tail(kv, ds4_gpu_tensor_offset(kv)), 4);
         ds4_enc_buf(enc, kv_wbuf, (NSUInteger)kv_inner_offset, 5);
-        ds4_enc_buf(enc, kvoutbuf, ds4_gpu_tensor_offset(kv_out), 6);
+        ds4_enc_buf_n(enc, kvoutbuf, ds4_gpu_tensor_offset(kv_out), ds4_tensor_tail(kv_out, ds4_gpu_tensor_offset(kv_out)), 6);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(rows, 2, 1), MTLSizeMake(ds4_gpu_rms_norm_threads(q_n), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -26076,13 +26171,13 @@ int ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_bytes(enc, &rope, sizeof(rope), 1);
         ds4_enc_bytes(enc, &store, sizeof(store), 2);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 3);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 3);
         ds4_enc_buf(enc, q_wbuf, (NSUInteger)q_inner_offset, 4);
-        ds4_enc_buf(enc, qoutbuf, ds4_gpu_tensor_offset(q_out), 5);
-        ds4_enc_buf(enc, kvbuf, ds4_gpu_tensor_offset(kv), 6);
+        ds4_enc_buf_n(enc, qoutbuf, ds4_gpu_tensor_offset(q_out), ds4_tensor_tail(q_out, ds4_gpu_tensor_offset(q_out)), 5);
+        ds4_enc_buf_n(enc, kvbuf, ds4_gpu_tensor_offset(kv), ds4_tensor_tail(kv, ds4_gpu_tensor_offset(kv)), 6);
         ds4_enc_buf(enc, kv_wbuf, (NSUInteger)kv_inner_offset, 7);
-        ds4_enc_buf(enc, kvoutbuf, ds4_gpu_tensor_offset(kv_out), 8);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_cache), 9);
+        ds4_enc_buf_n(enc, kvoutbuf, ds4_gpu_tensor_offset(kv_out), ds4_tensor_tail(kv_out, ds4_gpu_tensor_offset(kv_out)), 8);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_cache), ds4_tensor_tail(raw_cache, ds4_gpu_tensor_offset(raw_cache)), 9);
         ds4_enc_tgmem(enc, (32u + 64u) * sizeof(float), 0);
         const NSUInteger norm_threads = ds4_gpu_rms_norm_threads(q_n);
         const bool defer_kv = g_qkv_norm_defer_kv && !g_kv_task.pending;
@@ -26141,10 +26236,10 @@ int ds4_gpu_head_rms_norm_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_rms_norm_plain_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 4);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 4);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_head, n_tok, 1), MTLSizeMake(ds4_gpu_rms_norm_pipeline_threads(head_dim, g_rms_norm_plain_pipeline), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -26291,7 +26386,7 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_head, n_tok, 1), MTLSizeMake( ds4_gpu_rms_norm_pipeline_threads(head_dim, pipeline), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -26377,8 +26472,8 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_fp8_kv_quantize_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
         ds4_enc_tgmem(enc, 64u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tok, 1, 1), MTLSizeMake(64, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -26417,7 +26512,7 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_indexer_qat_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
         ds4_enc_tgmem(enc, 256u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_rows, 1, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -26554,7 +26649,7 @@ static int ds4_gpu_encode_set_rows_f32_i32(
     } else {
         ds4_enc_bytes(enc, rows, (NSUInteger)rows_bytes, 2);
     }
-    ds4_enc_buf(enc, dstbuf, ds4_gpu_tensor_offset(dst), 3);
+    ds4_enc_buf_n(enc, dstbuf, ds4_gpu_tensor_offset(dst), ds4_tensor_tail(dst, ds4_gpu_tensor_offset(dst)), 3);
     ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n_rows + nrptg - 1u) / nrptg, 1, 1), MTLSizeMake(nth, nrptg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -26712,8 +26807,8 @@ int ds4_gpu_kv_rope_fp8_store_raw_tensor(
         ds4_enc_pso(enc, g_dsv4_kv_rope_fp8_store_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_bytes(enc, &rope, sizeof(rope), 1);
-        ds4_enc_buf(enc, kvbuf, ds4_gpu_tensor_offset(kv), 2);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_cache), 3);
+        ds4_enc_buf_n(enc, kvbuf, ds4_gpu_tensor_offset(kv), ds4_tensor_tail(kv, ds4_gpu_tensor_offset(kv)), 2);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_cache), ds4_tensor_tail(raw_cache, ds4_gpu_tensor_offset(raw_cache)), 3);
         ds4_enc_tgmem(enc, 64u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(64, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -26762,8 +26857,8 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_kv_fp8_store_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, kvbuf, ds4_gpu_tensor_offset(kv), 1);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_cache), 2);
+        ds4_enc_buf_n(enc, kvbuf, ds4_gpu_tensor_offset(kv), ds4_tensor_tail(kv, ds4_gpu_tensor_offset(kv)), 1);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_cache), ds4_tensor_tail(raw_cache, ds4_gpu_tensor_offset(raw_cache)), 2);
         ds4_enc_tgmem(enc, 64u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(64, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -27069,11 +27164,11 @@ static int ds4_gpu_compressor_store_one_tensor(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, kvbuf, ds4_gpu_tensor_offset(kv), 1);
-    ds4_enc_buf(enc, scbuf, ds4_gpu_tensor_offset(sc), 2);
+    ds4_enc_buf_n(enc, kvbuf, ds4_gpu_tensor_offset(kv), ds4_tensor_tail(kv, ds4_gpu_tensor_offset(kv)), 1);
+    ds4_enc_buf_n(enc, scbuf, ds4_gpu_tensor_offset(sc), ds4_tensor_tail(sc, ds4_gpu_tensor_offset(sc)), 2);
     ds4_enc_buf(enc, apebuf, (NSUInteger)ape_inner, 3);
-    ds4_enc_buf(enc, statekvbuf, ds4_gpu_tensor_offset(state_kv), 4);
-    ds4_enc_buf(enc, statescbuf, ds4_gpu_tensor_offset(state_score), 5);
+    ds4_enc_buf_n(enc, statekvbuf, ds4_gpu_tensor_offset(state_kv), ds4_tensor_tail(state_kv, ds4_gpu_tensor_offset(state_kv)), 4);
+    ds4_enc_buf_n(enc, statescbuf, ds4_gpu_tensor_offset(state_score), ds4_tensor_tail(state_score, ds4_gpu_tensor_offset(state_score)), 5);
     ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)width + nth - 1u) / nth, 1, 1), MTLSizeMake(nth, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -27584,7 +27679,7 @@ static int ds4_gpu_encode_dsv4_softmax_pool_at(
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
     ds4_enc_buf(enc, kvbuf, kv_offset, 1);
     ds4_enc_buf(enc, scorebuf, score_offset, 2);
-    ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out) + out_off_bytes, 3);
+    ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out) + out_off_bytes, ds4_tensor_tail(out, ds4_gpu_tensor_offset(out) + out_off_bytes), 3);
     ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -27784,7 +27879,7 @@ static int ds4_gpu_encode_compressor_ratio4_direct_pool(
     ds4_enc_buf(enc, scorebuf, score_offset, 2);
     ds4_enc_buf(enc, statekvbuf, state_kv_offset, 3);
     ds4_enc_buf(enc, statescbuf, state_score_offset, 4);
-    ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 5);
+    ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 5);
     ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n + nth - 1u) / nth, 1, 1), MTLSizeMake(nth, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -27906,7 +28001,7 @@ static int ds4_gpu_encode_compressor_ratio4_decode_pack_ggml(
             ds4_enc_buf(enc, statescbuf, state_score_offset, 2);
             ds4_enc_buf(enc, g_compressor_pool_softmax_buffer, 0, 3);
             ds4_enc_buf(enc, g_compressor_pool_product_buffer, 0, 4);
-            ds4_enc_buf(enc, outbuf, out_offset, 5);
+            ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 5);
             ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
             ds4_gpu_dispatch(enc, MTLSizeMake(head_dim, 1, 1), MTLSizeMake(32, 1, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -28085,8 +28180,8 @@ static int ds4_gpu_encode_compressor_shift_ratio4(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, g_dsv4_ratio4_shift_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, statekvbuf, ds4_gpu_tensor_offset(state_kv), 1);
-    ds4_enc_buf(enc, statescbuf, ds4_gpu_tensor_offset(state_score), 2);
+    ds4_enc_buf_n(enc, statekvbuf, ds4_gpu_tensor_offset(state_kv), ds4_tensor_tail(state_kv, ds4_gpu_tensor_offset(state_kv)), 1);
+    ds4_enc_buf_n(enc, statescbuf, ds4_gpu_tensor_offset(state_score), ds4_tensor_tail(state_score, ds4_gpu_tensor_offset(state_score)), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -29655,8 +29750,8 @@ int ds4_gpu_dsv41_attention_output_low_rows(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, out_a_buf, (NSUInteger)out_a_inner, 1);
-        ds4_enc_buf(enc, heads_buf, ds4_gpu_tensor_offset(heads), 2);
-        ds4_enc_buf(enc, low_buf, ds4_gpu_tensor_offset(low), 3);
+        ds4_enc_buf_n(enc, heads_buf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
+        ds4_enc_buf_n(enc, low_buf, ds4_gpu_tensor_offset(low), ds4_tensor_tail(low, ds4_gpu_tensor_offset(low)), 3);
         ds4_enc_tgmem(enc, 32u * 2u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(row_groups, tiles, n_groups),
                          MTLSizeMake(32, nsg, 1));
@@ -29974,8 +30069,8 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)(inner + (k_off / 32u) * 34u), 1);
-        ds4_enc_buf(enc, xbuf, (NSUInteger)(ds4_gpu_tensor_offset(x) + x_elem_off * sizeof(float)), 2);
-        ds4_enc_buf(enc, outbuf, (NSUInteger)(ds4_gpu_tensor_offset(out) + out_elem_off * sizeof(float)), 3);
+        ds4_enc_buf_n(enc, xbuf, (NSUInteger)(ds4_gpu_tensor_offset(x) + x_elem_off * sizeof(float)), ds4_tensor_tail(x, (NSUInteger)(ds4_gpu_tensor_offset(x) + x_elem_off * sizeof(float))), 2);
+        ds4_enc_buf_n(enc, outbuf, (NSUInteger)(ds4_gpu_tensor_offset(out) + out_elem_off * sizeof(float)), ds4_tensor_tail(out, (NSUInteger)(ds4_gpu_tensor_offset(out) + out_elem_off * sizeof(float))), 3);
         if (fold) {
             const uint32_t ntg32 = (uint32_t)ntg;
             ds4_enc_buf(enc, g_tp_slab_buffer, (NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)fold_slot * 4u), 4);
@@ -30074,9 +30169,10 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_impl(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)(inner_offset + (k_off / 32u) * 34u), 1);
-        ds4_enc_buf(enc, xbuf, (NSUInteger)(ds4_gpu_tensor_offset(x) +
-                                    x_off * sizeof(float)), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, xbuf, (NSUInteger)(ds4_gpu_tensor_offset(x) +
+                                    x_off * sizeof(float)), ds4_tensor_tail(x, (NSUInteger)(ds4_gpu_tensor_offset(x) +
+                                    x_off * sizeof(float))), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, 2u * 64u * 32u * sizeof(uint16_t), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)(n_rows / tile_rows), (NSUInteger)(out_dim / 64u), 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -30209,8 +30305,8 @@ int ds4_gpu_matmul_quant_kslice_tensor(
                 ds4_enc_pso(enc, pipeline);
                 ds4_enc_bytes(enc, &args, sizeof(args), 0);
                 ds4_enc_buf(enc, wbuf, (NSUInteger)(inner + w_skip), 1);
-                ds4_enc_buf(enc, xbuf, (NSUInteger)(ds4_gpu_tensor_offset(x) + x_elem_off * sizeof(float)), 2);
-                ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+                ds4_enc_buf_n(enc, xbuf, (NSUInteger)(ds4_gpu_tensor_offset(x) + x_elem_off * sizeof(float)), ds4_tensor_tail(x, (NSUInteger)(ds4_gpu_tensor_offset(x) + x_elem_off * sizeof(float))), 2);
+                ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
                 ds4_enc_tgmem(enc, 32, 0);
                 ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg, 1, 1), MTLSizeMake(32, (NSUInteger)nsg, 1));
                 ds4_gpu_end_compute_encoder(cb, enc);
@@ -30681,8 +30777,8 @@ static int ds4_gpu_encode_cpy_f32_f16_1d(
             ds4_gpu_make_cpy_1d_args(n, sizeof(float), sizeof(uint16_t));
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
     }
-    ds4_enc_buf(enc, src, src_off, 1);
-    ds4_enc_buf(enc, dst, dst_off, 2);
+    ds4_enc_buf_n(enc, src, src_off, (NSUInteger)n * sizeof(float), 1);
+    ds4_enc_buf_n(enc, dst, dst_off, (NSUInteger)n * sizeof(uint16_t), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(groups, 1, 1), MTLSizeMake(nth, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -30726,8 +30822,8 @@ static int ds4_gpu_encode_cpy_f32_f16_2d(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, g_cpy_f32_f16_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, src, src_off, 1);
-    ds4_enc_buf(enc, dst, dst_off, 2);
+    ds4_enc_buf_n(enc, src, src_off, (NSUInteger)((rows - 1u) * src_row_stride + (uint64_t)cols * sizeof(float)), 1);
+    ds4_enc_buf_n(enc, dst, dst_off, (NSUInteger)((rows - 1u) * dst_row_stride + (uint64_t)cols * sizeof(uint16_t)), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(col_groups * rows, 1, 1), MTLSizeMake(nth, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -30774,8 +30870,8 @@ static int ds4_gpu_encode_cpy_f32_f16_3d(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, g_cpy_f32_f16_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, src, src_off, 1);
-    ds4_enc_buf(enc, dst, dst_off, 2);
+    ds4_enc_buf_n(enc, src, src_off, (NSUInteger)((planes - 1u) * src_plane_stride + (rows - 1u) * src_row_stride + (uint64_t)cols * sizeof(float)), 1);
+    ds4_enc_buf_n(enc, dst, dst_off, (NSUInteger)((planes - 1u) * dst_plane_stride + (rows - 1u) * dst_row_stride + (uint64_t)cols * sizeof(uint16_t)), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(col_groups * rows, planes, 1), MTLSizeMake(nth, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -30822,8 +30918,8 @@ static int ds4_gpu_encode_cpy_f16_f16_3d(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, g_cpy_f16_f16_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, src, src_off, 1);
-    ds4_enc_buf(enc, dst, dst_off, 2);
+    ds4_enc_buf_n(enc, src, src_off, (NSUInteger)((planes - 1u) * src_plane_stride + (rows - 1u) * src_row_stride + (uint64_t)cols * sizeof(uint16_t)), 1);
+    ds4_enc_buf_n(enc, dst, dst_off, (NSUInteger)((planes - 1u) * dst_plane_stride + (rows - 1u) * dst_row_stride + (uint64_t)cols * sizeof(uint16_t)), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(col_groups * rows, planes, 1), MTLSizeMake(nth, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -30891,8 +30987,8 @@ static int ds4_gpu_encode_copy_to_f16_1d(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_cpy_contig_f16_f16_pipeline);
         ds4_enc_bytes(enc, &n, sizeof(n), 0);
-        ds4_enc_buf(enc, src, src_off, 1);
-        ds4_enc_buf(enc, dst, dst_off, 2);
+        ds4_enc_buf_n(enc, src, src_off, (NSUInteger)n * sizeof(uint16_t), 1);
+        ds4_enc_buf_n(enc, dst, dst_off, (NSUInteger)n * sizeof(uint16_t), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(groups, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return 1;
@@ -31377,10 +31473,10 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-        ds4_enc_buf(enc, mask_buffer, 0, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -31428,13 +31524,13 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, vec_pipeline);
     ds4_enc_bytes(enc, &vec_args, sizeof(vec_args), 0);
-    ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
-    ds4_enc_buf(enc, mask_buffer, 0, 4);
+    ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 3);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 4);
     ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-    ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
-    ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 7);
+    ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 6);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, 0, tmp_bytes, 7);
     ds4_enc_tgmem(enc, shared_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, n_head, nwg), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -31445,8 +31541,8 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, reduce_pipeline);
     ds4_enc_bytes(enc, &reduce_args, sizeof(reduce_args), 0);
-    ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 1);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 2);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, 0, tmp_bytes, 1);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -31883,10 +31979,10 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-        ds4_enc_buf(enc, mask_buffer, 0, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -31908,7 +32004,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, blk_pipeline);
         ds4_enc_bytes(enc, &blk_args, sizeof(blk_args), 0);
-        ds4_enc_buf(enc, mask_buffer, 0, 1);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 1);
         ds4_enc_buf(enc, blk_buffer, 0, 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(nblk0, nblk1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -31959,14 +32055,14 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, attn_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
-    ds4_enc_buf(enc, mask_buffer, 0, 4);
+    ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 3);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 4);
     ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-    ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
+    ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 6);
     ds4_enc_buf(enc, blk_buffer, 0, 7);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 8);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 8);
     ds4_enc_tgmem(enc, shared_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(nblk1, n_head, 1), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -32162,10 +32258,10 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-        ds4_enc_buf(enc, mask_buffer, 0, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -32214,13 +32310,13 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, vec_pipeline);
     ds4_enc_bytes(enc, &vec_args, sizeof(vec_args), 0);
-    ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
-    ds4_enc_buf(enc, mask_buffer, 0, 4);
+    ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 3);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 4);
     ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-    ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
-    ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 7);
+    ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 6);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, 0, tmp_bytes, 7);
     ds4_enc_tgmem(enc, shared_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(n_tokens, n_head, nwg), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -32232,8 +32328,8 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, reduce_pipeline);
     ds4_enc_bytes(enc, &reduce_args, sizeof(reduce_args), 0);
-    ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 1);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 2);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, 0, tmp_bytes, 1);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_reduce");
@@ -32481,10 +32577,10 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-        ds4_enc_buf(enc, mask_buffer, 0, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -32506,7 +32602,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, blk_pipeline);
         ds4_enc_bytes(enc, &blk_args, sizeof(blk_args), 0);
-        ds4_enc_buf(enc, mask_buffer, 0, 1);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 1);
         ds4_enc_buf(enc, blk_buffer, 0, 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(nblk0, nblk1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -32557,14 +32653,14 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, attn_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
-    ds4_enc_buf(enc, mask_buffer, 0, 4);
+    ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 3);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 4);
     ds4_enc_buf(enc, has_sinks ? sinks_buf : qbuf, has_sinks ? sinks_offset : ds4_gpu_tensor_offset(q), 5);
-    ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
+    ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 6);
     ds4_enc_buf(enc, blk_buffer, 0, 7);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 8);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 8);
     ds4_enc_tgmem(enc, shared_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(nblk1, n_head, 1), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -32734,10 +32830,10 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_f16_offset, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_f16_offset, 2);
-        ds4_enc_buf(enc, mask_buffer, 0, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_f16_offset, kv_f16_bytes, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_f16_offset, kv_f16_bytes, 2);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -32786,13 +32882,13 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, vec_pipeline);
     ds4_enc_bytes(enc, &vec_args, sizeof(vec_args), 0);
-    ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_f16_offset, 2);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_f16_offset, 3);
-    ds4_enc_buf(enc, mask_buffer, 0, 4);
+    ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_f16_offset, kv_f16_bytes, 2);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_f16_offset, kv_f16_bytes, 3);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 4);
     ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-    ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
-    ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 7);
+    ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 6);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, 0, tmp_bytes, 7);
     ds4_enc_tgmem(enc, shared_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(n_tokens, n_head, nwg), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -32804,8 +32900,8 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, reduce_pipeline);
     ds4_enc_bytes(enc, &reduce_args, sizeof(reduce_args), 0);
-    ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 1);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 2);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, 0, tmp_bytes, 1);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_reduce");
@@ -33117,10 +33213,10 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_off, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_off, 2);
-        ds4_enc_buf(enc, flash_mask_buffer, mask_off, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, pad_off, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride, 2);
+        ds4_enc_buf_n(enc, flash_mask_buffer, mask_off, use_persistent_zero_mask ? mask_bytes : mask_stride, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, pad_off, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -33169,13 +33265,13 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         DS4Enc *packed_enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(packed_enc, packed_pipeline);
         ds4_enc_bytes(packed_enc, &vec_args, sizeof(vec_args), 0);
-        ds4_enc_buf(packed_enc, qbuf, ds4_gpu_tensor_offset(q), 1);
+        ds4_enc_buf_n(packed_enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
         ds4_enc_buf(packed_enc, g_flash_attn_kv_buffer, kv_off, 2);
         ds4_enc_buf(packed_enc, g_flash_attn_kv_buffer, kv_off, 3);
         ds4_enc_buf(packed_enc, flash_mask_buffer, mask_off, 4);
         ds4_enc_buf(packed_enc, sinks_buf, sinks_offset, 5);
         ds4_enc_buf(packed_enc, g_flash_attn_pad_buffer, pad_off, 6);
-        ds4_enc_buf(packed_enc, headsbuf, ds4_gpu_tensor_offset(heads), 7);
+        ds4_enc_buf_n(packed_enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 7);
         ds4_enc_bytes(packed_enc, &g_decode_attn_rope_args, sizeof(g_decode_attn_rope_args), 8);
         ds4_enc_tgmem(packed_enc, packed_shared_bytes, 0);
         ds4_gpu_dispatch(packed_enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(packed_threads, 1, 1));
@@ -33189,13 +33285,13 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, vec_pipeline);
         ds4_enc_bytes(enc, &vec_args, sizeof(vec_args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_off, 2);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, kv_off, 3);
-        ds4_enc_buf(enc, flash_mask_buffer, mask_off, 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride, 2);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride, 3);
+        ds4_enc_buf_n(enc, flash_mask_buffer, mask_off, use_persistent_zero_mask ? mask_bytes : mask_stride, 4);
         ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, pad_off, 6);
-        ds4_enc_buf(enc, g_flash_attn_tmp_buffer, tmp_off, 7);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, pad_off, pad_bytes, 6);
+        ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, tmp_off, tmp_bytes, 7);
         ds4_enc_tgmem(enc, shared_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, n_head, nwg), MTLSizeMake(32, nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -33219,8 +33315,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, reduce_pso);
     ds4_enc_bytes(enc, &reduce_args, sizeof(reduce_args), 0);
-    ds4_enc_buf(enc, g_flash_attn_tmp_buffer, tmp_off, 1);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 2);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, tmp_off, tmp_bytes, 1);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
     if (fuse_rope) {
         ds4_enc_bytes(enc, &g_decode_attn_rope_args, sizeof(g_decode_attn_rope_args), 3);
     }
@@ -33364,10 +33460,10 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-        ds4_enc_buf(enc, mask_buffer, 0, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -33386,8 +33482,8 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, blk_pipeline);
     ds4_enc_bytes(enc, &blk_args, sizeof(blk_args), 0);
-    ds4_enc_buf(enc, mask_buffer, 0, 1);
-    ds4_enc_buf(enc, g_flash_attn_blk_buffer, 0, 2);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 1);
+    ds4_enc_buf_n(enc, g_flash_attn_blk_buffer, 0, blk_bytes, 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(nblk0, nblk1, 1), MTLSizeMake(32, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33434,14 +33530,14 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, attn_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
-    ds4_enc_buf(enc, mask_buffer, 0, 4);
+    ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 3);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 4);
     ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-    ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
-    ds4_enc_buf(enc, g_flash_attn_blk_buffer, 0, 7);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 8);
+    ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 6);
+    ds4_enc_buf_n(enc, g_flash_attn_blk_buffer, 0, blk_bytes, 7);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 8);
     ds4_enc_tgmem(enc, shared_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(nblk1, n_head, 1), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -33636,10 +33732,10 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pad_pipeline);
         ds4_enc_bytes(enc, &pad_args, sizeof(pad_args), 0);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 1);
-        ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-        ds4_enc_buf(enc, mask_buffer, 0, 3);
-        ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 4);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 1);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+        ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(ncpsg, 1, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -33658,8 +33754,8 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, blk_pipeline);
     ds4_enc_bytes(enc, &blk_args, sizeof(blk_args), 0);
-    ds4_enc_buf(enc, mask_buffer, 0, 1);
-    ds4_enc_buf(enc, g_flash_attn_blk_buffer, 0, 2);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 1);
+    ds4_enc_buf_n(enc, g_flash_attn_blk_buffer, 0, blk_bytes, 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(nblk0, nblk1, 1), MTLSizeMake(32, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33706,14 +33802,14 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, attn_pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
-    ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
-    ds4_enc_buf(enc, mask_buffer, 0, 4);
+    ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 2);
+    ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, 0, kv_bytes, 3);
+    ds4_enc_buf_n(enc, mask_buffer, 0, mask_bytes, 4);
     ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-    ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
-    ds4_enc_buf(enc, g_flash_attn_blk_buffer, 0, 7);
-    ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 8);
+    ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, 0, pad_bytes, 6);
+    ds4_enc_buf_n(enc, g_flash_attn_blk_buffer, 0, blk_bytes, 7);
+    ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 8);
     ds4_enc_tgmem(enc, shared_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(nblk1, n_head, 1), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -34267,7 +34363,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             enc = ds4_gpu_compute_encoder(cb);
             ds4_enc_pso(enc, sort_pipeline);
             ds4_enc_bytes(enc, &sort_args, sizeof(sort_args), 0);
-            ds4_enc_buf(enc, topkbuf, ds4_gpu_tensor_offset(topk), 1);
+            ds4_enc_buf_n(enc, topkbuf, ds4_gpu_tensor_offset(topk), ds4_tensor_tail(topk, ds4_gpu_tensor_offset(topk)), 1);
             ds4_enc_buf(enc, g_indexed_topk_buffer, 0, 2);
             ds4_enc_tgmem(enc, (NSUInteger)top_k * sizeof(int32_t), 0);
             ds4_gpu_dispatch(enc, MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(top_k, 1, 1));
@@ -34292,9 +34388,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             enc = ds4_gpu_compute_encoder(cb);
             ds4_enc_pso(enc, attn_pipeline);
             ds4_enc_bytes(enc, &attn_args, sizeof(attn_args), 0);
-            ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-            ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_kv), 2);
-            ds4_enc_buf(enc, compbuf, ds4_gpu_tensor_offset(comp_kv), 3);
+            ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+            ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_kv), ds4_tensor_tail(raw_kv, ds4_gpu_tensor_offset(raw_kv)), 2);
+            ds4_enc_buf_n(enc, compbuf, ds4_gpu_tensor_offset(comp_kv), ds4_tensor_tail(comp_kv, ds4_gpu_tensor_offset(comp_kv)), 3);
             ds4_enc_buf(enc, skip_decode_sort ? topkbuf : g_indexed_topk_buffer, skip_decode_sort ? ds4_gpu_tensor_offset(topk) : 0, 4);
             ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 5);
             ds4_enc_tgmem(enc, 16u * 128u * sizeof(uint16_t) * 4u, 0);
@@ -34306,19 +34402,19 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_enc_bytes(enc, &attn_args, sizeof(attn_args), 0);
             ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 1);
             ds4_enc_buf(enc, sinks_buf, (NSUInteger)sinks_inner, 2);
-            ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 3);
+            ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 3);
             ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)nrows, 1, 1), MTLSizeMake(32, 4, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
         } else {
             enc = ds4_gpu_compute_encoder(cb);
             ds4_enc_pso(enc, attn_pipeline);
             ds4_enc_bytes(enc, &attn_args, sizeof(attn_args), 0);
-            ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-            ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_kv), 2);
-            ds4_enc_buf(enc, compbuf, ds4_gpu_tensor_offset(comp_kv), 3);
+            ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+            ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_kv), ds4_tensor_tail(raw_kv, ds4_gpu_tensor_offset(raw_kv)), 2);
+            ds4_enc_buf_n(enc, compbuf, ds4_gpu_tensor_offset(comp_kv), ds4_tensor_tail(comp_kv, ds4_gpu_tensor_offset(comp_kv)), 3);
             ds4_enc_buf(enc, skip_decode_sort ? topkbuf : g_indexed_topk_buffer, skip_decode_sort ? ds4_gpu_tensor_offset(topk) : 0, 4);
             ds4_enc_buf(enc, sinks_buf, (NSUInteger)sinks_inner, 5);
-            ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 6);
+            ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 6);
             ds4_enc_tgmem(enc, (decode_one_token ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t), 0);
             ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) / (prefill_dual_heads ? 16u : 8u), 1), MTLSizeMake(32, 8, 1));
@@ -34786,7 +34882,7 @@ int ds4_gpu_attention_decode_heads_block_dag_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, vec);
         ds4_enc_bytes(enc, &vargs, sizeof(vargs), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
         ds4_enc_buf(enc, g_flash_attn_mask_buffer, 0, 4);
@@ -34803,7 +34899,7 @@ int ds4_gpu_attention_decode_heads_block_dag_tensor(
         ds4_enc_pso(enc, red);
         ds4_enc_bytes(enc, &rargs, sizeof(rargs), 0);
         ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 1);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 2);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35051,7 +35147,7 @@ int ds4_gpu_attention_decode_heads_raw_rows_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, vec);
         ds4_enc_bytes(enc, &vargs, sizeof(vargs), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 2);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, 0, 3);
         ds4_enc_buf(enc, g_flash_attn_mask_buffer, 0, 4);
@@ -35068,7 +35164,7 @@ int ds4_gpu_attention_decode_heads_raw_rows_tensor(
         ds4_enc_pso(enc, red);
         ds4_enc_bytes(enc, &rargs, sizeof(rargs), 0);
         ds4_enc_buf(enc, g_flash_attn_tmp_buffer, 0, 1);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 2);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35186,9 +35282,9 @@ static int ds4_gpu_swiglu_round(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_swiglu_flat_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, gatebuf, ds4_gpu_tensor_offset(gate), 1);
-        ds4_enc_buf(enc, upbuf, ds4_gpu_tensor_offset(up), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, gatebuf, ds4_gpu_tensor_offset(gate), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate)), 1);
+        ds4_enc_buf_n(enc, upbuf, ds4_gpu_tensor_offset(up), ds4_tensor_tail(up, ds4_gpu_tensor_offset(up)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_gpu_dispatch(enc, MTLSizeMake(groups, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35254,9 +35350,9 @@ static int ds4_gpu_add_round(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_add2_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, abuf, ds4_gpu_tensor_offset(a), 1);
-        ds4_enc_buf(enc, bbuf, ds4_gpu_tensor_offset(b), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, abuf, ds4_gpu_tensor_offset(a), ds4_tensor_tail(a, ds4_gpu_tensor_offset(a)), 1);
+        ds4_enc_buf_n(enc, bbuf, ds4_gpu_tensor_offset(b), ds4_tensor_tail(b, ds4_gpu_tensor_offset(b)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_gpu_dispatch(enc, MTLSizeMake(groups, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35319,10 +35415,10 @@ int ds4_gpu_add3_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_add3_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, abuf, ds4_gpu_tensor_offset(a), 1);
-        ds4_enc_buf(enc, bbuf, ds4_gpu_tensor_offset(b), 2);
-        ds4_enc_buf(enc, cbuf, ds4_gpu_tensor_offset(c), 3);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 4);
+        ds4_enc_buf_n(enc, abuf, ds4_gpu_tensor_offset(a), ds4_tensor_tail(a, ds4_gpu_tensor_offset(a)), 1);
+        ds4_enc_buf_n(enc, bbuf, ds4_gpu_tensor_offset(b), ds4_tensor_tail(b, ds4_gpu_tensor_offset(b)), 2);
+        ds4_enc_buf_n(enc, cbuf, ds4_gpu_tensor_offset(c), ds4_tensor_tail(c, ds4_gpu_tensor_offset(c)), 3);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(groups, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35386,8 +35482,8 @@ int ds4_gpu_directional_steering_project_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
-        ds4_enc_buf(enc, dbuf, ds4_gpu_tensor_offset(directions), 2);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+        ds4_enc_buf_n(enc, dbuf, ds4_gpu_tensor_offset(directions), ds4_tensor_tail(directions, ds4_gpu_tensor_offset(directions)), 2);
         ds4_enc_tgmem(enc, nth * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)rows, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -36073,8 +36169,8 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     ds4_enc_bytes(enc, act, sizeof(*act), 1);
-    ds4_enc_buf(enc, gate_addrs, 0, 2);
-    ds4_enc_buf(enc, up_addrs, 0, 3);
+    ds4_enc_buf_n(enc, gate_addrs, 0, (gate_addrs).length, 2);
+    ds4_enc_buf_n(enc, up_addrs, 0, (up_addrs).length, 3);
     ds4_enc_buf(enc, src1, src1_off, 4);
     ds4_enc_buf(enc, dst_a, dst_a_off, 5);
     ds4_enc_buf(enc, dst_b, dst_b_off, 6);
@@ -36877,8 +36973,8 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     ds4_enc_bytes(enc, act, sizeof(*act), 1);
-    ds4_enc_buf(enc, gate_addrs, 0, 2);
-    ds4_enc_buf(enc, up_addrs, 0, 3);
+    ds4_enc_buf_n(enc, gate_addrs, 0, (gate_addrs).length, 2);
+    ds4_enc_buf_n(enc, up_addrs, 0, (up_addrs).length, 3);
     ds4_enc_buf(enc, src1, src1_off, 4);
     ds4_enc_buf(enc, dst_a, dst_a_off, 5);
     ds4_enc_buf(enc, dst_b, dst_b_off, 6);
@@ -36949,7 +37045,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
-    ds4_enc_buf(enc, addrs, 0, 1);
+    ds4_enc_buf_n(enc, addrs, 0, (addrs).length, 1);
     ds4_enc_buf(enc, src1, src1_off, 2);
     ds4_enc_buf(enc, dst, dst_off, 3);
     ds4_enc_buf(enc, ids, ids_off, 4);
@@ -37007,7 +37103,7 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
-    ds4_enc_buf(enc, addrs, 0, 1);
+    ds4_enc_buf_n(enc, addrs, 0, (addrs).length, 1);
     ds4_enc_buf(enc, src1, src1_off, 2);
     ds4_enc_buf(enc, dst, dst_off, 3);
     ds4_enc_buf(enc, ids, ids_off, 4);
@@ -37150,8 +37246,8 @@ int ds4_gpu_dsv41_spec_match(const ds4_gpu_tensor *actual,
                               (NSUInteger)pred_elem_off * sizeof(int32_t), 1);
     ds4_enc_buf(enc, sg, ds4_gpu_tensor_offset((ds4_gpu_tensor *)spec_gate), 2);
     ds4_enc_buf(enc, su, ds4_gpu_tensor_offset((ds4_gpu_tensor *)spec_up), 3);
-    ds4_enc_buf(enc, gb, ds4_gpu_tensor_offset(gate), 4);
-    ds4_enc_buf(enc, ub, ds4_gpu_tensor_offset(up), 5);
+    ds4_enc_buf_n(enc, gb, ds4_gpu_tensor_offset(gate), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate)), 4);
+    ds4_enc_buf_n(enc, ub, ds4_gpu_tensor_offset(up), ds4_tensor_tail(up, ds4_gpu_tensor_offset(up)), 5);
     ds4_enc_buf(enc, lm, 0, 6);
     ds4_enc_buf(enc, tg, 0, 7);
     ds4_enc_buf(enc, tu, 0, 8);
@@ -37226,16 +37322,16 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     ds4_enc_bytes(enc, act, sizeof(*act), 1);
     ds4_enc_bytes(enc, split, sizeof(*split), 2);
-    ds4_enc_buf(enc, gate_addrs, 0, 3);
-    ds4_enc_buf(enc, up_addrs, 0, 4);
+    ds4_enc_buf_n(enc, gate_addrs, 0, (gate_addrs).length, 3);
+    ds4_enc_buf_n(enc, up_addrs, 0, (up_addrs).length, 4);
     ds4_enc_buf(enc, src1, src1_off, 5);
     ds4_enc_buf(enc, dst_a, dst_a_off, 6);
     ds4_enc_buf(enc, dst_b, dst_b_off, 7);
     ds4_enc_buf(enc, dst_mid, dst_mid_off, 8);
     ds4_enc_buf(enc, ids, ids_off, 9);
     ds4_enc_buf(enc, weights, weights_off, 10);
-    ds4_enc_buf(enc, ds4_gpu_routed_lane_mask_buffer(), 0, 11);
-    ds4_enc_buf(enc, ds4_gpu_spec_counts_buffer(), 0, 12);
+    ds4_enc_buf_n(enc, ds4_gpu_routed_lane_mask_buffer(), 0, (ds4_gpu_routed_lane_mask_buffer()).length, 11);
+    ds4_enc_buf_n(enc, ds4_gpu_spec_counts_buffer(), 0, (ds4_gpu_spec_counts_buffer()).length, 12);
     if (entries) {
         for (uint32_t i = 0; i < 6; i++) {
             if ((split->active_mask & (1u << i)) == 0) continue;
@@ -37306,7 +37402,7 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     ds4_enc_bytes(enc, split, sizeof(*split), 1);
-    ds4_enc_buf(enc, addrs, 0, 2);
+    ds4_enc_buf_n(enc, addrs, 0, (addrs).length, 2);
     ds4_enc_buf(enc, src1, src1_off, 3);
     ds4_enc_buf(enc, dst, dst_off, 4);
     ds4_enc_buf(enc, ids, ids_off, 5);
@@ -37592,13 +37688,16 @@ static int ds4_gpu_encode_mul_mm_id_map(
         return 0;
     }
 
+    NSUInteger idmap_ids_at = 0, idmap_work_at = 0;
+    const NSUInteger idmap_total = ds4_moe_id_map_layout(mm_args->ne02, mm_args->ne20, mm_args->ne21,
+                                                         &idmap_ids_at, &idmap_work_at);
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, map_pipeline);
     ds4_enc_bytes(enc, map_args, sizeof(*map_args), 0);
     ds4_enc_buf(enc, ids, ids_off, 1);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, 0, 2);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, tpe_bytes, 3);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, work_offset, 4);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, 0, idmap_ids_at, 2);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, tpe_bytes, idmap_work_at - tpe_bytes, 3);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, work_offset, idmap_total - work_offset, 4);
     ds4_enc_tgmem(enc, (NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne20 * sizeof(uint16_t), 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake((NSUInteger)mm_args->ne02, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -37629,22 +37728,25 @@ static int ds4_gpu_encode_moe_packed_rhs(
         f16 ? "kernel_moe_pack_rhs_f16" : "kernel_moe_pack_rhs_f32");
     id<MTLComputePipelineState> offsets = ds4_gpu_get_pipeline("kernel_moe_packed_offsets");
     if (!pipeline || !offsets) return 0;
+    NSUInteger idmap_ids_at = 0, idmap_work_at = 0;
+    const NSUInteger idmap_total = ds4_moe_id_map_layout(args->ne02, args->ne20, args->ne21,
+                                                         &idmap_ids_at, &idmap_work_at);
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     const uint32_t experts = (uint32_t)args->ne02;
     ds4_enc_pso(enc, offsets);
     ds4_enc_bytes(enc, &experts, sizeof(experts), 0);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, 0, 1);
-    ds4_enc_buf(enc, g_moe_packed_rhs_buffer, 0, 2);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, 0, idmap_ids_at, 1);
+    ds4_enc_buf_n(enc, g_moe_packed_rhs_buffer, 0, bytes, 2);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(32, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     ds4_enc_buf(enc, src, offset, 1);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, 0, 2);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, counts_bytes, 3);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, work_offset, 4);
-    ds4_enc_buf(enc, g_moe_packed_rhs_buffer, 0, 5);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, 0, idmap_ids_at, 2);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, counts_bytes, idmap_work_at - counts_bytes, 3);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, work_offset, idmap_total - work_offset, 4);
+    ds4_enc_buf_n(enc, g_moe_packed_rhs_buffer, 0, bytes, 5);
     ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)tiles*tile_n, 1, 1), MTLSizeMake(128, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -37698,15 +37800,18 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile_resources(
         return 0;
     }
 
+    NSUInteger idmap_ids_at = 0, idmap_work_at = 0;
+    const NSUInteger idmap_total = ds4_moe_id_map_layout(mm_args->ne02, mm_args->ne20, mm_args->ne21,
+                                                         &idmap_ids_at, &idmap_work_at);
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, mm_pipeline);
     ds4_enc_bytes(enc, mm_args, sizeof(*mm_args), 0);
     ds4_enc_buf(enc, src0, src0_off, 1);
     ds4_enc_buf(enc, src1, src1_off, 2);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, 0, 3);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, tpe_bytes, 4);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, 0, idmap_ids_at, 3);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, tpe_bytes, idmap_work_at - tpe_bytes, 4);
     ds4_enc_buf(enc, dst, dst_off, 5);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, work_offset, 6);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, work_offset, idmap_total - work_offset, 6);
     for (uint32_t i = 0; resources && i < resource_count; i++) {
         ds4_gpu_stream_expert_cache_entry *entry = resources[i];
         id<MTLBuffer> b = resource_kind == 0 ? entry->gate_buffer :
@@ -37764,13 +37869,17 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
         return 0;
     }
 
+    NSUInteger idmap_ids_at = 0, idmap_work_at = 0;
+    const NSUInteger idmap_total = ds4_moe_id_map_layout(mm_args->ne02, mm_args->ne20, mm_args->ne21,
+                                                         &idmap_ids_at, &idmap_work_at);
+    (void)idmap_total;
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, mm_pipeline);
     ds4_enc_bytes(enc, mm_args, sizeof(*mm_args), 0);
     ds4_enc_buf(enc, src0_addrs, 0, 1);
     ds4_enc_buf(enc, src1, src1_off, 2);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, 0, 3);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, tpe_bytes, 4);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, 0, idmap_ids_at, 3);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, tpe_bytes, idmap_work_at - tpe_bytes, 4);
     ds4_enc_buf(enc, dst, dst_off, 5);
     ds4_enc_use(enc, src0_addrs, MTLResourceUsageRead);
     for (uint32_t i = 0; resources && i < resource_count; i++) {
@@ -37835,6 +37944,9 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
         return 0;
     }
 
+    NSUInteger idmap_ids_at = 0, idmap_work_at = 0;
+    const NSUInteger idmap_total = ds4_moe_id_map_layout(mm_args->ne02, mm_args->ne20, mm_args->ne21,
+                                                         &idmap_ids_at, &idmap_work_at);
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, mm_args, sizeof(*mm_args), 0);
@@ -37842,11 +37954,11 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     ds4_enc_buf(enc, gate_src0, gate_src0_off, 2);
     ds4_enc_buf(enc, up_src0, up_src0_off, 3);
     ds4_enc_buf(enc, src1, src1_off, 4);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, 0, 5);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, tpe_bytes, 6);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, 0, idmap_ids_at, 5);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, tpe_bytes, idmap_work_at - tpe_bytes, 6);
     ds4_enc_buf(enc, mid, mid_off, 7);
     ds4_enc_buf(enc, weights, weights_off, 8);
-    ds4_enc_buf(enc, g_moe_id_map_buffer, work_offset, 9);
+    ds4_enc_buf_n(enc, g_moe_id_map_buffer, work_offset, idmap_total - work_offset, 9);
     const NSUInteger tile_m = compact_tile ? 32u : 64u;
     ds4_enc_tgmem(enc, compact_tile ? 8192u : 16384u, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)work_cap, ((NSUInteger)mm_args->ne0 + tile_m - 1u) / tile_m, 1), MTLSizeMake(compact_tile ? 64u : 128u, 1, 1));
@@ -38431,19 +38543,19 @@ int ds4_gpu_router_project_select_tensor(
         ds4_enc_pso(enc, pipe);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, wbuf, (NSUInteger)w_inner, 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(logits), ds4_gpu_tensor_offset(logits), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(logits), ds4_gpu_tensor_offset(logits), ds4_tensor_tail(logits, ds4_gpu_tensor_offset(logits)), 3);
         ds4_enc_buf(enc, bbuf, (NSUInteger)b_inner, 4);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(probs), ds4_gpu_tensor_offset(probs), 5);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(selected), ds4_gpu_tensor_offset(selected), 6);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(weights), ds4_gpu_tensor_offset(weights), 7);
-        ds4_enc_buf(enc, validate ? table_gate : stub, 0, 8);
-        ds4_enc_buf(enc, validate ? table_up : stub, 0, 9);
-        ds4_enc_buf(enc, validate ? table_down : stub, 0, 10);
-        ds4_enc_buf(enc, validate ? g_gate_grid : stub, 0, 11);
-        ds4_enc_buf(enc, validate ? g_gate_miss : stub, validate ? (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t) : 0, 12);
-        ds4_enc_buf(enc, validate ? g_gate_route : stub, 0, 13);
-        ds4_enc_buf(enc, g_route_sched_completion, 0, 14);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(probs), ds4_gpu_tensor_offset(probs), ds4_tensor_tail(probs, ds4_gpu_tensor_offset(probs)), 5);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(selected), ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 6);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(weights), ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 7);
+        ds4_enc_buf_n(enc, validate ? table_gate : stub, 0, (validate ? table_gate : stub).length, 8);
+        ds4_enc_buf_n(enc, validate ? table_up : stub, 0, (validate ? table_up : stub).length, 9);
+        ds4_enc_buf_n(enc, validate ? table_down : stub, 0, (validate ? table_down : stub).length, 10);
+        ds4_enc_buf_n(enc, validate ? g_gate_grid : stub, 0, (validate ? g_gate_grid : stub).length, 11);
+        ds4_enc_buf_n(enc, validate ? g_gate_miss : stub, validate ? (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t) : 0, validate ? DS4_GATE_MISS_WORDS * sizeof(uint32_t) : stub.length, 12);
+        ds4_enc_buf_n(enc, validate ? g_gate_route : stub, 0, (validate ? g_gate_route : stub).length, 13);
+        ds4_enc_buf_n(enc, g_route_sched_completion, 0, (g_route_sched_completion).length, 14);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_groups, 1, 1), MTLSizeMake(512, 1, 1));
         if (validate) {
             ds4_gpu_gate_arm();
@@ -38662,7 +38774,7 @@ static int ds4_gpu_encode_router_select(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         if (use_transform_finalize_fusion) {
             ds4_enc_buf(enc, logitsbuf, logits_off, 1);
-            ds4_enc_buf(enc, probsbuf, probs_off, 2);
+            ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 2);
             if (has_bias) {
                 ds4_enc_buf(enc, biasbuf, bias_off, 3);
             } else {
@@ -38674,10 +38786,10 @@ static int ds4_gpu_encode_router_select(
             } else {
                 ds4_enc_bytes(enc, &zero_i32, sizeof(zero_i32), 5);
             }
-            ds4_enc_buf(enc, selectedbuf, selected_off, 6);
-            ds4_enc_buf(enc, weightsbuf, weights_off, 7);
+            ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 6);
+            ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 7);
         } else {
-            ds4_enc_buf(enc, probsbuf, probs_off, 1);
+            ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 1);
             if (has_bias) {
                 ds4_enc_buf(enc, biasbuf, bias_off, 2);
             } else {
@@ -38693,9 +38805,9 @@ static int ds4_gpu_encode_router_select(
             } else {
                 ds4_enc_bytes(enc, &zero_i32, sizeof(zero_i32), 4);
             }
-            ds4_enc_buf(enc, selectedbuf, selected_off, 5);
+            ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 5);
             if (use_simd_weights_fusion) {
-                ds4_enc_buf(enc, weightsbuf, weights_off, 6);
+                ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 6);
             }
         }
         const NSUInteger router_finalize_scratch_bytes = use_simd_finalize
@@ -38709,9 +38821,9 @@ static int ds4_gpu_encode_router_select(
 
         enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, router_weights_pipeline);
-        ds4_enc_buf(enc, probsbuf, probs_off, 0);
-        ds4_enc_buf(enc, selectedbuf, selected_off, 1);
-        ds4_enc_buf(enc, weightsbuf, weights_off, 2);
+        ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 0);
+        ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 1);
+        ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 2);
         ds4_gpu_dispatch_threads(enc, MTLSizeMake(6, 1, 1), MTLSizeMake(6, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return 1;
@@ -38748,15 +38860,15 @@ static int ds4_gpu_encode_router_select(
         ds4_enc_bytes(enc, &vargs, sizeof(vargs), 0);
         ds4_enc_buf(enc, logitsbuf, logits_off, 1);
         ds4_enc_buf(enc, biasbuf, bias_off, 2);
-        ds4_enc_buf(enc, probsbuf, probs_off, 3);
-        ds4_enc_buf(enc, selectedbuf, selected_off, 4);
-        ds4_enc_buf(enc, weightsbuf, weights_off, 5);
+        ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 3);
+        ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 4);
+        ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 5);
         ds4_enc_buf(enc, table_gate, 0, 6);
         ds4_enc_buf(enc, table_up, 0, 7);
         ds4_enc_buf(enc, table_down, 0, 8);
-        ds4_enc_buf(enc, g_gate_grid, 0, 9);
-        ds4_enc_buf(enc, g_gate_miss, (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t), 10);
-        ds4_enc_buf(enc, g_gate_route, 0, 11);
+        ds4_enc_buf_n(enc, g_gate_grid, 0, (g_gate_grid).length, 9);
+        ds4_enc_buf_n(enc, g_gate_miss, (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t), DS4_GATE_MISS_WORDS * sizeof(uint32_t), 10);
+        ds4_enc_buf_n(enc, g_gate_route, 0, (g_gate_route).length, 11);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1));
         ds4_gpu_gate_arm();
         ds4_enc_barrier_scope(enc, MTLBarrierScopeBuffers);
@@ -38792,9 +38904,9 @@ static int ds4_gpu_encode_router_select(
             ds4_enc_buf(enc, g_router_cmp_sel, 0, 4);
             ds4_enc_buf(enc, g_router_cmp_w, 0, 5);
         } else {
-            ds4_enc_buf(enc, probsbuf, probs_off, 3);
-            ds4_enc_buf(enc, selectedbuf, selected_off, 4);
-            ds4_enc_buf(enc, weightsbuf, weights_off, 5);
+            ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 3);
+            ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 4);
+            ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 5);
         }
         ds4_enc_tgmem(enc, (512u * 2u + 384u + 12u) * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1));
@@ -38863,14 +38975,14 @@ static int ds4_gpu_encode_router_select(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_router_select_visual_batch_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, probsbuf, probs_off, 1);
+        ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 1);
         if (has_bias) ds4_enc_buf(enc, biasbuf, bias_off, 2);
         else ds4_enc_bytes(enc, &zero_f32, sizeof(zero_f32), 2);
         ds4_enc_buf(enc, visual_biasbuf, visual_bias_off, 3);
         if (hash_mode) ds4_enc_buf(enc, hashbuf, hash_off, 4);
         else ds4_enc_bytes(enc, &zero_i32, sizeof(zero_i32), 4);
         ds4_enc_buf(enc, tokensbuf, tokens_off, 5);
-        ds4_enc_buf(enc, selectedbuf, selected_off, 6);
+        ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 6);
         ds4_enc_tgmem(enc, 256u * (sizeof(float) + sizeof(int32_t)), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -38935,9 +39047,9 @@ static int ds4_gpu_encode_router_select(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_dsv4_router_weights_batch_pipeline);
         ds4_enc_bytes(enc, &scale, sizeof(scale), 0);
-        ds4_enc_buf(enc, probsbuf, probs_off, 1);
-        ds4_enc_buf(enc, selectedbuf, selected_off, 2);
-        ds4_enc_buf(enc, weightsbuf, weights_off, 3);
+        ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 1);
+        ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 2);
+        ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 3);
         ds4_enc_tgmem(enc, 40u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tokens, 1, 1), MTLSizeMake(6, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -38951,9 +39063,9 @@ static int ds4_gpu_encode_router_select(
         if (!router_weights_pipeline) return 0;
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, router_weights_pipeline);
-        ds4_enc_buf(enc, probsbuf, probs_off, 0);
-        ds4_enc_buf(enc, selectedbuf, selected_off, 1);
-        ds4_enc_buf(enc, weightsbuf, weights_off, 2);
+        ds4_enc_buf_n(enc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 0);
+        ds4_enc_buf_n(enc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 1);
+        ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 2);
         /* One threadgroup of six, not six loose threads: the same launch, but
          * uniform, so the abort gate can switch it off with the rest. */
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(6, 1, 1));
@@ -39017,9 +39129,9 @@ static int ds4_gpu_encode_router_select(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, g_bin_mul_scalar_pipeline);
     ds4_enc_bytes(enc, &scale_args, sizeof(scale_args), 0);
-    ds4_enc_buf(enc, weightsbuf, weights_off, 1);
+    ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 1);
     ds4_enc_bytes(enc, &scale, sizeof(scale), 2);
-    ds4_enc_buf(enc, weightsbuf, weights_off, 3);
+    ds4_enc_buf_n(enc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 3);
     ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)scale_args.ne1, (NSUInteger)scale_args.ne2, (NSUInteger)scale_args.ne3), MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -39029,11 +39141,11 @@ static int ds4_gpu_encode_router_select(
         DS4Enc *cenc = ds4_gpu_compute_encoder(cb);
         if (!cenc) return 0;
         ds4_enc_pso(cenc, cmp);
-        ds4_enc_buf(cenc, probsbuf, probs_off, 0);
+        ds4_enc_buf_n(cenc, probsbuf, probs_off, ds4_tensor_tail(probs, probs_off), 0);
         ds4_enc_buf(cenc, g_router_cmp_probs, 0, 1);
-        ds4_enc_buf(cenc, selectedbuf, selected_off, 2);
+        ds4_enc_buf_n(cenc, selectedbuf, selected_off, ds4_tensor_tail(selected, selected_off), 2);
         ds4_enc_buf(cenc, g_router_cmp_sel, 0, 3);
-        ds4_enc_buf(cenc, weightsbuf, weights_off, 4);
+        ds4_enc_buf_n(cenc, weightsbuf, weights_off, ds4_tensor_tail(weights, weights_off), 4);
         ds4_enc_buf(cenc, g_router_cmp_w, 0, 5);
         ds4_enc_buf(cenc, g_router_cmp_counts, 0, 6);
         ds4_gpu_dispatch(cenc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
@@ -39115,9 +39227,9 @@ int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(kv_raw), 1);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(kv_raw), ds4_tensor_tail(kv_raw, ds4_gpu_tensor_offset(kv_raw)), 1);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)weight_inner, 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, nth * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -39207,8 +39319,8 @@ int ds4_gpu_glm_k_b_project_typed_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)weight_inner, 1);
-        ds4_enc_buf(enc, kvbuf, ds4_gpu_tensor_offset(kv_norm), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, kvbuf, ds4_gpu_tensor_offset(kv_norm), ds4_tensor_tail(kv_norm, ds4_gpu_tensor_offset(kv_norm)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, (NSUInteger)kv_lora_dim * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1), MTLSizeMake(32, q_blocks, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -39309,10 +39421,10 @@ int ds4_gpu_glm_store_compact_kv_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, kvnormbuf, ds4_gpu_tensor_offset(kv_norm), 1);
-        ds4_enc_buf(enc, kvrawbuf, ds4_gpu_tensor_offset(kv_raw), 2);
-        ds4_enc_buf(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), 3);
-        ds4_enc_buf(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), 4);
+        ds4_enc_buf_n(enc, kvnormbuf, ds4_gpu_tensor_offset(kv_norm), ds4_tensor_tail(kv_norm, ds4_gpu_tensor_offset(kv_norm)), 1);
+        ds4_enc_buf_n(enc, kvrawbuf, ds4_gpu_tensor_offset(kv_raw), ds4_tensor_tail(kv_raw, ds4_gpu_tensor_offset(kv_raw)), 2);
+        ds4_enc_buf_n(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), ds4_tensor_tail(kv_lora_cache, ds4_gpu_tensor_offset(kv_lora_cache)), 3);
+        ds4_enc_buf_n(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), ds4_tensor_tail(k_rope_cache, ds4_gpu_tensor_offset(k_rope_cache)), 4);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, 2, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -39420,13 +39532,13 @@ int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
         ds4_enc_buf(enc, q_weightbuf, (NSUInteger)q_weight_inner, 2);
-        ds4_enc_buf(enc, qoutbuf, ds4_gpu_tensor_offset(q_out), 3);
-        ds4_enc_buf(enc, kvrawbuf, ds4_gpu_tensor_offset(kv_raw), 4);
+        ds4_enc_buf_n(enc, qoutbuf, ds4_gpu_tensor_offset(q_out), ds4_tensor_tail(q_out, ds4_gpu_tensor_offset(q_out)), 3);
+        ds4_enc_buf_n(enc, kvrawbuf, ds4_gpu_tensor_offset(kv_raw), ds4_tensor_tail(kv_raw, ds4_gpu_tensor_offset(kv_raw)), 4);
         ds4_enc_buf(enc, kv_weightbuf, (NSUInteger)kv_weight_inner, 5);
-        ds4_enc_buf(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), 6);
-        ds4_enc_buf(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), 7);
+        ds4_enc_buf_n(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), ds4_tensor_tail(kv_lora_cache, ds4_gpu_tensor_offset(kv_lora_cache)), 6);
+        ds4_enc_buf_n(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), ds4_tensor_tail(k_rope_cache, ds4_gpu_tensor_offset(k_rope_cache)), 7);
         ds4_enc_tgmem(enc, 32u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, 3, 1), MTLSizeMake(ds4_gpu_rms_norm_threads(q_n), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -39532,10 +39644,10 @@ int ds4_gpu_glm_store_indexer_k_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_k), 1);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_k), ds4_tensor_tail(raw_k, ds4_gpu_tensor_offset(raw_k)), 1);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)weight_inner, 2);
         ds4_enc_buf(enc, biasbuf, (NSUInteger)bias_inner, 3);
-        ds4_enc_buf(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), 4);
+        ds4_enc_buf_n(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), ds4_tensor_tail(indexer_key_cache, ds4_gpu_tensor_offset(indexer_key_cache)), 4);
         ds4_enc_tgmem(enc, nth * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -39629,9 +39741,9 @@ int ds4_gpu_glm53_indexer_pool_update_tensor(
         ds4_enc_buf(enc, norm_weightbuf, (NSUInteger)norm_weight_inner, 3);
         ds4_enc_buf(enc, norm_biasbuf, (NSUInteger)norm_bias_inner, 4);
         ds4_enc_buf(enc, apebuf, (NSUInteger)ape_inner, 5);
-        ds4_enc_buf(enc, poolbuf, ds4_gpu_tensor_offset(pool_cache), 6);
-        ds4_enc_buf(enc, tailkbuf, ds4_gpu_tensor_offset(tail_k), 7);
-        ds4_enc_buf(enc, tailgatebuf, ds4_gpu_tensor_offset(tail_gate), 8);
+        ds4_enc_buf_n(enc, poolbuf, ds4_gpu_tensor_offset(pool_cache), ds4_tensor_tail(pool_cache, ds4_gpu_tensor_offset(pool_cache)), 6);
+        ds4_enc_buf_n(enc, tailkbuf, ds4_gpu_tensor_offset(tail_k), ds4_tensor_tail(tail_k, ds4_gpu_tensor_offset(tail_k)), 7);
+        ds4_enc_buf_n(enc, tailgatebuf, ds4_gpu_tensor_offset(tail_gate), ds4_tensor_tail(tail_gate, ds4_gpu_tensor_offset(tail_gate)), 8);
         ds4_enc_tgmem(enc, ((NSUInteger)pool_size * head_dim + 2u * pool_size) * sizeof(float), 0);
 
         uint32_t done = 0;
@@ -39650,8 +39762,8 @@ int ds4_gpu_glm53_indexer_pool_update_tensor(
                 .pad0 = 0,
             };
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
-            ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_k), 1);
-            ds4_enc_buf(enc, gatebuf, ds4_gpu_tensor_offset(gate), 2);
+            ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_k), ds4_tensor_tail(raw_k, ds4_gpu_tensor_offset(raw_k)), 1);
+            ds4_enc_buf_n(enc, gatebuf, ds4_gpu_tensor_offset(gate), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate)), 2);
             ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(head_dim, 1, 1));
             done = chunk;
         }
@@ -39668,10 +39780,12 @@ int ds4_gpu_glm53_indexer_pool_update_tensor(
                 .pad0 = 0,
             };
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
-            ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_k) +
-                           (NSUInteger)((uint64_t)done * head_dim * sizeof(float)), 1);
-            ds4_enc_buf(enc, gatebuf, ds4_gpu_tensor_offset(gate) +
-                           (NSUInteger)((uint64_t)done * head_dim * sizeof(float)), 2);
+            ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_k) +
+                           (NSUInteger)((uint64_t)done * head_dim * sizeof(float)), ds4_tensor_tail(raw_k, ds4_gpu_tensor_offset(raw_k) +
+                           (NSUInteger)((uint64_t)done * head_dim * sizeof(float))), 1);
+            ds4_enc_buf_n(enc, gatebuf, ds4_gpu_tensor_offset(gate) +
+                           (NSUInteger)((uint64_t)done * head_dim * sizeof(float)), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate) +
+                           (NSUInteger)((uint64_t)done * head_dim * sizeof(float))), 2);
             const uint32_t groups = (chunk + pool_size - 1u) / pool_size;
             ds4_gpu_dispatch(enc, MTLSizeMake(groups, 1, 1), MTLSizeMake(head_dim, 1, 1));
         }
@@ -39730,8 +39844,8 @@ int ds4_gpu_glm53_expand_pool_selection_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, poolbuf, ds4_gpu_tensor_offset(pool_selected), 1);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(raw_selected), 2);
+        ds4_enc_buf_n(enc, poolbuf, ds4_gpu_tensor_offset(pool_selected), ds4_tensor_tail(pool_selected, ds4_gpu_tensor_offset(pool_selected)), 1);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(raw_selected), ds4_tensor_tail(raw_selected, ds4_gpu_tensor_offset(raw_selected)), 2);
         const NSUInteger total = (NSUInteger)n_tokens * output_width;
         const NSUInteger nth = MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup);
         ds4_gpu_dispatch_threads(enc, MTLSizeMake(total, 1, 1), MTLSizeMake(nth, 1, 1));
@@ -39844,11 +39958,11 @@ int ds4_gpu_glm_build_kv_cache_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(kv_raw), 1);
-        ds4_enc_buf(enc, knbuf, ds4_gpu_tensor_offset(k_nope), 2);
-        ds4_enc_buf(enc, vbuf, ds4_gpu_tensor_offset(value), 3);
-        ds4_enc_buf(enc, keybuf, ds4_gpu_tensor_offset(key_cache), 4);
-        ds4_enc_buf(enc, valbuf, ds4_gpu_tensor_offset(value_cache), 5);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(kv_raw), ds4_tensor_tail(kv_raw, ds4_gpu_tensor_offset(kv_raw)), 1);
+        ds4_enc_buf_n(enc, knbuf, ds4_gpu_tensor_offset(k_nope), ds4_tensor_tail(k_nope, ds4_gpu_tensor_offset(k_nope)), 2);
+        ds4_enc_buf_n(enc, vbuf, ds4_gpu_tensor_offset(value), ds4_tensor_tail(value, ds4_gpu_tensor_offset(value)), 3);
+        ds4_enc_buf_n(enc, keybuf, ds4_gpu_tensor_offset(key_cache), ds4_tensor_tail(key_cache, ds4_gpu_tensor_offset(key_cache)), 4);
+        ds4_enc_buf_n(enc, valbuf, ds4_gpu_tensor_offset(value_cache), ds4_tensor_tail(value_cache, ds4_gpu_tensor_offset(value_cache)), 5);
         const NSUInteger group_y = decode_group4 ?
             ((NSUInteger)n_head + 3u) / 4u :
             (NSUInteger)n_head;
@@ -39971,11 +40085,11 @@ int ds4_gpu_glm_build_kv_cache_flash_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, rawbuf, ds4_gpu_tensor_offset(kv_raw), 1);
-        ds4_enc_buf(enc, knbuf, ds4_gpu_tensor_offset(k_nope), 2);
-        ds4_enc_buf(enc, vbuf, ds4_gpu_tensor_offset(value), 3);
-        ds4_enc_buf(enc, keybuf, ds4_gpu_tensor_offset(key_cache), 4);
-        ds4_enc_buf(enc, valbuf, ds4_gpu_tensor_offset(value_cache), 5);
+        ds4_enc_buf_n(enc, rawbuf, ds4_gpu_tensor_offset(kv_raw), ds4_tensor_tail(kv_raw, ds4_gpu_tensor_offset(kv_raw)), 1);
+        ds4_enc_buf_n(enc, knbuf, ds4_gpu_tensor_offset(k_nope), ds4_tensor_tail(k_nope, ds4_gpu_tensor_offset(k_nope)), 2);
+        ds4_enc_buf_n(enc, vbuf, ds4_gpu_tensor_offset(value), ds4_tensor_tail(value, ds4_gpu_tensor_offset(value)), 3);
+        ds4_enc_buf_n(enc, keybuf, ds4_gpu_tensor_offset(key_cache), ds4_tensor_tail(key_cache, ds4_gpu_tensor_offset(key_cache)), 4);
+        ds4_enc_buf_n(enc, valbuf, ds4_gpu_tensor_offset(value_cache), ds4_tensor_tail(value_cache, ds4_gpu_tensor_offset(value_cache)), 5);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, key_f16_offset, 6);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, value_f16_offset, 7);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1), MTLSizeMake(256, 1, 1));
@@ -40251,14 +40365,14 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, attn_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, key_f16_offset, 2);
         ds4_enc_buf(enc, g_flash_attn_kv_buffer, value_f16_offset, 3);
         ds4_enc_buf(enc, mask_buffer, 0, 4);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 5);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 5);
         ds4_enc_buf(enc, g_flash_attn_pad_buffer, 0, 6);
         ds4_enc_buf(enc, g_flash_attn_blk_buffer, 0, 7);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 8);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 8);
         ds4_enc_tgmem(enc, shared_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(nblk1, n_head, 1), MTLSizeMake(32, nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -40397,10 +40511,10 @@ int ds4_gpu_glm_attention_full_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, keybuf, ds4_gpu_tensor_offset(key_cache), 2);
-        ds4_enc_buf(enc, valbuf, ds4_gpu_tensor_offset(value_cache), 3);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, keybuf, ds4_gpu_tensor_offset(key_cache), ds4_tensor_tail(key_cache, ds4_gpu_tensor_offset(key_cache)), 2);
+        ds4_enc_buf_n(enc, valbuf, ds4_gpu_tensor_offset(value_cache), ds4_tensor_tail(value_cache, ds4_gpu_tensor_offset(value_cache)), 3);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 4);
         ds4_enc_tgmem(enc, ds4_gpu_align_up_ns(
                 (256u + (NSUInteger)cache_len) * sizeof(float), 16u), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1), MTLSizeMake(256, 1, 1));
@@ -40444,7 +40558,7 @@ int ds4_gpu_glm_fill_selected_range_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 1);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 1);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_groups, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -40495,7 +40609,7 @@ int ds4_gpu_glm_fill_selected_range_batch_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 1);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 1);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_groups, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -40571,7 +40685,7 @@ static int ds4_gpu_glm_rope_tail_offset_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_head, (NSUInteger)n_tokens, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -40701,10 +40815,10 @@ int ds4_gpu_glm_indexer_score_one_tensor(
             DS4Enc *enc = ds4_gpu_compute_encoder(cb);
             ds4_enc_pso(enc, direct_pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
-            ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-            ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 2);
-            ds4_enc_buf(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), 3);
-            ds4_enc_buf(enc, scoresbuf, ds4_gpu_tensor_offset(scores), 4);
+            ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+            ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 2);
+            ds4_enc_buf_n(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), ds4_tensor_tail(indexer_key_cache, ds4_gpu_tensor_offset(indexer_key_cache)), 3);
+            ds4_enc_buf_n(enc, scoresbuf, ds4_gpu_tensor_offset(scores), ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores)), 4);
             ds4_enc_tgmem(enc, (128u + 4u) * sizeof(float), 0);
             ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_rows, 1, 1), MTLSizeMake(32, 4, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -40727,10 +40841,10 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 2);
-        ds4_enc_buf(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), 3);
-        ds4_enc_buf(enc, scoresbuf, ds4_gpu_tensor_offset(scores), 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 2);
+        ds4_enc_buf_n(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), ds4_tensor_tail(indexer_key_cache, ds4_gpu_tensor_offset(indexer_key_cache)), 3);
+        ds4_enc_buf_n(enc, scoresbuf, ds4_gpu_tensor_offset(scores), ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores)), 4);
         ds4_enc_tgmem(enc, nth * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_rows, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -40822,10 +40936,10 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 2);
-        ds4_enc_buf(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), 3);
-        ds4_enc_buf(enc, scoresbuf, ds4_gpu_tensor_offset(scores), 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 2);
+        ds4_enc_buf_n(enc, cachebuf, ds4_gpu_tensor_offset(indexer_key_cache), ds4_tensor_tail(indexer_key_cache, ds4_gpu_tensor_offset(indexer_key_cache)), 3);
+        ds4_enc_buf_n(enc, scoresbuf, ds4_gpu_tensor_offset(scores), ds4_tensor_tail(scores, ds4_gpu_tensor_offset(scores)), 4);
         if (use_tiled) {
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 32u * 128u;
@@ -40922,11 +41036,11 @@ int ds4_gpu_dsv41_indexer_pack(ds4_gpu_tensor *packed,
         const uint64_t offset = ds4_gpu_tensor_offset(packed);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(keys), ds4_gpu_tensor_offset(keys), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(packed), offset, 3);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(packed), offset + flags_bytes, 4);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(packed), offset + flags_bytes + (uint64_t)rows * 8192u, 5);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(keys), ds4_gpu_tensor_offset(keys), ds4_tensor_tail(keys, ds4_gpu_tensor_offset(keys)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(packed), offset, ds4_tensor_tail(packed, offset), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(packed), offset + flags_bytes, ds4_tensor_tail(packed, offset + flags_bytes), 4);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(packed), offset + flags_bytes + (uint64_t)rows * 8192u, ds4_tensor_tail(packed, offset + flags_bytes + (uint64_t)rows * 8192u), 5);
         ds4_enc_tgmem(enc, 16, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)rows + ((NSUInteger)source_rows + 63u) / 64u, 1, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -40968,9 +41082,9 @@ int ds4_gpu_dsv41_indexer_scores_packed(ds4_gpu_tensor *scores,
         ds4_enc_bytes(enc, args, sizeof(args), 0);
         ds4_enc_bytes(enc, range, sizeof(range), 1);
         for (NSUInteger i = 0; i < 5; i++)
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(tensors[i]), ds4_gpu_tensor_offset(tensors[i]), i + 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(packed), base + flags_bytes, 7);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(packed), base + flags_bytes + (uint64_t)packed_rows * 8192u, 8);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(tensors[i]), ds4_gpu_tensor_offset(tensors[i]), ds4_tensor_tail(tensors[i], ds4_gpu_tensor_offset(tensors[i])), i + 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(packed), base + flags_bytes, ds4_tensor_tail(packed, base + flags_bytes), 7);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(packed), base + flags_bytes + (uint64_t)packed_rows * 8192u, ds4_tensor_tail(packed, base + flags_bytes + (uint64_t)packed_rows * 8192u), 8);
         ds4_enc_tgmem(enc, 32u * 64u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)source_rows + 63u) / 64u, rows, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -41101,8 +41215,8 @@ int ds4_gpu_glm_qk_lowrank_typed_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)weight_inner, 1);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(qk_low), 3);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(qk_low), ds4_tensor_tail(qk_low, ds4_gpu_tensor_offset(qk_low)), 3);
         if (use_glm52_sg) {
             /* 8 simdgroups x 2 rows per threadgroup: (64, 512/16) grid. */
             ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_head, (NSUInteger)(kv_lora_dim / 16u), 1), MTLSizeMake(32, 8, 1));
@@ -41233,8 +41347,8 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)weight_inner, 1);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(qk_low), 3);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(qk_low), ds4_tensor_tail(qk_low, ds4_gpu_tensor_offset(qk_low)), 3);
         if (use_glm52_t4) {
             ds4_enc_tgmem(enc, 4u * 192u * sizeof(float), 0);
             ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)head_count, ((NSUInteger)n_tokens + 3u) / 4u, 1), MTLSizeMake(256, 1, 1));
@@ -41362,8 +41476,8 @@ int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)weight_inner, 1);
-        ds4_enc_buf(enc, lorabuf, ds4_gpu_tensor_offset(lora), 2);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 3);
+        ds4_enc_buf_n(enc, lorabuf, ds4_gpu_tensor_offset(lora), ds4_tensor_tail(lora, ds4_gpu_tensor_offset(lora)), 2);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 3);
         if (use_mma) {
             ds4_enc_tgmem(enc, 16u * 1024u, 0);
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n_tokens + 31u) / 32u, ((NSUInteger)value_dim + 63u) / 64u, (NSUInteger)head_count), MTLSizeMake(128, 1, 1));
@@ -41520,13 +41634,13 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
             .value_type = value_weight_type,
         };
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), 2);
-        ds4_enc_buf(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), 3);
-        ds4_enc_buf(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), ds4_tensor_tail(qk_low, ds4_gpu_tensor_offset(qk_low)), 2);
+        ds4_enc_buf_n(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), ds4_tensor_tail(kv_lora_cache, ds4_gpu_tensor_offset(kv_lora_cache)), 3);
+        ds4_enc_buf_n(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), ds4_tensor_tail(k_rope_cache, ds4_gpu_tensor_offset(k_rope_cache)), 4);
         ds4_enc_buf(enc, valuebuf, (NSUInteger)value_inner, 5);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 6);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 7);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 6);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 7);
         const NSUInteger scratch_floats =
             256u + (NSUInteger)n_selected + (NSUInteger)kv_lora_dim;
         ds4_enc_tgmem(enc, ds4_gpu_align_up_ns(
@@ -41756,13 +41870,13 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, partial_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), 2);
-        ds4_enc_buf(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), 3);
-        ds4_enc_buf(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), 4);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 5);
-        ds4_enc_buf(enc, partial_lorabuf, ds4_gpu_tensor_offset(partial_lora), 6);
-        ds4_enc_buf(enc, partial_msbuf, ds4_gpu_tensor_offset(partial_ms), 7);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), ds4_tensor_tail(qk_low, ds4_gpu_tensor_offset(qk_low)), 2);
+        ds4_enc_buf_n(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), ds4_tensor_tail(kv_lora_cache, ds4_gpu_tensor_offset(kv_lora_cache)), 3);
+        ds4_enc_buf_n(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), ds4_tensor_tail(k_rope_cache, ds4_gpu_tensor_offset(k_rope_cache)), 4);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 5);
+        ds4_enc_buf_n(enc, partial_lorabuf, ds4_gpu_tensor_offset(partial_lora), ds4_tensor_tail(partial_lora, ds4_gpu_tensor_offset(partial_lora)), 6);
+        ds4_enc_buf_n(enc, partial_msbuf, ds4_gpu_tensor_offset(partial_ms), ds4_tensor_tail(partial_ms, ds4_gpu_tensor_offset(partial_ms)), 7);
         ds4_enc_tgmem(enc, partial_scratch_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_head / 8u, (NSUInteger)n_blocks, 1), MTLSizeMake(32, 8, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -41771,10 +41885,10 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, reduce_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, partial_lorabuf, ds4_gpu_tensor_offset(partial_lora), 1);
-        ds4_enc_buf(enc, partial_msbuf, ds4_gpu_tensor_offset(partial_ms), 2);
+        ds4_enc_buf_n(enc, partial_lorabuf, ds4_gpu_tensor_offset(partial_lora), ds4_tensor_tail(partial_lora, ds4_gpu_tensor_offset(partial_lora)), 1);
+        ds4_enc_buf_n(enc, partial_msbuf, ds4_gpu_tensor_offset(partial_ms), ds4_tensor_tail(partial_ms, ds4_gpu_tensor_offset(partial_ms)), 2);
         ds4_enc_buf(enc, valuebuf, (NSUInteger)value_inner, 3);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 4);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 4);
         ds4_enc_tgmem(enc, reduce_scratch_floats * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_head, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -42002,13 +42116,13 @@ int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), 2);
-        ds4_enc_buf(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), 3);
-        ds4_enc_buf(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), ds4_tensor_tail(qk_low, ds4_gpu_tensor_offset(qk_low)), 2);
+        ds4_enc_buf_n(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), ds4_tensor_tail(kv_lora_cache, ds4_gpu_tensor_offset(kv_lora_cache)), 3);
+        ds4_enc_buf_n(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), ds4_tensor_tail(k_rope_cache, ds4_gpu_tensor_offset(k_rope_cache)), 4);
         ds4_enc_buf(enc, valuebuf, (NSUInteger)value_inner, 5);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 6);
-        ds4_enc_buf(enc, headsbuf, ds4_gpu_tensor_offset(heads), 7);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 6);
+        ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 7);
         ds4_enc_tgmem(enc, scratch_bytes, 0);
         if (use_q2_group4) {
             ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)n_head + 3u) / 4u, ((NSUInteger)n_tokens + 1u) / 2u, 1), MTLSizeMake(32, 4, 1));
@@ -42138,8 +42252,8 @@ int ds4_gpu_sort_i32_rows_asc_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, srcbuf, ds4_gpu_tensor_offset(src), 1);
-        ds4_enc_buf(enc, dstbuf, ds4_gpu_tensor_offset(dst), 2);
+        ds4_enc_buf_n(enc, srcbuf, ds4_gpu_tensor_offset(src), ds4_tensor_tail(src, ds4_gpu_tensor_offset(src)), 1);
+        ds4_enc_buf_n(enc, dstbuf, ds4_gpu_tensor_offset(dst), ds4_tensor_tail(dst, ds4_gpu_tensor_offset(dst)), 2);
         ds4_enc_tgmem(enc, scratch_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_rows, 1, 1), MTLSizeMake(threads, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -42278,17 +42392,17 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), 2);
-        ds4_enc_buf(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), 3);
-        ds4_enc_buf(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), 4);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), ds4_tensor_tail(qk_low, ds4_gpu_tensor_offset(qk_low)), 2);
+        ds4_enc_buf_n(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), ds4_tensor_tail(kv_lora_cache, ds4_gpu_tensor_offset(kv_lora_cache)), 3);
+        ds4_enc_buf_n(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), ds4_tensor_tail(k_rope_cache, ds4_gpu_tensor_offset(k_rope_cache)), 4);
         if (use_vec_lora) {
-            ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 5);
-            ds4_enc_buf(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), 6);
+            ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 5);
+            ds4_enc_buf_n(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), ds4_tensor_tail(lora_out, ds4_gpu_tensor_offset(lora_out)), 6);
         } else {
-            ds4_enc_buf(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), 5);
-            ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 6);
-            ds4_enc_buf(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), 7);
+            ds4_enc_buf_n(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), ds4_tensor_tail(lora_out, ds4_gpu_tensor_offset(lora_out)), 5);
+            ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 6);
+            ds4_enc_buf_n(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), ds4_tensor_tail(lora_out, ds4_gpu_tensor_offset(lora_out)), 7);
         }
         ds4_enc_tgmem(enc, scratch_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)head_count + 7u) / 8u, (NSUInteger)n_tokens, 1), MTLSizeMake(32, 8, 1));
@@ -42411,11 +42525,11 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, qbuf, ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), 2);
-        ds4_enc_buf(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), 3);
-        ds4_enc_buf(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), 4);
-        ds4_enc_buf(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), 5);
+        ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, lowbuf, ds4_gpu_tensor_offset(qk_low), ds4_tensor_tail(qk_low, ds4_gpu_tensor_offset(qk_low)), 2);
+        ds4_enc_buf_n(enc, kvcachebuf, ds4_gpu_tensor_offset(kv_lora_cache), ds4_tensor_tail(kv_lora_cache, ds4_gpu_tensor_offset(kv_lora_cache)), 3);
+        ds4_enc_buf_n(enc, ropecachebuf, ds4_gpu_tensor_offset(k_rope_cache), ds4_tensor_tail(k_rope_cache, ds4_gpu_tensor_offset(k_rope_cache)), 4);
+        ds4_enc_buf_n(enc, lorabuf, ds4_gpu_tensor_offset(lora_out), ds4_tensor_tail(lora_out, ds4_gpu_tensor_offset(lora_out)), 5);
         ds4_enc_tgmem(enc, scratch_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)head_count + 7u) / 8u, (NSUInteger)n_tokens, 1), MTLSizeMake(32, 8, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -42591,11 +42705,11 @@ int ds4_gpu_glm_router_select_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, logitsbuf, ds4_gpu_tensor_offset(logits), 1);
+        ds4_enc_buf_n(enc, logitsbuf, ds4_gpu_tensor_offset(logits), ds4_tensor_tail(logits, ds4_gpu_tensor_offset(logits)), 1);
         ds4_enc_buf(enc, biasbuf, (NSUInteger)bias_inner, 2);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 3);
-        ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 4);
-        ds4_enc_buf(enc, probsbuf, ds4_gpu_tensor_offset(probs), 5);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 3);
+        ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 4);
+        ds4_enc_buf_n(enc, probsbuf, ds4_gpu_tensor_offset(probs), ds4_tensor_tail(probs, ds4_gpu_tensor_offset(probs)), 5);
         const NSUInteger router_threads = n_expert > 256u ? 512u : 256u;
         ds4_enc_tgmem(enc, router_threads *
              (sizeof(float) + sizeof(int32_t)), 0);
@@ -42676,11 +42790,11 @@ int ds4_gpu_glm_router_select_batch_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, logitsbuf, ds4_gpu_tensor_offset(logits), 1);
+        ds4_enc_buf_n(enc, logitsbuf, ds4_gpu_tensor_offset(logits), ds4_tensor_tail(logits, ds4_gpu_tensor_offset(logits)), 1);
         ds4_enc_buf(enc, biasbuf, (NSUInteger)bias_inner, 2);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 3);
-        ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 4);
-        ds4_enc_buf(enc, probsbuf, ds4_gpu_tensor_offset(probs), 5);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 3);
+        ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 4);
+        ds4_enc_buf_n(enc, probsbuf, ds4_gpu_tensor_offset(probs), ds4_tensor_tail(probs, ds4_gpu_tensor_offset(probs)), 5);
         const NSUInteger router_threads = n_expert > 256u ? 512u : 256u;
         ds4_enc_tgmem(enc, router_threads *
              (sizeof(float) + sizeof(int32_t)), 0);
@@ -43255,17 +43369,17 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             ds4_enc_bytes(enc, &stream_resident_mask, sizeof(stream_resident_mask), 1);
             ds4_enc_buf(enc, stream_gate_addr_buf, 0u, 2);
             ds4_enc_buf(enc, stream_up_addr_buf, 0u, 3);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 4);
-            ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 5);
-            ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 6);
-            ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 7);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 4);
+            ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 5);
+            ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 6);
+            ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 7);
         } else {
             ds4_enc_buf(enc, use_stream_expert_addr_table ? stream_gate_addr_buf : gatebuf, use_stream_expert_addr_table ? 0u : (NSUInteger)gate_inner, 1);
             ds4_enc_buf(enc, use_stream_expert_addr_table ? stream_up_addr_buf : upbuf, use_stream_expert_addr_table ? 0u : (NSUInteger)up_inner, 2);
-            ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-            ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 4);
-            ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 5);
-            ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 6);
+            ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+            ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 4);
+            ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 5);
+            ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 6);
         }
         if (use_stream_expert_addr_table) {
             const uint32_t use_count =
@@ -43368,10 +43482,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 ds4_enc_bytes(enc, &stream_missing_mask, sizeof(stream_missing_mask), 1);
                 ds4_enc_buf(enc, stream_gate_addr_buf, 0u, 2);
                 ds4_enc_buf(enc, stream_up_addr_buf, 0u, 3);
-                ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 4);
-                ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 5);
-                ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 6);
-                ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 7);
+                ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 4);
+                ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 5);
+                ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 6);
+                ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 7);
                 for (uint32_t i = 0; i < n_expert; i++) {
                     if ((stream_missing_mask & (1u << i)) == 0) continue;
                     ds4_enc_use(enc, stream_entries[i]->gate_buffer, MTLResourceUsageRead);
@@ -43391,9 +43505,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         ds4_enc_pso(enc, down_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, use_stream_expert_addr_table ? stream_down_addr_buf : downbuf, use_stream_expert_addr_table ? 0u : (NSUInteger)down_inner, 1);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 2);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 3);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 4);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 2);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 3);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
         if (use_stream_expert_addr_table) {
             const uint32_t use_count =
                 use_stream_split_deferred ? n_expert : stream_entry_count;
@@ -44505,10 +44619,10 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, use_stream_expert_addr_table ? stream_gate_addr_buf : gatebuf, use_stream_expert_addr_table ? 0u : (NSUInteger)gate_inner, 1);
         ds4_enc_buf(enc, use_stream_expert_addr_table ? stream_up_addr_buf : upbuf, use_stream_expert_addr_table ? 0u : (NSUInteger)up_inner, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 4);
-        ds4_enc_buf(enc, weightsbuf, ds4_gpu_tensor_offset(weights), 5);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 6);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 4);
+        ds4_enc_buf_n(enc, weightsbuf, ds4_gpu_tensor_offset(weights), ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights)), 5);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 6);
         if (use_stream_expert_addr_table) {
             for (uint32_t i = 0; i < stream_resource_count; i++) {
                 ds4_enc_use(enc, stream_resources[i]->gate_buffer, MTLResourceUsageRead);
@@ -44528,9 +44642,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         ds4_enc_pso(enc, down_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, use_stream_expert_addr_table ? stream_down_addr_buf : downbuf, use_stream_expert_addr_table ? 0u : (NSUInteger)down_inner, 1);
-        ds4_enc_buf(enc, selectedbuf, ds4_gpu_tensor_offset(selected), 2);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(mid), 3);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 4);
+        ds4_enc_buf_n(enc, selectedbuf, ds4_gpu_tensor_offset(selected), ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)), 2);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(mid), ds4_tensor_tail(mid, ds4_gpu_tensor_offset(mid)), 3);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
         if (use_stream_expert_addr_table) {
             for (uint32_t i = 0; i < stream_resource_count; i++) {
                 ds4_enc_use(enc, stream_resources[i]->down_buffer, MTLResourceUsageRead);
@@ -49843,10 +49957,10 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_hc_split_sinkhorn_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, mixbuf, ds4_gpu_tensor_offset(mix), 1);
+        ds4_enc_buf_n(enc, mixbuf, ds4_gpu_tensor_offset(mix), ds4_tensor_tail(mix, ds4_gpu_tensor_offset(mix)), 1);
         ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 2);
         ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 3);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 4);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tg, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -49932,9 +50046,9 @@ static int ds4_gpu_hc_weighted_sum_strided(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_hc_weighted_sum_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), 1);
-        ds4_enc_buf(enc, wbuf, ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset, 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 1);
+        ds4_enc_buf_n(enc, wbuf, ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset, ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tg, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -50115,12 +50229,12 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, g_hc_split_weighted_sum_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, mixbuf, ds4_gpu_tensor_offset(mix), 1);
+        ds4_enc_buf_n(enc, mixbuf, ds4_gpu_tensor_offset(mix), ds4_tensor_tail(mix, ds4_gpu_tensor_offset(mix)), 1);
         ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 2);
         ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 3);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), 4);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 5);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 6);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 4);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 5);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 6);
         ds4_enc_tgmem(enc, (NSUInteger)n_hc * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_rows64, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -50257,14 +50371,14 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, mixbuf, ds4_gpu_tensor_offset(mix), 1);
+        ds4_enc_buf_n(enc, mixbuf, ds4_gpu_tensor_offset(mix), ds4_tensor_tail(mix, ds4_gpu_tensor_offset(mix)), 1);
         ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 2);
         ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 3);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), 4);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 5);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 6);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 4);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 5);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 6);
         ds4_enc_buf(enc, normwbuf, (NSUInteger)norm_inner, 7);
-        ds4_enc_buf(enc, normbuf, ds4_gpu_tensor_offset(norm_out), 8);
+        ds4_enc_buf_n(enc, normbuf, ds4_gpu_tensor_offset(norm_out), ds4_tensor_tail(norm_out, ds4_gpu_tensor_offset(norm_out)), 8);
         ds4_enc_tgmem(enc, shared_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)n_rows64, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -50360,9 +50474,9 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
         ds4_enc_buf(enc, wbuf, (NSUInteger)weight_inner, 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, shared_floats * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(use_cluster2 ? (out_dim + 3u) / 4u : (out_dim + 1u) / 2u, 1, 1), MTLSizeMake(32, use_cluster2 ? 16 : 8, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -50529,18 +50643,18 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         ds4_enc_pso(enc, producer);
         ds4_enc_bytes(enc, &mix_args, sizeof(mix_args), 0);
         ds4_enc_bytes(enc, &split_args, sizeof(split_args), 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), 2);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 2);
         ds4_enc_buf(enc, mix_weight, (NSUInteger)mix_weight_inner, 3);
-        ds4_enc_buf(enc, mixbuf, ds4_gpu_tensor_offset(mix), 4);
+        ds4_enc_buf_n(enc, mixbuf, ds4_gpu_tensor_offset(mix), ds4_tensor_tail(mix, ds4_gpu_tensor_offset(mix)), 4);
         ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 5);
         ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 6);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 7);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 8);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 7);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 8);
         ds4_enc_buf(enc, norm_weight, (NSUInteger)norm_inner, 9);
-        ds4_enc_buf(enc, normbuf, ds4_gpu_tensor_offset(norm_out), 10);
+        ds4_enc_buf_n(enc, normbuf, ds4_gpu_tensor_offset(norm_out), ds4_tensor_tail(norm_out, ds4_gpu_tensor_offset(norm_out)), 10);
         ds4_enc_buf(enc, collapsebuf, collapse_weights ? ds4_gpu_tensor_offset(collapse_weights) :
                 ds4_gpu_tensor_offset(split), 11);
-        ds4_enc_buf(enc, completion, 0, 12);
+        ds4_enc_buf_n(enc, completion, 0, completion.length, 12);
         ds4_enc_tgmem(enc, shared_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(6, 1, 1), MTLSizeMake(32, 16, 1));
 
@@ -50765,23 +50879,23 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         ds4_enc_bytes(enc, &split_args, sizeof(split_args), 1);
         ds4_enc_bytes(enc, &ex, sizeof(ex), 2);
         ds4_enc_bytes(enc, &barrier_target, sizeof(barrier_target), 3);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), 4);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 4);
         ds4_enc_buf(enc, mix_weight, (NSUInteger)mix_weight_inner, 5);
-        ds4_enc_buf(enc, mixbuf, ds4_gpu_tensor_offset(mix), 6);
+        ds4_enc_buf_n(enc, mixbuf, ds4_gpu_tensor_offset(mix), ds4_tensor_tail(mix, ds4_gpu_tensor_offset(mix)), 6);
         ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 7);
         ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 8);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 9);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 10);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 9);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 10);
         ds4_enc_buf(enc, norm_weight, (NSUInteger)norm_inner, 11);
-        ds4_enc_buf(enc, normbuf, ds4_gpu_tensor_offset(norm_out), 12);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 13);
-        ds4_enc_buf(enc, completion, 0, 14);
+        ds4_enc_buf_n(enc, normbuf, ds4_gpu_tensor_offset(norm_out), ds4_tensor_tail(norm_out, ds4_gpu_tensor_offset(norm_out)), 12);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 13);
+        ds4_enc_buf_n(enc, completion, 0, completion.length, 14);
         ds4_enc_buf(enc, barrier, 0, 15);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 16);
-        ds4_enc_buf(enc, addbuf, ds4_gpu_tensor_offset(block_add), 17);
-        ds4_enc_buf(enc, prevbuf, ds4_gpu_tensor_offset(residual_prev), 18);
-        ds4_enc_buf(enc, postbuf, ds4_gpu_tensor_offset(post), 19);
-        ds4_enc_buf(enc, combbuf, ds4_gpu_tensor_offset(comb), 20);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 16);
+        ds4_enc_buf_n(enc, addbuf, ds4_gpu_tensor_offset(block_add), ds4_tensor_tail(block_add, ds4_gpu_tensor_offset(block_add)), 17);
+        ds4_enc_buf_n(enc, prevbuf, ds4_gpu_tensor_offset(residual_prev), ds4_tensor_tail(residual_prev, ds4_gpu_tensor_offset(residual_prev)), 18);
+        ds4_enc_buf_n(enc, postbuf, ds4_gpu_tensor_offset(post), ds4_tensor_tail(post, ds4_gpu_tensor_offset(post)), 19);
+        ds4_enc_buf_n(enc, combbuf, ds4_gpu_tensor_offset(comb), ds4_tensor_tail(comb, ds4_gpu_tensor_offset(comb)), 20);
         ds4_enc_tgmem(enc, shared_bytes, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(6, 1, 1), MTLSizeMake(32, 16, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -50873,10 +50987,10 @@ int ds4_gpu_output_hc_weights_tensor(
             DS4Enc *enc = ds4_gpu_compute_encoder(cb);
             ds4_enc_pso(enc, g_output_hc_weights4_pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
-            ds4_enc_buf(enc, prebuf, ds4_gpu_tensor_offset(pre), 1);
+            ds4_enc_buf_n(enc, prebuf, ds4_gpu_tensor_offset(pre), ds4_tensor_tail(pre, ds4_gpu_tensor_offset(pre)), 1);
             ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 2);
             ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 3);
-            ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 4);
+            ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
             ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(2, 1, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -50923,28 +51037,28 @@ int ds4_gpu_output_hc_weights_tensor(
 
         ds4_enc_pso(enc, g_bin_mul_scalar_pipeline);
         ds4_enc_bytes(enc, &mul_args, sizeof(mul_args), 0);
-        ds4_enc_buf(enc, prebuf, ds4_gpu_tensor_offset(pre), 1);
+        ds4_enc_buf_n(enc, prebuf, ds4_gpu_tensor_offset(pre), ds4_tensor_tail(pre, ds4_gpu_tensor_offset(pre)), 1);
         ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 2);
-        ds4_enc_buf(enc, outbuf, out_offset, 3);
+        ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 3);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)mul_args.ne01, (NSUInteger)mul_args.ne02, (NSUInteger)mul_args.ne03), MTLSizeMake(mul_nth, 1, 1));
 
         ds4_enc_pso(enc, g_add_pipeline);
         ds4_enc_bytes(enc, &add_args, sizeof(add_args), 0);
-        ds4_enc_buf(enc, outbuf, out_offset, 1);
+        ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 1);
         ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 2);
-        ds4_enc_buf(enc, outbuf, out_offset, 3);
+        ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 3);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)add_args.ne01, (NSUInteger)add_args.ne02, (NSUInteger)add_args.ne03), MTLSizeMake(add_nth, 1, 1));
 
         ds4_enc_pso(enc, g_unary_sigmoid_pipeline);
         ds4_enc_bytes(enc, &sigmoid_args, sizeof(sigmoid_args), 0);
-        ds4_enc_buf(enc, outbuf, out_offset, 1);
-        ds4_enc_buf(enc, outbuf, out_offset, 2);
+        ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 1);
+        ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(unary_nk0 * (NSUInteger)sigmoid_args.ne01, (NSUInteger)sigmoid_args.ne02, (NSUInteger)sigmoid_args.ne03), MTLSizeMake(unary_nth, 1, 1));
 
         ds4_enc_pso(enc, g_unary_scale_pipeline);
         ds4_enc_bytes(enc, &scale_args, sizeof(scale_args), 0);
-        ds4_enc_buf(enc, outbuf, out_offset, 1);
-        ds4_enc_buf(enc, outbuf, out_offset, 2);
+        ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 1);
+        ds4_enc_buf_n(enc, outbuf, out_offset, ds4_tensor_tail(out, out_offset), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(unary_nk0 * (NSUInteger)scale_args.ne01, (NSUInteger)scale_args.ne02, (NSUInteger)scale_args.ne03), MTLSizeMake(unary_nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -51048,12 +51162,12 @@ int ds4_gpu_hc_expand_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, expand_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 1);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 2);
-        ds4_enc_buf(enc, postbuf, ds4_gpu_tensor_offset(post), 3);
-        ds4_enc_buf(enc, combbuf, ds4_gpu_tensor_offset(comb), 4);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 5);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out_hc), 6);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 1);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 2);
+        ds4_enc_buf_n(enc, postbuf, ds4_gpu_tensor_offset(post), ds4_tensor_tail(post, ds4_gpu_tensor_offset(post)), 3);
+        ds4_enc_buf_n(enc, combbuf, ds4_gpu_tensor_offset(comb), ds4_tensor_tail(comb, ds4_gpu_tensor_offset(comb)), 4);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 5);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out_hc), ds4_tensor_tail(out_hc, ds4_gpu_tensor_offset(out_hc)), 6);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tg, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -51164,12 +51278,12 @@ int ds4_gpu_hc_expand_add_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, expand_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 1);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 2);
-        ds4_enc_buf(enc, postbuf, ds4_gpu_tensor_offset(post), 3);
-        ds4_enc_buf(enc, combbuf, ds4_gpu_tensor_offset(comb), 4);
-        ds4_enc_buf(enc, addbuf, ds4_gpu_tensor_offset(block_add), 5);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out_hc), 6);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 1);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 2);
+        ds4_enc_buf_n(enc, postbuf, ds4_gpu_tensor_offset(post), ds4_tensor_tail(post, ds4_gpu_tensor_offset(post)), 3);
+        ds4_enc_buf_n(enc, combbuf, ds4_gpu_tensor_offset(comb), ds4_tensor_tail(comb, ds4_gpu_tensor_offset(comb)), 4);
+        ds4_enc_buf_n(enc, addbuf, ds4_gpu_tensor_offset(block_add), ds4_tensor_tail(block_add, ds4_gpu_tensor_offset(block_add)), 5);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out_hc), ds4_tensor_tail(out_hc, ds4_gpu_tensor_offset(out_hc)), 6);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tg, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -51283,12 +51397,12 @@ static int ds4_gpu_hc_expand_split_round(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, expand_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 1);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 2);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), 3);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), 4);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 5);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out_hc), 6);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 1);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 2);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float)), 3);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float)), 4);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 5);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out_hc), ds4_tensor_tail(out_hc, ds4_gpu_tensor_offset(out_hc)), 6);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tg, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -51426,12 +51540,12 @@ int ds4_gpu_hc_expand_add_split_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, expand_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 1);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 2);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), 3);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), 4);
-        ds4_enc_buf(enc, addbuf, ds4_gpu_tensor_offset(block_add), 5);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out_hc), 6);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 1);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 2);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float)), 3);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float)), 4);
+        ds4_enc_buf_n(enc, addbuf, ds4_gpu_tensor_offset(block_add), ds4_tensor_tail(block_add, ds4_gpu_tensor_offset(block_add)), 5);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out_hc), ds4_tensor_tail(out_hc, ds4_gpu_tensor_offset(out_hc)), 6);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tg, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -51553,13 +51667,13 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
         ds4_enc_bytes(enc, &hc_args, sizeof(hc_args), 1);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 2);
-        ds4_enc_buf(enc, midbuf, ds4_gpu_tensor_offset(shared_mid), 3);
-        ds4_enc_buf(enc, sharedbuf, ds4_gpu_tensor_offset(shared_out), 4);
-        ds4_enc_buf(enc, routedbuf, ds4_gpu_tensor_offset(routed_out), 5);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 6);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), 7);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), 8);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out_hc), 9);
+        ds4_enc_buf_n(enc, midbuf, ds4_gpu_tensor_offset(shared_mid), ds4_tensor_tail(shared_mid, ds4_gpu_tensor_offset(shared_mid)), 3);
+        ds4_enc_buf_n(enc, sharedbuf, ds4_gpu_tensor_offset(shared_out), ds4_tensor_tail(shared_out, ds4_gpu_tensor_offset(shared_out)), 4);
+        ds4_enc_buf_n(enc, routedbuf, ds4_gpu_tensor_offset(routed_out), ds4_tensor_tail(routed_out, ds4_gpu_tensor_offset(routed_out)), 5);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 6);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float)), 7);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float)), 8);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out_hc), ds4_tensor_tail(out_hc, ds4_gpu_tensor_offset(out_hc)), 9);
         ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -51676,12 +51790,12 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
         ds4_enc_bytes(enc, &hc_args, sizeof(hc_args), 1);
         ds4_enc_buf(enc, wbuf, (NSUInteger)inner_offset, 2);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 3);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 4);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 5);
-        ds4_enc_buf(enc, splitbuf, split_offset + (NSUInteger)n_hc * sizeof(float), 6);
-        ds4_enc_buf(enc, splitbuf, split_offset + (NSUInteger)(2u * n_hc) * sizeof(float), 7);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out_hc), 8);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 3);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 4);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 5);
+        ds4_enc_buf_n(enc, splitbuf, split_offset + (NSUInteger)n_hc * sizeof(float), ds4_tensor_tail(split, split_offset + (NSUInteger)n_hc * sizeof(float)), 6);
+        ds4_enc_buf_n(enc, splitbuf, split_offset + (NSUInteger)(2u * n_hc) * sizeof(float), ds4_tensor_tail(split, split_offset + (NSUInteger)(2u * n_hc) * sizeof(float)), 7);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out_hc), ds4_tensor_tail(out_hc, ds4_gpu_tensor_offset(out_hc)), 8);
         ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -51773,8 +51887,8 @@ int ds4_gpu_glm53_embedding_bf16(
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         ds4_enc_buf(enc, weightbuf, (NSUInteger)inner, 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(token_ids), ds4_gpu_tensor_offset(token_ids), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(token_ids), ds4_gpu_tensor_offset(token_ids), ds4_tensor_tail(token_ids, ds4_gpu_tensor_offset(token_ids)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_gpu_dispatch_threads(enc, MTLSizeMake(n_embd, n_tokens, 1), MTLSizeMake(MIN((NSUInteger)n_embd, 256u), 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 BF16 embedding");
@@ -51836,8 +51950,8 @@ int ds4_gpu_glm53_matmul_bf16(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
             ds4_enc_buf(enc, weightbuf, (NSUInteger)inner, 1);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             ds4_gpu_dispatch(enc, MTLSizeMake((out_dim + nsg - 1u) / nsg, n_rows, 1), MTLSizeMake(32u * nsg, 1, 1));
         } else {
             ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
@@ -51845,8 +51959,8 @@ int ds4_gpu_glm53_matmul_bf16(
             ds4_enc_pso(enc, pipeline);
             ds4_enc_bytes(enc, &args, sizeof(args), 0);
             ds4_enc_buf(enc, weightbuf, (NSUInteger)inner, 1);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 2);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 3);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
             ds4_enc_tgmem(enc, (bc_out ? 8192u : 6144u), 0);
             ds4_gpu_dispatch(enc, MTLSizeMake((n_rows + 31u) / 32u, (out_dim + 63u) / 64u, 1), MTLSizeMake(128, 1, 1));
         }
@@ -51910,10 +52024,10 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
         ds4_enc_buf(enc, weight_q, (NSUInteger)inner_q, 1);
         ds4_enc_buf(enc, weight_k, (NSUInteger)inner_k, 2);
         ds4_enc_buf(enc, weight_v, (NSUInteger)inner_v, 3);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 4);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out_q), ds4_gpu_tensor_offset(out_q), 5);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out_k), ds4_gpu_tensor_offset(out_k), 6);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out_v), ds4_gpu_tensor_offset(out_v), 7);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 4);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out_q), ds4_gpu_tensor_offset(out_q), ds4_tensor_tail(out_q, ds4_gpu_tensor_offset(out_q)), 5);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out_k), ds4_gpu_tensor_offset(out_k), ds4_tensor_tail(out_k, ds4_gpu_tensor_offset(out_k)), 6);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out_v), ds4_gpu_tensor_offset(out_v), ds4_tensor_tail(out_v, ds4_gpu_tensor_offset(out_v)), 7);
         ds4_gpu_dispatch(enc, MTLSizeMake((out_dim + nsg - 1u) / nsg, 1u, 3u), MTLSizeMake(32u * nsg, 1u, 1u));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned,
@@ -51972,9 +52086,9 @@ static int glm53_vision_dispatch_rows(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
     ds4_enc_buf(enc, weight, (NSUInteger)inner, 2);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 3);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
     ds4_enc_tgmem(enc, 8u * sizeof(float), 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -52004,10 +52118,10 @@ static int glm53_vision_dispatch_bias(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
     ds4_enc_buf(enc, bias, (NSUInteger)inner, 2);
     if (residual) {
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(residual), ds4_gpu_tensor_offset(residual), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(residual), ds4_gpu_tensor_offset(residual), ds4_tensor_tail(residual, ds4_gpu_tensor_offset(residual)), 3);
     }
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(width, rows, 1), MTLSizeMake(MIN((NSUInteger)width, 256u), 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -52045,13 +52159,13 @@ static int glm53_vision_dispatch_qkv(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(qkv), ds4_gpu_tensor_offset(qkv), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(qkv), ds4_gpu_tensor_offset(qkv), ds4_tensor_tail(qkv, ds4_gpu_tensor_offset(qkv)), 1);
     ds4_enc_buf(enc, bias, (NSUInteger)bias_inner, 2);
     ds4_enc_buf(enc, qw, (NSUInteger)q_inner, 3);
     ds4_enc_buf(enc, kw, (NSUInteger)k_inner, 4);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), 5);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), 6);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), 7);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 5);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), ds4_tensor_tail(k, ds4_gpu_tensor_offset(k)), 6);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), ds4_tensor_tail(v, ds4_gpu_tensor_offset(v)), 7);
     ds4_gpu_dispatch(enc, MTLSizeMake(rows, 16u, 1), MTLSizeMake(32u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision QKV");
@@ -52073,10 +52187,10 @@ static int glm53_vision_dispatch_attention(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), 1);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), 2);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), 3);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 4);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), ds4_tensor_tail(k, ds4_gpu_tensor_offset(k)), 2);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), ds4_tensor_tail(v, ds4_gpu_tensor_offset(v)), 3);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
     ds4_gpu_dispatch(enc, MTLSizeMake(rows, 16u, 1), MTLSizeMake(32u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision attention");
@@ -52111,11 +52225,11 @@ static int glm53_vision_dispatch_swiglu_bias(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(gate), ds4_gpu_tensor_offset(gate), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(gate), ds4_gpu_tensor_offset(gate), ds4_tensor_tail(gate, ds4_gpu_tensor_offset(gate)), 1);
     ds4_enc_buf(enc, gate_bias, (NSUInteger)gate_inner, 2);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(up), ds4_gpu_tensor_offset(up), 3);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(up), ds4_gpu_tensor_offset(up), ds4_tensor_tail(up, ds4_gpu_tensor_offset(up)), 3);
     ds4_enc_buf(enc, up_bias, (NSUInteger)up_inner, 4);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 5);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 5);
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(width, rows, 1), MTLSizeMake(MIN((NSUInteger)width, 256u), 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision SwiGLU");
@@ -52133,8 +52247,8 @@ static int glm53_vision_dispatch_reorder(
     DS4Enc *enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 0);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 1);
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(4096u, rows, 1), MTLSizeMake(256u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision downsample reorder");
@@ -52165,10 +52279,10 @@ static int glm53_vision_dispatch_layernorm_gelu(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
     ds4_enc_buf(enc, weight, (NSUInteger)weight_inner, 2);
     ds4_enc_buf(enc, bias, (NSUInteger)bias_inner, 3);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 4);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 4);
     ds4_enc_tgmem(enc, 8u * sizeof(float), 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(256u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -52363,11 +52477,11 @@ static int deepseek4_vision_dispatch_qkv(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(qkv), ds4_gpu_tensor_offset(qkv), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(qkv), ds4_gpu_tensor_offset(qkv), ds4_tensor_tail(qkv, ds4_gpu_tensor_offset(qkv)), 1);
     ds4_enc_buf(enc, bias, (NSUInteger)bias_inner, 2);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), 3);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), 4);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), 5);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 3);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), ds4_tensor_tail(k, ds4_gpu_tensor_offset(k)), 4);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), ds4_tensor_tail(v, ds4_gpu_tensor_offset(v)), 5);
     ds4_gpu_dispatch(enc, MTLSizeMake(rows, 16u, 1), MTLSizeMake(32u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned,
@@ -52390,8 +52504,8 @@ static int deepseek4_vision_dispatch_two_rows(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 1);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 2);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(width, rows, 1), MTLSizeMake(MIN((NSUInteger)width, 256u), 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, label);
@@ -52411,7 +52525,7 @@ static int deepseek4_vision_dispatch_round(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(width, rows, 1), MTLSizeMake(MIN((NSUInteger)width, 256u), 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned,
@@ -52436,8 +52550,8 @@ static int deepseek4_vision_dispatch_aligner_reorder(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 2);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 2);
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(9216u, output_rows, 1), MTLSizeMake(256u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned,
@@ -52466,9 +52580,9 @@ static int deepseek4_vision_dispatch_gelu_bias(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
     ds4_enc_buf(enc, bias, (NSUInteger)bias_inner, 2);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 3);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(width, rows, 1), MTLSizeMake(256u, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned,
@@ -52716,8 +52830,8 @@ int ds4_gpu_glm53_scatter_image_hc(
     if (!enc) return 0;
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, &args, sizeof(args), 0);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(hc), ds4_gpu_tensor_offset(hc), 1);
-    ds4_enc_buf(enc, ds4_gpu_tensor_buffer(image), ds4_gpu_tensor_offset(image), 2);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(hc), ds4_gpu_tensor_offset(hc), ds4_tensor_tail(hc, ds4_gpu_tensor_offset(hc)), 1);
+    ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(image), ds4_gpu_tensor_offset(image), ds4_tensor_tail(image, ds4_gpu_tensor_offset(image)), 2);
     ds4_gpu_dispatch_threads(enc, MTLSizeMake(n_embd, rows * n_hc, 1), MTLSizeMake(MIN((NSUInteger)n_embd, 256u), 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision scatter");
@@ -52824,21 +52938,21 @@ int ds4_gpu_glm53_kda_decode(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), 3);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(raw_gate), ds4_gpu_tensor_offset(raw_gate), 4);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(raw_beta), ds4_gpu_tensor_offset(raw_beta), 5);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(output_gate), ds4_gpu_tensor_offset(output_gate), 6);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), ds4_tensor_tail(k, ds4_gpu_tensor_offset(k)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), ds4_tensor_tail(v, ds4_gpu_tensor_offset(v)), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(raw_gate), ds4_gpu_tensor_offset(raw_gate), ds4_tensor_tail(raw_gate, ds4_gpu_tensor_offset(raw_gate)), 4);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(raw_beta), ds4_gpu_tensor_offset(raw_beta), ds4_tensor_tail(raw_beta, ds4_gpu_tensor_offset(raw_beta)), 5);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(output_gate), ds4_gpu_tensor_offset(output_gate), ds4_tensor_tail(output_gate, ds4_gpu_tensor_offset(output_gate)), 6);
         ds4_enc_buf(enc, qw, (NSUInteger)qw_inner, 7);
         ds4_enc_buf(enc, kw, (NSUInteger)kw_inner, 8);
         ds4_enc_buf(enc, vw, (NSUInteger)vw_inner, 9);
         ds4_enc_buf(enc, a_log, (NSUInteger)a_inner, 10);
         ds4_enc_buf(enc, dt_bias, (NSUInteger)dt_inner, 11);
         ds4_enc_buf(enc, output_norm, (NSUInteger)norm_inner, 12);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(conv_state), ds4_gpu_tensor_offset(conv_state), 13);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(recurrent_state), ds4_gpu_tensor_offset(recurrent_state), 14);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 15);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(conv_state), ds4_gpu_tensor_offset(conv_state), ds4_tensor_tail(conv_state, ds4_gpu_tensor_offset(conv_state)), 13);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(recurrent_state), ds4_gpu_tensor_offset(recurrent_state), ds4_tensor_tail(recurrent_state, ds4_gpu_tensor_offset(recurrent_state)), 14);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 15);
         ds4_enc_tgmem(enc, 656u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_rows, n_heads, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -52946,34 +53060,34 @@ int ds4_gpu_glm53_kda_prefill(
 
         ds4_enc_pso(enc, prep_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), 3);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(raw_gate), ds4_gpu_tensor_offset(raw_gate), 4);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), ds4_tensor_tail(k, ds4_gpu_tensor_offset(k)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), ds4_tensor_tail(v, ds4_gpu_tensor_offset(v)), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(raw_gate), ds4_gpu_tensor_offset(raw_gate), ds4_tensor_tail(raw_gate, ds4_gpu_tensor_offset(raw_gate)), 4);
         ds4_enc_buf(enc, qw, (NSUInteger)qw_inner, 5);
         ds4_enc_buf(enc, kw, (NSUInteger)kw_inner, 6);
         ds4_enc_buf(enc, vw, (NSUInteger)vw_inner, 7);
         ds4_enc_buf(enc, a_log, (NSUInteger)a_inner, 8);
         ds4_enc_buf(enc, dt_bias, (NSUInteger)dt_inner, 9);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(conv_state), ds4_gpu_tensor_offset(conv_state), 10);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(conv_state), ds4_gpu_tensor_offset(conv_state), ds4_tensor_tail(conv_state, ds4_gpu_tensor_offset(conv_state)), 10);
         ds4_enc_tgmem(enc, 264u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_heads, 1, 1), MTLSizeMake(128, 1, 1));
 
         ds4_enc_pso(enc, recurrence_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), 3);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(raw_gate), ds4_gpu_tensor_offset(raw_gate), 4);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(raw_beta), ds4_gpu_tensor_offset(raw_beta), 5);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(recurrent_state), ds4_gpu_tensor_offset(recurrent_state), 6);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 7);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(q), ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(k), ds4_gpu_tensor_offset(k), ds4_tensor_tail(k, ds4_gpu_tensor_offset(k)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(v), ds4_gpu_tensor_offset(v), ds4_tensor_tail(v, ds4_gpu_tensor_offset(v)), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(raw_gate), ds4_gpu_tensor_offset(raw_gate), ds4_tensor_tail(raw_gate, ds4_gpu_tensor_offset(raw_gate)), 4);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(raw_beta), ds4_gpu_tensor_offset(raw_beta), ds4_tensor_tail(raw_beta, ds4_gpu_tensor_offset(raw_beta)), 5);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(recurrent_state), ds4_gpu_tensor_offset(recurrent_state), ds4_tensor_tail(recurrent_state, ds4_gpu_tensor_offset(recurrent_state)), 6);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 7);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_heads, 32, 1), MTLSizeMake(128, 1, 1));
 
         ds4_enc_pso(enc, output_pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(output_gate), ds4_gpu_tensor_offset(output_gate), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(out), ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(output_gate), ds4_gpu_tensor_offset(output_gate), ds4_tensor_tail(output_gate, ds4_gpu_tensor_offset(output_gate)), 2);
         ds4_enc_buf(enc, output_norm, (NSUInteger)norm_inner, 3);
         ds4_enc_tgmem(enc, 4u * sizeof(float), 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tokens, n_heads, 1), MTLSizeMake(128, 1, 1));
@@ -53049,9 +53163,10 @@ int ds4_gpu_dsv41_rope_nodes(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
         if (!enc) return 0;
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(positions), ds4_gpu_tensor_offset(positions) +
-                       (NSUInteger)position_offset * sizeof(uint32_t), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(positions), ds4_gpu_tensor_offset(positions) +
+                       (NSUInteger)position_offset * sizeof(uint32_t), ds4_tensor_tail(positions, ds4_gpu_tensor_offset(positions) +
+                       (NSUInteger)position_offset * sizeof(uint32_t)), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(heads, rows, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 per-node RoPE");
@@ -53103,7 +53218,7 @@ int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
         if (!enc) return 0;
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
         ds4_gpu_dispatch(enc, MTLSizeMake(heads, rows, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 unit-magnitude RoPE");
@@ -53139,7 +53254,7 @@ int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
         ds4_enc_pso(enc, pipeline);
         if (linear) ds4_enc_bytes(enc, &count, sizeof(count), 0);
         else ds4_enc_bytes(enc, args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
         if (linear) {
             ds4_gpu_dispatch(enc, MTLSizeMake((count + 1023u) / 1024u, 1, 1), MTLSizeMake(256, 1, 1));
         } else {
@@ -53177,7 +53292,7 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         const ds4_gpu_tensor *inputs[] = {residual, kv, q_weight, k_weight, mask ? mask : residual};
         for (NSUInteger i = 0; i < 5; i++)
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]), i + 1);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]), ds4_tensor_tail(inputs[i], ds4_gpu_tensor_offset(inputs[i])), i + 1);
         ds4_gpu_dispatch(enc, MTLSizeMake(rows, 4, 1), MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 Engram gate");
@@ -53204,9 +53319,10 @@ int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_offset,
         if (!enc) return 0;
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(packed), ds4_gpu_tensor_offset(packed) +
-            (NSUInteger)row_offset * words * sizeof(uint32_t), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(plain), ds4_gpu_tensor_offset(plain), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(packed), ds4_gpu_tensor_offset(packed) +
+            (NSUInteger)row_offset * words * sizeof(uint32_t), ds4_tensor_tail(packed, ds4_gpu_tensor_offset(packed) +
+            (NSUInteger)row_offset * words * sizeof(uint32_t)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(plain), ds4_gpu_tensor_offset(plain), ds4_tensor_tail(plain, ds4_gpu_tensor_offset(plain)), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(((uint64_t)width + 127u) / 128u, rows, 1), MTLSizeMake(128, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 compact prefill carry");
@@ -53292,12 +53408,12 @@ int ds4_gpu_dsv41_flash_kv_stage_dag(const ds4_gpu_tensor *ring, uint32_t ring_c
         if (!enc) return 0;
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(ring), ds4_gpu_tensor_offset(ring), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(ring), ds4_gpu_tensor_offset(ring), ds4_tensor_tail(ring, ds4_gpu_tensor_offset(ring)), 1);
         ds4_enc_buf(enc, delta ? ds4_gpu_tensor_buffer(delta) : ds4_gpu_tensor_buffer(ring), delta ? ds4_gpu_tensor_offset(delta) : ds4_gpu_tensor_offset(ring), 2);
         ds4_enc_buf(enc, path ? ds4_gpu_tensor_buffer(path) : ds4_gpu_tensor_buffer(ring), (path ? ds4_gpu_tensor_offset(path) : ds4_gpu_tensor_offset(ring)) +
                        (NSUInteger)path_offset * sizeof(uint32_t), 3);
         ds4_enc_buf(enc, comp ? ds4_gpu_tensor_buffer(comp) : ds4_gpu_tensor_buffer(ring), comp ? ds4_gpu_tensor_offset(comp) : ds4_gpu_tensor_offset(ring), 4);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(dst), ds4_gpu_tensor_offset(dst), 5);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(dst), ds4_gpu_tensor_offset(dst), ds4_tensor_tail(dst, ds4_gpu_tensor_offset(dst)), 5);
         const uint32_t vecs = (visible_count + n_comp) * 128u;
         const NSUInteger tw = 256;
         ds4_gpu_dispatch(enc, MTLSizeMake((vecs + tw - 1u) / tw, 1, 1), MTLSizeMake(tw, 1, 1));
@@ -53340,10 +53456,10 @@ int ds4_gpu_dsv41_block_publish_rows(ds4_gpu_tensor *window,
         if (!enc) return 0;
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, args, sizeof(args), 0);
-        ds4_enc_buf(enc, accbuf, ds4_gpu_tensor_offset(accept), 1);
+        ds4_enc_buf_n(enc, accbuf, ds4_gpu_tensor_offset(accept), ds4_tensor_tail(accept, ds4_gpu_tensor_offset(accept)), 1);
         ds4_enc_buf(enc, slots ? ds4_gpu_tensor_buffer(slots) : accbuf, slots ? ds4_gpu_tensor_offset(slots) : ds4_gpu_tensor_offset(accept), 2);
-        ds4_enc_buf(enc, delbuf, ds4_gpu_tensor_offset(delta), 3);
-        ds4_enc_buf(enc, winbuf, ds4_gpu_tensor_offset(window), 4);
+        ds4_enc_buf_n(enc, delbuf, ds4_gpu_tensor_offset(delta), ds4_tensor_tail(delta, ds4_gpu_tensor_offset(delta)), 3);
+        ds4_enc_buf_n(enc, winbuf, ds4_gpu_tensor_offset(window), ds4_tensor_tail(window, ds4_gpu_tensor_offset(window)), 4);
         const NSUInteger tw = row_floats < 256u ? row_floats : 256u;
         ds4_gpu_dispatch(enc,
                          MTLSizeMake((row_floats + tw - 1u) / tw, depth, 1),
@@ -53384,7 +53500,7 @@ static int dsv41_exec_dispatch(const char *kernel, const void *args, NSUInteger 
                 fprintf(stderr, "ds4: %s: buffer %u is missing\n", kernel, i);
                 return 0;
             }
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(bufs[i]), ds4_gpu_tensor_offset(bufs[i]) + (NSUInteger)(offs ? offs[i] : 0), i + 1);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(bufs[i]), ds4_gpu_tensor_offset(bufs[i]) + (NSUInteger)(offs ? offs[i] : 0), ds4_tensor_tail(bufs[i], ds4_gpu_tensor_offset(bufs[i]) + (NSUInteger)(offs ? offs[i] : 0)), i + 1);
         }
         if (shared) ds4_enc_tgmem(enc, shared, 0);
         if (tg_y > 1) {
@@ -53512,10 +53628,10 @@ int ds4_gpu_dsv41_tree_accept_encode(const ds4_gpu_tensor *argmax,
         (void)ds4_gpu_concurrent_section_barrier();
         ds4_enc_pso(enc, pipe);
         ds4_enc_bytes(enc, a, sizeof(a), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(argmax), ds4_gpu_tensor_offset(argmax), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(tokens), ds4_gpu_tensor_offset(tokens), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(parents), ds4_gpu_tensor_offset(parents), 3);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(result), ds4_gpu_tensor_offset(result), 4);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(argmax), ds4_gpu_tensor_offset(argmax), ds4_tensor_tail(argmax, ds4_gpu_tensor_offset(argmax)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(tokens), ds4_gpu_tensor_offset(tokens), ds4_tensor_tail(tokens, ds4_gpu_tensor_offset(tokens)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(parents), ds4_gpu_tensor_offset(parents), ds4_tensor_tail(parents, ds4_gpu_tensor_offset(parents)), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(result), ds4_gpu_tensor_offset(result), ds4_tensor_tail(result, ds4_gpu_tensor_offset(result)), 4);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 tree accept");
@@ -53562,8 +53678,8 @@ int ds4_gpu_dsv41_block_accept_encode_ex(const ds4_gpu_tensor *logits,
             const uint32_t a1[] = { n_vocab, rows, row_floats };
             ds4_enc_pso(enc, pick);
             ds4_enc_bytes(enc, a1, sizeof(a1), 0);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(logits), ds4_gpu_tensor_offset(logits), 1);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(argmax), part_off, 2);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(logits), ds4_gpu_tensor_offset(logits), ds4_tensor_tail(logits, ds4_gpu_tensor_offset(logits)), 1);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(argmax), part_off, ds4_tensor_tail(argmax, part_off), 2);
             ds4_gpu_dispatch(enc, MTLSizeMake(chunks, rows, 1), MTLSizeMake(256, 1, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
             /* Inside an open batch buffer these three dispatches share one
@@ -53575,8 +53691,8 @@ int ds4_gpu_dsv41_block_accept_encode_ex(const ds4_gpu_tensor *logits,
             if (!enc) return 0;
             ds4_enc_pso(enc, fold);
             ds4_enc_bytes(enc, a1, sizeof(a1), 0);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(argmax), part_off, 1);
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(argmax), ans_off, 2);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(argmax), part_off, ds4_tensor_tail(argmax, part_off), 1);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(argmax), ans_off, ds4_tensor_tail(argmax, ans_off), 2);
             ds4_gpu_dispatch(enc, MTLSizeMake(rows, 1, 1), MTLSizeMake(32, 1, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
         }
@@ -53590,9 +53706,9 @@ int ds4_gpu_dsv41_block_accept_encode_ex(const ds4_gpu_tensor *logits,
         const uint32_t a2[] = { accept_rows, max_commit };
         ds4_enc_pso(enc, acc);
         ds4_enc_bytes(enc, a2, sizeof(a2), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(argmax), ds4_gpu_tensor_offset(argmax), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(tokens), ds4_gpu_tensor_offset(tokens), 2);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(result), ds4_gpu_tensor_offset(result), 3);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(argmax), ds4_gpu_tensor_offset(argmax), ds4_tensor_tail(argmax, ds4_gpu_tensor_offset(argmax)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(tokens), ds4_gpu_tensor_offset(tokens), ds4_tensor_tail(tokens, ds4_gpu_tensor_offset(tokens)), 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(result), ds4_gpu_tensor_offset(result), ds4_tensor_tail(result, ds4_gpu_tensor_offset(result)), 3);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(1, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         if (owned && !ds4_gpu_finish_command_buffer(cb, owned, "V4.1 block accept")) return 0;
@@ -53645,7 +53761,7 @@ int ds4_gpu_dsv41_pool2_ex(ds4_gpu_tensor *out,
             ds4_enc_bytes(enc, args, sizeof(args), 0);
             const ds4_gpu_tensor *inputs[] = {out, kv, scores, previous_kv, previous_scores};
             for (NSUInteger i = 0; i < 5; i++)
-                ds4_enc_buf(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]), i + 1);
+                ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]), ds4_tensor_tail(inputs[i], ds4_gpu_tensor_offset(inputs[i])), i + 1);
             /* Uniform, so the abort gate can switch it off: a non-uniform
              * dispatch has no indirect form. kernel_dsv41_pool2 bounds-checks
              * index.x and index.y, so the rounded-up threads return. */
@@ -53705,7 +53821,7 @@ static int dsv41_candidates_strided(ds4_gpu_tensor *out, const ds4_gpu_tensor *s
             mask ? 0u : scores_elem_off * sizeof(float),
         };
         for (NSUInteger i = 0; i < 3; i++)
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]) + (NSUInteger)offs[i], i + 1);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]) + (NSUInteger)offs[i], ds4_tensor_tail(inputs[i], ds4_gpu_tensor_offset(inputs[i]) + (NSUInteger)offs[i]), i + 1);
         /* Uniform for the same reason; both candidate kernels bounds-check
          * index.x against the real width and index.y against the rows. */
         {
@@ -53789,7 +53905,7 @@ int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
         const ds4_gpu_tensor *inputs[] = {source, ids, out};
         for (NSUInteger i = 0; i < 3; i++)
-            ds4_enc_buf(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]), i + 1);
+            ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(inputs[i]), ds4_gpu_tensor_offset(inputs[i]), ds4_tensor_tail(inputs[i], ds4_gpu_tensor_offset(inputs[i])), i + 1);
         ds4_gpu_dispatch(enc, MTLSizeMake(2u * selected_rows, 1, 1), MTLSizeMake(256, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 sparse KV gather");
@@ -55807,9 +55923,9 @@ int ds4_gpu_qwen4_matmul_q8_0_weights_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, &mv_args, sizeof(mv_args), 0);
-        ds4_enc_buf(enc, wbuf, ds4_gpu_tensor_offset(w), 1);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(x), 2);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out), 3);
+        ds4_enc_buf_n(enc, wbuf, ds4_gpu_tensor_offset(w), ds4_tensor_tail(w, ds4_gpu_tensor_offset(w)), 1);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 2);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out), ds4_tensor_tail(out, ds4_gpu_tensor_offset(out)), 3);
         ds4_enc_tgmem(enc, mv_dispatch.smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0, 1, 1), MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -56346,15 +56462,15 @@ int ds4_gpu_dsv41_hc_tail_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipe);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, mixbuf, ds4_gpu_tensor_offset(mix), 1);
+        ds4_enc_buf_n(enc, mixbuf, ds4_gpu_tensor_offset(mix), ds4_tensor_tail(mix, ds4_gpu_tensor_offset(mix)), 1);
         ds4_enc_buf(enc, scalebuf, (NSUInteger)scale_inner, 2);
         ds4_enc_buf(enc, basebuf, (NSUInteger)base_inner, 3);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 4);
-        ds4_enc_buf(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), 5);
-        ds4_enc_buf(enc, wbuf, ds4_gpu_tensor_offset(weights) + (NSUInteger)weights_off, 6);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 4);
+        ds4_enc_buf_n(enc, xbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 5);
+        ds4_enc_buf_n(enc, wbuf, ds4_gpu_tensor_offset(weights) + (NSUInteger)weights_off, ds4_tensor_tail(weights, ds4_gpu_tensor_offset(weights) + (NSUInteger)weights_off), 6);
         ds4_enc_buf(enc, nwbuf, (NSUInteger)norm_inner, 7);
-        ds4_enc_buf(enc, sumbuf, ds4_gpu_tensor_offset(sum_out), 8);
-        ds4_enc_buf(enc, normbuf, ds4_gpu_tensor_offset(norm_out), 9);
+        ds4_enc_buf_n(enc, sumbuf, ds4_gpu_tensor_offset(sum_out), ds4_tensor_tail(sum_out, ds4_gpu_tensor_offset(sum_out)), 8);
+        ds4_enc_buf_n(enc, normbuf, ds4_gpu_tensor_offset(norm_out), ds4_tensor_tail(norm_out, ds4_gpu_tensor_offset(norm_out)), 9);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 HC tail")) return 0;
@@ -56426,14 +56542,14 @@ int ds4_gpu_dsv41_hc_expand_pre_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipe);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 1);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 2);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), 3);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), 4);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block_out), 5);
-        ds4_enc_buf(enc, outbuf, ds4_gpu_tensor_offset(out_hc), 6);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 7);
-        ds4_enc_buf(enc, prebuf, ds4_gpu_tensor_offset(pre), 8);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 1);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 2);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)n_hc * sizeof(float)), 3);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float)), 4);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block_out), ds4_tensor_tail(block_out, ds4_gpu_tensor_offset(block_out)), 5);
+        ds4_enc_buf_n(enc, outbuf, ds4_gpu_tensor_offset(out_hc), ds4_tensor_tail(out_hc, ds4_gpu_tensor_offset(out_hc)), 6);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 7);
+        ds4_enc_buf_n(enc, prebuf, ds4_gpu_tensor_offset(pre), ds4_tensor_tail(pre, ds4_gpu_tensor_offset(pre)), 8);
         ds4_gpu_dispatch(enc, MTLSizeMake(n_tg, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 HC expand/pre")) return 0;
@@ -56467,8 +56583,8 @@ int ds4_gpu_dsv41_compare_row(const ds4_gpu_tensor *a, uint64_t a_off,
     if (!cb) return 0;
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, pipe);
-    ds4_enc_buf(enc, abuf, ds4_gpu_tensor_offset(a) + (NSUInteger)a_off, 0);
-    ds4_enc_buf(enc, bbuf, ds4_gpu_tensor_offset(b), 1);
+    ds4_enc_buf_n(enc, abuf, ds4_gpu_tensor_offset(a) + (NSUInteger)a_off, ds4_tensor_tail(a, ds4_gpu_tensor_offset(a) + (NSUInteger)a_off), 0);
+    ds4_enc_buf_n(enc, bbuf, ds4_gpu_tensor_offset(b), ds4_tensor_tail(b, ds4_gpu_tensor_offset(b)), 1);
     ds4_enc_bytes(enc, &n_words, sizeof(n_words), 2);
     ds4_enc_bytes(enc, &slot, sizeof(slot), 3);
     ds4_enc_buf(enc, g_dsv41_cmp_counts, 0, 4);
@@ -56511,8 +56627,8 @@ int ds4_gpu_dsv41_quantize_store(ds4_gpu_tensor *x, uint32_t width, uint32_t row
         if (!enc) return 0;
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, args, sizeof(args), 0);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), 1);
-        ds4_enc_buf(enc, ds4_gpu_tensor_buffer(store), ds4_gpu_tensor_offset(store) + (NSUInteger)store_off, 2);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(x), ds4_gpu_tensor_offset(x), ds4_tensor_tail(x, ds4_gpu_tensor_offset(x)), 1);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(store), ds4_gpu_tensor_offset(store) + (NSUInteger)store_off, ds4_tensor_tail(store, ds4_gpu_tensor_offset(store) + (NSUInteger)store_off), 2);
         ds4_gpu_dispatch(enc, MTLSizeMake(((uint64_t)width + block - 1u) / block, rows, 1),
                          MTLSizeMake(32, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -56580,13 +56696,13 @@ int ds4_gpu_dsv41_hc_expand_tail_tensor(
         DS4Enc *enc = ds4_gpu_compute_encoder(cb);
         ds4_enc_pso(enc, pipe);
         ds4_enc_bytes(enc, &args, sizeof(args), 0);
-        ds4_enc_buf(enc, blockbuf, ds4_gpu_tensor_offset(block), 1);
-        ds4_enc_buf(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), 2);
-        ds4_enc_buf(enc, splitbuf, ds4_gpu_tensor_offset(split), 3);
-        ds4_enc_buf(enc, afterbuf, ds4_gpu_tensor_offset(after_hc), 4);
+        ds4_enc_buf_n(enc, blockbuf, ds4_gpu_tensor_offset(block), ds4_tensor_tail(block, ds4_gpu_tensor_offset(block)), 1);
+        ds4_enc_buf_n(enc, resbuf, ds4_gpu_tensor_offset(residual_hc), ds4_tensor_tail(residual_hc, ds4_gpu_tensor_offset(residual_hc)), 2);
+        ds4_enc_buf_n(enc, splitbuf, ds4_gpu_tensor_offset(split), ds4_tensor_tail(split, ds4_gpu_tensor_offset(split)), 3);
+        ds4_enc_buf_n(enc, afterbuf, ds4_gpu_tensor_offset(after_hc), ds4_tensor_tail(after_hc, ds4_gpu_tensor_offset(after_hc)), 4);
         ds4_enc_buf(enc, nwbuf, (NSUInteger)norm_inner, 5);
-        ds4_enc_buf(enc, sumbuf, ds4_gpu_tensor_offset(sum_out), 6);
-        ds4_enc_buf(enc, normbuf, ds4_gpu_tensor_offset(norm_out), 7);
+        ds4_enc_buf_n(enc, sumbuf, ds4_gpu_tensor_offset(sum_out), ds4_tensor_tail(sum_out, ds4_gpu_tensor_offset(sum_out)), 6);
+        ds4_enc_buf_n(enc, normbuf, ds4_gpu_tensor_offset(norm_out), ds4_tensor_tail(norm_out, ds4_gpu_tensor_offset(norm_out)), 7);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(cb, owned, "V4.1 HC expand and tail")) return 0;
