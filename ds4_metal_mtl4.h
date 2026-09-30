@@ -260,6 +260,15 @@ API_AVAILABLE(macos(26.0))
     const void *last_pso;
     /* The next node must wait for everything before it: set after a fence. */
     uint8_t fence_next;
+    /* The encoder timeline (DS4_METAL_ENCODER_TIMELINE), when it is on: a
+     * record a node, and a heap its start and end timestamps go into. */
+    ds4_timeline_rec *tl;
+    uint32_t tl_cap;
+    id<MTL4CounterHeap> tl_heap;
+    NSUInteger tl_heap_cap;
+    uint64_t tl_seq;
+    /* The decode ledger's record of this submission (DS4_METAL_LEDGER). */
+    ds4_ledger_m4 ledger;
 }
 /* The engine's handle for this context, and its recorder. */
 @property (nonatomic, strong) DS4Cmd *cmd;
@@ -271,6 +280,7 @@ API_AVAILABLE(macos(26.0))
     free(nodes);
     free(addrs);
     free(ranges);
+    free(tl);
 }
 @end
 
@@ -541,14 +551,6 @@ static void ds4_m4_engine_barrier(DS4Enc *e) {
     g_m4s[DS4_M4S_ENGINE_BARRIER]++;
 }
 
-static void ds4_m4_sample_counters(DS4Enc *e) {
-    (void)e;
-    /* The timeline and stage samplers are Metal 3 encoder facilities; see
-     * ds4_gpu_use_metal4 for what stops them being armed here. */
-    fprintf(stderr, "ds4: counter sampling reached the Metal 4 context\n");
-    abort();
-}
-
 API_AVAILABLE(macos(26.0))
 static void ds4_m4_add_range(DS4M4Ctx *c, const void *buf, uint64_t lo, uint64_t hi, int write) {
     if (!ds4_m4_grow((void **)&c->ranges, &c->cap_ranges, c->n_ranges + 1u, sizeof(ds4_m4_range))) {
@@ -572,6 +574,13 @@ static ds4_m4_node *ds4_m4_new_node(DS4M4Ctx *c, int kind) {
     ds4_m4_node *n = &c->nodes[c->n_nodes++];
     memset(n, 0, sizeof(*n));
     n->kind = (uint8_t)kind;
+    if (g_timeline_enabled) {
+        if (!ds4_m4_grow((void **)&c->tl, &c->tl_cap, c->n_nodes, sizeof(ds4_timeline_rec))) {
+            fprintf(stderr, "ds4: Metal 4 timeline allocation failed\n");
+            abort();
+        }
+        memset(&c->tl[c->n_nodes - 1u], 0, sizeof(ds4_timeline_rec));
+    }
     n->range_at = c->n_ranges;
     n->fence = c->fence_next;
     c->fence_next = 0;
@@ -593,6 +602,31 @@ static void ds4_m4_fence_writes(DS4M4Ctx *c, ds4_m4_node *n) {
         g_m4s[DS4_M4S_FENCES]++;
         return;
     }
+}
+
+/* What the timeline writes for a node: its kernel, its grid, and the code
+ * that encoded it. */
+API_AVAILABLE(macos(26.0))
+static void ds4_m4_timeline_note(DS4M4Ctx *c, id pso, MTLSize a, MTLSize b, int threads,
+                                 uintptr_t caller) {
+    ds4_timeline_rec *r = &c->tl[c->n_nodes - 1u];
+    r->caller = caller;
+    r->n_dispatch = 1;
+    if (threads) {
+        r->tg[0] = (uint32_t)((a.width + b.width - 1) / (b.width ? b.width : 1));
+        r->tg[1] = (uint32_t)((a.height + b.height - 1) / (b.height ? b.height : 1));
+        r->tg[2] = (uint32_t)((a.depth + b.depth - 1) / (b.depth ? b.depth : 1));
+    } else {
+        r->tg[0] = (uint32_t)a.width; r->tg[1] = (uint32_t)a.height; r->tg[2] = (uint32_t)a.depth;
+    }
+    r->tpt[0] = (uint32_t)b.width; r->tpt[1] = (uint32_t)b.height; r->tpt[2] = (uint32_t)b.depth;
+    NSString *name = nil;
+    if (pso) {
+        pthread_mutex_lock(&g_timeline_mutex);
+        if (g_timeline_pso_names) name = g_timeline_pso_names[@((uintptr_t)(__bridge void *)pso)];
+        pthread_mutex_unlock(&g_timeline_mutex);
+    }
+    snprintf(r->kernel, sizeof(r->kernel), "%s", pso ? (name ? name.UTF8String : "?") : "copy");
 }
 
 static void ds4_m4_dispatch(DS4Enc *e, int kind, MTLSize a, MTLSize b,
@@ -654,6 +688,9 @@ static void ds4_m4_dispatch(DS4Enc *e, int kind, MTLSize a, MTLSize b,
         }
         n->n_range = c->n_ranges - n->range_at;
         ds4_m4_fence_writes(c, n);
+        if (g_timeline_enabled)
+            ds4_m4_timeline_note(c, e->pso, a, b, kind == DS4_M4_NODE_THREADS,
+                                 (uintptr_t)__builtin_return_address(0));
         g_mtl4_dispatches++;
         g_m4s[DS4_M4S_DISPATCH]++;
     }
@@ -693,6 +730,9 @@ static int ds4_mtl4_copy(id<MTLBuffer> src, NSUInteger soff,
     ds4_m4_add_range(c, n->dst, doff, doff + size, 1);
     n->n_range = c->n_ranges - n->range_at;
     ds4_m4_fence_writes(c, n);
+    if (g_timeline_enabled)
+        ds4_m4_timeline_note(c, nil, MTLSizeMake(0, 0, 0), MTLSizeMake(0, 0, 0), 0,
+                             (uintptr_t)__builtin_return_address(0));
     g_m4s[DS4_M4S_COPY]++;
     return 1;
 }
@@ -764,10 +804,16 @@ static void ds4_m4_encode_part(DS4M4Ctx *c, unsigned part, uint32_t from, uint32
         if (n->barrier && i != from)
             [enc barrierAfterEncoderStages:MTLStageAll beforeEncoderStages:MTLStageAll
                          visibilityOptions:vis];
+        if (c->tl_heap)
+            [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                                      intoHeap:c->tl_heap atIndex:2u * i];
         if (n->kind == DS4_M4_NODE_COPY) {
             [enc copyFromBuffer:(__bridge id<MTLBuffer>)n->src sourceOffset:n->soff
                        toBuffer:(__bridge id<MTLBuffer>)n->dst destinationOffset:n->doff
                            size:n->size];
+            if (c->tl_heap)
+                [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                                          intoHeap:c->tl_heap atIndex:2u * i + 1u];
             continue;
         }
         if (n->pso != cur_pso) {
@@ -792,6 +838,9 @@ static void ds4_m4_encode_part(DS4M4Ctx *c, unsigned part, uint32_t from, uint32
             [enc dispatchThreadgroupsWithIndirectBuffer:n->indirect threadsPerThreadgroup:n->b];
             break;
         }
+        if (c->tl_heap)
+            [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
+                                      intoHeap:c->tl_heap atIndex:2u * i + 1u];
     }
     /* What this part wrote is visible to what follows it on the queue, and to
      * the host once the completion is seen. */
@@ -887,6 +936,41 @@ static void ds4_mtl4_release_completed(void) {
     }
 }
 
+/* A completed context's timeline, in the Metal 3 timeline's format: a "B" line
+ * for the submission and an "E" line a node, times in ns. */
+API_AVAILABLE(macos(26.0))
+static void ds4_m4_timeline_resolve(DS4M4Ctx *c) {
+    if (!g_timeline_file || !c->n_nodes) return;
+    NSData *d = [c->tl_heap resolveCounterRange:NSMakeRange(0, 2u * c->n_nodes)];
+    if (!d || d.length < 2u * c->n_nodes * sizeof(MTL4TimestampHeapEntry)) return;
+    const MTL4TimestampHeapEntry *ts = (const MTL4TimestampHeapEntry *)d.bytes;
+    static double ns_per_tick;
+    if (ns_per_tick == 0.0) {
+        const uint64_t hz = [g_device queryTimestampFrequency];
+        ns_per_tick = hz ? 1e9 / (double)hz : 1.0;
+    }
+    pthread_mutex_lock(&g_timeline_mutex);
+    fprintf(g_timeline_file, "B %llu %u %.0f %.0f\n", (unsigned long long)c->tl_seq, c->n_nodes,
+            c->gpu_start * 1e9, c->gpu_end * 1e9);
+    uint64_t prev_end = 0;
+    for (uint32_t i = 0; i < c->n_nodes; i++) {
+        const uint64_t start = (uint64_t)((double)ts[2u * i].timestamp * ns_per_tick);
+        const uint64_t end = (uint64_t)((double)ts[2u * i + 1u].timestamp * ns_per_tick);
+        const ds4_timeline_rec *r = &c->tl[i];
+        const double dur_us = end >= start ? (double)(end - start) / 1000.0 : -1.0;
+        const double gap_us = prev_end && start >= prev_end ? (double)(start - prev_end) / 1000.0 : 0.0;
+        fprintf(g_timeline_file, "E %llu %u %llu %llu %.2f %.2f 0x%llx %u %ux%ux%u %ux%ux%u %s\n",
+                (unsigned long long)c->tl_seq, i, (unsigned long long)start,
+                (unsigned long long)end, dur_us, gap_us,
+                (unsigned long long)(r->caller - (uintptr_t)_dyld_get_image_vmaddr_slide(0)),
+                r->n_dispatch, r->tg[0], r->tg[1], r->tg[2], r->tpt[0], r->tpt[1], r->tpt[2],
+                r->kernel[0] ? r->kernel : "?");
+        if (end) prev_end = end;
+    }
+    fflush(g_timeline_file);
+    pthread_mutex_unlock(&g_timeline_mutex);
+}
+
 /* Wait until every submission up to `value` has completed and reported.
  * Returns 0 if any of them failed, or if a report did not arrive; in the second
  * case nothing is marked done, so a later wait looks again. */
@@ -944,6 +1028,7 @@ static int ds4_mtl4_wait_to(uint64_t value) {
             return 0;
         }
         if (atomic_load(&slot->fb_failed)) good = 0;
+        if (g_timeline_enabled && slot->tl_heap) ds4_m4_timeline_resolve(slot);
         /* The union of the submissions' spans, not their sum: with the next
          * one committed before the current one is read, their spans overlap.
          * Stamps are waited in order. */
@@ -1091,6 +1176,7 @@ static int ds4_mtl4_begin(void) {
         DS4M4Ctx *c = ds4_mtl4_take();
         if (!c) return 0;
         ds4_m4_ctx_clear(c);
+        c->ledger = ds4_gpu_ledger_m4_begin();
         g_mtl4_cur = c;
         /* 0 is never a live generation, so a zeroed memo entry never hits. */
         if (++c->gen == 0) ++c->gen;
@@ -1118,6 +1204,22 @@ static int ds4_mtl4_commit(void) {
             for (DS4M4Ctx *p in g_mtl4_pool) held += p->res_bytes;
             if (held > g_mtl4_res_peak) g_mtl4_res_peak = held;
         }
+        if (g_timeline_enabled && c->n_nodes) {
+            if (!c->tl_heap || c->tl_heap_cap < 2u * c->n_nodes) {
+                MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new];
+                hd.type = MTL4CounterHeapTypeTimestamp;
+                hd.count = 2u * c->n_nodes;
+                NSError *herr = nil;
+                c->tl_heap = [g_device newCounterHeapWithDescriptor:hd error:&herr];
+                c->tl_heap_cap = c->tl_heap ? hd.count : 0;
+                if (!c->tl_heap)
+                    fprintf(stderr, "ds4: Metal 4 timeline heap: %s\n", herr.description.UTF8String);
+            }
+            c->tl_seq = ++g_timeline_seq;
+        } else if (c->tl_heap) {
+            c->tl_heap = nil;
+            c->tl_heap_cap = 0;
+        }
         uint32_t bounds[DS4_MTL4_PARTS + 1u];
         const unsigned parts = ds4_m4_split(c, bounds);
         if (parts == 1) {
@@ -1132,9 +1234,22 @@ static int ds4_mtl4_commit(void) {
         }
         c->parts = parts;
         g_m4s[DS4_M4S_BAR_QUEUE] += 2u * parts;
+        if (ds4_gpu_ledger_active()) {
+            const void **psos = calloc(c->n_nodes ? c->n_nodes : 1, sizeof(*psos));
+            uint32_t copies = 0;
+            uint64_t copy_bytes = 0;
+            for (uint32_t i = 0; i < c->n_nodes; i++) {
+                psos[i] = c->nodes[i].pso;
+                if (c->nodes[i].kind == DS4_M4_NODE_COPY) { copies++; copy_bytes += c->nodes[i].size; }
+            }
+            ds4_gpu_ledger_m4_commit(&c->ledger, psos, c->n_nodes, copies, copy_bytes);
+            free(psos);
+        }
         const uint64_t stamp = g_mtl4_stamp + 1u;
+        const ds4_ledger_m4 ledger = c->ledger;
         MTL4CommitOptions *opts = [MTL4CommitOptions new];
         [opts addFeedbackHandler:^(id<MTL4CommitFeedback> fb) {
+            ds4_gpu_ledger_m4_done(&ledger, fb.GPUStartTime, fb.GPUEndTime);
             ds4_mtl4_fb_note(c, stamp, fb.error, fb.GPUStartTime, fb.GPUEndTime);
         }];
         id<MTL4CommandBuffer> list[DS4_MTL4_PARTS];
@@ -1345,6 +1460,45 @@ int ds4_mtl4_pacer_run(void *pacer, id<MTLComputePipelineState> pipeline, id<MTL
 void ds4_mtl4_pacer_free(void *pacer) API_AVAILABLE(macos(26.0));
 void ds4_mtl4_pacer_free(void *pacer) {
     if (pacer) { DS4MTL4Side *s = (__bridge_transfer DS4MTL4Side *)pacer; (void)s; }
+}
+
+/* ---- the full expert address table's prewire ---------------------------
+
+/* Every expert buffer the table names copied once into a scratch buffer, so
+ * its pages are wired before decode rather than during it. Its own command
+ * buffer, committed behind whatever is in flight and ahead of the context
+ * being recorded, and waited for. The copies all land in one scratch buffer;
+ * what they leave there is never read. */
+static int ds4_mtl4_prewire(NSArray<id<MTLBuffer>> *buffers, id<MTLBuffer> scratch) {
+    if (@available(macOS 26.0, *)) {
+        if (!g_mtl4_queue || !scratch) return 0;
+        id<MTL4CommandAllocator> alloc = [g_device newCommandAllocator];
+        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
+        id<MTLSharedEvent> done = [g_device newSharedEvent];
+        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+        rd.label = @"ds4_mtl4_prewire";
+        id<MTLResidencySet> res = [g_device newResidencySetWithDescriptor:rd error:nil];
+        if (!alloc || !cb || !done || !res) return 0;
+        [res addAllocation:scratch];
+        for (id<MTLBuffer> b in buffers) [res addAllocation:b];
+        [res commit];
+        [cb beginCommandBufferWithAllocator:alloc];
+        [cb useResidencySet:res];
+        id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
+        for (id<MTLBuffer> b in buffers) {
+            if ([b length] == 0) continue;
+            [e copyFromBuffer:b sourceOffset:0 toBuffer:scratch destinationOffset:0 size:[b length]];
+        }
+        [e endEncoding];
+        [cb endCommandBuffer];
+        id<MTL4CommandBuffer> one = cb;
+        DS4_M4_NOTE("full_expert_addr_prewire", DS4_BK_COMMIT);
+        [g_mtl4_queue commit:&one count:1];
+        [g_mtl4_queue signalEvent:done value:1];
+        DS4_M4_NOTE("full_expert_addr_prewire", DS4_BK_WAIT);
+        return [done waitUntilSignaledValue:1 timeoutMS:600000] ? 1 : 0;
+    }
+    return 0;
 }
 
 /* ---- teardown ----------------------------------------------------------- */

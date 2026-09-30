@@ -215,15 +215,6 @@ static inline void ds4_enc_end(DS4Enc *e) {
     ds4_m4_end(e);
 }
 
-/* Counter sampling is a Metal 3 encoder facility; see ds4_metal_mtl4.h for
- * what the Metal 4 context does instead. */
-static void ds4_m4_sample_counters(DS4Enc *e);
-static inline void ds4_enc_sample_counters(DS4Enc *e, id<MTLCounterSampleBuffer> sb,
-                                           NSUInteger index, BOOL barrier) {
-    if (e->m3) { [e->m3 sampleCountersInBuffer:sb atSampleIndex:index withBarrier:barrier]; return; }
-    ds4_m4_sample_counters(e);
-}
-
 static inline MTLDispatchType ds4_enc_dispatch_type(DS4Enc *e) {
     if (e->m3) return e->m3.dispatchType;
     return e->concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial;

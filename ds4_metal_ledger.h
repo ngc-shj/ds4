@@ -914,4 +914,87 @@ void ds4_gpu_ledger_dump(void) {
             n, (unsigned long long)dropped, g_ledger_path);
 }
 
+/* ---- the Metal 4 context ---------------------------------------------- */
+
+/* A Metal 4 context is recorded here as what it is on the GPU: one submission
+ * (a "command buffer" in this ledger's terms, on queue "mtl4") holding one
+ * encoder whose kernel composition is the context's nodes. Nothing is hooked:
+ * the context calls these itself. */
+typedef struct { uint64_t seq, token; int32_t layer; } ds4_ledger_m4;
+
+static ds4_ledger_m4 ds4_gpu_ledger_m4_begin(void) {
+    ds4_ledger_m4 m = { 0, 0, -1 };
+    if (!g_ledger_on) return m;
+    const ds4_ledger_ctx ctx = g_ledger_ctx;
+    m.seq = atomic_fetch_add(&g_ledger_cb_seq, 1u) + 1u;
+    m.token = ctx.token;
+    m.layer = ctx.layer;
+    const uint16_t role = ds4_ledger_intern(ctx.role ? ctx.role : "unset");
+    const uint16_t origin = ds4_ledger_intern(g_ledger_origin);
+    g_ledger_origin = "other";
+    ds4_ledger_rec *r = ds4_ledger_claim();
+    if (r) {
+        memset(r, 0, sizeof(*r));
+        r->kind = DS4_LR_CB_CREATE; r->id = m.seq; r->token = m.token;
+        r->layer = m.layer; r->name_id = role; r->t_ns = ds4_ledger_now();
+        r->a = ds4_ledger_intern("mtl4"); r->b = origin;
+    }
+    return m;
+}
+
+/* At commit: the encoder record, with the composition of the nodes' kernels
+ * in order of first appearance, and the commit. */
+static void ds4_gpu_ledger_m4_commit(const ds4_ledger_m4 *m, const void *const *psos,
+                                     uint32_t n, uint32_t copies, uint64_t copy_bytes) {
+    if (!g_ledger_on || !m->seq) return;
+    uint16_t name[DS4_LEDGER_ENC_KERNELS];
+    uint32_t count[DS4_LEDGER_ENC_KERNELS];
+    uint16_t nk = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!psos[i]) continue;
+        const uint16_t k = ds4_ledger_pso_name(psos[i]);
+        uint16_t j = 0;
+        for (; j < nk; j++) if (name[j] == k) break;
+        if (j == nk && nk < DS4_LEDGER_ENC_KERNELS) { name[j] = k; count[j] = 0; nk++; }
+        if (j < DS4_LEDGER_ENC_KERNELS) count[j]++;
+    }
+    char comp[768];
+    size_t used = 0;
+    comp[0] = '\0';
+    for (uint16_t i = 0; i < nk && used + 1 < sizeof(comp); i++)
+        used += (size_t)snprintf(comp + used, sizeof(comp) - used, "%s%s*%u",
+                                 i ? "+" : "", g_ledger_names[name[i]], count[i]);
+    if (copies && used + 1 < sizeof(comp))
+        used += (size_t)snprintf(comp + used, sizeof(comp) - used, "%scopy*%u",
+                                 nk ? "+" : "", copies);
+    if (!nk && !copies) snprintf(comp, sizeof(comp), "none");
+    const uint64_t eseq = atomic_fetch_add(&g_ledger_enc_seq, 1u) + 1u;
+    const uint64_t now = ds4_ledger_now();
+    ds4_ledger_rec *r = ds4_ledger_claim();
+    if (r) {
+        memset(r, 0, sizeof(*r));
+        r->kind = DS4_LR_ENC; r->enc_kind = 0; r->id = eseq; r->parent = m->seq;
+        r->token = m->token; r->layer = m->layer; r->name_id = ds4_ledger_intern(comp);
+        r->t_ns = now; r->a = n; r->b = copy_bytes;
+    }
+    r = ds4_ledger_claim();
+    if (r) {
+        memset(r, 0, sizeof(*r));
+        r->kind = DS4_LR_CB_COMMIT; r->id = m->seq; r->token = m->token; r->layer = m->layer;
+        r->t_ns = now; r->a = 1;
+    }
+}
+
+/* From the commit feedback, on its own queue. */
+static void ds4_gpu_ledger_m4_done(const ds4_ledger_m4 *m, double gpu_start, double gpu_end) {
+    if (!g_ledger_on || !m->seq) return;
+    ds4_ledger_rec *f = ds4_ledger_claim();
+    if (!f) return;
+    memset(f, 0, sizeof(*f));
+    f->kind = DS4_LR_CB_DONE; f->id = m->seq; f->token = m->token; f->layer = m->layer;
+    f->t_ns = ds4_ledger_now();
+    f->a = (uint64_t)(gpu_start * 1e9);
+    f->b = (uint64_t)(gpu_end * 1e9);
+}
+
 #endif /* DS4_METAL_LEDGER_H */

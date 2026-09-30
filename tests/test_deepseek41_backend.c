@@ -33,7 +33,6 @@ void ds4_gpu_mtl4_counts(unsigned long long *segments, unsigned long long *dispa
 void ds4_gpu_mtl4_structure(unsigned long long out[16]);
 int ds4_gpu_warm_command_queue(void);
 unsigned long long ds4_gpu_full_addr_table_uses(void);
-unsigned long long ds4_gpu_full_addr_table_asks_m4(void);
 void ds4_gpu_stream_expert_cache_counters(uint64_t *hits, uint64_t *misses, uint64_t *evictions,
                                           uint32_t *entries, uint32_t *budget);
 int ds4_gpu_test_warm_model_views(void);
@@ -284,32 +283,20 @@ int main(int argc, char **argv) {
     unsigned long long m3f[4];
     ds4_gpu_backend_m3_after_selection(m3f);
     printf("m3api      Metal 3 command execution after Metal 4 selection: %llu; refused %llu "
-           "(the deliberate one, and one for the full address table if asked); Metal 3 queues "
+           "(the deliberate one); Metal 3 queues "
            "created before selection %llu, after %llu\n",
            m3f[0], m3f[1], m3f[2], m3f[3]);
     /* No Metal 3 queue at all: the queue is made only when the Metal 3
      * backend first needs one, and V4.1 selects Metal 4 before that. */
-    /* The full expert address table, under Metal 4, is refused the first
-     * time a path asks for it, and the ordinary path runs instead. The
-     * environment says whether it may be asked for (SSD streaming - this test
-     * always streams - ENABLE set, DISABLE not); only the paths that consult
-     * it ever ask, and the single-row decode does not. So the refusal is
-     * expected exactly when it was asked, never more than once, and the table
-     * is never used either way. */
-    const int full_enabled = getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
-                             getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL;
-    const unsigned long long full_asks = ds4_gpu_full_addr_table_asks_m4();
-    const int full_asked = full_asks > 0;
-    CHECK(full_enabled || !full_asked, "the full address table was asked for with it disabled");
-    const unsigned long long want_refused = 1u + (full_asked ? 1u : 0u);
+    /* The full expert address table runs on Metal 4 like everything else;
+     * the single-row decode never consults it, so it is used only when the
+     * environment enables it and a path that asks for it runs. The one
+     * refusal is the deliberate Metal 3-only call above. */
     const unsigned long long full_uses = ds4_gpu_full_addr_table_uses();
-    printf("fulltable  enabled %s, asked %llu times under Metal 4; full expert address table "
-           "uses %llu; expert cache hits %llu, misses %llu\n", full_enabled ? "yes" : "no",
-           full_asks, full_uses,
-           (unsigned long long)hits, (unsigned long long)misses);
-    CHECK(full_uses == 0, "the full expert address table was used under Metal 4");
+    printf("fulltable  full expert address table uses %llu; expert cache hits %llu, misses %llu\n",
+           full_uses, (unsigned long long)hits, (unsigned long long)misses);
     CHECK(hits + misses > 0, "the ordinary expert-cache path did not engage");
-    CHECK(m3f[0] == 0 && m3f[1] == want_refused && m3f[2] == 0 && m3f[3] == 0,
+    CHECK(m3f[0] == 0 && m3f[1] == 1 && m3f[2] == 0 && m3f[3] == 0,
           "Metal 3 after selection, or queue counts not as expected");
     {
         extern void ds4_gpu_mtl4_coarse_report(FILE *f, unsigned max_lines);
