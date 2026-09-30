@@ -4,10 +4,9 @@
  *
  * Ordering and visibility have been rearranged in every shape available and
  * the answer does not move, which leaves what the dispatches read. That is
- * not a thing to reason about: it is a thing to record. This wraps whatever
- * encoder the engine is handed - the Metal 3 encoder itself, or the Metal 4
- * one - and writes one line a call, in encode order, with addresses rather
- * than object identities so the two runs are comparable.
+ * not a thing to reason about: it is a thing to record. Every encoder call
+ * the engine makes, on either backend, writes one line, in encode order, with
+ * addresses rather than object identities so the two runs are comparable.
  *
  * DS4_METAL_V41_ENC_TRACE=<path> turns it on. It is off otherwise and costs
  * a branch. The file is closed after DS4_ENC_TRACE_MAX lines so a long run
@@ -97,106 +96,7 @@ static uint64_t ds4_enc_trace_hash(const void *p, NSUInteger n) {
     return h;
 }
 
-@interface DS4TraceEncoder : NSObject <DS4Encoder>
-@property (nonatomic, strong) id<DS4Encoder> inner;
-@end
-
-@implementation DS4TraceEncoder
-
-- (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
-    ds4_enc_trace("pso %u %s\n", ds4_enc_trace_pso_id(state),
-                  state.label ? state.label.UTF8String : "-");
-    [self.inner setComputePipelineState:state];
-}
-
-- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
-    /* The address, not the object: Metal 3 binds a buffer and an offset and
-     * Metal 4 binds a GPU address, and the question is whether the dispatch
-     * ends up reading the same bytes. */
-    ds4_enc_trace("buf %lu b%u+%lu\n", (unsigned long)index,
-                  ds4_enc_trace_buf_id(buffer), (unsigned long)(buffer ? offset : 0));
-    [self.inner setBuffer:buffer offset:offset atIndex:index];
-}
-
-- (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
-    ds4_enc_trace("byt %lu %lu %llx\n", (unsigned long)index, (unsigned long)length,
-                  (unsigned long long)ds4_enc_trace_hash(bytes, length));
-    [self.inner setBytes:bytes length:length atIndex:index];
-}
-
-- (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index {
-    ds4_enc_trace("tgm %lu %lu\n", (unsigned long)index, (unsigned long)length);
-    [self.inner setThreadgroupMemoryLength:length atIndex:index];
-}
-
-- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage {
-    [self.inner useResource:resource usage:usage];
-}
-
-- (void)useResources:(const id<MTLResource> *)resources count:(NSUInteger)count
-               usage:(MTLResourceUsage)usage {
-    [self.inner useResources:resources count:count usage:usage];
-}
-
-- (void)memoryBarrierWithScope:(MTLBarrierScope)scope {
-    ds4_enc_trace("bar %lu\n", (unsigned long)scope);
-    [self.inner memoryBarrierWithScope:scope];
-}
-
-- (void)memoryBarrierWithResources:(const id<MTLResource> *)resources count:(NSUInteger)count {
-    ds4_enc_trace("barr %lu\n", (unsigned long)count);
-    [self.inner memoryBarrierWithResources:resources count:count];
-}
-
-- (void)dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt {
-    ds4_enc_trace("dtg %lu.%lu.%lu %lu.%lu.%lu\n",
-                  (unsigned long)tg.width, (unsigned long)tg.height, (unsigned long)tg.depth,
-                  (unsigned long)tpt.width, (unsigned long)tpt.height, (unsigned long)tpt.depth);
-    [self.inner dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
-}
-
-- (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)indirectBuffer
-                          indirectBufferOffset:(NSUInteger)offset
-                         threadsPerThreadgroup:(MTLSize)tpt {
-    ds4_enc_trace("did b%u+%lu %lu.%lu.%lu\n",
-                  ds4_enc_trace_buf_id(indirectBuffer), (unsigned long)offset,
-                  (unsigned long)tpt.width, (unsigned long)tpt.height, (unsigned long)tpt.depth);
-    [self.inner dispatchThreadgroupsWithIndirectBuffer:indirectBuffer
-                                  indirectBufferOffset:offset
-                                 threadsPerThreadgroup:tpt];
-}
-
-- (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt {
-    ds4_enc_trace("dth %lu.%lu.%lu %lu.%lu.%lu\n",
-                  (unsigned long)threads.width, (unsigned long)threads.height,
-                  (unsigned long)threads.depth,
-                  (unsigned long)tpt.width, (unsigned long)tpt.height, (unsigned long)tpt.depth);
-    [self.inner dispatchThreads:threads threadsPerThreadgroup:tpt];
-}
-
-- (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
-                 atSampleIndex:(NSUInteger)sampleIndex
-                   withBarrier:(BOOL)barrier {
-    [self.inner sampleCountersInBuffer:sampleBuffer atSampleIndex:sampleIndex withBarrier:barrier];
-}
-
-- (void)endEncoding {
-    ds4_enc_trace("end\n");
-    [self.inner endEncoding];
-}
-
-- (MTLDispatchType)dispatchType { return self.inner.dispatchType; }
-- (NSString *)label { return self.inner.label; }
-- (void)setLabel:(NSString *)label { self.inner.label = label; }
-
-@end
-
-static id<DS4Encoder> ds4_enc_trace_wrap(id<DS4Encoder> enc) {
-    if (!enc || !ds4_enc_trace_file()) return enc;
-    DS4TraceEncoder *t = [DS4TraceEncoder new];
-    t.inner = enc;
-    ds4_enc_trace("enc\n");
-    return (id<DS4Encoder>)t;
-}
+/* The calls themselves are written in ds4_metal_cmd.h, where every encoder
+ * call on either backend goes through. */
 
 #endif  /* DS4_METAL_ENC_TRACE_H */

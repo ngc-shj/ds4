@@ -79,10 +79,10 @@ void ds4_gpu_stage_probe(id<MTLDevice> device) {
 }
 
 /* Called from the dispatch helper when the stage has changed. */
-static void ds4_stage_mark(id<DS4Encoder> enc) {
+static void ds4_stage_mark(DS4Enc *enc) {
     if (!g_stage_on || g_stage_n >= DS4_STAGE_MAX_SAMPLES) return;
     g_stage_of[g_stage_n] = (uint8_t)g_stage_cur;
-    [enc sampleCountersInBuffer:g_stage_sb atSampleIndex:g_stage_n withBarrier:NO];
+    ds4_enc_sample_counters(enc, g_stage_sb, g_stage_n, NO);
     g_stage_n++;
 }
 

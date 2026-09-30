@@ -364,7 +364,7 @@ void ds4_gpu_encode_counts(unsigned long long *dispatches, unsigned long long *v
     if (commits) ds4_gpu_mtl4_counts(commits, NULL, NULL);
 }
 
-static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {
+static void ds4_gpu_dispatch(DS4Enc *enc, MTLSize tg, MTLSize tpt) {
     NSUInteger off = 0;
     atomic_fetch_add(&g_ds4_dispatches_encoded, 1u);
     ds4_uce_order(enc);
@@ -373,7 +373,7 @@ static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {
         ds4_gate_direct_prefix_on()) {
         /* Ahead of the buffer's first validate. Certain to run, so plain. */
         atomic_fetch_add_explicit(&g_gate_direct_total, 1u, memory_order_relaxed);
-        [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+        ds4_enc_dispatch_raw(enc, tg, tpt);
         return;
     }
     if (g_gate_layers && atomic_load_explicit(&g_gate_active, memory_order_relaxed) &&
@@ -386,19 +386,17 @@ static void ds4_gpu_dispatch(id<DS4Encoder> enc, MTLSize tg, MTLSize tpt) {
             if (slot < DS4_GATE_MAX_SLOTS)
                 g_gate_slot_site[slot] = (uint16_t)site;
         }
-        [enc dispatchThreadgroupsWithIndirectBuffer:g_gate_grid
-                               indirectBufferOffset:off
-                              threadsPerThreadgroup:tpt];
+        ds4_enc_dispatch_indirect(enc, g_gate_grid, off, tpt);
         return;
     }
-    [enc dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
+    ds4_enc_dispatch_raw(enc, tg, tpt);
 }
 
 /* Non-uniform dispatch has no indirect form. The decode path has none left -
  * both of its call sites were rounded up to whole threadgroups, their kernels
  * already bounds-checking - so one arriving here while a segment is gated is
  * counted and named rather than left running after an abort. */
-static void ds4_gpu_dispatch_threads(id<DS4Encoder> enc, MTLSize th, MTLSize tpt) {
+static void ds4_gpu_dispatch_threads(DS4Enc *enc, MTLSize th, MTLSize tpt) {
     ds4_uce_order(enc);
     /* One of these ahead of the buffer's first validate is certain to run, so
      * it is not something the gate failed to switch off. */
@@ -407,7 +405,7 @@ static void ds4_gpu_dispatch_threads(id<DS4Encoder> enc, MTLSize th, MTLSize tpt
         atomic_fetch_add_explicit(&g_gate_ungatable, 1u, memory_order_relaxed);
         ds4_gate_note_ungatable((uintptr_t)__builtin_return_address(0), th, tpt);
     }
-    [enc dispatchThreads:th threadsPerThreadgroup:tpt];
+    ds4_enc_dispatch_threads(enc, th, tpt);
 }
 
 /* ---- lifecycle --------------------------------------------------------- */
