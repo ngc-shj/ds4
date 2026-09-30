@@ -109,6 +109,7 @@ enum {
 
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
+static id<MTLCommandQueue> ds4_gpu_m3_queue(void);
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<DS4Encoder> g_batch_enc;
@@ -279,8 +280,7 @@ static unsigned long long ds4_gpu_backend_m3_commands(void) {
 }
 
 /* Metal 3 command queues this process created, and the counts as they stood
- * when Metal 4 was selected. The queue made at init, before the model says
- * which backend it needs, is the one expected creation. */
+ * when Metal 4 was selected. A process that selects Metal 4 expects none. */
 static unsigned long long g_bk_m3_queues, g_bk_m3_queues_at_selection;
 static unsigned long long g_bk_m3_commands_at_selection;
 static int g_bk_selected_m4;
@@ -1574,9 +1574,9 @@ static id<MTLBuffer> g_stream_expert_validate_status_buffer;
     if (@available(macOS 15.0, *)) {
         if (_residencySet) {
             if (_residencySetAddedToQueue &&
-                g_queue &&
-                [g_queue respondsToSelector:@selector(removeResidencySet:)]) {
-                [g_queue removeResidencySet:_residencySet];
+                ds4_gpu_m3_queue() &&
+                [ds4_gpu_m3_queue() respondsToSelector:@selector(removeResidencySet:)]) {
+                [ds4_gpu_m3_queue() removeResidencySet:_residencySet];
             }
             ds4_gpu_queue_residency_removed(_residencySet);
             [_residencySet endResidency];
@@ -1597,9 +1597,9 @@ static id<MTLBuffer> g_stream_expert_validate_status_buffer;
     if (@available(macOS 15.0, *)) {
         if (_residencySet) {
             if (_addedToQueue &&
-                g_queue &&
-                [g_queue respondsToSelector:@selector(removeResidencySet:)]) {
-                [g_queue removeResidencySet:_residencySet];
+                ds4_gpu_m3_queue() &&
+                [ds4_gpu_m3_queue() respondsToSelector:@selector(removeResidencySet:)]) {
+                [ds4_gpu_m3_queue() removeResidencySet:_residencySet];
             }
             ds4_gpu_queue_residency_removed(_residencySet);
             [_residencySet endResidency];
@@ -1982,9 +1982,9 @@ static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
         initialized = 1;
     }
     if (use_unretained) {
-        return [g_queue commandBufferWithUnretainedReferences];
+        return [ds4_gpu_m3_queue() commandBufferWithUnretainedReferences];
     }
-    return [g_queue commandBuffer];
+    return [ds4_gpu_m3_queue() commandBuffer];
 }
 
 static uint64_t ds4_gpu_exact_view_cache_limit_bytes(void) {
@@ -2737,9 +2737,9 @@ static void ds4_gpu_model_residency_clear(void) {
     if (@available(macOS 15.0, *)) {
         if (g_model_residency_set) {
             if (g_model_residency_added_to_queue &&
-                g_queue &&
-                [g_queue respondsToSelector:@selector(removeResidencySet:)]) {
-                [g_queue removeResidencySet:g_model_residency_set];
+                ds4_gpu_m3_queue() &&
+                [ds4_gpu_m3_queue() respondsToSelector:@selector(removeResidencySet:)]) {
+                [ds4_gpu_m3_queue() removeResidencySet:g_model_residency_set];
             }
             ds4_gpu_queue_residency_removed(g_model_residency_set);
             [g_model_residency_set endResidency];
@@ -2798,8 +2798,8 @@ static int ds4_gpu_model_residency_request_views(void) {
         [g_model_residency_set commit];
         [g_model_residency_set requestResidency];
         if (getenv("DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET") == NULL) {
-            if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)]) {
-                [g_queue addResidencySet:g_model_residency_set];
+            if (ds4_gpu_m3_queue() && [ds4_gpu_m3_queue() respondsToSelector:@selector(addResidencySet:)]) {
+                [ds4_gpu_m3_queue() addResidencySet:g_model_residency_set];
                 g_model_residency_added_to_queue = 1;
             }
             /* The Metal 4 queue, which is the only one once it is selected. */
@@ -7590,14 +7590,6 @@ int ds4_gpu_init(void) {
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
 
-        g_queue = [g_device newCommandQueueWithMaxCommandBufferCount:256];
-        if (g_queue) g_bk_m3_queues++;
-        ds4_gpu_ledger_note_queue(g_queue, "main");
-        if (!g_queue) {
-            fprintf(stderr, "ds4: failed to create Metal command queue\n");
-            g_device = nil;
-            return 0;
-        }
         g_model_buffer_cache = [NSMutableDictionary dictionary];
         g_model_buffer_cache_bytes = 0;
         g_model_buffer_cache_evictions = 0;
@@ -9914,6 +9906,22 @@ int ds4_gpu_init(void) {
     return 1;
 }
 
+/* The Metal 3 queue exists only once something on the Metal 3 backend needs
+ * it. ds4_gpu_init used to create it with the device, so V4.1 - which selects
+ * Metal 4 before encoding anything - still made one it never used; now a
+ * process that selects Metal 4 creates none. */
+static id<MTLCommandQueue> ds4_gpu_m3_queue(void) {
+    if (g_queue || g_backend == 4 || !g_device) return g_queue;
+    g_queue = [g_device newCommandQueueWithMaxCommandBufferCount:256];
+    if (!g_queue) {
+        fprintf(stderr, "ds4: failed to create Metal command queue\n");
+        return nil;
+    }
+    g_bk_m3_queues++;
+    ds4_gpu_ledger_note_queue(g_queue, "main");
+    return g_queue;
+}
+
 /* DeepSeek V4.1 runs on the Metal 4 backend, and only there. The engine asks
  * for it once the model is known and before any work is encoded; other models
  * keep the Metal 3 batch. Metal 4 that cannot be had is an error, not a quiet
@@ -9932,10 +9940,11 @@ int ds4_gpu_use_metal4(void) {
                 ready ? "incompatible with the encoder timeline" : "unavailable");
         return 0;
     }
+    if (g_queue) {
+        fprintf(stderr, "ds4: Metal 4 was selected after a Metal 3 queue was made\n");
+        return 0;
+    }
     g_backend = 4;
-    /* Nothing is submitted to the Metal 3 queue from here on, so it is not
-     * kept: a path that still reached for it would find nothing there. */
-    g_queue = nil;
     g_bk_selected_m4 = 1;
     g_bk_m3_commands_at_selection = ds4_gpu_backend_m3_commands();
     g_bk_m3_queues_at_selection = g_bk_m3_queues;
@@ -12474,7 +12483,7 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
             continue;
         }
         @autoreleasepool {
-            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            id<MTLCommandBuffer> cb = [ds4_gpu_m3_queue() commandBuffer];
             id<DS4Encoder> enc = (id<DS4Encoder>)[cb computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
             [enc setBuffer:scratch offset:0 atIndex:0];
@@ -15890,9 +15899,9 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
                     [g_stream_expert_residency_set addAllocation:slab_buffer];
                     [g_stream_expert_residency_set commit];
                     [g_stream_expert_residency_set requestResidency];
-                    if (!g_stream_expert_residency_on_mtl3_queue && g_queue &&
-                        [g_queue respondsToSelector:@selector(addResidencySet:)]) {
-                        [g_queue addResidencySet:g_stream_expert_residency_set];
+                    if (!g_stream_expert_residency_on_mtl3_queue && ds4_gpu_m3_queue() &&
+                        [ds4_gpu_m3_queue() respondsToSelector:@selector(addResidencySet:)]) {
+                        [ds4_gpu_m3_queue() addResidencySet:g_stream_expert_residency_set];
                         g_stream_expert_residency_on_mtl3_queue = 1;
                     }
                     /* The Metal 4 queue keeps its own list; adding twice is a no-op. */
@@ -17106,7 +17115,7 @@ static int g_stream_full_expert_residency_on_queue;
  * readback it removes, so pay it once, here, before the first token. */
 static void ds4_gpu_stream_full_expert_addr_prewire(NSArray<id<MTLBuffer>> *buffers) {
     if (g_backend == 4) { (void)ds4_gpu_metal3_only("full expert address prewire"); return; }
-    if (!g_device || !g_queue || buffers.count == 0) return;
+    if (!g_device || !ds4_gpu_m3_queue() || buffers.count == 0) return;
     if (getenv("DS4_METAL_FULL_ADDR_NO_PREWIRE") != NULL) return;
     /* Copy the whole expert, not a token amount of it: the pages are wired as
      * they are touched, so a 16-byte read leaves the rest for decode to pay. */
@@ -17119,7 +17128,7 @@ static void ds4_gpu_stream_full_expert_addr_prewire(NSArray<id<MTLBuffer>> *buff
     }
     const double t0 = ds4_gpu_now_ms();
     @autoreleasepool {
-        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLCommandBuffer> cb = [ds4_gpu_m3_queue() commandBuffer];
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         if (!blit) return;
         for (id<MTLBuffer> b in buffers) {
@@ -17163,8 +17172,8 @@ static void ds4_gpu_stream_full_expert_addr_note_residency(NSArray<id<MTLBuffer>
         /* fall through: commit and request below */
         [g_stream_full_expert_residency_set commit];
         [g_stream_full_expert_residency_set requestResidency];
-        if (!g_stream_full_expert_residency_on_queue && g_queue) {
-            [g_queue addResidencySet:g_stream_full_expert_residency_set];
+        if (!g_stream_full_expert_residency_on_queue && ds4_gpu_m3_queue()) {
+            [ds4_gpu_m3_queue() addResidencySet:g_stream_full_expert_residency_set];
             g_stream_full_expert_residency_on_queue = 1;
         }
     }
@@ -17696,8 +17705,8 @@ static id ds4_gpu_expert_residency_set(void) {
             }
             [g_stream_expert_residency_set commit];
             [g_stream_expert_residency_set requestResidency];
-            if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)])
-                [g_queue addResidencySet:g_stream_expert_residency_set];
+            if (ds4_gpu_m3_queue() && [ds4_gpu_m3_queue() respondsToSelector:@selector(addResidencySet:)])
+                [ds4_gpu_m3_queue() addResidencySet:g_stream_expert_residency_set];
             /* The Metal 4 queue inherits no set from the Metal 3 one. The
              * verify executor reaches these experts by raw address, so without
              * this an expert loaded by a repair is read by the resumed pass
@@ -21192,7 +21201,7 @@ static bool ds4_gpu_q4_table_queue_residency_requested(void) {
 static bool ds4_gpu_q4_table_queue_residency_available(void) {
 #if TARGET_OS_OSX
     if (@available(macOS 15.0, *)) {
-        return g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)];
+        return ds4_gpu_m3_queue() && [ds4_gpu_m3_queue() respondsToSelector:@selector(addResidencySet:)];
     }
 #endif
     return false;
@@ -21426,7 +21435,7 @@ static id ds4_gpu_q4_expert_layer_residency_set(DS4MetalQ4ExpertTable *gate_tabl
         DS4MetalQ4LayerResidency *entry = [DS4MetalQ4LayerResidency new];
         entry.residencySet = residency_set;
         if (queue_residency) {
-            [g_queue addResidencySet:residency_set];
+            [ds4_gpu_m3_queue() addResidencySet:residency_set];
             entry.addedToQueue = YES;
         }
         [g_q4_expert_layer_residency_cache setObject:entry forKey:key];

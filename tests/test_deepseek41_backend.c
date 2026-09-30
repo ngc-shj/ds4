@@ -287,8 +287,8 @@ int main(int argc, char **argv) {
            "(the deliberate one, and one for the full address table if asked); Metal 3 queues "
            "created before selection %llu, after %llu\n",
            m3f[0], m3f[1], m3f[2], m3f[3]);
-    /* One Metal 3 queue is made at each engine's init, before the model says
-     * which backend it needs: two engines were opened here. */
+    /* No Metal 3 queue at all: the queue is made only when the Metal 3
+     * backend first needs one, and V4.1 selects Metal 4 before that. */
     /* The full expert address table, under Metal 4, is refused the first
      * time a path asks for it, and the ordinary path runs instead. The
      * environment says whether it may be asked for (SSD streaming - this test
@@ -309,7 +309,7 @@ int main(int argc, char **argv) {
            (unsigned long long)hits, (unsigned long long)misses);
     CHECK(full_uses == 0, "the full expert address table was used under Metal 4");
     CHECK(hits + misses > 0, "the ordinary expert-cache path did not engage");
-    CHECK(m3f[0] == 0 && m3f[1] == want_refused && m3f[2] == 2 && m3f[3] == 0,
+    CHECK(m3f[0] == 0 && m3f[1] == want_refused && m3f[2] == 0 && m3f[3] == 0,
           "Metal 3 after selection, or queue counts not as expected");
     printf("%s\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;
