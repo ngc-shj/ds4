@@ -21,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
 
@@ -1777,6 +1778,32 @@ static DS4Cmd *ds4_gpu_command_buffer(int *owned) {
 
 #include "ds4_metal_mtl4.h"
 
+/* Every compute pipeline is made here, with its binding reflection, so the
+ * Metal 4 context knows which of a dispatch's bindings it reads and which it
+ * writes. */
+static id<MTLComputePipelineState> ds4_gpu_new_pso(id<MTLFunction> fn, NSError **error) {
+    MTLAutoreleasedComputePipelineReflection refl = nil;
+    id<MTLComputePipelineState> pso =
+        [g_device newComputePipelineStateWithFunction:fn
+                                              options:MTLPipelineOptionBindingInfo
+                                           reflection:&refl
+                                                error:error];
+    ds4_pso_access_note(pso, refl);
+    return pso;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_new_pso_desc(MTLComputePipelineDescriptor *d,
+                                                        NSError **error) {
+    MTLAutoreleasedComputePipelineReflection refl = nil;
+    id<MTLComputePipelineState> pso =
+        [g_device newComputePipelineStateWithDescriptor:d
+                                                options:MTLPipelineOptionBindingInfo
+                                             reflection:&refl
+                                                  error:error];
+    ds4_pso_access_note(pso, refl);
+    return pso;
+}
+
 static bool ds4_gpu_uce_on(void) {
     static int checked, on;
     if (g_uce_override >= 0) return g_uce_override != 0;
@@ -3175,7 +3202,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -3209,7 +3236,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -3240,7 +3267,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
         return nil;
     }
 
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -3460,7 +3487,7 @@ static int ds4_gpu_compile_tensor_probe(void) {
             return 0;
         }
         error = nil;
-        id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
         if (!pipeline) {
             fprintf(stderr, "ds4: Metal 4 tensor API probe pipeline failed: %s\n",
                     error ? [[error localizedDescription] UTF8String] : "(unknown)");
@@ -3803,7 +3830,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -3847,10 +3874,7 @@ static id<MTLComputePipelineState> ds4_gpu_new_mul_mv_tg_multiple_pipeline(
 
     error = nil;
     id<MTLComputePipelineState> pipeline =
-        [g_device newComputePipelineStateWithDescriptor:descriptor
-                                                options:MTLPipelineOptionNone
-                                             reflection:nil
-                                                  error:&error];
+        ds4_gpu_new_pso_desc(descriptor, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s tg-multiple pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -4078,7 +4102,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -4138,7 +4162,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_pad pipeline failed: %s\n",
                 [[error localizedDescription] UTF8String]);
@@ -4197,7 +4221,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_blk_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_blk pipeline failed: %s\n",
                 [[error localizedDescription] UTF8String]);
@@ -4289,7 +4313,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -4379,7 +4403,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -4423,7 +4447,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_rope_pipeline(
         return nil;
     }
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_vec_reduce_rope pipeline failed: %s\n",
                 [[error localizedDescription] UTF8String]);
@@ -4476,7 +4500,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
     }
 
     error = nil;
-    id<MTLComputePipelineState> pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pso(fn, &error);
     if (!pipeline) {
         fprintf(stderr, "ds4: Metal kernel_flash_attn_ext_vec_reduce pipeline failed: %s\n",
                 [[error localizedDescription] UTF8String]);
@@ -7655,7 +7679,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_get_rows_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_get_rows_f32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_get_rows_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7672,7 +7696,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_get_rows_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_get_rows_f16_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_get_rows_f16_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_f16 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7689,7 +7713,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_get_rows_i32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_get_rows_i32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_get_rows_i32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_i32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7706,7 +7730,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_get_rows_q8_0_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_get_rows_q8_0_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_get_rows_q8_0_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_q8_0_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7723,7 +7747,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_get_rows_q4_0_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_get_rows_q4_0_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_get_rows_q4_0_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_q4_0_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7740,7 +7764,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_get_rows_q4_K_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_get_rows_q4_K_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_get_rows_q4_K_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_q4_K_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7757,7 +7781,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_repeat_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_repeat_f32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_repeat_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_repeat_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7774,7 +7798,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_set_rows_f32_i32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_set_rows_f32_i32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_set_rows_f32_i32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_set_rows_f32_i32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7791,7 +7815,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_concat_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_concat_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_concat_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_concat pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7808,7 +7832,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_cpy_f32_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_cpy_f32_f32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_cpy_f32_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_f32_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7825,7 +7849,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_cpy_f32_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_cpy_f32_f16_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_cpy_f32_f16_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_f32_f16 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7842,7 +7866,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_cpy_contig_f32_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_cpy_contig_f32_f16_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_cpy_contig_f32_f16_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_contig_f32_f16_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7859,7 +7883,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_cpy_f16_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_cpy_f16_f32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_cpy_f16_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_f16_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7876,7 +7900,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_cpy_f16_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_cpy_f16_f16_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_cpy_f16_f16_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_f16_f16 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7893,7 +7917,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_cpy_contig_f16_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_cpy_contig_f16_f32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_cpy_contig_f16_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_contig_f16_f32_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7910,7 +7934,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_cpy_contig_f16_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_cpy_contig_f16_f16_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_cpy_contig_f16_f16_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_contig_f16_f16_bits_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7923,7 +7947,7 @@ int ds4_gpu_init(void) {
         fn = [library newFunctionWithName:@"kernel_dsv4_flash_kv_stage_f16"];
         if (fn) {
             g_flash_kv_stage_f16_pipeline =
-                [g_device newComputePipelineStateWithFunction:fn error:&error];
+                ds4_gpu_new_pso(fn, &error);
             if (!g_flash_kv_stage_f16_pipeline) {
                 fprintf(stderr,
                         "ds4: optional Metal gathered KV staging pipeline unavailable: %s\n",
@@ -7941,7 +7965,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_fp8_kv_quantize_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_fp8_kv_quantize_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_fp8_kv_quantize_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_fp8_kv_quantize_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7957,7 +7981,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_indexer_qat_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_indexer_qat_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_indexer_qat_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_indexer_hadamard_fp4_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7973,7 +7997,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_kv_fp8_store_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_kv_fp8_store_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_kv_fp8_store_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_kv_fp8_store_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -7990,7 +8014,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         error = nil;
-        g_dsv4_kv_rope_fp8_store_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_kv_rope_fp8_store_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_kv_rope_fp8_store_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_kv_rope_fp8_store_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8006,7 +8030,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_ratio4_shift_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_ratio4_shift_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_ratio4_shift_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_ratio4_shift_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8023,7 +8047,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8041,7 +8065,7 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        g_swiglu_flat_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_swiglu_flat_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_swiglu_flat_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_swiglu_flat_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8058,7 +8082,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_moe_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8075,7 +8099,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_moe_sum8_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_sum8_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_sum8_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum8_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8106,7 +8130,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_add_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_add_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_add_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_bin_fuse_f32_f32_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8124,7 +8148,7 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        g_add2_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_add2_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_add2_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_add2_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8142,7 +8166,7 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        g_add3_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_add3_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_add3_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_add3_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8173,7 +8197,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_mul_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_mul_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_mul_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_bin_fuse_f32_f32_f32 mul pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8204,7 +8228,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_bin_mul_scalar_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_bin_mul_scalar_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_bin_mul_scalar_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_bin_fuse_f32_f32_f32 mul-scalar pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8235,7 +8259,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        g_bin_div_row_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_bin_div_row_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_bin_div_row_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_bin_fuse_f32_f32_f32 div-row pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8251,7 +8275,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_rms_norm_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_rms_norm_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_rms_norm_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_rms_norm_mul_f32_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8267,7 +8291,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_rms_norm_plain_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_rms_norm_plain_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_rms_norm_plain_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_rms_norm_f32_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8283,7 +8307,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_add_rms_norm_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_add_rms_norm_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_add_rms_norm_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_add_rms_norm_mul_f32_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8299,7 +8323,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_qkv_rms_norm_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_qkv_rms_norm_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_qkv_rms_norm_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_qkv_rms_norm_f32_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8318,7 +8342,7 @@ int ds4_gpu_init(void) {
         }
         error = nil;
         g_dsv4_head_rms_norm_rope_tail_pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
+            ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_head_rms_norm_rope_tail_pipeline) {
             fprintf(stderr,
                     "ds4: Metal kernel_dsv4_head_rms_norm_rope_tail_f32 pipeline failed: %s\n",
@@ -8346,7 +8370,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_iq2_xxs_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_iq2_xxs_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_iq2_xxs_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq2_xxs_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8366,7 +8390,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_iq2_xxs_pair_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_iq2_xxs_pair_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_iq2_xxs_pair_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq2_xxs_pair_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8386,7 +8410,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq2_xxs_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8401,7 +8425,7 @@ int ds4_gpu_init(void) {
                                     error:&error];
         if (fn) {
             g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pack2_pipeline =
-                [g_device newComputePipelineStateWithFunction:fn error:&error];
+                ds4_gpu_new_pso(fn, &error);
         }
         if (!g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pack2_pipeline) {
             fprintf(stderr,
@@ -8421,7 +8445,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_q2_k_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_q2_k_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_q2_k_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q2_K_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8441,7 +8465,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_q2_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_q2_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_q2_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q2_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8461,7 +8485,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_iq2_xxs_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_iq2_xxs_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_iq2_xxs_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_iq2_xxs_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8481,7 +8505,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8501,7 +8525,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_slots6_q2_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_slots6_q2_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_slots6_q2_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_slots6_q2_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8521,7 +8545,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8541,7 +8565,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_addr_iq2_xxs_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_addr_iq2_xxs_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_addr_iq2_xxs_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_iq2_xxs_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8561,7 +8585,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_addr_q2_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_addr_q2_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_addr_q2_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8582,7 +8606,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
+            ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8603,7 +8627,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
+            ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_sum6_masked_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8621,7 +8645,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_moe_stream_expert_cache_validate_pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
+            ds4_gpu_new_pso(fn, &error);
         if (!g_moe_stream_expert_cache_validate_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_stream_expert_cache_validate pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8639,7 +8663,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_moe_block_residency_pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
+            ds4_gpu_new_pso(fn, &error);
         if (!g_moe_block_residency_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv41_moe_block_residency pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8659,7 +8683,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_q4_k_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_q4_k_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_q4_k_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q4_K_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8679,7 +8703,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_q4_k_pair_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_q4_k_pair_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_q4_k_pair_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q4_K_pair_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8699,7 +8723,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q4_K_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8719,7 +8743,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_id_q4_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_id_q4_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_id_q4_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q4_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8739,7 +8763,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group_q4_k_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group_q4_k_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group_q4_k_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group_q4_K_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8759,7 +8783,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group_q4_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group_q4_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group_q4_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group_q4_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8779,7 +8803,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group6_q4_k_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group6_q4_k_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group6_q4_k_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group6_q4_K_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8799,7 +8823,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group6_q4_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group6_q4_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group6_q4_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group6_q4_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8819,7 +8843,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group8_q4_k_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group8_q4_k_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group8_q4_k_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group8_q4_K_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8839,7 +8863,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group8_q4_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group8_q4_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group8_q4_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group8_q4_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8859,7 +8883,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group24_q4_k_id_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group24_q4_k_id_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group24_q4_k_id_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group24_q4_K_id_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8879,7 +8903,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_group24_q4_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_group24_q4_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_group24_q4_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_group24_q4_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8899,7 +8923,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_slots6_q4_K_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -8919,7 +8943,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_slots6_q4_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_slots6_q4_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_slots6_q4_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_slots6_q4_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9009,7 +9033,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_q4_gather_slots6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_q4_gather_slots6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_q4_gather_slots6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_q4_gather_slots6 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9037,7 +9061,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_table_q4_k_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_table_q4_k_pair_swiglu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_table_q4_k_pair_swiglu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_table_q4_K_pair_swiglu_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9064,7 +9088,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_moe_mul_mv_table_q4_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_moe_mul_mv_table_q4_k_sum6_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_moe_mul_mv_table_q4_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_table_q4_K_sum6_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9079,7 +9103,7 @@ int ds4_gpu_init(void) {
                                     error:&error];
         if (fn) {
             g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline =
-                [g_device newComputePipelineStateWithFunction:fn error:&error];
+                ds4_gpu_new_pso(fn, &error);
             if (!g_moe_mul_mv_addr_q4_k_pair_swiglu_pipeline) {
                 fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q4_K_pair_swiglu_f32 pipeline unavailable: %s\n",
                         [[error localizedDescription] UTF8String]);
@@ -9095,7 +9119,7 @@ int ds4_gpu_init(void) {
                                     error:&error];
         if (fn) {
             g_moe_mul_mv_addr_q4_k_sum6_pipeline =
-                [g_device newComputePipelineStateWithFunction:fn error:&error];
+                ds4_gpu_new_pso(fn, &error);
             if (!g_moe_mul_mv_addr_q4_k_sum6_pipeline) {
                 fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q4_K_sum6_f32 pipeline unavailable: %s\n",
                         [[error localizedDescription] UTF8String]);
@@ -9112,7 +9136,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_rope_tail_batch_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_rope_tail_batch_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_rope_tail_batch_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_rope_tail_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9130,7 +9154,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_rope_tail_inplace_pair_pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
+            ds4_gpu_new_pso(fn, &error);
         if (!g_rope_tail_inplace_pair_pipeline) {
             fprintf(stderr,
                     "ds4: Metal kernel_dsv4_rope_tail_f32_inplace_pair pipeline failed: %s\n",
@@ -9147,7 +9171,7 @@ int ds4_gpu_init(void) {
                     "ds4: optional Metal shared-head RoPE kernel unavailable; using per-head path\n");
         } else {
             g_rope_tail_inplace_pair_shared4_pipeline =
-                [g_device newComputePipelineStateWithFunction:fn error:&error];
+                ds4_gpu_new_pso(fn, &error);
             if (!g_rope_tail_inplace_pair_shared4_pipeline) {
                 fprintf(stderr,
                         "ds4: optional Metal shared-head RoPE pipeline unavailable; using per-head path: %s\n",
@@ -9159,7 +9183,7 @@ int ds4_gpu_init(void) {
         fn = [library newFunctionWithName:@"kernel_dsv4_rope_tail_f32_inplace_pair_affine"];
         if (fn) {
             g_rope_tail_inplace_pair_affine_pipeline =
-                [g_device newComputePipelineStateWithFunction:fn error:&error];
+                ds4_gpu_new_pso(fn, &error);
             if (!g_rope_tail_inplace_pair_affine_pipeline) {
                 fprintf(stderr,
                         "ds4: optional Metal affine-position RoPE pair pipeline unavailable: %s\n",
@@ -9178,7 +9202,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_softmax_pool_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_softmax_pool_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_softmax_pool_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_softmax_pool pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9194,7 +9218,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_soft_max_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_soft_max_f32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_soft_max_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_soft_max_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9210,7 +9234,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_soft_max_f32_4_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_soft_max_f32_4_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_soft_max_f32_4_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_soft_max_f32_4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9226,7 +9250,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_argsort_f32_i32_desc_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_argsort_f32_i32_desc_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_argsort_f32_i32_desc_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_argsort_f32_i32_desc pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9242,7 +9266,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_argsort_merge_f32_i32_desc_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_argsort_merge_f32_i32_desc_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_argsort_merge_f32_i32_desc_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_argsort_merge_f32_i32_desc pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9266,7 +9290,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_sum_rows_f32_f32_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_sum_rows_f32_f32_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_sum_rows_f32_f32_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_sum_rows_f32_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9282,7 +9306,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_topk_mask_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_topk_mask_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_topk_mask_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_topk_mask pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9298,7 +9322,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_topk_mask_scatter_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_topk_mask_scatter_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_topk_mask_scatter_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_topk_mask_scatter pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9314,7 +9338,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_dsv4_indexer_weighted_sum_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_dsv4_indexer_weighted_sum_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_dsv4_indexer_weighted_sum_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_indexer_weighted_sum pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9330,7 +9354,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_hc_split_sinkhorn_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_hc_split_sinkhorn_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_hc_split_sinkhorn_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_hc_split_sinkhorn pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9346,7 +9370,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_hc_split_weighted_sum_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_hc_split_weighted_sum_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_hc_split_weighted_sum_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_hc_split_weighted_sum pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9362,7 +9386,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_hc_split_weighted_sum_norm_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_hc_split_weighted_sum_norm_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_hc_split_weighted_sum_norm_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_hc_split_weighted_sum_norm4 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9378,7 +9402,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_hc_weighted_sum_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_hc_weighted_sum_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_hc_weighted_sum_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_hc_weighted_sum pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9391,7 +9415,7 @@ int ds4_gpu_init(void) {
         fn = [library newFunctionWithName:@"kernel_dsv4_output_hc_weights4"];
         if (fn) {
             g_output_hc_weights4_pipeline =
-                [g_device newComputePipelineStateWithFunction:fn error:&error];
+                ds4_gpu_new_pso(fn, &error);
             if (!g_output_hc_weights4_pipeline) {
                 fprintf(stderr,
                         "ds4: optional Metal output HC weights4 pipeline unavailable: %s\n",
@@ -9419,7 +9443,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_sigmoid_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_sigmoid_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_sigmoid_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f32_f32_4 sigmoid pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9444,7 +9468,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_silu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_silu_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_silu_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f32_f32_4 silu pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9469,7 +9493,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_softplus_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_softplus_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_softplus_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f32_f32_4 softplus pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9494,7 +9518,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_sqrt_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_sqrt_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_sqrt_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f32_f32_4 sqrt pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9519,7 +9543,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_clamp_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_clamp_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_clamp_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f32_f32 clamp pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9544,7 +9568,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_scale_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_scale_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_scale_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f32_f32_4 scale pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9569,7 +9593,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_fill_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_fill_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_fill_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f32_f32_4 fill pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9589,7 +9613,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_unary_fill_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_unary_fill_f16_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_unary_fill_f16_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_unary_f16_f16 fill pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -9605,7 +9629,7 @@ int ds4_gpu_init(void) {
             g_device = nil;
             return 0;
         }
-        g_hc_expand_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        g_hc_expand_pipeline = ds4_gpu_new_pso(fn, &error);
         if (!g_hc_expand_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_hc_expand pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -54660,7 +54684,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 id<MTLFunction> fn = [g_library newFunctionWithName:
                     [NSString stringWithUTF8String:qwen4_kernel_names[kernel]]
                     constantValues:constants error:&error];
-                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+                if (fn) pipeline = ds4_gpu_new_pso(fn, &error);
                 if (!pipeline) {
                     fprintf(stderr, "ds4: Qwen MoE decode pipeline failed: %s\n", [[error localizedDescription] UTF8String]);
                     return 0;
@@ -54690,7 +54714,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 id<MTLFunction> fn = [g_library newFunctionWithName:
                     [NSString stringWithUTF8String:qwen4_kernel_names[kernel]]
                     constantValues:constants error:&error];
-                if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+                if (fn) pipeline = ds4_gpu_new_pso(fn, &error);
                 if (!pipeline) {
                     fprintf(stderr, "ds4: Qwen MoE pipeline failed: %s\n",
                             [[error localizedDescription] UTF8String]);

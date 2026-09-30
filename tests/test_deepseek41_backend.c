@@ -311,6 +311,10 @@ int main(int argc, char **argv) {
     CHECK(hits + misses > 0, "the ordinary expert-cache path did not engage");
     CHECK(m3f[0] == 0 && m3f[1] == want_refused && m3f[2] == 0 && m3f[3] == 0,
           "Metal 3 after selection, or queue counts not as expected");
+    {
+        extern void ds4_gpu_mtl4_coarse_report(FILE *f, unsigned max_lines);
+        ds4_gpu_mtl4_coarse_report(stderr, 400);
+    }
     printf("%s\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;
 }

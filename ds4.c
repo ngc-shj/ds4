@@ -46116,15 +46116,15 @@ spec_done:;
             ds4_gpu_mtl4_structure(c_s);
             for (int i = 0; i < 16; i++) { d_s[i] = c_s[i] - w_s[i]; w_s[i] = c_s[i]; }
             fprintf(stderr,
-                    "ds4:   Metal 4 a token: encoders %.1f serial + %.1f concurrent; barriers "
-                    "%.1f after a dispatch, %.1f at copies, %.1f from the engine, %.1f opening "
-                    "and %.1f ending an encoder; %.1f table clears, %.1f setBuffer, %.1f setBytes "
-                    "(%.0f B); %.1f dispatches, %.1f copies; %.2f blocking waits, %.2f ms; "
-                    "%.1f section barriers\n",
+                    "ds4:   Metal 4 a token: %.2f contexts in %.2f command buffers (%.2f split); "
+                    "%.1f nodes = %.1f dispatches + %.1f copies; barriers %.1f from the graph, "
+                    "%.1f queue; engine asked for %.1f barriers and %.1f section ends, neither "
+                    "encoded; %.1f buffer and %.1f constant bindings (%.0f B), %.1f with no "
+                    "stated length; %.2f blocking waits, %.2f ms\n",
                     d_s[0] / dt, d_s[1] / dt, d_s[2] / dt, d_s[3] / dt, d_s[4] / dt,
                     d_s[5] / dt, d_s[6] / dt, d_s[7] / dt, d_s[8] / dt, d_s[9] / dt,
-                    d_s[10] / dt, d_s[11] / dt, d_s[12] / dt, d_s[13] / dt,
-                    (double)d_s[14] / 1e6 / dt, d_s[15] / dt);
+                    d_s[10] / dt, d_s[11] / dt, d_s[12] / dt, d_s[15] / dt, d_s[13] / dt,
+                    (double)d_s[14] / 1e6 / dt);
         }
             w_sec_att = sec_att; w_sec_open = sec_open;
             w_spec_cmp = spec_cmp; w_spec_diff = spec_diff; w_spec_far = spec_far;

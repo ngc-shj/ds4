@@ -22,6 +22,10 @@
 
 @class DS4M4Ctx;
 
+/* Buffer bindings an encoder can hold; MTL4ArgumentTableDescriptor caps a
+ * table at 31. */
+#define DS4_ENC_SLOTS 31u
+
 #ifdef DS4_CMD_TYPECHECK
 /* A build that only type-checks: as a C struct, an id<MTLCommandBuffer>
  * passed where a DS4Cmd is expected is an error rather than silence. */
@@ -41,33 +45,53 @@ typedef struct DS4Cmd { id<MTLCommandBuffer> m3; __unsafe_unretained DS4M4Ctx *m
 typedef struct DS4Enc {
 
     id<MTLComputeCommandEncoder> m3;
-    /* Metal 4: the context this records into, and its encoder and table. */
+    /* Metal 4: the context this records into. */
     __unsafe_unretained DS4M4Ctx *m4;
-    id m4enc;                   /* id<MTL4ComputeCommandEncoder> */
-    id m4table;                 /* id<MTL4ArgumentTable> */
-    /* The engine ended its section; what it encodes next is ordered after. */
+    /* The engine ended its section; the next open starts with nothing bound. */
     BOOL ended;
-    /* The Metal 4 encoder itself has ended; only the commit does that. */
-    BOOL finished;
-    /* A barrier after every dispatch: a serial section. */
-    BOOL serial;
     BOOL concurrent;
+    /* Metal 4: what is bound now, which the next dispatch snapshots. A
+     * binding's byte range is [off, off + len); len 0 means the call site
+     * stated none, and the range runs to the end of the buffer. */
+    __unsafe_unretained id<MTLComputePipelineState> pso;
+    uint32_t bound;                        /* slots set, buffer or constant */
+    uint32_t constant;                     /* of those, constants */
+    uint64_t addr[DS4_ENC_SLOTS];
+    __unsafe_unretained id<MTLBuffer> buf[DS4_ENC_SLOTS];
+    NSUInteger off[DS4_ENC_SLOTS], len[DS4_ENC_SLOTS];
+    uint32_t line[DS4_ENC_SLOTS];          /* the call site, for the census */
+    uint32_t tgmem[4];
+    uint8_t tgmem_set;
+    /* Resources declared with useResource since the last dispatch. */
+    __unsafe_unretained id use[64];
+    MTLResourceUsage use_usage[64];
+    uint32_t n_use;
 } DS4Enc;
 #else
 @interface DS4Enc : NSObject {
 @public
     id<MTLComputeCommandEncoder> m3;
-    /* Metal 4: the context this records into, and its encoder and table. */
+    /* Metal 4: the context this records into. */
     __unsafe_unretained DS4M4Ctx *m4;
-    id m4enc;                   /* id<MTL4ComputeCommandEncoder> */
-    id m4table;                 /* id<MTL4ArgumentTable> */
-    /* The engine ended its section; what it encodes next is ordered after. */
+    /* The engine ended its section; the next open starts with nothing bound. */
     BOOL ended;
-    /* The Metal 4 encoder itself has ended; only the commit does that. */
-    BOOL finished;
-    /* A barrier after every dispatch: a serial section. */
-    BOOL serial;
     BOOL concurrent;
+    /* Metal 4: what is bound now, which the next dispatch snapshots. A
+     * binding's byte range is [off, off + len); len 0 means the call site
+     * stated none, and the range runs to the end of the buffer. */
+    __unsafe_unretained id<MTLComputePipelineState> pso;
+    uint32_t bound;                        /* slots set, buffer or constant */
+    uint32_t constant;                     /* of those, constants */
+    uint64_t addr[DS4_ENC_SLOTS];
+    __unsafe_unretained id<MTLBuffer> buf[DS4_ENC_SLOTS];
+    NSUInteger off[DS4_ENC_SLOTS], len[DS4_ENC_SLOTS];
+    uint32_t line[DS4_ENC_SLOTS];          /* the call site, for the census */
+    uint32_t tgmem[4];
+    uint8_t tgmem_set;
+    /* Resources declared with useResource since the last dispatch. */
+    __unsafe_unretained id use[64];
+    MTLResourceUsage use_usage[64];
+    uint32_t n_use;
 }
 @end
 @implementation DS4Enc
@@ -76,7 +100,8 @@ typedef struct DS4Enc {
 
 /* The Metal 4 side, in ds4_metal_mtl4.h. */
 static void ds4_m4_pso(DS4Enc *e, id<MTLComputePipelineState> pso);
-static void ds4_m4_buf(DS4Enc *e, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index);
+static void ds4_m4_buf(DS4Enc *e, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger length,
+                       NSUInteger index, uint32_t line);
 static void ds4_m4_bytes(DS4Enc *e, const void *bytes, NSUInteger length, NSUInteger index);
 static void ds4_m4_tgmem(DS4Enc *e, NSUInteger length, NSUInteger index);
 static void ds4_m4_use(DS4Enc *e, id<MTLResource> resource, MTLResourceUsage usage);
@@ -85,7 +110,7 @@ static void ds4_m4_dispatch(DS4Enc *e, int kind, MTLSize a, MTLSize b,
                             id<MTLBuffer> indirect, NSUInteger indirect_offset);
 static void ds4_m4_end(DS4Enc *e);
 
-enum { DS4_M4_NODE_GROUPS = 0, DS4_M4_NODE_THREADS, DS4_M4_NODE_INDIRECT };
+enum { DS4_M4_NODE_GROUPS = 0, DS4_M4_NODE_THREADS, DS4_M4_NODE_INDIRECT, DS4_M4_NODE_COPY };
 
 static inline void ds4_enc_pso(DS4Enc *e, id<MTLComputePipelineState> pso) {
     if (g_enc_trace_fp)
@@ -95,15 +120,22 @@ static inline void ds4_enc_pso(DS4Enc *e, id<MTLComputePipelineState> pso) {
     ds4_m4_pso(e, pso);
 }
 
-static inline void ds4_enc_buf(DS4Enc *e, id<MTLBuffer> buffer, NSUInteger offset, NSUInteger index) {
+/* A buffer binding and the bytes the dispatch may reach through it:
+ * [offset, offset + length). ds4_enc_buf states no length - the range then
+ * runs to the end of the buffer, which is sound and coarse, and the Metal 4
+ * context counts such bindings by call site. */
+static inline void ds4_enc_buf_at(DS4Enc *e, id<MTLBuffer> buffer, NSUInteger offset,
+                                  NSUInteger length, NSUInteger index, uint32_t line) {
     /* The address, not the object: the question a trace answers is whether a
      * dispatch ends up reading the same bytes on both backends. */
     if (g_enc_trace_fp)
         ds4_enc_trace("buf %lu b%u+%lu\n", (unsigned long)index,
                       ds4_enc_trace_buf_id(buffer), (unsigned long)(buffer ? offset : 0));
     if (e->m3) { [e->m3 setBuffer:buffer offset:offset atIndex:index]; return; }
-    ds4_m4_buf(e, buffer, offset, index);
+    ds4_m4_buf(e, buffer, offset, length, index, line);
 }
+#define ds4_enc_buf(e, b, o, i) ds4_enc_buf_at((e), (b), (o), 0, (i), __LINE__)
+#define ds4_enc_buf_n(e, b, o, n, i) ds4_enc_buf_at((e), (b), (o), (n), (i), __LINE__)
 
 static inline void ds4_enc_bytes(DS4Enc *e, const void *bytes, NSUInteger length, NSUInteger index) {
     if (g_enc_trace_fp)
