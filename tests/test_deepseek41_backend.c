@@ -27,6 +27,12 @@
 
 void ds4_gpu_mtl4_inject_failure(void);
 unsigned long long ds4_gpu_backend_m3_fallback(void);
+void ds4_gpu_backend_m3_after_selection(unsigned long long out[4]);
+void ds4_gpu_mtl4_counts(unsigned long long *segments, unsigned long long *dispatches,
+                         unsigned long long *m3_fallback);
+void ds4_gpu_mtl4_structure(unsigned long long out[16]);
+int ds4_gpu_warm_command_queue(void);
+int ds4_gpu_test_warm_model_views(void);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
 void ds4_gpu_mtl4_health(unsigned long long out[8]);
 
@@ -215,6 +221,28 @@ int main(int argc, char **argv) {
     };
     if (ds4_engine_open(&engine, &opt) != 0) return 2;
     const int vocab = ds4_engine_vocab_size(engine);
+    /* The model-view warmup runs only with full residency, never in this
+     * streaming configuration; driven here, it has to go through Metal 4. */
+    unsigned long long m3a[4], m3b[4], c0 = 0, c1 = 0, st0[16], st1[16];
+    ds4_gpu_backend_m3_after_selection(m3a);
+    ds4_gpu_mtl4_counts(&c0, NULL, NULL);
+    ds4_gpu_mtl4_structure(st0);
+    const int warmed = ds4_gpu_test_warm_model_views();
+    ds4_gpu_backend_m3_after_selection(m3b);
+    ds4_gpu_mtl4_counts(&c1, NULL, NULL);
+    ds4_gpu_mtl4_structure(st1);
+    const unsigned long long enc = (st1[0] + st1[1]) - (st0[0] + st0[1]);
+    printf("warmup     model views touched: %s; Metal 4 commits +%llu, encoders +%llu; "
+           "Metal 3 commands +%llu\n", warmed ? "ok" : "FAILED", c1 - c0, enc, m3b[0] - m3a[0]);
+    CHECK(warmed && c1 > c0 && enc > 0 && m3b[0] == m3a[0], "warmup did not run on Metal 4 only");
+    /* A Metal 3-only path under Metal 4 is refused, counted once, and runs
+     * nothing. */
+    const int warmq = ds4_gpu_warm_command_queue();
+    unsigned long long m3c[4];
+    ds4_gpu_backend_m3_after_selection(m3c);
+    printf("refusal    a Metal 3-only call returned %d; refusals +%llu, Metal 3 commands +%llu\n",
+           warmq, m3c[1] - m3b[1], m3c[0] - m3b[0]);
+    CHECK(warmq == 0 && m3c[1] - m3b[1] == 1 && m3c[0] == m3b[0], "refusal not counted exactly once");
     int *ref = calloc((size_t)steps, sizeof(int));
 
     paired(engine, "short", "Explain how a modern CPU executes an instruction, from fetch "
@@ -245,6 +273,15 @@ int main(int argc, char **argv) {
     reopened(&opt, "Explain how a modern CPU executes an instruction, from fetch "
              "to retire, in as much detail as you can.", ref, steps);
     free(ref);
+    unsigned long long m3f[4];
+    ds4_gpu_backend_m3_after_selection(m3f);
+    printf("m3api      Metal 3 command execution after Metal 4 selection: %llu; refused %llu "
+           "(the one deliberate); Metal 3 queues created before selection %llu, after %llu\n",
+           m3f[0], m3f[1], m3f[2], m3f[3]);
+    /* One Metal 3 queue is made at each engine's init, before the model says
+     * which backend it needs: two engines were opened here. */
+    CHECK(m3f[0] == 0 && m3f[1] == 1 && m3f[2] == 2 && m3f[3] == 0,
+          "Metal 3 after selection, or queue counts not as expected");
     printf("%s\n", g_failures ? "FAIL" : "PASS");
     return g_failures ? 1 : 0;
 }

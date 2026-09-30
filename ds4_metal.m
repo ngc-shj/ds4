@@ -169,7 +169,8 @@ static unsigned long long g_bk_m3_fallback;
 
 /* The two background submitters - the queue keepalive and the pacer - run on
  * their own threads, so they count atomically and apart from the table. */
-static _Atomic unsigned long long g_bk_keepalive_commits[2], g_bk_pacer_commits;
+static _Atomic unsigned long long g_bk_keepalive_commits[2], g_bk_pacer_commits,
+                                  g_bk_pacer_commits_m4;
 
 static void ds4_bk_note(int mtl4, const char *site, int kind) {
     ds4_bk_site *t = g_bk_sites[mtl4 ? 1 : 0];
@@ -189,6 +190,7 @@ static void ds4_bk_note(int mtl4, const char *site, int kind) {
 /* One line a backend a site that moved since the last call, then the totals.
  * `tag` names the window. */
 static void ds4_report_boundaries(const char *tag);
+void ds4_gpu_backend_m3_after_selection(unsigned long long out[4]);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens);
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
     unsigned long long tot[2][DS4_BK_KINDS] = {{0}};
@@ -227,24 +229,64 @@ void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
             tag, g_mtl4_fb_late - late_seen, (double)(g_mtl4_fb_late_ns - late_ns_seen) / 1e6);
     late_seen = g_mtl4_fb_late;
     late_ns_seen = g_mtl4_fb_late_ns;
-    fprintf(stderr, "ds4: backend %s background: keepalive M3 %llu M4 %llu, pacer %llu (cumulative)\n",
+    {
+        unsigned long long a[4];
+        ds4_gpu_backend_m3_after_selection(a);
+        fprintf(stderr, "ds4: backend %s Metal 3 command execution after Metal 4 selection: %llu "
+                "(refused %llu); Metal 3 queues created before selection %llu, after %llu\n",
+                tag, a[0], a[1], a[2], a[3]);
+    }
+    fprintf(stderr, "ds4: backend %s background: keepalive M3 %llu M4 %llu, pacer M3 %llu M4 %llu "
+            "(cumulative)\n",
             tag, (unsigned long long)g_bk_keepalive_commits[0],
             (unsigned long long)g_bk_keepalive_commits[1],
-            (unsigned long long)g_bk_pacer_commits);
+            (unsigned long long)g_bk_pacer_commits,
+            (unsigned long long)g_bk_pacer_commits_m4);
 }
 
 /* A Metal 3 mechanism that has no Metal 4 form here - tensor parallelism, the
  * V4 graph's readback overlap, the resident-layer service. None is on the V4.1
  * production path; under the Metal 4 backend each refuses rather than
  * submitting to a queue nothing else is ordered against. */
+static unsigned long long g_bk_m3_refusals;
 static int ds4_gpu_metal3_only(const char *what) {
     fprintf(stderr, "ds4: %s is Metal 3 only and the Metal 4 backend is selected\n", what);
-    g_bk_m3_fallback++;
+    g_bk_m3_refusals++;
     return 0;
 }
 
 unsigned long long ds4_gpu_backend_m3_fallback(void);
 unsigned long long ds4_gpu_backend_m3_fallback(void) { return g_bk_m3_fallback; }
+
+/* Metal 3 commands - commits, waits, events, copies, encoders, the
+ * background Metal 3 submitters - counted since the process started. Host
+ * readbacks are memcpys, not commands, and are left out. */
+static unsigned long long ds4_gpu_backend_m3_commands(void) {
+    unsigned long long t = g_bk_keepalive_commits[0] + g_bk_pacer_commits;
+    for (unsigned i = 0; i < DS4_BK_SITES && g_bk_sites[0][i].site; i++)
+        for (int k = 0; k < DS4_BK_KINDS; k++)
+            if (k != DS4_BK_READBACK) t += g_bk_sites[0][i].n[k];
+    return t;
+}
+
+/* Metal 3 command queues this process created, and the counts as they stood
+ * when Metal 4 was selected. The queue made at init, before the model says
+ * which backend it needs, is the one expected creation. */
+static unsigned long long g_bk_m3_queues, g_bk_m3_queues_at_selection;
+static unsigned long long g_bk_m3_commands_at_selection;
+static int g_bk_selected_m4;
+
+/* What "Metal 4 only after selection" is checked against: Metal 3 commands
+ * run, and Metal 3 paths refused, since Metal 4 was selected; Metal 3 queues
+ * created before and after it. */
+void ds4_gpu_backend_m3_after_selection(unsigned long long out[4]);
+void ds4_gpu_backend_m3_after_selection(unsigned long long out[4]) {
+    const unsigned long long cmds = ds4_gpu_backend_m3_commands();
+    out[0] = g_bk_selected_m4 ? cmds - g_bk_m3_commands_at_selection : 0;
+    out[1] = g_bk_m3_refusals;
+    out[2] = g_bk_selected_m4 ? g_bk_m3_queues_at_selection : g_bk_m3_queues;
+    out[3] = g_bk_selected_m4 ? g_bk_m3_queues - g_bk_m3_queues_at_selection : 0;
+}
 
 /* Batch boundaries by the engine call site that asked for them - a flush, an
  * end, a wait - so each can be classed by whether the host really needs the
@@ -1824,6 +1866,10 @@ static id<DS4Encoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
         ds4_bk_note(g_batch_enc_is_mtl4, "encoder batch", DS4_BK_ENCODER);
         return g_batch_enc;
     }
+    if (g_backend == 4) {
+        (void)ds4_gpu_metal3_only("a Metal 3 encoder");
+        return nil;
+    }
     DS4_M3_NOTE("encoder owned", DS4_BK_ENCODER);
     id<DS4Encoder> enc = (id<DS4Encoder>)[cb computeCommandEncoder];
     return enc;
@@ -1870,6 +1916,7 @@ double ds4_gpu_take_span_ms(void) {
 }
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    if (g_backend == 4) return ds4_gpu_metal3_only("a Metal 3 wait");
     DS4_M3_NOTE(label ? label : "(unlabelled)", DS4_BK_WAIT);
     [cb waitUntilCompleted];
     if (cb.GPUEndTime > cb.GPUStartTime) {
@@ -1912,6 +1959,13 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
 }
 
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
+    /* Under the Metal 4 backend there is no Metal 3 queue to take one from,
+     * and a path that asks for one has missed its Metal 4 form: fail it
+     * where it is, loudly, rather than run it anywhere. */
+    if (g_backend == 4) {
+        (void)ds4_gpu_metal3_only("a Metal 3 command buffer");
+        return nil;
+    }
     static int initialized;
     static int use_unretained;
     if (!initialized) {
@@ -2734,12 +2788,13 @@ static int ds4_gpu_model_residency_request_views(void) {
         }
         [g_model_residency_set commit];
         [g_model_residency_set requestResidency];
-        if (getenv("DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET") == NULL &&
-            g_queue &&
-            [g_queue respondsToSelector:@selector(addResidencySet:)]) {
-            [g_queue addResidencySet:g_model_residency_set];
+        if (getenv("DS4_METAL_DISABLE_QUEUE_RESIDENCY_SET") == NULL) {
+            if (g_queue && [g_queue respondsToSelector:@selector(addResidencySet:)]) {
+                [g_queue addResidencySet:g_model_residency_set];
+                g_model_residency_added_to_queue = 1;
+            }
+            /* The Metal 4 queue, which is the only one once it is selected. */
             ds4_gpu_queue_residency_added(g_model_residency_set);
-            g_model_residency_added_to_queue = 1;
         }
         g_model_residency_count = g_model_view_count;
     }
@@ -3547,13 +3602,20 @@ static int ds4_gpu_warm_model_views(void) {
     }
     out.label = @"ds4_model_warmup";
 
-    id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+    /* Through the owned-batch path, so it runs on whichever backend is
+     * selected: under Metal 4 an owned batch is a Metal 4 buffer. */
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
     if (!cb) {
         fprintf(stderr, "ds4: Metal model warmup command buffer allocation failed\n");
         return 0;
     }
 
     id<DS4Encoder> enc = ds4_gpu_compute_encoder(cb);
+    if (!enc) {
+        if (owned) (void)ds4_gpu_finish_command_buffer(cb, owned, "model warmup");
+        return 0;
+    }
     [enc setComputePipelineState:pipeline];
     uint64_t dst_offset = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
@@ -3569,19 +3631,17 @@ static int ds4_gpu_warm_model_views(void) {
     }
     ds4_gpu_end_compute_encoder(cb, enc);
 
-    DS4_M3_NOTE("warm_model_views", DS4_BK_COMMIT);
-    [cb commit];
-    DS4_M3_NOTE("warm_model_views", DS4_BK_WAIT);
-    [cb waitUntilCompleted];
-
-    if (cb.status == MTLCommandBufferStatusError) {
-        fprintf(stderr, "ds4: Metal model warmup failed: %s\n",
-                [[cb.error localizedDescription] UTF8String]);
+    if (!ds4_gpu_finish_command_buffer(cb, owned, "model warmup")) {
+        fprintf(stderr, "ds4: Metal model warmup failed\n");
         return 0;
     }
-
     return 1;
 }
+
+/* The warmup is reached only with full residency, which this engine's
+ * streaming configuration never takes; tests drive it directly. */
+int ds4_gpu_test_warm_model_views(void);
+int ds4_gpu_test_warm_model_views(void) { return ds4_gpu_warm_model_views(); }
 
 static const char *ds4_gpu_mul_mm_id_map0_name(uint32_t ne20) {
     switch (ne20) {
@@ -7522,6 +7582,7 @@ int ds4_gpu_init(void) {
         ds4_gpu_detect_metal4_features();
 
         g_queue = [g_device newCommandQueueWithMaxCommandBufferCount:256];
+        if (g_queue) g_bk_m3_queues++;
         ds4_gpu_ledger_note_queue(g_queue, "main");
         if (!g_queue) {
             fprintf(stderr, "ds4: failed to create Metal command queue\n");
@@ -9863,6 +9924,12 @@ int ds4_gpu_use_metal4(void) {
         return 0;
     }
     g_backend = 4;
+    /* Nothing is submitted to the Metal 3 queue from here on, so it is not
+     * kept: a path that still reached for it would find nothing there. */
+    g_queue = nil;
+    g_bk_selected_m4 = 1;
+    g_bk_m3_commands_at_selection = ds4_gpu_backend_m3_commands();
+    g_bk_m3_queues_at_selection = g_bk_m3_queues;
     fprintf(stderr, "ds4: Metal backend: Metal 4\n");
     return 1;
 }
@@ -11894,6 +11961,7 @@ int ds4_gpu_tp_init(uint32_t rank,
     if (getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
         uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
         g_tp_keepalive_queue = [g_device newCommandQueue];
+        if (g_tp_keepalive_queue) g_bk_m3_queues++;
         ds4_gpu_ledger_note_queue(g_tp_keepalive_queue, "keepalive");
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
                                                       options:MTLResourceStorageModeShared];
@@ -12478,7 +12546,8 @@ static void *ds4_gpu_pacer_thread(void *arg) {
     (void)arg;
     ds4_gpu_ledger_role("pacer");
     id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
-    id<MTLCommandQueue> queue = [g_device newCommandQueue];
+    id<MTLCommandQueue> queue = g_backend == 4 ? nil : [g_device newCommandQueue];
+    if (queue) g_bk_m3_queues++;
     /* Labelled so a trace can be split by it. Without this the pacer's own
      * short buffers sit in the same process as the decode ones and drag every
      * median that gets quoted about them; separating by duration does not
@@ -12490,11 +12559,36 @@ static void *ds4_gpu_pacer_thread(void *arg) {
     const double idle_ms = (double)ds4_gpu_env_u64("DS4_METAL_GPU_PACER_IDLE_MS", 20u, 1u, 10000u);
     id<MTLBuffer> scratch = [g_device newBufferWithLength:(NSUInteger)tgs * 256u * sizeof(float)
                                                   options:MTLResourceStorageModeShared];
-    if (!pipeline || !queue || !scratch) {
+    if (!pipeline || (!queue && g_backend != 4) || !scratch) {
         fprintf(stderr, "ds4: GPU pacer setup failed (continuing without)\n");
         return NULL;
     }
     memset(scratch.contents, 0, (size_t)tgs * 256u * sizeof(float));
+    if (g_backend == 4) {
+        /* The Metal 4 pacer: the same kernel on its own Metal 4 queue. */
+        int ran = 0;
+        if (@available(macOS 26.0, *)) {
+            id<MTLBuffer> iters_buf = [g_device newBufferWithBytes:&iters length:sizeof(iters)
+                                                           options:MTLResourceStorageModeShared];
+            void *pacer = ds4_mtl4_pacer_new(scratch, iters_buf);
+            if (pacer) {
+                ran = 1;
+                while (!g_pacer_stop) {
+                    if (ds4_gpu_now_ms() - g_pacer_last_activity_ms > idle_ms) {
+                        usleep(2000);
+                        continue;
+                    }
+                    @autoreleasepool {
+                        if (!ds4_mtl4_pacer_run(pacer, pipeline, scratch, iters_buf, tgs)) break;
+                        atomic_fetch_add(&g_bk_pacer_commits_m4, 1u);
+                    }
+                }
+                ds4_mtl4_pacer_free(pacer);
+            }
+        }
+        if (!ran) fprintf(stderr, "ds4: Metal 4 GPU pacer setup failed (continuing without)\n");
+        return NULL;
+    }
     while (!g_pacer_stop) {
         if (ds4_gpu_now_ms() - g_pacer_last_activity_ms > idle_ms) {
             usleep(2000);

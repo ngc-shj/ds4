@@ -938,73 +938,111 @@ static int ds4_mtl4_rotate(void) {
  * the unit of completion. */
 static uint64_t ds4_mtl4_last_stamp(void) { return g_mtl4_stamp; }
 
+/* ---- small submissions from other threads ------------------------------
+ *
+ * The queue keepalive and the GPU pacer each run one small kernel from their
+ * own thread, over and over. Each gets its own allocator, buffer, table,
+ * residency and event, so nothing it does touches the engine's pool or
+ * stamps; the allocator is reset only once the previous kernel has run. */
+API_AVAILABLE(macos(26.0))
+@interface DS4MTL4Side : NSObject
+@property (nonatomic, strong) id<MTL4CommandQueue> queue;
+@property (nonatomic, strong) id<MTL4CommandAllocator> allocator;
+@property (nonatomic, strong) id<MTL4CommandBuffer> cb;
+@property (nonatomic, strong) id<MTL4ArgumentTable> table;
+@property (nonatomic, strong) id<MTLResidencySet> res;
+@property (nonatomic, strong) id<MTLSharedEvent> event;
+@property (nonatomic) uint64_t sent;
+@end
+@implementation DS4MTL4Side
+@end
+
+API_AVAILABLE(macos(26.0))
+static DS4MTL4Side *ds4_mtl4_side_new(id<MTL4CommandQueue> queue, id<MTLBuffer> b0, id<MTLBuffer> b1,
+                                      NSString *label) {
+    if (!queue || !b0 || !b1) return nil;
+    DS4MTL4Side *s = [DS4MTL4Side new];
+    s.queue = queue;
+    s.allocator = [g_device newCommandAllocator];
+    s.cb = [g_device newCommandBuffer];
+    MTL4ArgumentTableDescriptor *d = [MTL4ArgumentTableDescriptor new];
+    d.maxBufferBindCount = 2;
+    d.initializeBindings = YES;
+    s.table = [g_device newArgumentTableWithDescriptor:d error:nil];
+    MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+    rd.label = label;
+    s.res = [g_device newResidencySetWithDescriptor:rd error:nil];
+    s.event = [g_device newSharedEvent];
+    if (!s.allocator || !s.cb || !s.table || !s.res || !s.event) return nil;
+    [s.res addAllocation:b0];
+    [s.res addAllocation:b1];
+    [s.res commit];
+    return s;
+}
+
+/* One dispatch of `groups` threadgroups; with `wait`, until it has run. */
+API_AVAILABLE(macos(26.0))
+static int ds4_mtl4_side_run(DS4MTL4Side *s, id<MTLComputePipelineState> pipeline,
+                             id<MTLBuffer> b0, id<MTLBuffer> b1, NSUInteger groups, int wait) {
+    if (!s || !pipeline) return 0;
+    if (s.sent && ![s.event waitUntilSignaledValue:s.sent timeoutMS:10000]) return 0;
+    [s.allocator reset];
+    [s.cb beginCommandBufferWithAllocator:s.allocator];
+    [s.cb useResidencySet:s.res];
+    id<MTL4ComputeCommandEncoder> e = [s.cb computeCommandEncoder];
+    [e setArgumentTable:s.table];
+    [e setComputePipelineState:pipeline];
+    [s.table setAddress:b0.gpuAddress atIndex:0];
+    [s.table setAddress:b1.gpuAddress atIndex:1];
+    [e dispatchThreadgroups:MTLSizeMake(groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+    [s.cb endCommandBuffer];
+    id<MTL4CommandBuffer> one = s.cb;
+    [s.queue commit:&one count:1];
+    s.sent++;
+    [s.queue signalEvent:s.event value:s.sent];
+    if (wait && ![s.event waitUntilSignaledValue:s.sent timeoutMS:10000]) return 0;
+    return 1;
+}
+
 /* ---- the queue keepalive ----------------------------------------------- */
 
 /* The keepalive exists because a queue left idle for about three seconds
  * loses the process's GPU mappings and the next buffer on it starts 600-800
  * ms late, and work on other queues does not prevent it. With this backend
  * selected the queue doing the work is this one, so the keepalive's kernel
- * goes here. It runs on its own thread, so it has its own allocator, buffer,
- * table and residency, and its own event: nothing it does touches the
- * engine's pool or stamps. Returns 0 if it could not submit. */
-int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
-                            id<MTLBuffer> args) API_AVAILABLE(macos(26.0));
-static id<MTL4CommandAllocator> g_mtl4_ka_alloc API_AVAILABLE(macos(26.0));
-static id<MTL4CommandBuffer> g_mtl4_ka_cb API_AVAILABLE(macos(26.0));
-static id<MTL4ArgumentTable> g_mtl4_ka_table API_AVAILABLE(macos(26.0));
-static id<MTLResidencySet> g_mtl4_ka_res;
-static id<MTLSharedEvent> g_mtl4_ka_event;
-static uint64_t g_mtl4_ka_sent;
+ * goes here. Returns 0 if it could not submit. */
+static DS4MTL4Side *g_mtl4_keepalive API_AVAILABLE(macos(26.0));
 
 int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
+                            id<MTLBuffer> args) API_AVAILABLE(macos(26.0));
+int ds4_mtl4_keepalive_once(id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
                             id<MTLBuffer> args) {
-#define alloc g_mtl4_ka_alloc
-#define cb g_mtl4_ka_cb
-#define table g_mtl4_ka_table
-#define res g_mtl4_ka_res
-#define ev g_mtl4_ka_event
-#define sent g_mtl4_ka_sent
-    id<MTL4CommandQueue> q = g_mtl4_queue;
-    if (!q || !pipeline || !scratch || !args) return 0;
-    if (!alloc) {
-        alloc = [g_device newCommandAllocator];
-        cb = [g_device newCommandBuffer];
-        MTL4ArgumentTableDescriptor *d = [MTL4ArgumentTableDescriptor new];
-        d.maxBufferBindCount = 2;
-        d.initializeBindings = YES;
-        table = [g_device newArgumentTableWithDescriptor:d error:nil];
-        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
-        rd.label = @"ds4_mtl4_keepalive";
-        res = [g_device newResidencySetWithDescriptor:rd error:nil];
-        ev = [g_device newSharedEvent];
-        if (!alloc || !cb || !table || !res || !ev) { alloc = nil; return 0; }
-        [res addAllocation:scratch];
-        [res addAllocation:args];
-        [res commit];
-    }
-    /* The allocator is reset only once the previous kernel has run. */
-    if (sent && ![ev waitUntilSignaledValue:sent timeoutMS:10000]) return 0;
-    [alloc reset];
-    [cb beginCommandBufferWithAllocator:alloc];
-    [cb useResidencySet:res];
-    id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
-    [e setArgumentTable:table];
-    [e setComputePipelineState:pipeline];
-    [table setAddress:scratch.gpuAddress atIndex:0];
-    [table setAddress:args.gpuAddress atIndex:1];
-    [e dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    [e endEncoding];
-    [cb endCommandBuffer];
-    id<MTL4CommandBuffer> one = cb;
-    [q commit:&one count:1];
-    [q signalEvent:ev value:++sent];
-    return 1;
-#undef alloc
-#undef cb
-#undef table
-#undef res
-#undef ev
-#undef sent
+    if (!g_mtl4_queue) return 0;
+    if (!g_mtl4_keepalive)
+        g_mtl4_keepalive = ds4_mtl4_side_new(g_mtl4_queue, scratch, args, @"ds4_mtl4_keepalive");
+    return ds4_mtl4_side_run(g_mtl4_keepalive, pipeline, scratch, args, 1, 0);
+}
+
+/* The GPU pacer on this backend: its own Metal 4 queue, as the Metal 3 pacer
+ * has its own queue, so its kernels sit beside the engine's rather than in
+ * its order. Created by the pacer thread and used only there. */
+void *ds4_mtl4_pacer_new(id<MTLBuffer> scratch, id<MTLBuffer> args) API_AVAILABLE(macos(26.0));
+void *ds4_mtl4_pacer_new(id<MTLBuffer> scratch, id<MTLBuffer> args) {
+    id<MTL4CommandQueue> q = [g_device newMTL4CommandQueue];
+    if (!q) return NULL;
+    DS4MTL4Side *s = ds4_mtl4_side_new(q, scratch, args, @"ds4_mtl4_pacer");
+    return s ? (__bridge_retained void *)s : NULL;
+}
+int ds4_mtl4_pacer_run(void *pacer, id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
+                       id<MTLBuffer> args, NSUInteger groups) API_AVAILABLE(macos(26.0));
+int ds4_mtl4_pacer_run(void *pacer, id<MTLComputePipelineState> pipeline, id<MTLBuffer> scratch,
+                       id<MTLBuffer> args, NSUInteger groups) {
+    return ds4_mtl4_side_run((__bridge DS4MTL4Side *)pacer, pipeline, scratch, args, groups, 1);
+}
+void ds4_mtl4_pacer_free(void *pacer) API_AVAILABLE(macos(26.0));
+void ds4_mtl4_pacer_free(void *pacer) {
+    if (pacer) { DS4MTL4Side *s = (__bridge_transfer DS4MTL4Side *)pacer; (void)s; }
 }
 
 /* ---- teardown ----------------------------------------------------------- */
@@ -1047,12 +1085,7 @@ static int ds4_mtl4_shutdown(void) {
         g_mtl4_table = nil;
         g_mtl4_queue = nil;
         g_mtl4_event = nil;
-        g_mtl4_ka_alloc = nil;
-        g_mtl4_ka_cb = nil;
-        g_mtl4_ka_table = nil;
-        g_mtl4_ka_res = nil;
-        g_mtl4_ka_event = nil;
-        g_mtl4_ka_sent = 0;
+        g_mtl4_keepalive = nil;
         memset(g_mtl4_mark_memo, 0, sizeof(g_mtl4_mark_memo));
         g_mtl4_encode_error = 0;
     }
