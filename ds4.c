@@ -142,6 +142,22 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 #include "ds4_gpu.h"
 #endif
 
+/* The Metal backend makes autoreleased objects - command buffers, encoders,
+ * descriptors, collections - that live until the enclosing autorelease pool
+ * drains. A caller with no pool (a plain C program, a worker thread) never
+ * drains one, so what an engine made while opening or closing stayed alive
+ * until the thread ended: tens of gigabytes after a close. Opening and
+ * closing drain their own pool; what the engine keeps, it holds strongly. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *pool);
+#define DS4_POOL_PUSH() objc_autoreleasePoolPush()
+#define DS4_POOL_POP(p) objc_autoreleasePoolPop(p)
+#else
+#define DS4_POOL_PUSH() NULL
+#define DS4_POOL_POP(p) ((void)(p))
+#endif
+
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
  * stubs for the multi-GPU plumbing multi-GPU functions and globals declared in
  * ds4_gpu_mgpu.h. These keep the linker happy on Mac/Metal and on CPU
@@ -50355,6 +50371,9 @@ typedef enum {
 struct ds4_engine {
     char *model_path;
     uint64_t ds41_session_bytes;
+    /* The streamed expert cache's size as planned for the sessions the engine
+     * was opened for; sessions beyond those are paid for out of it. */
+    uint32_t ds41_cache_experts_max;
     ds4_model model;
     ds4_model mtp_model;
     ds4_model vision_model;
@@ -71002,7 +71021,16 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
 }
 #endif
 
+static int ds4_session_save_payload_unpooled(ds4_session *s, FILE *fp, char *err, size_t errlen);
+
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_save_payload_unpooled(s, fp, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_save_payload_unpooled(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -71353,7 +71381,16 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 #endif
 }
 
+static int ds4_session_load_payload_unpooled(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
+
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_load_payload_unpooled(s, fp, payload_bytes, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_load_payload_unpooled(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -71982,7 +72019,16 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 #endif
 }
 
+static int ds4_session_save_snapshot_unpooled(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
+
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_save_snapshot_unpooled(s, snap, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_save_snapshot_unpooled(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");
         return 1;
@@ -72028,7 +72074,16 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
     return 0;
 }
 
+static int ds4_session_load_snapshot_unpooled(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
+
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_load_snapshot_unpooled(s, snap, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_load_snapshot_unpooled(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -72730,7 +72785,16 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 }
 #endif
 
+static int ds4_session_eval_argmax_unpooled(ds4_session *s, int token, char *err, size_t errlen);
+
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_eval_argmax_unpooled(s, token, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_eval_argmax_unpooled(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) || ds4_session_is_ds41(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
@@ -76641,6 +76705,35 @@ static void ds41_reclaim_headroom_for_prefill(void) {
     g_ds41_headroom_lent = 0;
 }
 
+static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
+
+/* Size a streamed engine's expert cache for the sessions it has, `session_bytes`
+ * of them: from the size planned at open, fitted down to what the memory budget
+ * leaves. A session added makes it smaller - the backend gives slabs back as
+ * the session's buffers need the room - and one freed lets it grow back, never
+ * past the size planned at open. False: the sessions do not fit even with no
+ * cache. */
+static bool ds41_fit_cache_to_sessions(ds4_engine *e, uint64_t session_bytes) {
+    if (!e->ssd_streaming || e->ds41_cache_experts_max == 0)
+        return ds41_memory_admit(e, session_bytes, false);
+    const uint32_t before = e->ssd_streaming_cache_experts;
+    e->ssd_streaming_cache_experts = e->ds41_cache_experts_max;
+    if (!ds41_memory_admit(e, session_bytes, true)) {
+        e->ssd_streaming_cache_experts = before;
+        return false;
+    }
+    if (e->ssd_streaming_cache_experts == before) return true;
+    uint64_t expert = 0;
+    if (ds4_streaming_routed_expert_bytes(&e->weights, &expert))
+        ds41_note_prefill_headroom(e->ssd_streaming_cache_experts,
+                                   e->ssd_streaming_prefill_headroom_bytes, expert);
+    ds4_gpu_move_streaming_expert_cache_budget(
+        g_ds41_headroom_lent ? g_ds41_decode_budget : g_ds41_admitted_budget);
+    fprintf(stderr, "ds4: expert cache sized for %.2f GiB of sessions: %u -> %u experts\n",
+            session_bytes / 1073741824.0, before, e->ssd_streaming_cache_experts);
+    return true;
+}
+
 static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
     g_glm_streaming_full_resident_start = 0;
     g_glm_streaming_full_resident_layers = 0;
@@ -78711,21 +78804,6 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
-/* The Metal backend makes autoreleased objects - command buffers, encoders,
- * descriptors, collections - that live until the enclosing autorelease pool
- * drains. A caller with no pool (a plain C program, a worker thread) never
- * drains one, so what an engine made while opening or closing stayed alive
- * until the thread ended: tens of gigabytes after a close. Opening and
- * closing drain their own pool; what the engine keeps, it holds strongly. */
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-void *objc_autoreleasePoolPush(void);
-void objc_autoreleasePoolPop(void *pool);
-#define DS4_POOL_PUSH() objc_autoreleasePoolPush()
-#define DS4_POOL_POP(p) objc_autoreleasePoolPop(p)
-#else
-#define DS4_POOL_PUSH() NULL
-#define DS4_POOL_POP(p) ((void)(p))
-#endif
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     void *pool = DS4_POOL_PUSH();
@@ -79599,6 +79677,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
              * allocation to the same budget while the engine runs, so what
              * the plan did not foresee - decode borrowing the prefill reserve,
              * the full address table - evicts rather than grows past it. */
+            e->ds41_cache_experts_max = e->ssd_streaming ? e->ssd_streaming_cache_experts : 0;
             if (e->ssd_streaming)
                 ds4_gpu_set_memory_budget(
                     ds41_memory_budget(e, ds41_host_memory_bytes(),
@@ -81191,10 +81270,11 @@ static int ds4_session_create_unpooled(ds4_session **out, ds4_engine *e, int ctx
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         if (ctx_size > 1048576 ||
-            !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
+            !ds41_fit_cache_to_sessions(e, ds4_add_sat_u64(e->ds41_session_bytes,
+                ds41_graph_bytes((uint32_t)ctx_size))) ||
             !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
                               e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
+            (void)ds41_fit_cache_to_sessions(e, e->ds41_session_bytes);
             free(s);
             return 1;
         }
@@ -81646,6 +81726,7 @@ void ds4_session_free(ds4_session *s) {
         if (s->ds41_graph_ready) {
             s->engine->ds41_session_bytes -= s->ds41_graph.allocation_bytes;
             ds41_graph_free(&s->ds41_graph);
+            (void)ds41_fit_cache_to_sessions(s->engine, s->engine->ds41_session_bytes);
         } else
 #endif
 #ifdef DS4_HAS_QWEN4_GPU
@@ -83536,7 +83617,28 @@ static int ds4_session_sync_unpooled(ds4_session *s, const ds4_tokens *prompt, c
     return rc;
 }
 
+static int ds4_session_sync_multimodal_unpooled(
+        ds4_session *s,
+        const ds4_tokens *prompt,
+        const ds4_vision_span *images,
+        size_t image_count,
+        char *err,
+        size_t errlen);
+
 int ds4_session_sync_multimodal(
+        ds4_session *s,
+        const ds4_tokens *prompt,
+        const ds4_vision_span *images,
+        size_t image_count,
+        char *err,
+        size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_sync_multimodal_unpooled(s, prompt, images, image_count, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_sync_multimodal_unpooled(
         ds4_session *s,
         const ds4_tokens *prompt,
         const ds4_vision_span *images,
@@ -86100,7 +86202,18 @@ static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
  * the one that has to be zero between verify and commit: a semantic write that
  * reaches the committed state before the commit is the bug this is looking for. */
 
+static int ds4_session_verify_block_unpooled(ds4_session *s, const int *candidates, int k,
+                             int *accepted, char *err, size_t errlen);
+
 int ds4_session_verify_block(ds4_session *s, const int *candidates, int k,
+                             int *accepted, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_verify_block_unpooled(s, candidates, k, accepted, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_verify_block_unpooled(ds4_session *s, const int *candidates, int k,
                              int *accepted, char *err, size_t errlen) {
     return ds4_session_verify_block_ex(s, candidates, k, k, accepted, err, errlen);
 }
@@ -87522,7 +87635,18 @@ static int ds41_speculative_argmax(ds4_session *s, int first_token, int max_toke
 }
 #endif
 
+static int ds4_session_verify_block_ex_unpooled(ds4_session *s, const int *candidates, int k,
+                                int max_commit, int *accepted, char *err, size_t errlen);
+
 int ds4_session_verify_block_ex(ds4_session *s, const int *candidates, int k,
+                                int max_commit, int *accepted, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_verify_block_ex_unpooled(s, candidates, k, max_commit, accepted, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_verify_block_ex_unpooled(ds4_session *s, const int *candidates, int k,
                                 int max_commit, int *accepted, char *err, size_t errlen) {
     if (!s || !candidates || !accepted || k < 2 || k > DS4_TP_BATCH_MAX_ROWS ||
         max_commit < 0 || max_commit > k) {
@@ -92985,7 +93109,20 @@ static bool qwen4_batch_spec_next(const ds4_engine *e) {
 }
 #endif
 
+static int ds4_sessions_eval_batch_speculative_argmax_unpooled(ds4_decode_item *items, int count,
+                                               int (*accepted)[2], int *n_accepted,
+                                               char *err, size_t errlen);
+
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
+                                               int (*accepted)[2], int *n_accepted,
+                                               char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_sessions_eval_batch_speculative_argmax_unpooled(items, count, accepted, n_accepted, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_sessions_eval_batch_speculative_argmax_unpooled(ds4_decode_item *items, int count,
                                                int (*accepted)[2], int *n_accepted,
                                                char *err, size_t errlen) {
     if (!items || count <= 0 || !accepted || !n_accepted) {
@@ -93173,7 +93310,18 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
     return 0;
 }
 
+static int ds4_sessions_eval_batch_unpooled(ds4_decode_item *items, int count,
+                            char *err, size_t errlen);
+
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
+                            char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_sessions_eval_batch_unpooled(items, count, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_sessions_eval_batch_unpooled(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
     if (!items || count <= 0) {
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
@@ -93247,7 +93395,28 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
     return 0;
 }
 
+static int ds4_sessions_eval_batch_with_prefill_unpooled(
+        ds4_decode_item *items,
+        int count,
+        ds4_session *prefill_session,
+        const ds4_tokens *prefill_prompt,
+        char *err,
+        size_t errlen);
+
 int ds4_sessions_eval_batch_with_prefill(
+        ds4_decode_item *items,
+        int count,
+        ds4_session *prefill_session,
+        const ds4_tokens *prefill_prompt,
+        char *err,
+        size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_sessions_eval_batch_with_prefill_unpooled(items, count, prefill_session, prefill_prompt, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_sessions_eval_batch_with_prefill_unpooled(
         ds4_decode_item *items,
         int count,
         ds4_session *prefill_session,
@@ -98092,7 +98261,22 @@ static int ds4_session_eval_speculative_argmax_impl(
 #endif
 }
 
+static int ds4_session_eval_speculative_argmax_unpooled(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen);
+
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_eval_speculative_argmax_unpooled(s, first_token, max_tokens, eos_token, accepted, accepted_cap, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_eval_speculative_argmax_unpooled(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
@@ -98101,7 +98285,22 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         accepted, accepted_cap, err, errlen);
 }
 
+static int ds4_session_eval_speculative_argmax_ignoring_eos_unpooled(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        ds4_think_mode think_mode,
+        int *accepted, int accepted_cap, char *err, size_t errlen);
+
 int ds4_session_eval_speculative_argmax_ignoring_eos(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        ds4_think_mode think_mode,
+        int *accepted, int accepted_cap, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_eval_speculative_argmax_ignoring_eos_unpooled(s, first_token, max_tokens, eos_token, think_mode, accepted, accepted_cap, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_eval_speculative_argmax_ignoring_eos_unpooled(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         ds4_think_mode think_mode,
         int *accepted, int accepted_cap, char *err, size_t errlen) {
@@ -98110,7 +98309,26 @@ int ds4_session_eval_speculative_argmax_ignoring_eos(
         accepted, accepted_cap, err, errlen);
 }
 
+static int ds4_session_eval_speculative_unpooled(ds4_session *s, int first_token,
+                                 int max_tokens, int eos_token,
+                                 float temperature, int top_k,
+                                 float top_p, float min_p, uint64_t *rng,
+                                 int *accepted, int accepted_cap,
+                                 char *err, size_t errlen);
+
 int ds4_session_eval_speculative(ds4_session *s, int first_token,
+                                 int max_tokens, int eos_token,
+                                 float temperature, int top_k,
+                                 float top_p, float min_p, uint64_t *rng,
+                                 int *accepted, int accepted_cap,
+                                 char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_eval_speculative_unpooled(s, first_token, max_tokens, eos_token, temperature, top_k, top_p, min_p, rng, accepted, accepted_cap, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_eval_speculative_unpooled(ds4_session *s, int first_token,
                                  int max_tokens, int eos_token,
                                  float temperature, int top_k,
                                  float top_p, float min_p, uint64_t *rng,
