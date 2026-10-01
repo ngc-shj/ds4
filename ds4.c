@@ -76544,6 +76544,9 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
 static uint32_t g_ds41_admitted_budget;
 static uint32_t g_ds41_decode_budget;
 static int g_ds41_headroom_lent;
+/* Set once the expert cache has been prewarmed. Per engine, not per process:
+ * closing an engine empties the cache, so the next one opened prewarms again. */
+static int g_ds41_prewarmed;
 
 static void ds41_note_prefill_headroom(uint32_t budget,
                                        uint64_t headroom_bytes,
@@ -76557,7 +76560,7 @@ static void ds41_note_prefill_headroom(uint32_t budget,
     g_ds41_decode_budget = budget + (uint32_t)extra;
 }
 
-/* Fill the expert cache from the built-in V4.1 hotlist once a process - at
+/* Fill the expert cache from the built-in V4.1 hotlist once an engine - at
  * model load, or failing that at the end of the first prefill - so the first
  * few hundred tokens do not read their experts from the device one miss at a
  * time. Off unless
@@ -76567,9 +76570,8 @@ static void ds41_note_prefill_headroom(uint32_t budget,
  * does not take the prewarmed set first. */
 #define DS4_METAL_PREWARM_BATCH 6u
 static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
-    static int done;
-    if (done) return;
-    done = 1;
+    if (g_ds41_prewarmed) return;
+    g_ds41_prewarmed = 1;
     const char *cap_s = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
     const uint32_t cap = cap_s && cap_s[0] ? (uint32_t)strtoul(cap_s, NULL, 10) : 0u;
     if (cap == 0 || DS4_N_LAYER > 64u) return;
@@ -78689,14 +78691,36 @@ static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cach
 }
 #endif
 
+/* The Metal backend makes autoreleased objects - command buffers, encoders,
+ * descriptors, collections - that live until the enclosing autorelease pool
+ * drains. A caller with no pool (a plain C program, a worker thread) never
+ * drains one, so what an engine made while opening or closing stayed alive
+ * until the thread ended: tens of gigabytes after a close. Opening and
+ * closing drain their own pool; what the engine keeps, it holds strongly. */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+void *objc_autoreleasePoolPush(void);
+void objc_autoreleasePoolPop(void *pool);
+#define DS4_POOL_PUSH() objc_autoreleasePoolPush()
+#define DS4_POOL_POP(p) objc_autoreleasePoolPop(p)
+#else
+#define DS4_POOL_PUSH() NULL
+#define DS4_POOL_POP(p) ((void)(p))
+#endif
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    return ds4_engine_open_internal(out, opt, NULL);
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_engine_open_internal(out, opt, NULL);
+    DS4_POOL_POP(pool);
+    return rc;
 }
 
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg) {
-    return ds4_engine_open_internal(out, opt, gpu_cfg);
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_engine_open_internal(out, opt, gpu_cfg);
+    DS4_POOL_POP(pool);
+    return rc;
 }
 
 static int ds4_engine_open_internal(ds4_engine **out,
@@ -80902,8 +80926,16 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
+static void ds4_engine_close_internal(ds4_engine *e);
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    void *pool = DS4_POOL_PUSH();
+    ds4_engine_close_internal(e);
+    DS4_POOL_POP(pool);
+}
+
+static void ds4_engine_close_internal(ds4_engine *e) {
     ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);
@@ -80927,6 +80959,10 @@ void ds4_engine_close(ds4_engine *e) {
     }
     ds4_gpu_cleanup();
 #endif
+    /* The expert cache these described is gone with the backend. */
+    g_ds41_prewarmed = 0;
+    g_ds41_headroom_lent = 0;
+    g_ds41_admitted_budget = g_ds41_decode_budget = 0;
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
@@ -81072,7 +81108,19 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+static int ds4_session_create_unpooled(ds4_session **out, ds4_engine *e, int ctx_size);
+
+/* A session's GPU buffers are held by the session; the references Metal
+ * hands back autoreleased are dropped here, so freeing the session frees
+ * them without waiting for a caller's pool. */
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_create_unpooled(out, e, ctx_size);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_create_unpooled(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
         if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
@@ -83359,7 +83407,19 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
+static int ds4_session_sync_unpooled(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+
+/* Prefill and decode are where command buffers, encoders and their transient
+ * buffers are made, each commit's autoreleased; they are drained here, at the
+ * public call, so a caller without a pool does not keep them. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_sync_unpooled(s, prompt, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
+}
+
+static int ds4_session_sync_unpooled(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -90489,7 +90549,10 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
         probe_mtp = false;
     }
 #endif
-    return ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    void *pool = DS4_POOL_PUSH();
+    const int rc = ds4_session_eval_probe_tp(s, token, probe_mtp, err, errlen);
+    DS4_POOL_POP(pool);
+    return rc;
 }
 
 #ifndef DS4_NO_GPU
