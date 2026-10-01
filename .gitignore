@@ -89,3 +89,4 @@ __pycache__/
 /tests/test_deepseek41_backend
 /tests/test_deepseek41_state
 /tests/test_deepseek41_fulltable
+/tests/test_deepseek41_lifecycle

@@ -23,6 +23,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <mach/mach.h>
 
 /* Weak, so the same source builds against the frozen Metal 3 tree, which has
  * none of these: there the ledger lines are skipped and the table runs as that
@@ -34,13 +36,28 @@ void ds4_gpu_full_addr_counts(unsigned long long out[8]) __attribute__((weak));
 void ds4_gpu_mtl4_health(unsigned long long out[8]) __attribute__((weak));
 void ds4_gpu_test_mtl4_parts(unsigned parts) __attribute__((weak));
 
+/* The Objective-C runtime's pool, from C: with a tenth argument each round
+ * runs inside one, which tells a leak through autorelease apart from one
+ * through a reference somebody still holds. */
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *pool);
+
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     const unsigned char *c = p;
     for (size_t i = 0; i < n; i++) { h ^= c[i]; h *= 1099511628211ull; }
     return h;
 }
 
+/* What the process holds in physical memory, which every build can report. */
+static double footprint_gib(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return -1.0;
+    return (double)info.phys_footprint / 1073741824.0;
+}
+
 static void ledger(const char *when) {
+    printf("%-8s footprint %.2f GiB\n", when, footprint_gib());
     if (!ds4_gpu_full_addr_counts || !ds4_gpu_mtl4_health || !ds4_gpu_test_working_set) return;
     unsigned long long f[8], h[8], ws = 0, al = 0;
     ds4_gpu_full_addr_counts(f);
@@ -144,7 +161,9 @@ int main(int argc, char **argv) {
         .placement_session_count_hint = 2, .power_percent = 100,
     };
     int ok = 1;
+    const int pooled = argc > 9 && atoi(argv[9]) != 0;
     for (int r = 0; r < (run ? rounds : 1); r++) {
+        void *pool = pooled ? objc_autoreleasePoolPush() : NULL;
         ds4_engine *engine = NULL;
         if (ds4_engine_open(&engine, &opt) != 0) return 2;
         ledger("opened");
@@ -159,7 +178,11 @@ int main(int argc, char **argv) {
                room > 0 ? (int)(room / layer_gib) : 0);
         if (run) ok &= one_round(engine, steps, r);
         ds4_engine_close(engine);
+        if (pool) objc_autoreleasePoolPop(pool);
         ledger("closed");
+        /* With a ninth argument, hold still after each close so the process
+         * can be inspected from outside (vmmap, footprint). */
+        if (argc > 8) { printf("paused   %d s after round %d\n", atoi(argv[8]), r); sleep((unsigned)atoi(argv[8])); }
     }
     return ok ? 0 : 1;
 }

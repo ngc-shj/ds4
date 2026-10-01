@@ -10030,6 +10030,47 @@ void ds4_gpu_test_working_set(unsigned long long *recommended, unsigned long lon
     if (allocated) *allocated = g_device ? (unsigned long long)g_device.currentAllocatedSize : 0;
 }
 
+/* What this process still holds of the GPU, read the same way before an
+ * engine opens and after it closes (tests/test_deepseek41_lifecycle.c). The
+ * device is asked through MTLCreateSystemDefaultDevice, which is the same
+ * device object whether or not an engine holds it:
+ *   [0] bytes the device has allocated for this process
+ *   [1] live tensor handles          [2] model views
+ *   [3] expert-cache slabs            [4] allocations in the expert cache's set
+ *   [5] allocations in the model's set
+ *   [6] residency sets the Metal 4 queue list still names
+ *   [7] Metal 4 contexts in the pool
+ *   [8] expert-cache entries live     [9] expert-cache slots in slabs
+ *   [10] of those, free               [11] bytes the cache counts as held
+ *   [12] bytes in the expert cache's set  [13] bytes in the model's set */
+void ds4_gpu_test_lifecycle(unsigned long long out[14]);
+void ds4_gpu_test_lifecycle(unsigned long long out[14]) {
+    @autoreleasepool {
+        id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+        out[0] = d ? (unsigned long long)d.currentAllocatedSize : 0;
+        out[1] = g_tensor_live_count;
+        out[2] = g_model_view_count;
+        out[3] = g_stream_expert_cache_slab_count;
+        out[4] = out[5] = out[12] = out[13] = 0;
+        if (@available(macOS 15.0, *)) {
+            if (g_stream_expert_residency_set) {
+                out[4] = ((id<MTLResidencySet>)g_stream_expert_residency_set).allocationCount;
+                out[12] = ((id<MTLResidencySet>)g_stream_expert_residency_set).allocatedSize;
+            }
+            if (g_model_residency_set) {
+                out[5] = ((id<MTLResidencySet>)g_model_residency_set).allocationCount;
+                out[13] = ((id<MTLResidencySet>)g_model_residency_set).allocatedSize;
+            }
+        }
+        out[6] = g_mtl4_queue_sets.count;
+        out[7] = g_mtl4_pool.count;
+        out[8] = g_stream_expert_cache_entry_count;
+        out[9] = g_stream_expert_cache_slab_total_slots;
+        out[10] = g_stream_expert_cache_free_slot_count;
+        out[11] = g_stream_expert_cache_bytes;
+    }
+}
+
 /* DeepSeek V4.1 runs on the Metal 4 backend, and only there. The engine asks
  * for it once the model is known and before any work is encoded; other models
  * keep the Metal 3 batch. Metal 4 that cannot be had is an error, not a quiet
@@ -18007,6 +18048,15 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_cache_slab_slots_used[i] = 0;
     }
     g_stream_expert_cache_slab_count = 0;
+    /* The residency set holds every slab it was given: emptied with them, or
+     * the slabs outlive the cache - an engine closed and opened again kept
+     * the last engine's tens of gigabytes mapped, on either backend. */
+    if (@available(macOS 15.0, *)) {
+        if (g_stream_expert_residency_set) {
+            [(id<MTLResidencySet>)g_stream_expert_residency_set removeAllAllocations];
+            [(id<MTLResidencySet>)g_stream_expert_residency_set commit];
+        }
+    }
     g_stream_expert_cache_slab_total_slots = 0;
     g_stream_expert_cache_free_slot_count = 0;
     g_stream_expert_cache_slab_slot_bytes = 0;

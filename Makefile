@@ -244,6 +244,12 @@ tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
 
+tests/test_deepseek41_lifecycle.o: tests/test_deepseek41_lifecycle.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_deepseek41_lifecycle: tests/test_deepseek41_lifecycle.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_deepseek41_fulltable.o: tests/test_deepseek41_fulltable.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
