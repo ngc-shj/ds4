@@ -76640,6 +76640,9 @@ static void ds41_note_prefill_headroom(uint32_t budget,
  * does not take the prewarmed set first. */
 #define DS4_METAL_PREWARM_BATCH 6u
 static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
+#ifndef DS4_HAS_DEEPSEEK41_GPU
+    (void)m; (void)w;
+#else
     if (g_ds41_prewarmed) return;
     g_ds41_prewarmed = 1;
     const char *cap_s = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
@@ -76694,11 +76697,14 @@ static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
             "(%u failed), %.2f GiB in %.2f s%s\n", loaded, failed,
             (double)bytes / (1024.0 * 1024.0 * 1024.0), now_sec() - t0,
             full ? "; stopped where the cache was full" : "");
+#endif
 }
 
 static void ds41_lend_headroom_to_decode(void) {
     if (g_ds41_headroom_lent || g_ds41_decode_budget <= g_ds41_admitted_budget) return;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
     ds4_gpu_move_streaming_expert_cache_budget(g_ds41_decode_budget);
+#endif
     g_ds41_headroom_lent = 1;
     fprintf(stderr, "ds4: expert cache lent the prefill headroom for decode: "
                     "%u -> %u experts\n",
@@ -76707,7 +76713,9 @@ static void ds41_lend_headroom_to_decode(void) {
 
 static void ds41_reclaim_headroom_for_prefill(void) {
     if (!g_ds41_headroom_lent) return;
+#ifdef DS4_HAS_DEEPSEEK41_GPU
     ds4_gpu_move_streaming_expert_cache_budget(g_ds41_admitted_budget);
+#endif
     g_ds41_headroom_lent = 0;
 }
 
@@ -76733,8 +76741,10 @@ static bool ds41_fit_cache_to_sessions(ds4_engine *e, uint64_t session_bytes) {
     if (ds4_streaming_routed_expert_bytes(&e->weights, &expert))
         ds41_note_prefill_headroom(e->ssd_streaming_cache_experts,
                                    e->ssd_streaming_prefill_headroom_bytes, expert);
+#ifdef DS4_HAS_DEEPSEEK41_GPU
     ds4_gpu_move_streaming_expert_cache_budget(
         g_ds41_headroom_lent ? g_ds41_decode_budget : g_ds41_admitted_budget);
+#endif
     fprintf(stderr, "ds4: expert cache sized for %.2f GiB of sessions: %u -> %u experts\n",
             session_bytes / 1073741824.0, before, e->ssd_streaming_cache_experts);
     return true;
@@ -85759,6 +85769,7 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 /* The selftests that run once, at the first decode of the first session: from the
  * single-step path, and from the verify executor now that production decode goes
  * through it and not through a single step. */
+#ifdef DS4_HAS_DEEPSEEK41_GPU
 static void ds41_selftests(ds4_session *s, int token) {
     static int selftest_done;
     ds4_engine *e = s->engine;
@@ -85777,6 +85788,7 @@ static void ds41_selftests(ds4_session *s, int token) {
     ds41_oracle_block_bench(s, &e->model, &e->weights);
     ds41_verify_selftest(&s->ds41_graph, &e->model, &e->weights, token);
 }
+#endif
 
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
@@ -86046,6 +86058,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
  * position whose pair came from before the block, and the committed carry is
  * already that value - which the transaction never overwrote, so keeping it is
  * a no-op rather than a restore. */
+#ifdef DS4_HAS_DEEPSEEK41_GPU
 static bool ds41_block_carry_commit(ds41_gpu_graph *g, uint32_t accepted) {
     if (!g->block_carry_owners) return true;
     if (accepted > g->block_carry_rows) { g_ds41_txn_refuse++; return false; }
@@ -86160,6 +86173,7 @@ static bool ds41_block_kv_commit(ds41_gpu_graph *g, uint32_t accepted) {
     g->block_kv_delta_rows = 0;
     return true;
 }
+#endif
 
 /* One K-row verification step for a single session, in production.
  *
@@ -86377,6 +86391,7 @@ typedef struct {
 
 /* Every offset aligned, inside its arena, and no two live regions overlapping.
  * Checked when the layout is built, so a descriptor cannot carry a bad offset. */
+#ifdef DS4_HAS_DEEPSEEK41_GPU
 static bool ds41_arena_layout_valid(const ds41_arena_layout *l, uint32_t layers) {
     if (!l || !layers) return false;
     const uint64_t control[5] = { l->node_desc_off, l->cursor_off, l->miss_queue_off,
@@ -86403,6 +86418,7 @@ static bool ds41_arena_layout_valid(const ds41_arena_layout *l, uint32_t layers)
     /* The two transaction regions must not share a byte. */
     return kv_end <= l->carry_delta_off || carry_end <= l->kv_delta_off;
 }
+#endif
 
 /* One block in flight, owning its arenas. There is no current slot: every entry
  * point takes the slot and its generation, so a descriptor built for an earlier
@@ -86656,6 +86672,7 @@ static uint32_t ds41_slot_miss_mask(const ds41_block_slot *slot) {
  * positions[0] + i, so a branching DAG is refused before its first dispatch
  * rather than computed as if the siblings were a sequence. That refusal is the
  * honest state of the layer computation, and the test below asks for it. */
+#ifdef DS4_HAS_DEEPSEEK41_GPU
 static int ds41_verify_block_dag(ds4_session *s, const ds41_candidate_dag *dag,
                                  ds41_block_slot *slot, char *err, size_t errlen) {
     if (!s || !dag || !slot || !dag->node_count ||
@@ -86711,6 +86728,7 @@ static int ds41_verify_block_dag(ds4_session *s, const ds41_candidate_dag *dag,
                                                : DS41_NODE_REJECTED;
     return n;
 }
+#endif
 
 #if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
 /* ============================================================================
@@ -87974,6 +87992,7 @@ static int ds4_session_verify_block_ex_unpooled(ds4_session *s, const int *candi
 #endif
 }
 
+#ifdef DS4_HAS_DEEPSEEK41_GPU
 /* Does a block that commits A leave the session exactly where A single steps
  * would? DS4_V41_BLOCK_TXN_TEST=1.
  *
@@ -90715,6 +90734,7 @@ static void ds41_oracle_block_bench(ds4_session *s, const ds4_model *m,
 done:
     free(oracle); free(acc); free(lg); free(carry);
 }
+#endif
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     bool probe_mtp = true;

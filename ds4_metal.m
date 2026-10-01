@@ -17826,8 +17826,13 @@ static int ds4_gpu_encode_moe_block_residency(
     ds4_enc_buf_n(enc, gate_addrs, 0, (gate_addrs).length, 2);
     ds4_enc_buf_n(enc, up_addrs, 0, (up_addrs).length, 3);
     ds4_enc_buf_n(enc, down_addrs, 0, (down_addrs).length, 4);
-    ds4_enc_buf(enc, out, 0, 5);
-    ds4_enc_buf(enc, gated ? g_gate_grid : out, 0, 6);
+    ds4_enc_buf_n(enc, out, 0, out.length, 5);
+    /* The kernel zeroes only grid slots [gate_from, gate_to), but the grid is
+     * declared whole: the host writes slots into it directly as it encodes, and
+     * those writes are no node of the graph. Declared as the slots alone, the
+     * gated executor's tokens changed from run to run, so something ordered by
+     * this write is still unaccounted for. */
+    ds4_enc_buf_n(enc, gated ? g_gate_grid : out, 0, (gated ? g_gate_grid : out).length, 6);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     if (gated) {
         ds4_gpu_gate_arm();
@@ -31624,10 +31629,15 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         ds4_enc_bytes(enc, dargs, sizeof(dargs), 0);
         ds4_enc_buf(enc, raw, raw_offset, 1);
         ds4_enc_buf(enc, dag->delta ? ds4_gpu_tensor_buffer(dag->delta) : raw, dag->delta ? ds4_gpu_tensor_offset(dag->delta) : raw_offset, 2);
-        ds4_enc_buf(enc, dag->path ? ds4_gpu_tensor_buffer(dag->path) : raw, (dag->path ? ds4_gpu_tensor_offset(dag->path) : raw_offset) +
-                       (NSUInteger)dag->path_offset * sizeof(uint32_t), 3);
+        /* The path to the end of its tensor, not the node's path_length
+         * entries the kernel indexes: bound to those alone the executor's
+         * tokens changed, which is not yet explained. The keys are written as
+         * vcount + n_comp rows of 128 half4. */
+        ds4_enc_buf_n(enc, dag->path ? ds4_gpu_tensor_buffer(dag->path) : raw, (dag->path ? ds4_gpu_tensor_offset(dag->path) : raw_offset) +
+                       (NSUInteger)dag->path_offset * sizeof(uint32_t),
+                      dag->path ? (NSUInteger)(ds4_gpu_tensor_bytes(dag->path) - (uint64_t)dag->path_offset * sizeof(uint32_t)) : sizeof(uint32_t), 3);
         ds4_enc_buf(enc, comp ? comp : raw, comp ? comp_offset : raw_offset, 4);
-        ds4_enc_buf(enc, dst, dst_offset, 5);
+        ds4_enc_buf_n(enc, dst, dst_offset, (NSUInteger)(vcount + n_comp) * 128u * 4u * sizeof(uint16_t), 5);
         const uint32_t vecs = (vcount + n_comp) * 128u;
         const NSUInteger nth = 256;
         ds4_gpu_dispatch(enc, MTLSizeMake((vecs + nth - 1u) / nth, 1, 1),
