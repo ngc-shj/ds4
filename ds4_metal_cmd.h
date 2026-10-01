@@ -67,6 +67,10 @@ typedef struct DS4Enc {
     __unsafe_unretained id use[256];
     MTLResourceUsage use_usage[256];
     uint32_t n_use;
+    /* More ranges a binding reaches, beyond its own [off, off + len): the
+     * rows an indirect access gathers. Cleared with the dispatch. */
+    struct { uint32_t slot; uint64_t lo, hi; } extra[64];
+    uint32_t n_extra;
 } DS4Enc;
 #else
 @interface DS4Enc : NSObject {
@@ -94,6 +98,10 @@ typedef struct DS4Enc {
     __unsafe_unretained id use[256];
     MTLResourceUsage use_usage[256];
     uint32_t n_use;
+    /* More ranges a binding reaches, beyond its own [off, off + len): the
+     * rows an indirect access gathers. Cleared with the dispatch. */
+    struct { uint32_t slot; uint64_t lo, hi; } extra[64];
+    uint32_t n_extra;
 }
 @end
 @implementation DS4Enc
@@ -138,6 +146,31 @@ static inline void ds4_enc_buf_at(DS4Enc *e, id<MTLBuffer> buffer, NSUInteger of
 }
 #define ds4_enc_buf(e, b, o, i) ds4_enc_buf_at((e), (b), (o), 0, (i), __LINE__)
 #define ds4_enc_buf_n(e, b, o, n, i) ds4_enc_buf_at((e), (b), (o), (n), (i), __LINE__)
+/* Bound at `offset`, but what the dispatch touches is [lo, lo + n) of the
+ * buffer: a table the kernel indexes by absolute slot, of which this dispatch
+ * writes a run. */
+static inline void ds4_enc_buf_span_at(DS4Enc *e, id<MTLBuffer> buffer, NSUInteger offset,
+                                       NSUInteger lo, NSUInteger n, NSUInteger index,
+                                       uint32_t line) {
+    if (e->m3) { ds4_enc_buf_at(e, buffer, offset, n, index, line); return; }
+    ds4_m4_buf(e, buffer, offset, n, index, line);
+    if (buffer && index < DS4_ENC_SLOTS) e->off[index] = lo;
+}
+#define ds4_enc_buf_span(e, b, o, lo, n, i) ds4_enc_buf_span_at((e), (b), (o), (lo), (n), (i), __LINE__)
+/* A further range [lo, hi) of the buffer bound at `index`, read or written as
+ * that binding is. Aborts past the table rather than drop a dependency. */
+static inline void ds4_enc_buf_more(DS4Enc *e, NSUInteger index, uint64_t lo, uint64_t hi) {
+    if (e->m3 || hi <= lo) return;
+    if (e->n_extra == sizeof(e->extra) / sizeof(e->extra[0])) {
+        fprintf(stderr, "ds4: Metal 4 more than %zu extra ranges for one dispatch\n",
+                sizeof(e->extra) / sizeof(e->extra[0]));
+        abort();
+    }
+    e->extra[e->n_extra].slot = (uint32_t)index;
+    e->extra[e->n_extra].lo = lo;
+    e->extra[e->n_extra].hi = hi;
+    e->n_extra++;
+}
 
 static inline void ds4_enc_bytes(DS4Enc *e, const void *bytes, NSUInteger length, NSUInteger index) {
     if (g_enc_trace_fp)

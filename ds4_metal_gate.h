@@ -69,7 +69,22 @@ void ds4_gpu_gate_print_sites(unsigned long long tokens);
 void ds4_gpu_gate_census_settle(uint32_t aborted_layer);  /* after the buffer completes */
 
 static int        g_gate_layers;
-static id<MTLBuffer> g_gate_grid;
+/* The grid is two buffers on Metal 4. The host writes each gated dispatch's
+ * threadgroup count into the seed as it encodes; the device works on the live
+ * copy - the aborts zero it, the indirect dispatches read it. A context's own
+ * slots are copied seed to live by a node at its head, recorded in its graph
+ * like any other, so no host write ever lands on a slot the device may still
+ * be zeroing or reading: an abort that zeroes ahead into a segment encoded
+ * behind it is undone by that segment's copy and then re-applied by its
+ * reassert. On Metal 3 there is no graph to put the copy in and seed is live. */
+static id<MTLBuffer> g_gate_grid;          /* live */
+static id<MTLBuffer> g_gate_seed;
+static int  ds4_mtl4_gate_split(void);                 /* in ds4_metal_mtl4.h */
+static void ds4_mtl4_gate_slot_taken(uint32_t slot);   /* in ds4_metal_mtl4.h */
+static void ds4_mtl4_gate_ring_ready(uint32_t slot);   /* in ds4_metal_mtl4.h */
+static id<MTLBuffer> ds4_gate_host_grid(void) {
+    return ds4_mtl4_gate_split() ? g_gate_seed : g_gate_grid;
+}
 static id<MTLBuffer> g_gate_miss;
 static id<MTLBuffer> g_gate_route;     /* {valid, layer, ids[6]} a layer */
 static _Atomic uint32_t g_gate_next_slot;
@@ -325,7 +340,10 @@ static int ds4_gate_take_slot(MTLSize tg, NSUInteger *offset) {
         atomic_fetch_add_explicit(&g_gate_ungatable, 1u, memory_order_relaxed);
         return 0;
     }
-    uint32_t *grid = (uint32_t *)[g_gate_grid contents];
+    /* Before the host writes a seed slot a context committed earlier copies
+     * from, that context has to have run its copy. */
+    ds4_mtl4_gate_slot_taken(i);
+    uint32_t *grid = (uint32_t *)[ds4_gate_host_grid() contents];
     grid[3u * i + 0u] = (uint32_t)tg.width;
     grid[3u * i + 1u] = (uint32_t)tg.height;
     grid[3u * i + 2u] = (uint32_t)tg.depth;
@@ -341,7 +359,8 @@ uint32_t ds4_gpu_gate_disable_from(uint32_t slot) {
     uint32_t end = atomic_load_explicit(&g_gate_next_slot, memory_order_relaxed);
     if (end > DS4_GATE_MAX_SLOTS) end = DS4_GATE_MAX_SLOTS;
     if (!g_gate_grid || slot >= end) return 0;
-    uint32_t *grid = (uint32_t *)[g_gate_grid contents];
+    /* Encoded but not sent: these slots' copy has not been recorded yet. */
+    uint32_t *grid = (uint32_t *)[ds4_gate_host_grid() contents];
     memset(grid + 3u * slot, 0, (size_t)(end - slot) * 3u * sizeof(uint32_t));
     return end - slot;
 }
@@ -426,14 +445,17 @@ void ds4_gpu_gate_probe(id<MTLDevice> device) {
     if (n > (long)DS4_GATE_MAX_LAYER) n = DS4_GATE_MAX_LAYER;
     g_gate_grid = [device newBufferWithLength:DS4_GATE_MAX_SLOTS * 3u * sizeof(uint32_t)
                                       options:MTLResourceStorageModeShared];
+    g_gate_seed = [device newBufferWithLength:DS4_GATE_MAX_SLOTS * 3u * sizeof(uint32_t)
+                                      options:MTLResourceStorageModeShared];
     g_gate_miss = [device newBufferWithLength:DS4_GATE_MISS_SLOTS * DS4_GATE_MISS_WORDS *
                                              sizeof(uint32_t)
                                       options:MTLResourceStorageModeShared];
     g_gate_route = [device newBufferWithLength:DS4_GATE_MAX_LAYER * 8u * sizeof(uint32_t)
                                        options:MTLResourceStorageModeShared];
-    if (!g_gate_grid || !g_gate_miss || !g_gate_route) {
-        g_gate_grid = nil; g_gate_miss = nil; g_gate_route = nil; return;
+    if (!g_gate_grid || !g_gate_seed || !g_gate_miss || !g_gate_route) {
+        g_gate_grid = nil; g_gate_seed = nil; g_gate_miss = nil; g_gate_route = nil; return;
     }
+    g_gate_seed.label = @"ds4_gate_seed";
     g_gate_route.label = @"ds4_gate_route_log";
     g_gate_grid.label = @"ds4_gate_grid";
     g_gate_miss.label = @"ds4_gate_miss";
@@ -486,6 +508,9 @@ uint32_t ds4_gpu_gate_segment_begin(void) {
     /* This segment's own miss word only: the previous segment may still be
      * running and writing its own. */
     const uint32_t slot = g_gate_seg_seq++ % DS4_GATE_MISS_SLOTS;
+    /* The host clears this miss word now and writes this range word at the
+     * segment's end: the segment that last owned them must have completed. */
+    ds4_mtl4_gate_ring_ready(slot);
     g_gate_encode_slot = slot;
     g_gate_seg_slot_base[slot] = atomic_load_explicit(&g_gate_next_slot,
                                                       memory_order_relaxed);

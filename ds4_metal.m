@@ -17031,6 +17031,9 @@ int ds4_gpu_gate_ensure(void) {
     if (!g_gate_grid)
         g_gate_grid = [g_device newBufferWithLength:DS4_GATE_MAX_SLOTS * 3u * sizeof(uint32_t)
                                             options:MTLResourceStorageModeShared];
+    if (!g_gate_seed)
+        g_gate_seed = [g_device newBufferWithLength:DS4_GATE_MAX_SLOTS * 3u * sizeof(uint32_t)
+                                            options:MTLResourceStorageModeShared];
     if (!g_gate_miss)
         g_gate_miss = [g_device newBufferWithLength:DS4_GATE_MISS_SLOTS * DS4_GATE_MISS_WORDS *
                                                    sizeof(uint32_t)
@@ -17038,9 +17041,20 @@ int ds4_gpu_gate_ensure(void) {
     if (!g_gate_route)
         g_gate_route = [g_device newBufferWithLength:DS4_GATE_MAX_LAYER * 8u * sizeof(uint32_t)
                                              options:MTLResourceStorageModeShared];
-    if (!g_gate_grid || !g_gate_miss || !g_gate_route) return 0;
+    if (!g_gate_grid || !g_gate_seed || !g_gate_miss || !g_gate_route) return 0;
     if (!g_gate_layers) g_gate_layers = (int)DS4_GATE_MAX_LAYER;
     return 1;
+}
+
+/* The live grid bound whole - the kernels index it by absolute slot - but
+ * declared as the slots [from, to) the dispatch zeroes. */
+static void ds4_gate_bind_live(DS4Enc *enc, uint32_t from, uint32_t to, NSUInteger index) {
+    const NSUInteger slot = 3u * sizeof(uint32_t);
+    if (from >= DS4_GATE_MAX_SLOTS) from = DS4_GATE_MAX_SLOTS - 1u;
+    if (to > DS4_GATE_MAX_SLOTS) to = DS4_GATE_MAX_SLOTS;
+    if (to <= from) to = from + 1u;
+    ds4_enc_buf_span(enc, g_gate_grid, 0, (NSUInteger)from * slot, (NSUInteger)(to - from) * slot,
+                     index);
 }
 
 int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
@@ -17087,7 +17101,7 @@ int ds4_gpu_gate_encode_validate(const void *selected_tensor, uint32_t layer,
     ds4_enc_buf(enc, table_gate, 0, 1);
     ds4_enc_buf(enc, table_up, 0, 2);
     ds4_enc_buf(enc, table_down, 0, 3);
-    ds4_enc_buf_n(enc, g_gate_grid, 0, (g_gate_grid).length, 4);
+    ds4_gate_bind_live(enc, gate_from, n_slots, 4);
     /* The segment being encoded owns one miss word of the ring; the one before
      * it may still be running and writing its own. */
     ds4_enc_buf_n(enc, g_gate_miss, (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t), DS4_GATE_MISS_WORDS * sizeof(uint32_t), 5);
@@ -17134,9 +17148,13 @@ int ds4_gpu_gate_encode_reassert(uint32_t prev_slot) {
     if (!enc) return 0;
     ds4_enc_pso(enc, g_gate_reassert_pso);
     ds4_enc_buf_n(enc, g_gate_miss, (NSUInteger)(prev_slot % DS4_GATE_MISS_SLOTS) * DS4_GATE_MISS_WORDS * sizeof(uint32_t), DS4_GATE_MISS_WORDS * sizeof(uint32_t), 0);
-    ds4_enc_buf_n(enc, g_gate_grid, 0, (g_gate_grid).length, 1);
+    /* It zeroes this segment's own slots, which are known once it is
+     * committed: the context bounds the range then. */
+    ds4_gate_bind_live(enc, g_gate_seg_slot_base[ds4_gpu_gate_encode_slot() % DS4_GATE_MISS_SLOTS],
+                       DS4_GATE_MAX_SLOTS, 1);
     ds4_enc_buf_n(enc, g_gate_range, (NSUInteger)(ds4_gpu_gate_encode_slot() % DS4_GATE_MISS_SLOTS) * 2u * sizeof(uint32_t), 2u * sizeof(uint32_t), 2);
     ds4_enc_dispatch_raw(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
+    if (@available(macOS 26.0, *)) ds4_mtl4_gate_mark_reassert();
     ds4_enc_barrier_scope(enc, MTLBarrierScopeBuffers);
     ds4_gpu_end_compute_encoder(g_batch_cmd, enc);
     return 1;
@@ -17827,12 +17845,10 @@ static int ds4_gpu_encode_moe_block_residency(
     ds4_enc_buf_n(enc, up_addrs, 0, (up_addrs).length, 3);
     ds4_enc_buf_n(enc, down_addrs, 0, (down_addrs).length, 4);
     ds4_enc_buf_n(enc, out, 0, out.length, 5);
-    /* The kernel zeroes only grid slots [gate_from, gate_to), but the grid is
-     * declared whole: the host writes slots into it directly as it encodes, and
-     * those writes are no node of the graph. Declared as the slots alone, the
-     * gated executor's tokens changed from run to run, so something ordered by
-     * this write is still unaccounted for. */
-    ds4_enc_buf_n(enc, gated ? g_gate_grid : out, 0, (gated ? g_gate_grid : out).length, 6);
+    /* Gated, it zeroes slots [gate_from, gate_to) of the live grid; ungated it
+     * writes none, and the slot only needs a buffer bound. */
+    if (gated) ds4_gate_bind_live(enc, gate_from, gate_to, 6);
+    else ds4_enc_buf_n(enc, out, 0, sizeof(uint32_t), 6);
     ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(256, 1, 1));
     if (gated) {
         ds4_gpu_gate_arm();
@@ -31627,16 +31643,66 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         (void)ds4_gpu_concurrent_section_barrier();
         ds4_enc_pso(enc, pipeline);
         ds4_enc_bytes(enc, dargs, sizeof(dargs), 0);
-        ds4_enc_buf(enc, raw, raw_offset, 1);
-        ds4_enc_buf(enc, dag->delta ? ds4_gpu_tensor_buffer(dag->delta) : raw, dag->delta ? ds4_gpu_tensor_offset(dag->delta) : raw_offset, 2);
-        /* The path to the end of its tensor, not the node's path_length
-         * entries the kernel indexes: bound to those alone the executor's
-         * tokens changed, which is not yet explained. The keys are written as
-         * vcount + n_comp rows of 128 half4. */
-        ds4_enc_buf_n(enc, dag->path ? ds4_gpu_tensor_buffer(dag->path) : raw, (dag->path ? ds4_gpu_tensor_offset(dag->path) : raw_offset) +
-                       (NSUInteger)dag->path_offset * sizeof(uint32_t),
-                      dag->path ? (NSUInteger)(ds4_gpu_tensor_bytes(dag->path) - (uint64_t)dag->path_offset * sizeof(uint32_t)) : sizeof(uint32_t), 3);
-        ds4_enc_buf(enc, comp ? comp : raw, comp ? comp_offset : raw_offset, 4);
+        /* What the kernel reaches, as ranges, not as the buffers: absolute key
+         * a of the window [vstart, vstart + vcount) comes from ring slot
+         * a % ring_cap while a < committed_rows, and otherwise from the delta
+         * row path[a - committed_rows] names - so the ring is at most two runs
+         * of slots, the path a run of entries, and the delta the set of rows
+         * the path holds, read here from the path the host wrote before
+         * encoding. */
+        const uint64_t ring_row = 128u * 4u * sizeof(float);
+        const uint32_t ring_hi = dag->committed_rows < vstart + vcount ?
+            dag->committed_rows : vstart + vcount;
+        const uint32_t ring_n = ring_hi > vstart ? ring_hi - vstart : 0u;
+        if (ring_n == 0) {
+            ds4_enc_buf_span(enc, raw, raw_offset, raw_offset, sizeof(uint32_t), 1);
+        } else {
+            const uint32_t first = vstart % dag->ring_cap;
+            const uint32_t run1 = ring_n < dag->ring_cap - first ? ring_n : dag->ring_cap - first;
+            ds4_enc_buf_span(enc, raw, raw_offset, raw_offset + (NSUInteger)(first * ring_row),
+                             (NSUInteger)(run1 * ring_row), 1);
+            if (ring_n > run1)
+                ds4_enc_buf_more(enc, 1, raw_offset,
+                                 raw_offset + (uint64_t)(ring_n - run1) * ring_row);
+        }
+        const uint32_t path_from = vstart > dag->committed_rows ? vstart - dag->committed_rows : 0u;
+        const uint32_t path_n = dag->path_length > path_from ? dag->path_length - path_from : 0u;
+        id<MTLBuffer> pathbuf = dag->path ? ds4_gpu_tensor_buffer(dag->path) : raw;
+        const NSUInteger path_base = (dag->path ? ds4_gpu_tensor_offset(dag->path) : raw_offset) +
+                                     (NSUInteger)dag->path_offset * sizeof(uint32_t);
+        id<MTLBuffer> deltabuf = dag->delta ? ds4_gpu_tensor_buffer(dag->delta) : raw;
+        const NSUInteger delta_base = dag->delta ? ds4_gpu_tensor_offset(dag->delta) : raw_offset;
+        const uint64_t delta_row = (uint64_t)dag->delta_row_floats * sizeof(float);
+        if (path_n == 0 || !dag->path || !dag->delta) {
+            ds4_enc_buf_span(enc, deltabuf, delta_base, delta_base, sizeof(uint32_t), 2);
+            ds4_enc_buf_span(enc, pathbuf, path_base, path_base, sizeof(uint32_t), 3);
+        } else {
+            const uint32_t *path = (const uint32_t *)((const uint8_t *)ds4_gpu_buffer_contents(pathbuf) +
+                                                      path_base) + path_from;
+            /* Runs of consecutive rows, the first one the binding's own. */
+            uint32_t run_lo = path[0], run_hi = path[0] + 1u;
+            int first_run = 1;
+            for (uint32_t k = 1; k <= path_n; k++) {
+                if (k < path_n && path[k] == run_hi) { run_hi++; continue; }
+                if (k < path_n && path[k] + 1u == run_lo) { run_lo--; continue; }
+                const uint64_t lo = delta_base + (uint64_t)run_lo * delta_row;
+                const uint64_t hi = delta_base + (uint64_t)run_hi * delta_row;
+                if (first_run) {
+                    ds4_enc_buf_span(enc, deltabuf, delta_base, (NSUInteger)lo, (NSUInteger)(hi - lo), 2);
+                    first_run = 0;
+                } else {
+                    ds4_enc_buf_more(enc, 2, lo, hi);
+                }
+                if (k < path_n) { run_lo = path[k]; run_hi = path[k] + 1u; }
+            }
+            ds4_enc_buf_span(enc, pathbuf, path_base, path_base + (NSUInteger)path_from * sizeof(uint32_t),
+                             (NSUInteger)path_n * sizeof(uint32_t), 3);
+        }
+        const uint64_t comp_row = 128u * 4u * (comp_is_f16 ? sizeof(uint16_t) : sizeof(float));
+        if (comp && n_comp)
+            ds4_enc_buf_n(enc, comp, comp_offset, (NSUInteger)(n_comp * comp_row), 4);
+        else
+            ds4_enc_buf_span(enc, raw, raw_offset, raw_offset, sizeof(uint32_t), 4);
         ds4_enc_buf_n(enc, dst, dst_offset, (NSUInteger)(vcount + n_comp) * 128u * 4u * sizeof(uint16_t), 5);
         const uint32_t vecs = (vcount + n_comp) * 128u;
         const NSUInteger nth = 256;
@@ -39035,7 +39101,8 @@ int ds4_gpu_router_project_select_tensor(
         ds4_enc_buf_n(enc, validate ? table_gate : stub, 0, (validate ? table_gate : stub).length, 8);
         ds4_enc_buf_n(enc, validate ? table_up : stub, 0, (validate ? table_up : stub).length, 9);
         ds4_enc_buf_n(enc, validate ? table_down : stub, 0, (validate ? table_down : stub).length, 10);
-        ds4_enc_buf_n(enc, validate ? g_gate_grid : stub, 0, (validate ? g_gate_grid : stub).length, 11);
+        if (validate) ds4_gate_bind_live(enc, gate_from, n_slots, 11);
+        else ds4_enc_buf_n(enc, stub, 0, stub.length, 11);
         ds4_enc_buf_n(enc, validate ? g_gate_miss : stub, validate ? (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t) : 0, validate ? DS4_GATE_MISS_WORDS * sizeof(uint32_t) : stub.length, 12);
         ds4_enc_buf_n(enc, validate ? g_gate_route : stub, 0, (validate ? g_gate_route : stub).length, 13);
         ds4_enc_buf_n(enc, g_route_sched_completion, 0, (g_route_sched_completion).length, 14);
@@ -39349,7 +39416,7 @@ static int ds4_gpu_encode_router_select(
         ds4_enc_buf(enc, table_gate, 0, 6);
         ds4_enc_buf(enc, table_up, 0, 7);
         ds4_enc_buf(enc, table_down, 0, 8);
-        ds4_enc_buf_n(enc, g_gate_grid, 0, (g_gate_grid).length, 9);
+        ds4_gate_bind_live(enc, gate_from, n_slots, 9);
         ds4_enc_buf_n(enc, g_gate_miss, (NSUInteger)ds4_gpu_gate_encode_slot() * DS4_GATE_MISS_WORDS * sizeof(uint32_t), DS4_GATE_MISS_WORDS * sizeof(uint32_t), 10);
         ds4_enc_buf_n(enc, g_gate_route, 0, (g_gate_route).length, 11);
         ds4_gpu_dispatch(enc, MTLSizeMake(1, 1, 1), MTLSizeMake(512, 1, 1));

@@ -269,6 +269,12 @@ API_AVAILABLE(macos(26.0))
     uint64_t tl_seq;
     /* The decode ledger's record of this submission (DS4_METAL_LEDGER). */
     ds4_ledger_m4 ledger;
+    /* The gate slots taken while this context was recorded, [gate_lo,
+     * gate_hi): what its head copies seed to live. gate_hi 0: none. And the
+     * range of its reassert, if it has one, which is bounded to the same
+     * slots once they are known (range index + 1, 0 for none). */
+    uint32_t gate_lo, gate_hi;
+    uint32_t reassert_range;
 }
 /* The engine's handle for this context, and its recorder. */
 @property (nonatomic, strong) DS4Cmd *cmd;
@@ -419,6 +425,8 @@ enum {
     DS4_M4S_WAIT_NS,            /* host time blocked in them */
     DS4_M4S_COARSE,             /* bindings recorded with no stated length */
     DS4_M4S_FENCES,             /* writes to queue-resident buffers, fenced */
+    DS4_M4S_GATE_COPIES,        /* seed-to-live copies at a context's head */
+    DS4_M4S_GATE_REUSE_WAITS,   /* seed slots that had to wait for their last copy */
     DS4_M4S_KINDS
 };
 static unsigned long long g_m4s[DS4_M4S_KINDS];
@@ -683,7 +691,13 @@ static void ds4_m4_dispatch(DS4Enc *e, int kind, MTLSize a, MTLSize b,
             }
             if (rd & (1u << i)) ds4_m4_add_range(c, buf, e->off[i], hi, 0);
             if (wr & (1u << i)) ds4_m4_add_range(c, buf, e->off[i], hi, 1);
+            for (uint32_t x = 0; x < e->n_extra; x++) {
+                if (e->extra[x].slot != i) continue;
+                if (rd & (1u << i)) ds4_m4_add_range(c, buf, e->extra[x].lo, e->extra[x].hi, 0);
+                if (wr & (1u << i)) ds4_m4_add_range(c, buf, e->extra[x].lo, e->extra[x].hi, 1);
+            }
         }
+        e->n_extra = 0;
         for (uint32_t u = 0; u < e->n_use; u++) {
             id<MTLBuffer> ub = (id<MTLBuffer>)e->use[u];
             if (ds4_m4_readonly(ub)) continue;
@@ -716,6 +730,7 @@ static void ds4_m4_end(DS4Enc *e) {
     e->bound = e->constant = 0;
     e->tgmem_set = 0;
     e->n_use = 0;
+    e->n_extra = 0;
     e->pso = nil;
     g_m4s[DS4_M4S_SECTIONS]++;
 }
@@ -1194,6 +1209,8 @@ static DS4M4Ctx *ds4_mtl4_take(void) {
 API_AVAILABLE(macos(26.0))
 static void ds4_m4_ctx_clear(DS4M4Ctx *c) {
     c->scratch_used = 0;
+    c->gate_lo = c->gate_hi = 0;
+    c->reassert_range = 0;
     c->stamp = 0;
     c->used = NO;
     c->n_nodes = c->n_addrs = c->n_ranges = 0;
@@ -1205,6 +1222,7 @@ static void ds4_m4_ctx_clear(DS4M4Ctx *c) {
     e->bound = e->constant = 0;
     e->tgmem_set = 0;
     e->n_use = 0;
+    e->n_extra = 0;
     e->pso = nil;
 }
 
@@ -1232,6 +1250,102 @@ static int ds4_mtl4_begin(void) {
 /* Encode the open context's graph and send it, without waiting. */
 static int ds4_mtl4_commit_unpooled(void);
 
+/* ---- the gate's seed and live grid (see ds4_metal_gate.h) ---------------- */
+
+#define DS4_GATE_CHUNK 256u
+/* The stamp of the last context whose head copied from each chunk of seed
+ * slots: a slot is not written again until that context has completed. */
+static uint64_t g_gate_chunk_stamp[DS4_GATE_MAX_SLOTS / DS4_GATE_CHUNK];
+/* The same for the miss and range rings: the stamp of the last context of the
+ * segment that owned each ring entry. */
+static uint64_t g_gate_ring_stamp[DS4_GATE_MISS_SLOTS];
+
+static void ds4_mtl4_gate_ring_ready(uint32_t slot) {
+    if (g_backend != 4) return;
+    const uint64_t last = g_gate_ring_stamp[slot % DS4_GATE_MISS_SLOTS];
+    if (last > g_mtl4_done) {
+        if (@available(macOS 26.0, *)) (void)ds4_mtl4_wait_to(last);
+        g_m4s[DS4_M4S_GATE_REUSE_WAITS]++;
+    }
+}
+
+static int ds4_mtl4_gate_split(void) {
+    return g_backend == 4 && g_gate_seed != nil && g_gate_grid != nil;
+}
+
+static void ds4_mtl4_gate_slot_taken(uint32_t slot) {
+    if (!ds4_mtl4_gate_split() || slot >= DS4_GATE_MAX_SLOTS) return;
+    const uint64_t last = g_gate_chunk_stamp[slot / DS4_GATE_CHUNK];
+    if (last > g_mtl4_done) {
+        if (@available(macOS 26.0, *)) (void)ds4_mtl4_wait_to(last);
+        g_m4s[DS4_M4S_GATE_REUSE_WAITS]++;
+    }
+    DS4M4Ctx *c = g_mtl4_cur;
+    if (!c) return;
+    if (c->gate_hi == 0) { c->gate_lo = slot; c->gate_hi = slot + 1u; return; }
+    if (slot < c->gate_lo) c->gate_lo = slot;
+    if (slot + 1u > c->gate_hi) c->gate_hi = slot + 1u;
+}
+
+/* At commit, before the barriers are placed: the copy of this context's seed
+ * slots to live, as its first node, and its reassert bounded to them. */
+API_AVAILABLE(macos(26.0))
+static void ds4_m4_gate_prologue(DS4M4Ctx *c) {
+    if (!ds4_mtl4_gate_split()) return;
+    const uint64_t slot_bytes = 3u * sizeof(uint32_t);
+    if (c->reassert_range) {
+        ds4_m4_range *r = &c->ranges[c->reassert_range - 1u];
+        const uint64_t lo = r->lo;
+        const uint64_t hi = c->gate_hi ? (uint64_t)c->gate_hi * slot_bytes : lo;
+        r->hi = hi > lo ? hi : lo;
+    }
+    if (c->gate_hi <= c->gate_lo) return;
+    const uint8_t fence_next = c->fence_next;
+    c->fence_next = 0;
+    const NSUInteger off = (NSUInteger)c->gate_lo * slot_bytes;
+    const NSUInteger len = (NSUInteger)(c->gate_hi - c->gate_lo) * slot_bytes;
+    if (!ds4_mtl4_copy(g_gate_seed, off, g_gate_grid, off, len)) {
+        c->fence_next = fence_next;
+        return;
+    }
+    c->fence_next = fence_next;
+    /* Recorded last, run first: moved to the head of the graph. */
+    ds4_m4_node copy = c->nodes[c->n_nodes - 1u];
+    copy.fence = 0;
+    memmove(&c->nodes[1], &c->nodes[0], (size_t)(c->n_nodes - 1u) * sizeof(ds4_m4_node));
+    c->nodes[0] = copy;
+    if (g_timeline_enabled && c->tl) {
+        ds4_timeline_rec rec = c->tl[c->n_nodes - 1u];
+        memmove(&c->tl[1], &c->tl[0], (size_t)(c->n_nodes - 1u) * sizeof(ds4_timeline_rec));
+        c->tl[0] = rec;
+    }
+    g_m4s[DS4_M4S_GATE_COPIES]++;
+}
+
+/* The reassert just recorded: its write to the live grid is bounded to this
+ * context's slots at commit. */
+API_AVAILABLE(macos(26.0))
+static void ds4_mtl4_gate_mark_reassert(void) {
+    DS4M4Ctx *c = g_mtl4_cur;
+    if (!c || !c->n_nodes) return;
+    const ds4_m4_node *n = &c->nodes[c->n_nodes - 1u];
+    for (uint32_t k = 0; k < n->n_range; k++) {
+        const ds4_m4_range *r = &c->ranges[n->range_at + k];
+        if (r->write && r->buf == (__bridge const void *)g_gate_grid) {
+            c->reassert_range = n->range_at + k + 1u;
+            return;
+        }
+    }
+}
+
+static void ds4_m4_gate_epilogue(DS4M4Ctx *c) {
+    if (g_gate_layers && (c->gate_hi > c->gate_lo || c->reassert_range))
+        g_gate_ring_stamp[g_gate_encode_slot % DS4_GATE_MISS_SLOTS] = c->stamp;
+    if (!ds4_mtl4_gate_split() || c->gate_hi <= c->gate_lo) return;
+    for (uint32_t k = c->gate_lo / DS4_GATE_CHUNK; k <= (c->gate_hi - 1u) / DS4_GATE_CHUNK; k++)
+        g_gate_chunk_stamp[k] = c->stamp;
+}
+
 /* Encoding a context's graph and committing it is where the driver hands back
  * autoreleased objects - a compute context a commit, and a reference to every
  * buffer it reaches. Drained here, a commit at a time: a public call that
@@ -1248,6 +1362,7 @@ static int ds4_mtl4_commit_unpooled(void) {
     if (@available(macOS 26.0, *)) {
         DS4M4Ctx *c = g_mtl4_cur;
         if (!c) return 0;
+        ds4_m4_gate_prologue(c);
         g_m4s[DS4_M4S_BAR_GRAPH] += ds4_m4_place_barriers(c);
         /* The constant scratch is reached only through the table, so it is
          * declared here; the set is complete once the graph is. */
@@ -1311,6 +1426,7 @@ static int ds4_mtl4_commit_unpooled(void) {
         DS4_M4_NOTE("segment", DS4_BK_COMMIT);
         [g_mtl4_queue commit:list count:parts options:opts];
         c->stamp = ++g_mtl4_stamp;
+        ds4_m4_gate_epilogue(c);
         g_mtl4_commits++;
         g_m4s[DS4_M4S_CONTEXTS]++;
         g_m4s[DS4_M4S_BUFFERS] += parts;
