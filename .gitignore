@@ -88,3 +88,4 @@ __pycache__/
 /tests/test_q8_prefill_variants
 /tests/test_deepseek41_backend
 /tests/test_deepseek41_state
+/tests/test_deepseek41_fulltable

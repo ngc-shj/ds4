@@ -1479,23 +1479,30 @@ void ds4_mtl4_pacer_free(void *pacer) {
 /* Every expert buffer the table names copied once into a scratch buffer, so
  * its pages are wired before decode rather than during it. Its own command
  * buffer, committed behind whatever is in flight and ahead of the context
- * being recorded, and waited for. The copies all land in one scratch buffer;
- * what they leave there is never read. */
+ * being recorded, and waited for. The experts are resident through the
+ * table's set on the queue; this submission's own set holds only the scratch.
+ * The copies all land in one scratch buffer; what they leave there is never
+ * read. */
 static int ds4_mtl4_prewire(NSArray<id<MTLBuffer>> *buffers, id<MTLBuffer> scratch) {
     if (@available(macOS 26.0, *)) {
         if (!g_mtl4_queue || !scratch) return 0;
+        static id<MTLResidencySet> scratch_set;
+        static __weak id<MTLBuffer> scratch_held;
+        if (!scratch_set || scratch_held != scratch) {
+            MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
+            rd.label = @"ds4_mtl4_prewire_scratch";
+            scratch_set = [g_device newResidencySetWithDescriptor:rd error:nil];
+            if (!scratch_set) return 0;
+            [scratch_set addAllocation:scratch];
+            [scratch_set commit];
+            scratch_held = scratch;
+        }
         id<MTL4CommandAllocator> alloc = [g_device newCommandAllocator];
         id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
         id<MTLSharedEvent> done = [g_device newSharedEvent];
-        MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
-        rd.label = @"ds4_mtl4_prewire";
-        id<MTLResidencySet> res = [g_device newResidencySetWithDescriptor:rd error:nil];
-        if (!alloc || !cb || !done || !res) return 0;
-        [res addAllocation:scratch];
-        for (id<MTLBuffer> b in buffers) [res addAllocation:b];
-        [res commit];
+        if (!alloc || !cb || !done) return 0;
         [cb beginCommandBufferWithAllocator:alloc];
-        [cb useResidencySet:res];
+        [cb useResidencySet:scratch_set];
         id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
         for (id<MTLBuffer> b in buffers) {
             if ([b length] == 0) continue;
