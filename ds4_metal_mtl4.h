@@ -538,6 +538,11 @@ static void ds4_m4_use(DS4Enc *e, id<MTLResource> resource, MTLResourceUsage usa
     if (@available(macOS 26.0, *)) ds4_mtl4_mark_resident(e->m4, resource);
     /* Only buffers carry a range. The engine declares no textures. */
     if (![resource conformsToProtocol:@protocol(MTLBuffer)]) return;
+    /* Cached experts share slabs: one entry a buffer, the usages merged. */
+    for (uint32_t u = 0; u < e->n_use; u++) {
+        if (e->use[u] == resource) { e->use_usage[u] |= usage; return; }
+    }
+    /* Dropping one would drop a dependency the graph must order on. */
     if (e->n_use == sizeof(e->use) / sizeof(e->use[0])) {
         fprintf(stderr, "ds4: Metal 4 more than %zu resources declared for one dispatch\n",
                 sizeof(e->use) / sizeof(e->use[0]));
@@ -930,6 +935,29 @@ static void ds4_mtl4_fb_note(DS4M4Ctx *c, uint64_t stamp, NSError *error,
     atomic_fetch_add(&g_mtl4_fb_received, 1u);
 }
 
+/* A buffer about to be freed - a cache slab handed back to the memory budget -
+ * out of every context's residency. Only with no batch open and everything
+ * committed complete: then no context is recording or in flight, the current
+ * one included, which release_completed leaves alone. Each context's memo is
+ * invalidated, since another buffer may be allocated at the same address. */
+/* Whether a context holds recorded work not yet committed. */
+static int ds4_mtl4_recording(void) { return g_mtl4_cur && g_mtl4_cur->used; }
+
+static void ds4_mtl4_forget_resource(id<MTLResource> r) API_AVAILABLE(macos(26.0));
+static void ds4_mtl4_forget_resource(id<MTLResource> r) {
+    if (!r) return;
+    for (DS4M4Ctx *c in g_mtl4_pool) {
+        if (![c->resident containsObject:r]) continue;
+        [c->resident removeObject:r];
+        [c->resset removeAllocation:r];
+        [c->resset commit];
+        const uint64_t bytes = [r allocatedSize];
+        c->res_bytes = c->res_bytes > bytes ? c->res_bytes - bytes : 0;
+        g_mtl4_res_releases++;
+        if (++c->gen == 0) ++c->gen;
+    }
+}
+
 /* A completed context lets go of what it held: emptied and committed now, not
  * when the context is next reused, so a freed session is not held resident by
  * a context that happens to sit idle in the pool. */
@@ -1202,7 +1230,21 @@ static int ds4_mtl4_begin(void) {
 }
 
 /* Encode the open context's graph and send it, without waiting. */
+static int ds4_mtl4_commit_unpooled(void);
+
+/* Encoding a context's graph and committing it is where the driver hands back
+ * autoreleased objects - a compute context a commit, and a reference to every
+ * buffer it reaches. Drained here, a commit at a time: a public call that
+ * commits hundreds of times would otherwise hold every buffer it touched,
+ * cache slabs included, until it returned, and a slab handed back to the
+ * memory budget in between would free nothing. */
 static int ds4_mtl4_commit(void) {
+    @autoreleasepool {
+        return ds4_mtl4_commit_unpooled();
+    }
+}
+
+static int ds4_mtl4_commit_unpooled(void) {
     if (@available(macOS 26.0, *)) {
         DS4M4Ctx *c = g_mtl4_cur;
         if (!c) return 0;

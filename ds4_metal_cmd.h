@@ -62,9 +62,10 @@ typedef struct DS4Enc {
     uint32_t line[DS4_ENC_SLOTS];          /* the call site, for the census */
     uint32_t tgmem[4];
     uint8_t tgmem_set;
-    /* Resources declared with useResource since the last dispatch. */
-    __unsafe_unretained id use[64];
-    MTLResourceUsage use_usage[64];
+    /* Resources declared with useResource since the last dispatch, each
+     * once. A K-row block reads K rows' experts: up to 8 x 6 x 3 buffers. */
+    __unsafe_unretained id use[256];
+    MTLResourceUsage use_usage[256];
     uint32_t n_use;
 } DS4Enc;
 #else
@@ -88,9 +89,10 @@ typedef struct DS4Enc {
     uint32_t line[DS4_ENC_SLOTS];          /* the call site, for the census */
     uint32_t tgmem[4];
     uint8_t tgmem_set;
-    /* Resources declared with useResource since the last dispatch. */
-    __unsafe_unretained id use[64];
-    MTLResourceUsage use_usage[64];
+    /* Resources declared with useResource since the last dispatch, each
+     * once. A K-row block reads K rows' experts: up to 8 x 6 x 3 buffers. */
+    __unsafe_unretained id use[256];
+    MTLResourceUsage use_usage[256];
     uint32_t n_use;
 }
 @end

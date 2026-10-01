@@ -45265,7 +45265,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                              const ds4_weights *w, int token, float *logits) {
     const double t0 = now_sec();
     g_ds41_dag_graph = g;
+    /* A step's command buffers, encoders and the references they take are
+     * autoreleased; a caller that steps many times in one call - speculation,
+     * the executor's checks - would otherwise keep every buffer it touched,
+     * cache slabs the memory budget hands back included, until it returns. */
+    void *pool = DS4_POOL_PUSH();
     const bool r = ds41_graph_step_inner(g, m, w, token, logits);
+    DS4_POOL_POP(pool);
     g_ds41_dag_graph = NULL;
     if (g) g->engram_split = false;
     /* Nothing owed may outlive the step it was made in. */
@@ -87236,9 +87242,24 @@ static bool ds41_exec_repair_split(ds41_exec *x, uint32_t layer, const int32_t *
 /* The executor. Returns the committed depth, fills accepted[] with the committed
  * tokens (the pending token first), leaves the session's logits at the last
  * committed node's and the session one past it. */
+static int ds41_mtl4_verify_executor_unpooled(ds4_session *s, const ds41_candidate_dag *dag,
+                                              int *accepted, int accepted_cap,
+                                              char *err, size_t errlen);
+
+/* One block verified is one step of the executor, and drains its own pool for
+ * the reason ds41_graph_step does. */
 static int ds41_mtl4_verify_executor(ds4_session *s, const ds41_candidate_dag *dag,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
+    void *pool = DS4_POOL_PUSH();
+    const int got = ds41_mtl4_verify_executor_unpooled(s, dag, accepted, accepted_cap, err, errlen);
+    DS4_POOL_POP(pool);
+    return got;
+}
+
+static int ds41_mtl4_verify_executor_unpooled(ds4_session *s, const ds41_candidate_dag *dag,
+                                              int *accepted, int accepted_cap,
+                                              char *err, size_t errlen) {
     ds4_engine *e = s->engine;
     ds41_gpu_graph *g = &s->ds41_graph;
     if (!ds4_session_is_ds41(s) || !s->ds41_graph_ready || !s->checkpoint_valid ||
