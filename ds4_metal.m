@@ -10028,6 +10028,18 @@ int ds4_gpu_use_metal4(void) {
         fprintf(stderr, "ds4: the Metal 4 backend is unavailable\n");
         return 0;
     }
+    /* Quarantined: the Metal 4 form of the full expert address table brought
+     * the machine down (a kernel panic in the GPU driver, three times, with
+     * the table enabled on the native batch). Until its residency is
+     * rebuilt and proven bounded, asking for it stops the engine here rather
+     * than running it or quietly running without it. */
+    if (getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
+        getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL) {
+        fprintf(stderr, "ds4: the full expert address table is quarantined under Metal 4 "
+                        "pending its residency fix; unset "
+                        "DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE\n");
+        return 0;
+    }
     if (g_queue) {
         fprintf(stderr, "ds4: Metal 4 was selected after a Metal 3 queue was made\n");
         return 0;
@@ -37712,7 +37724,9 @@ static int ds4_gpu_encode_mul_mm_id_map(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, map_pipeline);
     ds4_enc_bytes(enc, map_args, sizeof(*map_args), 0);
-    ds4_enc_buf(enc, ids, ids_off, 1);
+    ds4_enc_buf_n(enc, ids, ids_off,
+                  (NSUInteger)((uint64_t)(map_args->ne21 - 1) * map_args->nb21 +
+                               (uint64_t)map_args->ne20 * sizeof(int32_t)), 1);
     ds4_enc_buf_n(enc, g_moe_id_map_buffer, 0, idmap_ids_at, 2);
     ds4_enc_buf_n(enc, g_moe_id_map_buffer, tpe_bytes, idmap_work_at - tpe_bytes, 3);
     ds4_enc_buf_n(enc, g_moe_id_map_buffer, work_offset, idmap_total - work_offset, 4);
