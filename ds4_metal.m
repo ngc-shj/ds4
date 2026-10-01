@@ -1481,6 +1481,13 @@ static uint32_t g_stream_expert_cache_free_slots[DS4_METAL_STREAM_EXPERT_CACHE_M
 static uint32_t g_stream_expert_cache_free_slot_count;
 static uint8_t g_stream_expert_cache_slab_slot_locked[DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES];
 static uint32_t g_stream_expert_cache_mlock_budget_cap;
+/* The engine's memory budget: what the device may have allocated, the expert
+ * cache and the full address table included, with the prefill reserve - the
+ * expert layers prefill maps and makes resident - held back on top. Zero: no
+ * budget. The cache grows only into it; past it, an insert evicts. */
+static uint64_t g_memory_budget_bytes;
+static uint64_t g_memory_budget_reserve_bytes;
+static unsigned long long g_memory_budget_refusals;
 static uint8_t g_stream_expert_cache_mlock_relief_applied;
 static uint64_t g_stream_expert_cache_mlock_bytes;
 static uint64_t g_stream_expert_cache_mlock_fail_bytes;
@@ -5368,6 +5375,30 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
 
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     g_glm_streaming_prefill_full_layer_runtime = enabled ? 1 : 0;
+}
+
+void ds4_gpu_set_memory_budget(uint64_t bytes, uint64_t reserve) {
+    g_memory_budget_bytes = bytes;
+    g_memory_budget_reserve_bytes = reserve;
+}
+
+/* Bytes the device may still allocate under the budget. */
+static uint64_t ds4_gpu_memory_budget_room(void) {
+    if (g_memory_budget_bytes == 0 || !g_device) return UINT64_MAX;
+    const uint64_t used = (uint64_t)g_device.currentAllocatedSize;
+    const uint64_t held = used > UINT64_MAX - g_memory_budget_reserve_bytes ?
+        UINT64_MAX : used + g_memory_budget_reserve_bytes;
+    return g_memory_budget_bytes > held ? g_memory_budget_bytes - held : 0;
+}
+
+static void ds4_gpu_memory_budget_refused(const char *what, uint64_t need) {
+    if (g_memory_budget_refusals++ != 0) return;
+    fprintf(stderr, "ds4: memory budget reached: %s of %.2f GiB refused with %.2f GiB "
+            "allocated and a %.2f GiB prefill reserve, of a %.2f GiB budget; "
+            "the expert cache now evicts to make room\n", what, need / 1073741824.0,
+            g_device ? (double)g_device.currentAllocatedSize / 1073741824.0 : 0.0,
+            g_memory_budget_reserve_bytes / 1073741824.0,
+            g_memory_budget_bytes / 1073741824.0);
 }
 
 /* Move the budget without discarding what the cache already holds.
@@ -13577,7 +13608,9 @@ void ds4_gpu_cleanup(void) {
             if (!ds4_mtl4_shutdown())
                 fprintf(stderr, "ds4: Metal 4 work failed while shutting down\n");
         }
-        /* The next engine chooses its own backend. */
+        /* The next engine chooses its own backend, and sets its own budget. */
+        g_memory_budget_bytes = g_memory_budget_reserve_bytes = 0;
+        g_memory_budget_refusals = 0;
         g_backend = 3;
         g_library = nil;
         g_queue = nil;
@@ -14759,6 +14792,31 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void) {
         budget = g_stream_expert_cache_mlock_budget_cap;
     }
     return budget;
+}
+
+/* Whether n more experts fit without evicting any: under the cache's
+ * configured budget, and in free slots or in slab room the memory budget
+ * allows. A prewarm stops where this says no rather than evict what it
+ * loaded itself. */
+int ds4_gpu_stream_expert_cache_has_room(uint32_t n) {
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    if (budget != 0 && g_stream_expert_cache_entry_count + n > budget) return 0;
+    uint32_t free_slots = g_stream_expert_cache_free_slot_count;
+    if (g_stream_expert_cache_slab_count != 0) {
+        const uint32_t last = g_stream_expert_cache_slab_count - 1;
+        free_slots += g_stream_expert_cache_slab_slot_count[last] -
+                      g_stream_expert_cache_slab_slots_used[last];
+    }
+    if (free_slots >= n) return 1;
+    uint64_t slot_bytes = g_stream_expert_cache_slab_slot_bytes;
+    if (slot_bytes == 0) {
+        const uint64_t page = (uint64_t)getpagesize();
+        slot_bytes = page ? round_up_u64(g_stream_expert_cache_expert_bytes, page) :
+                            g_stream_expert_cache_expert_bytes;
+    }
+    if (slot_bytes == 0) return 1;
+    const uint64_t room = ds4_gpu_memory_budget_room();
+    return room / slot_bytes >= (uint64_t)(n - free_slots);
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_effective_cap(
@@ -15972,6 +16030,15 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
             if (slots > remaining) slots = remaining;
         }
         if (slots == 0) return 0;
+        const uint64_t room = ds4_gpu_memory_budget_room();
+        if ((uint64_t)slots * slot_bytes > room) {
+            const uint64_t asked = (uint64_t)slots * slot_bytes;
+            slots = (uint32_t)(room / slot_bytes);
+            if (slots == 0) {
+                ds4_gpu_memory_budget_refused("a cache slab", asked);
+                return 0;
+            }
+        }
         id<MTLBuffer> slab_buffer = nil;
         while (slots != 0) {
             if ((uint64_t)slots <= UINT64_MAX / slot_bytes &&
@@ -17134,15 +17201,29 @@ static int ds4_gpu_stream_full_expert_addr_admit(uint32_t layer, uint32_t n_tota
     const uint64_t need = (uint64_t)n_total_expert * (2u * gate_expert_bytes + down_expert_bytes);
     const uint64_t limit = (uint64_t)g_device.recommendedMaxWorkingSetSize;
     const uint64_t used = (uint64_t)g_device.currentAllocatedSize;
-    if (limit > DS4_FULL_ADDR_MARGIN && used + need <= limit - DS4_FULL_ADDR_MARGIN) return 1;
+    /* Under the engine's memory budget the table is admitted from the same
+     * room the expert cache grows into, not stacked on top of it. */
+    if (g_memory_budget_bytes != 0) {
+        if (need <= ds4_gpu_memory_budget_room()) return 1;
+    } else if (limit > DS4_FULL_ADDR_MARGIN && used + need <= limit - DS4_FULL_ADDR_MARGIN) {
+        return 1;
+    }
     g_full_layers_refused++;
     if (!g_full_layer_refusal_said[layer]) {
         g_full_layer_refusal_said[layer] = 1;
-        fprintf(stderr, "ds4: full expert address table: layer %u not admitted - it needs "
-                "%.2f GiB, the device has %.2f GiB allocated of a %.2f GiB working set "
-                "with %.0f GiB kept free; the layer runs the per-expert path\n",
-                layer, need / 1073741824.0, used / 1073741824.0, limit / 1073741824.0,
-                DS4_FULL_ADDR_MARGIN / 1073741824.0);
+        if (g_memory_budget_bytes != 0)
+            fprintf(stderr, "ds4: full expert address table: layer %u not admitted - it needs "
+                    "%.2f GiB, the device has %.2f GiB allocated and a %.2f GiB prefill "
+                    "reserve of a %.2f GiB memory budget; the layer runs the per-expert path\n",
+                    layer, need / 1073741824.0, used / 1073741824.0,
+                    g_memory_budget_reserve_bytes / 1073741824.0,
+                    g_memory_budget_bytes / 1073741824.0);
+        else
+            fprintf(stderr, "ds4: full expert address table: layer %u not admitted - it needs "
+                    "%.2f GiB, the device has %.2f GiB allocated of a %.2f GiB working set "
+                    "with %.0f GiB kept free; the layer runs the per-expert path\n",
+                    layer, need / 1073741824.0, used / 1073741824.0, limit / 1073741824.0,
+                    DS4_FULL_ADDR_MARGIN / 1073741824.0);
     }
     return 0;
 }
@@ -18639,11 +18720,12 @@ static int ds4_gpu_stream_expert_cache_take_capped_reusable(
         NSUInteger    *gate_inner,
         NSUInteger    *up_inner,
         NSUInteger    *down_inner) {
-    if (g_stream_expert_cache_mlock_budget_cap == 0) return 0;
+    if (g_stream_expert_cache_mlock_budget_cap == 0 && g_memory_budget_bytes == 0) return 0;
 
-    ds4_gpu_stream_expert_cache_release_mlock_margin(protect_layer,
-                                                     protect_ids,
-                                                     n_protect);
+    if (g_stream_expert_cache_mlock_budget_cap != 0)
+        ds4_gpu_stream_expert_cache_release_mlock_margin(protect_layer,
+                                                         protect_ids,
+                                                         n_protect);
     ds4_gpu_stream_expert_reusable_buffers reuse = { nil, nil, nil, 0, 0, 0 };
     if (!ds4_gpu_stream_expert_cache_take_reusable(1,
                                                    protect_layer,
@@ -18771,7 +18853,9 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
                                                   down_inner)) {
             return 1;
         }
-        if (g_stream_expert_cache_mlock_budget_cap != 0) {
+        /* Under a memory budget a full cache evicts; a buffer of its own
+         * beside the slabs would be allocation the budget never saw. */
+        if (g_stream_expert_cache_mlock_budget_cap != 0 || g_memory_budget_bytes != 0) {
             return ds4_gpu_stream_expert_cache_take_capped_reusable(
                     protect_layer, protect_ids, n_protect,
                     gate_expert_bytes, down_expert_bytes,
@@ -18800,6 +18884,15 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
         return 1;
     }
 
+    if (g_memory_budget_bytes != 0 &&
+        gate_expert_bytes * 2ull + down_expert_bytes > ds4_gpu_memory_budget_room()) {
+        ds4_gpu_memory_budget_refused("an expert's buffers", gate_expert_bytes * 2ull + down_expert_bytes);
+        return ds4_gpu_stream_expert_cache_take_capped_reusable(
+                protect_layer, protect_ids, n_protect,
+                gate_expert_bytes, down_expert_bytes,
+                gate_buf, up_buf, down_buf,
+                gate_inner, up_inner, down_inner);
+    }
     id<MTLBuffer> explicit_gate =
         ds4_gpu_stream_expert_alloc_buffer(gate_expert_bytes,
                                            @"ds4_stream_expert_gate");

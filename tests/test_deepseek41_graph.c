@@ -1320,7 +1320,7 @@ static int check_decoder_publication(const char *path, bool encoder) {
         for (uint32_t t = 0; t < count; t++) {
             row.pos = start + t;
             row.norm = old->rows_view[t].norm;
-            REQUIRE(ds41_attention_publish(&row, &engine->model, &engine->weights.layer[il], il));
+            REQUIRE(ds41_attention_publish(&row, &engine->model, &engine->weights.layer[il], il, false));
         }
         REQUIRE(ds4_gpu_end_commands());
         REQUIRE(ds4_gpu_begin_commands());
@@ -1715,8 +1715,9 @@ static int check_memory_plan(const char *path) {
     REQUIRE(ds4_engine_dynamic_expert_cache_bytes(&e) == e.ssd_streaming_cache_bytes);
     uint64_t planned = fixed + graph + 2 * gib +
         ds4_engine_dynamic_expert_cache_bytes(&e) + e.ssd_streaming_prefill_headroom_bytes;
-    REQUIRE(e.ssd_streaming_cache_experts > 0 && planned <= 110 * gib);
-    REQUIRE(planned + expert > 110 * gib);
+    /* Streamed, the budget is five eighths of the host, not the working set. */
+    REQUIRE(e.ssd_streaming_cache_experts > 0 && planned <= 80 * gib);
+    REQUIRE(planned + expert > 80 * gib);
     const uint32_t fitted = e.ssd_streaming_cache_experts;
     REQUIRE(ds41_memory_admit_for_host(&e, graph, false, 128 * gib, 110 * gib));
     REQUIRE(!ds41_memory_admit_for_host(&e, graph + expert, false, 128 * gib, 110 * gib));

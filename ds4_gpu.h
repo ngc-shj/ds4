@@ -305,6 +305,12 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
  * lowering lets the next prune walk down. */
 void ds4_gpu_move_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+/* What the device may have allocated, with `reserve` held back for the
+ * prefill's mapped expert layers; the expert cache and the full address table
+ * grow only into what is left. 0 removes the budget. */
+void ds4_gpu_set_memory_budget(uint64_t bytes, uint64_t reserve);
+/* Whether n more experts fit in the cache without evicting any. */
+int ds4_gpu_stream_expert_cache_has_room(uint32_t n);
 int ds4_gpu_qwen4_conv_stream_rows_tensor(
         ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

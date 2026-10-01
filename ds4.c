@@ -76588,8 +76588,9 @@ static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
     uint32_t npend[64] = {0};
     unsigned long long bytes = 0;
     uint32_t loaded = 0, failed = 0;
+    bool full = false;
     const double t0 = now_sec();
-    for (uint32_t i = 0; i <= want; i++) {
+    for (uint32_t i = 0; i <= want && !full; i++) {
         const bool last = i == want;
         const uint32_t il = last ? 0u : ds4_v41_streaming_hotlist[i].layer;
         if (!last) {
@@ -76602,6 +76603,9 @@ static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
         }
         for (uint32_t l = last ? 0u : il; l < (last ? DS4_N_LAYER : il + 1u); l++) {
             if (npend[l] == 0 || (!last && npend[l] < DS4_METAL_PREWARM_BATCH)) continue;
+            /* The cache's size or the memory budget ends the prewarm: past
+             * either, each load would evict one the prewarm loaded. */
+            if (!ds4_gpu_stream_expert_cache_has_room(npend[l])) { full = true; break; }
             const ds4_layer_weights *lw = &w->layer[l];
             uint64_t gate_row = 0, down_row = 0;
             if (!tensor_nbytes(lw->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
@@ -76617,8 +76621,9 @@ static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
         }
     }
     fprintf(stderr, "ds4: expert cache prewarmed from the built-in V4.1 hotlist: %u experts "
-            "(%u failed), %.2f GiB in %.2f s\n", loaded, failed,
-            (double)bytes / (1024.0 * 1024.0 * 1024.0), now_sec() - t0);
+            "(%u failed), %.2f GiB in %.2f s%s\n", loaded, failed,
+            (double)bytes / (1024.0 * 1024.0 * 1024.0), now_sec() - t0,
+            full ? "; stopped where the cache was full" : "");
 }
 
 static void ds41_lend_headroom_to_decode(void) {
@@ -78642,16 +78647,37 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
 }
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+/* All a V4.1 engine may hold: weights, graph buffers, the expert cache, the
+ * prefill reserve. Streamed, the expert cache is wired memory on a unified
+ * memory machine, and wired memory that grows to the top of the machine ends
+ * in a watchdog panic (one came at 109.7 GiB wired of 128). Five eighths of
+ * the host leaves an eighth below the 88 GiB (eleven sixteenths) at which a
+ * run is stopped from outside, for the system's own wired memory and for
+ * what sampling once a second cannot catch. */
+static uint64_t ds41_memory_budget(const ds4_engine *e, uint64_t host, uint64_t recommended) {
+    const uint64_t budget = e->ssd_streaming ? host / 8u * 5u : host / 8u * 7u;
+    return budget > recommended ? recommended : budget;
+}
+
+static uint64_t ds41_host_memory_bytes(void) {
+    uint64_t host = glm_graph_host_memory_bytes();
+#ifdef __linux__
+    const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && page_size > 0 && (uint64_t)pages <= UINT64_MAX / (uint64_t)page_size)
+        host = (uint64_t)pages * (uint64_t)page_size;
+#endif
+    return host;
+}
+
 static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
                                       bool fit_cache, uint64_t host,
                                       uint64_t recommended) {
     const uint64_t gib = UINT64_C(1073741824);
-    uint64_t budget = host / 8u * 7u;
     if (!host || !recommended) {
         fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
         return false;
     }
-    if (budget > recommended) budget = recommended;
+    const uint64_t budget = ds41_memory_budget(e, host, recommended);
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
@@ -78680,14 +78706,8 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
 }
 
 static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache) {
-    uint64_t host = glm_graph_host_memory_bytes();
-#ifdef __linux__
-    const long pages = sysconf(_SC_PHYS_PAGES), page_size = sysconf(_SC_PAGESIZE);
-    if (pages > 0 && page_size > 0 && (uint64_t)pages <= UINT64_MAX / (uint64_t)page_size)
-        host = (uint64_t)pages * (uint64_t)page_size;
-#endif
     return ds41_memory_admit_for_host(e, graph_bytes, fit_cache,
-        host, ds4_gpu_recommended_working_set_size());
+        ds41_host_memory_bytes(), ds4_gpu_recommended_working_set_size());
 }
 #endif
 
@@ -79575,6 +79595,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
+            /* The plan above fits the cache's size; the backend holds every
+             * allocation to the same budget while the engine runs, so what
+             * the plan did not foresee - decode borrowing the prefill reserve,
+             * the full address table - evicts rather than grows past it. */
+            if (e->ssd_streaming)
+                ds4_gpu_set_memory_budget(
+                    ds41_memory_budget(e, ds41_host_memory_bytes(),
+                                       ds4_gpu_recommended_working_set_size()),
+                    e->ssd_streaming_prefill_headroom_bytes);
         }
 #endif
         ds4_engine_fit_glm_streaming_budget(
