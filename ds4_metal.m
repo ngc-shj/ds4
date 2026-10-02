@@ -1469,8 +1469,6 @@ static ds4_gpu_stream_expert_cache_entry
 static uint32_t g_stream_expert_spare_next[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_take_spare(uint32_t layer);
-static ds4_gpu_stream_expert_cache_entry
-    g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_hits[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_misses[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -10141,15 +10139,10 @@ static id<MTLCommandQueue> ds4_gpu_m3_queue(void) {
     return g_queue;
 }
 
-/* Test hooks for the full expert address table's staged bring-up
- * (tests/test_deepseek41_fulltable.c): let a test process past the
- * quarantine, and give only the first `limit` experts of a layer buffers of
- * their own - the rest are addressed at expert 0's, so nothing is read through
- * an address that names nothing. 0 means every expert. */
-static int g_full_addr_test_admitted;
+/* Test hook for the staged bring-up of pinned windows
+ * (tests/test_deepseek41_fulltable.c): pin only the first `limit` experts of
+ * each asked layer; the rest are the cache's. 0 means every expert. */
 static uint32_t g_full_addr_test_expert_limit;
-void ds4_gpu_test_full_addr_admit(void);
-void ds4_gpu_test_full_addr_admit(void) { g_full_addr_test_admitted = 1; }
 void ds4_gpu_test_full_addr_expert_limit(uint32_t limit);
 void ds4_gpu_test_full_addr_expert_limit(uint32_t limit) { g_full_addr_test_expert_limit = limit; }
 /* Test hook: while set, a batch of exactly `rows` rows has its routed experts
@@ -13359,7 +13352,6 @@ int ds4_gpu_synchronize(void) {
 static void qwen4_nax_release_scratch(void);
 static void qwen4_batch_release_scratch(void);
 
-static void ds4_gpu_stream_full_expert_addr_reset(void);
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
@@ -13719,7 +13711,6 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache = nil;
         g_transient_buffers = nil;
         g_pending_cbs = nil;
-        ds4_gpu_stream_full_expert_addr_reset();
         if (@available(macOS 26.0, *)) {
             if (!ds4_mtl4_shutdown())
                 fprintf(stderr, "ds4: Metal 4 work failed while shutting down\n");
@@ -16587,36 +16578,14 @@ static int ds4_gpu_stream_block_residency_requested(void) {
 }
 
 /* The old full expert address table - per-expert views of the mapped model,
- * a residency set of its own, the shared table overwritten whole - is off for
- * good: it brought the machine down under Metal 4, and it was a second cache
- * beside the first. DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE now asks
- * for pinned windows in the one expert directory (ds41_expert_pin_windows in
- * ds4.c), which every path already looks up. */
-static int ds4_gpu_stream_full_expert_addr_table_requested(void) {
-    return 0;
-}
-
+ * a residency set of its own, the shared table overwritten whole - is gone: it
+ * brought the machine down under Metal 4, and it was a second cache beside the
+ * first. DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE asks for pinned
+ * windows in the one expert directory (ds41_expert_pin_windows in ds4.c),
+ * which every path already looks up. Its use count stays, at zero, as the
+ * evidence a report can print. */
 unsigned long long ds4_gpu_full_addr_table_uses(void);
 unsigned long long ds4_gpu_full_addr_table_uses(void) { return g_full_addr_table_uses; }
-
-/* A layer whose address table holds every expert never needs the host to fix it
- * up, so it can skip the per-layer readback entirely.  The pages of the experts
- * it actually reads stay wired for the life of the process, so only as many
- * layers as the expert budget can hold get this treatment: 384 experts is
- * ~3.56 GiB a layer. */
-static uint32_t ds4_gpu_stream_full_expert_addr_layers(void) {
-    static int checked;
-    static uint32_t layers;
-    if (!checked) {
-        checked = 1;
-        const char *env = getenv("DS4_METAL_FULL_ADDR_LAYERS");
-        if (env && env[0]) {
-            const long v = strtol(env, NULL, 10);
-            if (v > 0 && v <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) layers = (uint32_t)v;
-        }
-    }
-    return layers;
-}
 
 static uint64_t ds4_gpu_buffer_address(id<MTLBuffer> buffer, NSUInteger inner) {
     if (!buffer) return 0;
@@ -17311,446 +17280,6 @@ uint64_t ds4_gpu_resident_addr_batch_layers(void) {
     return g_ds41_resident_addr_batch_layers;
 }
 
-/* The full expert address table's residency, owned in one place.
- *
- * A layer's table names every expert of that layer - three buffers each,
- * about 3.6 GiB a layer - and the kernels reach them by raw address, so they
- * have to be resident without being bound. They live in one residency set,
- * attached once to the queue that carries the work, layer by layer:
- *
- *   admitted   only while the device's allocated size plus the layer stays a
- *              margin below its recommended working set; a layer that does
- *              not fit is refused, counted and named, and runs the ordinary
- *              per-expert path
- *   added      once: an allocation already in the set is counted, not added
- *              again
- *   removed    with its layer, when the layer is cleared or the engine closes
- *
- * Nothing else declares them: no requestResidency besides the queue's own,
- * no set of the prewire's own. Unbounded, this asked for every layer - on the
- * frozen Metal 3 build that was fourteen layers and then an out-of-memory
- * error; under Metal 4 the same load ended in a kernel panic in the GPU
- * driver. */
-#define DS4_FULL_ADDR_MARGIN (8ull << 30)
-static NSMutableArray<id<MTLBuffer>> *g_full_layer_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static uint64_t g_full_layer_bytes[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static uint8_t g_full_layer_refusal_said[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static id<MTLResidencySet> g_stream_full_expert_residency_set API_AVAILABLE(macos(15.0));
-static int g_stream_full_expert_residency_on_queue;
-static uint64_t g_full_bytes;
-static unsigned long long g_full_adds, g_full_removes, g_full_dups,
-                          g_full_layers_admitted, g_full_layers_refused;
-
-/* allocations held, bytes held, adds, removes, duplicate adds refused, layers
- * admitted, layers refused for the budget, allocations the set reports. */
-void ds4_gpu_full_addr_counts(unsigned long long out[8]);
-void ds4_gpu_full_addr_counts(unsigned long long out[8]) {
-    unsigned long long held = 0;
-    for (uint32_t l = 0; l < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; l++)
-        held += g_full_layer_buffers[l].count;
-    out[0] = held;
-    out[1] = g_full_bytes;
-    out[2] = g_full_adds;
-    out[3] = g_full_removes;
-    out[4] = g_full_dups;
-    out[5] = g_full_layers_admitted;
-    out[6] = g_full_layers_refused;
-    out[7] = 0;
-    if (@available(macOS 15.0, *))
-        out[7] = g_stream_full_expert_residency_set ?
-                 g_stream_full_expert_residency_set.allocationCount : 0;
-}
-
-/* Whether a layer may hold the full table: already does, or fits. */
-static int ds4_gpu_stream_full_expert_addr_admit(uint32_t layer, uint32_t n_total_expert,
-                                                 uint64_t gate_expert_bytes,
-                                                 uint64_t down_expert_bytes) {
-    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !g_device) return 0;
-    if (g_full_layer_buffers[layer]) return 1;
-    const uint64_t need = (uint64_t)n_total_expert * (2u * gate_expert_bytes + down_expert_bytes);
-    const uint64_t limit = (uint64_t)g_device.recommendedMaxWorkingSetSize;
-    const uint64_t used = (uint64_t)g_device.currentAllocatedSize;
-    /* Under the engine's memory budget the table is admitted from the same
-     * room the expert cache grows into, not stacked on top of it. */
-    if (g_memory_budget_bytes != 0) {
-        if (need <= ds4_gpu_memory_budget_room()) return 1;
-    } else if (limit > DS4_FULL_ADDR_MARGIN && used + need <= limit - DS4_FULL_ADDR_MARGIN) {
-        return 1;
-    }
-    g_full_layers_refused++;
-    if (!g_full_layer_refusal_said[layer]) {
-        g_full_layer_refusal_said[layer] = 1;
-        if (g_memory_budget_bytes != 0)
-            fprintf(stderr, "ds4: full expert address table: layer %u not admitted - it needs "
-                    "%.2f GiB, the device has %.2f GiB allocated and a %.2f GiB prefill "
-                    "reserve of a %.2f GiB memory budget; the layer runs the per-expert path\n",
-                    layer, need / 1073741824.0, used / 1073741824.0,
-                    g_memory_budget_reserve_bytes / 1073741824.0,
-                    g_memory_budget_bytes / 1073741824.0);
-        else
-            fprintf(stderr, "ds4: full expert address table: layer %u not admitted - it needs "
-                    "%.2f GiB, the device has %.2f GiB allocated of a %.2f GiB working set "
-                    "with %.0f GiB kept free; the layer runs the per-expert path\n",
-                    layer, need / 1073741824.0, used / 1073741824.0, limit / 1073741824.0,
-                    DS4_FULL_ADDR_MARGIN / 1073741824.0);
-    }
-    return 0;
-}
-
-/* A layer's buffers into the set, once each, and the set onto the queue. */
-static void ds4_gpu_stream_full_expert_addr_hold_layer(uint32_t layer, NSArray<id<MTLBuffer>> *buffers) {
-#if TARGET_OS_OSX
-    if (@available(macOS 15.0, *)) {
-        if (!g_device || buffers.count == 0 || layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
-        /* Nothing else declares these buffers -- the kernel reaches them through
-         * raw addresses in the table -- so without the set the GPU reads pages
-         * it was never given, which comes back as plausible numbers and a
-         * different answer rather than as a fault.  Refuse instead. */
-        if (getenv("DS4_METAL_NO_RESIDENCY") != NULL) {
-            fprintf(stderr,
-                    "ds4: the full expert address table needs a residency set; "
-                    "DS4_METAL_NO_RESIDENCY would silently corrupt its reads\n");
-            abort();
-        }
-        if (!g_stream_full_expert_residency_set) {
-            MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
-            desc.label = @"ds4_full_expert_addr";
-            NSError *err = nil;
-            g_stream_full_expert_residency_set =
-                [g_device newResidencySetWithDescriptor:desc error:&err];
-            if (!g_stream_full_expert_residency_set) return;
-        }
-        NSMutableArray<id<MTLBuffer>> *held = [NSMutableArray arrayWithCapacity:buffers.count];
-        uint64_t bytes = 0;
-        for (id<MTLBuffer> b in buffers) {
-            if ([g_stream_full_expert_residency_set containsAllocation:b]) { g_full_dups++; continue; }
-            [g_stream_full_expert_residency_set addAllocation:b];
-            [held addObject:b];
-            bytes += b.length;
-            g_full_adds++;
-        }
-        [g_stream_full_expert_residency_set commit];
-        g_full_layer_buffers[layer] = held;
-        g_full_layer_bytes[layer] = bytes;
-        g_full_bytes += bytes;
-        g_full_layers_admitted++;
-        if (!g_stream_full_expert_residency_on_queue) {
-            /* The queue that carries the work holds it; that is the only
-             * request for residency these buffers get. */
-            if (g_backend == 4) {
-                ds4_gpu_queue_residency_added(g_stream_full_expert_residency_set);
-                g_stream_full_expert_residency_on_queue = 1;
-            } else if (ds4_gpu_m3_queue()) {
-                [ds4_gpu_m3_queue() addResidencySet:g_stream_full_expert_residency_set];
-                g_stream_full_expert_residency_on_queue = 1;
-            }
-        }
-    }
-#else
-    (void)layer; (void)buffers;
-#endif
-}
-
-/* A layer's buffers out of the set again. */
-static void ds4_gpu_stream_full_expert_addr_release_layer(uint32_t layer) {
-    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !g_full_layer_buffers[layer]) return;
-    if (@available(macOS 15.0, *)) {
-        for (id<MTLBuffer> b in g_full_layer_buffers[layer]) {
-            [g_stream_full_expert_residency_set removeAllocation:b];
-            g_full_removes++;
-        }
-        [g_stream_full_expert_residency_set commit];
-    }
-    g_full_bytes -= g_full_layer_bytes[layer];
-    g_full_layer_bytes[layer] = 0;
-    g_full_layer_buffers[layer] = nil;
-}
-
-/* Wiring a buffer's pages happens when the GPU first touches it, and costs
- * about 1.7 ms for an expert whether the read is one byte or all of it.  Paying
- * that lazily during decode is what made a full address table slower than the
- * readback it removes, so pay it once, here, before the first token. */
-static int ds4_mtl4_prewire(NSArray<id<MTLBuffer>> *buffers, id<MTLBuffer> scratch);
-
-static void ds4_gpu_stream_full_expert_addr_prewire(NSArray<id<MTLBuffer>> *buffers) {
-    if (!g_device || buffers.count == 0) return;
-    if (g_backend != 4 && !ds4_gpu_m3_queue()) return;
-    if (getenv("DS4_METAL_FULL_ADDR_NO_PREWIRE") != NULL) return;
-    /* Copy the whole expert, not a token amount of it: the pages are wired as
-     * they are touched, so a 16-byte read leaves the rest for decode to pay. */
-    NSUInteger widest = 0;
-    for (id<MTLBuffer> b in buffers) if ([b length] > widest) widest = [b length];
-    static id<MTLBuffer> scratch;
-    if (!scratch || [scratch length] < widest) {
-        scratch = [g_device newBufferWithLength:widest options:MTLResourceStorageModePrivate];
-        if (!scratch) return;
-    }
-    const double t0 = ds4_gpu_now_ms();
-    if (g_backend == 4) {
-        /* On its own submission, ahead of the context being recorded, and
-         * waited for, as the Metal 3 form waits for its command buffer. */
-        if (!ds4_mtl4_prewire(buffers, scratch)) return;
-    } else @autoreleasepool {
-        id<MTLCommandBuffer> cb = [ds4_gpu_m3_queue() commandBuffer];
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-        if (!blit) return;
-        for (id<MTLBuffer> b in buffers) {
-            if ([b length] == 0) continue;
-            [blit copyFromBuffer:b sourceOffset:0 toBuffer:scratch destinationOffset:0
-                            size:[b length]];
-        }
-        [blit endEncoding];
-        DS4_M3_NOTE("full_expert_addr_prewire", DS4_BK_COMMIT);
-        [cb commit];
-        DS4_M3_NOTE("full_expert_addr_prewire", DS4_BK_WAIT);
-        [cb waitUntilCompleted];
-    }
-    fprintf(stderr, "ds4: V4.1 wired %lu expert buffers in %.0f ms\n",
-            (unsigned long)buffers.count, ds4_gpu_now_ms() - t0);
-}
-
-static void ds4_gpu_stream_full_expert_addr_clear_layer(uint32_t layer);
-
-/* Engine teardown: the table's buffers and its set belong to the device being
- * released, and the next engine's queue does not hold the set, so the next
- * table starts from nothing rather than believing it is resident. */
-static void ds4_gpu_stream_full_expert_addr_reset(void) {
-    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++)
-        ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-    if (@available(macOS 15.0, *)) {
-        if (g_stream_full_expert_residency_set && g_stream_full_expert_residency_on_queue) {
-            if (g_backend == 4) ds4_gpu_queue_residency_removed(g_stream_full_expert_residency_set);
-            else if (g_queue) [g_queue removeResidencySet:g_stream_full_expert_residency_set];
-        }
-        g_stream_full_expert_residency_set = nil;
-    }
-    g_stream_full_expert_residency_on_queue = 0;
-    memset(g_full_layer_refusal_said, 0, sizeof(g_full_layer_refusal_said));
-}
-
-static void ds4_gpu_stream_full_expert_addr_clear_layer(uint32_t layer) {
-    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
-    ds4_gpu_stream_full_expert_addr_release_layer(layer);
-    ds4_gpu_stream_expert_cache_entry *e = &g_stream_full_expert_addr_entry[layer];
-    e->gate_buffer = nil;
-    e->up_buffer = nil;
-    e->down_buffer = nil;
-    e->model_map = NULL;
-    e->model_size = 0;
-    e->gate_abs_offset = 0;
-    e->up_abs_offset = 0;
-    e->down_abs_offset = 0;
-    e->gate_expert_bytes = 0;
-    e->down_expert_bytes = 0;
-    e->logical_bytes = 0;
-    e->last_used = 0;
-    e->use_count = 0;
-    e->gate_inner = 0;
-    e->up_inner = 0;
-    e->down_inner = 0;
-    e->slab_slot = 0;
-    e->valid = 0;
-    e->slab_backed = 0;
-}
-
-static int ds4_gpu_stream_full_expert_addr_table_prepare(
-        const void    *model_map,
-        uint64_t       model_size,
-        uint32_t       layer,
-        uint32_t       n_total_expert,
-        uint64_t       gate_abs_offset,
-        uint64_t       up_abs_offset,
-        uint64_t       down_abs_offset,
-        uint64_t       gate_expert_bytes,
-        uint64_t       down_expert_bytes,
-        __strong id<MTLBuffer> *gate_addrs,
-        __strong id<MTLBuffer> *up_addrs,
-        __strong id<MTLBuffer> *down_addrs,
-        ds4_gpu_stream_expert_cache_entry **entry_out) {
-    if (!ds4_gpu_stream_full_expert_addr_table_requested()) return 0;
-    atomic_fetch_add(&g_full_addr_table_uses, 1u);
-    if (!model_map || model_size == 0 ||
-        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
-        n_total_expert == 0 ||
-        n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
-        gate_expert_bytes == 0 ||
-        down_expert_bytes == 0 ||
-        n_total_expert > UINT64_MAX / gate_expert_bytes ||
-        n_total_expert > UINT64_MAX / down_expert_bytes) {
-        return 0;
-    }
-
-    const uint64_t gate_tensor_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
-    const uint64_t down_tensor_bytes = (uint64_t)n_total_expert * down_expert_bytes;
-    if (gate_abs_offset > model_size ||
-        up_abs_offset > model_size ||
-        down_abs_offset > model_size ||
-        gate_tensor_bytes > model_size - gate_abs_offset ||
-        gate_tensor_bytes > model_size - up_abs_offset ||
-        down_tensor_bytes > model_size - down_abs_offset) {
-        return 0;
-    }
-
-    ds4_gpu_stream_expert_cache_entry *entry =
-        &g_stream_full_expert_addr_entry[layer];
-    if (!entry->valid ||
-        entry->model_map != model_map ||
-        entry->model_size != model_size ||
-        entry->gate_abs_offset != gate_abs_offset ||
-        entry->up_abs_offset != up_abs_offset ||
-        entry->down_abs_offset != down_abs_offset ||
-        entry->gate_expert_bytes != gate_expert_bytes ||
-        entry->down_expert_bytes != down_expert_bytes ||
-        /* A per-expert table keeps its buffers in the permanent array, not in
-         * the entry, so the entry's own buffers are nil by design. */
-        (getenv("DS4_METAL_FULL_ADDR_WHOLE_TENSOR") != NULL &&
-         (!entry->gate_buffer || !entry->up_buffer || !entry->down_buffer))) {
-        ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-
-        uint64_t gate_inner = 0;
-        uint64_t up_inner = 0;
-        uint64_t down_inner = 0;
-        /* The spanning buffers are only for the whole-tensor form; per-expert
-         * tables must not create them, or the first touch wires the tensor the
-         * split was meant to avoid. */
-        const int want_spanning = getenv("DS4_METAL_FULL_ADDR_WHOLE_TENSOR") != NULL;
-        id<MTLBuffer> gate_buf = !want_spanning ? nil :
-            ds4_gpu_wrap_model_exact_range_owned(model_map,
-                                                 model_size,
-                                                 gate_abs_offset,
-                                                 gate_tensor_bytes,
-                                                 &gate_inner);
-        id<MTLBuffer> up_buf = !want_spanning ? nil :
-            ds4_gpu_wrap_model_exact_range_owned(model_map,
-                                                 model_size,
-                                                 up_abs_offset,
-                                                 gate_tensor_bytes,
-                                                 &up_inner);
-        id<MTLBuffer> down_buf = !want_spanning ? nil :
-            ds4_gpu_wrap_model_exact_range_owned(model_map,
-                                                 model_size,
-                                                 down_abs_offset,
-                                                 down_tensor_bytes,
-                                                 &down_inner);
-        if (want_spanning && (!gate_buf || !up_buf || !down_buf)) return 0;
-
-        entry->gate_buffer = gate_buf;
-        entry->up_buffer = up_buf;
-        entry->down_buffer = down_buf;
-        entry->model_map = model_map;
-        entry->model_size = model_size;
-        entry->gate_abs_offset = gate_abs_offset;
-        entry->up_abs_offset = up_abs_offset;
-        entry->down_abs_offset = down_abs_offset;
-        entry->gate_expert_bytes = gate_expert_bytes;
-        entry->down_expert_bytes = down_expert_bytes;
-        entry->logical_bytes = gate_tensor_bytes * 2ull + down_tensor_bytes;
-        entry->gate_inner = (NSUInteger)gate_inner;
-        entry->up_inner = (NSUInteger)up_inner;
-        entry->down_inner = (NSUInteger)down_inner;
-        entry->valid = 1;
-
-        if (!ds4_gpu_stream_expert_cache_ensure_addr_buffers(layer)) {
-            ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-            return 0;
-        }
-
-        const uint64_t gate_base = want_spanning
-            ? ds4_gpu_buffer_address(entry->gate_buffer, entry->gate_inner) : 1;
-        const uint64_t up_base = want_spanning
-            ? ds4_gpu_buffer_address(entry->up_buffer, entry->up_inner) : 1;
-        const uint64_t down_base = want_spanning
-            ? ds4_gpu_buffer_address(entry->down_buffer, entry->down_inner) : 1;
-        if (gate_base == 0 || up_base == 0 || down_base == 0) {
-            fprintf(stderr, "ds4: Metal full streaming expert address table requires GPU addresses\n");
-            ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-            return 0;
-        }
-
-        id<MTLBuffer> buffers[3] = { nil, nil, nil };
-        if (!ds4_gpu_stream_expert_cache_addr_seed(layer, &buffers[0], &buffers[1], &buffers[2])) {
-            ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-            return 0;
-        }
-        for (uint32_t x = 0; x < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; x++)
-            ds4_mtl4_addr_slot_written(layer, x);
-        uint64_t *gate_addr = (uint64_t *)[buffers[0] contents];
-        uint64_t *up_addr = (uint64_t *)[buffers[1] contents];
-        uint64_t *down_addr = (uint64_t *)[buffers[2] contents];
-        /* One buffer per expert rather than one spanning the whole tensor.  A
-         * buffer's pages are wired when the GPU first reads it, so wrapping
-         * 3.56 GiB of experts in one buffer wires all of it the first time any
-         * one expert is touched; per-expert buffers wire only what the router
-         * actually picks, and they cost 2.8 us each to make. */
-        const int per_expert = !want_spanning;
-        NSMutableArray<id<MTLBuffer>> *kept =
-            per_expert ? [NSMutableArray arrayWithCapacity:n_total_expert * 3u] : nil;
-        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
-            if (expert >= n_total_expert) {
-                gate_addr[expert] = 0;
-                up_addr[expert] = 0;
-                down_addr[expert] = 0;
-                continue;
-            }
-            if (!per_expert) {
-                gate_addr[expert] = gate_base + (uint64_t)expert * gate_expert_bytes;
-                up_addr[expert] = up_base + (uint64_t)expert * gate_expert_bytes;
-                down_addr[expert] = down_base + (uint64_t)expert * down_expert_bytes;
-                continue;
-            }
-            if (g_full_addr_test_expert_limit && expert >= g_full_addr_test_expert_limit) {
-                gate_addr[expert] = gate_addr[0];
-                up_addr[expert] = up_addr[0];
-                down_addr[expert] = down_addr[0];
-                continue;
-            }
-            uint64_t gi = 0, ui = 0, di = 0;
-            id<MTLBuffer> g = ds4_gpu_wrap_model_exact_range_owned(
-                    model_map, model_size,
-                    gate_abs_offset + (uint64_t)expert * gate_expert_bytes,
-                    gate_expert_bytes, &gi);
-            id<MTLBuffer> u = ds4_gpu_wrap_model_exact_range_owned(
-                    model_map, model_size,
-                    up_abs_offset + (uint64_t)expert * gate_expert_bytes,
-                    gate_expert_bytes, &ui);
-            id<MTLBuffer> dn = ds4_gpu_wrap_model_exact_range_owned(
-                    model_map, model_size,
-                    down_abs_offset + (uint64_t)expert * down_expert_bytes,
-                    down_expert_bytes, &di);
-            if (!g || !u || !dn) {
-                ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-                return 0;
-            }
-            gate_addr[expert] = ds4_gpu_buffer_address(g, (NSUInteger)gi);
-            up_addr[expert] = ds4_gpu_buffer_address(u, (NSUInteger)ui);
-            down_addr[expert] = ds4_gpu_buffer_address(dn, (NSUInteger)di);
-            if (gate_addr[expert] == 0 || up_addr[expert] == 0 || down_addr[expert] == 0) {
-                ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-                return 0;
-            }
-            [kept addObject:g];
-            [kept addObject:u];
-            [kept addObject:dn];
-        }
-        if (per_expert) {
-            ds4_gpu_stream_full_expert_addr_hold_layer(layer, kept);
-            ds4_gpu_stream_full_expert_addr_prewire(kept);
-            fprintf(stderr,
-                    "ds4: V4.1 layer %u addresses every expert (%u buffers, no readback)\n",
-                    layer, (unsigned)kept.count);
-        }
-    }
-
-    if (gate_addrs) *gate_addrs = g_stream_expert_cache_gate_addr_buffers[layer];
-    if (up_addrs) *up_addrs = g_stream_expert_cache_up_addr_buffers[layer];
-    if (down_addrs) *down_addrs = g_stream_expert_cache_down_addr_buffers[layer];
-    if (entry_out) *entry_out = entry;
-    return entry->valid &&
-           g_stream_expert_cache_gate_addr_buffers[layer] &&
-           g_stream_expert_cache_up_addr_buffers[layer] &&
-           g_stream_expert_cache_down_addr_buffers[layer];
-}
-
 static id<MTLBuffer> ds4_gpu_stream_expert_validate_status_buffer(void) {
     if (!g_device) return nil;
     if (g_stream_expert_validate_status_buffer) {
@@ -18284,7 +17813,6 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
             g_stream_expert_cache[layer][expert].pins = 0;
             ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
         }
-        ds4_gpu_stream_full_expert_addr_clear_layer(layer);
         g_stream_expert_cache_layer_count[layer] = 0;
         /* Seed and live both: nothing is in flight when the whole cache is
          * cleared, and nothing is left to publish. */
@@ -47161,17 +46689,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
             const int stream_expert_cache_size_known =
                 ds4_gpu_stream_expert_cache_note_expert_size(gate_expert_bytes,
                                                              down_expert_bytes);
-            const uint32_t full_addr_layers = ds4_gpu_stream_full_expert_addr_layers();
-            const bool use_iq2_full_expert_addr_table =
-                use_iq2_selected_slots &&
-                ds4_gpu_stream_full_expert_addr_table_requested() &&
-                (full_addr_layers == 0 || layer_index < full_addr_layers) &&
-                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
-                g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil &&
-                ds4_gpu_stream_full_expert_addr_admit(layer_index, n_total_expert,
-                                                      gate_expert_bytes, down_expert_bytes);
             use_stream_expert_cache =
-                !use_iq2_full_expert_addr_table &&
                 (use_iq2_selected_slots || use_iq2_stream_addr_table ||
                  use_q4_selected_slots || use_mxfp4_selected_slots) &&
                 stream_expert_cache_size_known &&
@@ -47213,35 +46731,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                                                          &stream_gate_addr_buf,
                                                          &stream_up_addr_buf,
                                                          &stream_down_addr_buf);
-            if (use_iq2_full_expert_addr_table) {
-                selected_id_source = "gpu-full-addr";
-                selected_ids_available = false;
-                g_routed_moe_selected_override_n = 0;
-                ds4_gpu_stream_expert_cache_entry *full_entry = NULL;
-                if (!ds4_gpu_stream_full_expert_addr_table_prepare(model_map,
-                                                                   model_size,
-                                                                   layer_index,
-                                                                   n_total_expert,
-                                                                   gate_offset,
-                                                                   up_offset,
-                                                                   down_offset,
-                                                                   gate_expert_bytes,
-                                                                   down_expert_bytes,
-                                                                   &stream_gate_addr_buf,
-                                                                   &stream_up_addr_buf,
-                                                                   &stream_down_addr_buf,
-                                                                   &full_entry)) {
-                    if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32880);
-                    return 0;
-                }
-                for (uint32_t i = 0; i < n_expert; i++) {
-                    /* A per-expert table has no single entry to point at, and
-                     * its buffers are resident on the queue already. */
-                    stream_slot_entries[i] = full_entry && full_entry->gate_buffer
-                                                 ? full_entry : NULL;
-                }
-                use_stream_expert_addr_table = true;
-            } else if (g_moe_selected_capture_replay &&
+            if (g_moe_selected_capture_replay &&
                        ds4_gpu_moe_selected_capture_peek(selected_ids, n_expert) > 0 &&
                        (!ds4_gpu_capture_hits_only() ||
                         ds4_gpu_capture_all_cached(model_map, model_size, layer_index,
@@ -49217,33 +48707,18 @@ int ds4_gpu_routed_moe_batch_tensor(
             getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
             getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL;
-        /* The same address-table kernels, with the whole layer's expert
-         * addresses in the table instead of the selected subset. Nothing has to
-         * be read back to build it, so the layer neither drains the queue to
-         * fetch the selected ids nor drains it again to release a cache pin:
-         * those two waits per layer are what serialised the verify block. */
-        const uint32_t full_addr_layers_batch = ds4_gpu_stream_full_expert_addr_layers();
-        const bool use_iq2_batch_full_addr =
-            use_iq2_batch_selected_addr &&
-            ds4_gpu_stream_full_expert_addr_table_requested() &&
-            g_tp_split_world == 1 &&
-            (full_addr_layers_batch == 0 || layer_index < full_addr_layers_batch) &&
-            ds4_gpu_stream_full_expert_addr_admit(layer_index, n_total_expert,
-                                                  gate_expert_bytes, down_expert_bytes);
         /* Same kernels and the same per-layer table the cache already keeps,
          * with the residency question answered where the answer is used. What
          * this removes is not a dispatch but a wait: the readback below drains
          * the queue once a layer, and a second drain releases the pin after. */
         const bool use_iq2_batch_resident_addr =
             use_iq2_batch_selected_addr &&
-            !use_iq2_batch_full_addr &&
             ds4_gpu_stream_block_residency_requested() &&
             g_block_residency_suspend == 0 &&
             g_tp_split_world == 1 &&
             g_moe_block_residency_pipeline != nil;
         const bool use_cached_batch =
             (use_iq2_batch_selected_addr &&
-             !use_iq2_batch_full_addr &&
              !use_iq2_batch_resident_addr) ||
             use_iq2_cached_batch;
 
@@ -49685,41 +49160,6 @@ int ds4_gpu_routed_moe_batch_tensor(
             stream_unique = n_total_expert;
             g_ds41_resident_addr_batch_layers++;
         }
-        if (use_iq2_batch_full_addr) {
-            /* An arm that skipped nothing is not an arm: say which address
-             * source the block path actually took. */
-            static bool said_full_addr_batch;
-            if (!said_full_addr_batch) { said_full_addr_batch = true;
-                fprintf(stderr, "ds4: V4.1 routed batch expert addresses: "
-                        "full per-layer table, no selected readback\n"); }
-            g_ds41_full_addr_batch_layers++;
-            ds4_gpu_stream_expert_cache_entry *full_entry = NULL;
-            if (!ds4_gpu_stream_full_expert_addr_table_prepare(model_map,
-                                                               model_size,
-                                                               layer_index,
-                                                               n_total_expert,
-                                                               gate_offset,
-                                                               up_offset,
-                                                               down_offset,
-                                                               gate_expert_bytes,
-                                                               down_expert_bytes,
-                                                               &stream_gate_addr_buf,
-                                                               &stream_up_addr_buf,
-                                                               &stream_down_addr_buf,
-                                                               &full_entry)) {
-                fprintf(stderr,
-                        "ds4: Metal routed batch full expert address table layer=%u "
-                        "could not be prepared\n",
-                        layer_index);
-                return 0;
-            }
-            /* The per-expert buffers are resident on the queue, not named by the
-             * dispatch, so one entry stands for the table. */
-            stream_entries_arg = NULL;
-            stream_resource_count = 1u;
-            stream_unique = n_total_expert;
-            (void)full_entry;
-        }
         if (use_cached_batch) {
             const int had_batch = g_batch_cmd != nil;
             if (had_batch && ds4_gpu_end_commands() == 0) {
@@ -49849,8 +49289,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 fprintf(stderr, "ds4: Metal Q4 batch expert table residency set is not available\n");
                 return 0;
             }
-        } else if (use_cached_batch || use_iq2_batch_full_addr ||
-                   use_iq2_batch_resident_addr) {
+        } else if (use_cached_batch || use_iq2_batch_resident_addr) {
             if (n_expert > 1 && (!expertsbuf ||
                 ds4_gpu_tensor_bytes(experts) < down_scratch_bytes)) {
                 if (!ds4_gpu_ensure_scratch_buffer(&g_moe_down_scratch_buffer,
