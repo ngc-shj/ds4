@@ -88136,10 +88136,41 @@ static uint32_t ds41_txn_state_diff(ds41_gpu_graph *a, ds41_gpu_graph *b,
  * Then the readback path services the layer and the next block has to commit the
  * same logits the oracle did, bit for bit.
  * DS4_V41_FORCE_MISS_TEST=<layer>. */
+/* What a self-test exercises has to be switched on for its verdict to mean
+ * anything. Without it the block ran another path - the ring written through,
+ * or the miss repaired on the host - and the test reported that path's
+ * behaviour against expectations written for this one: FAIL and MISMATCH,
+ * in the frozen build as in this one, with nothing wrong. It says so instead
+ * and does not run. */
+static bool ds41_selftest_env_on(const char *name) {
+    const char *e = getenv(name);
+    return e && e[0] && atoi(e) != 0;
+}
+
+static bool ds41_selftest_txn_ready(const char *test) {
+    const bool kv = ds41_selftest_env_on("DS4_METAL_V41_BLOCK") ||
+                    ds41_selftest_env_on("DS4_METAL_V41_BLOCK_KV");
+    const bool txn = ds41_selftest_env_on("DS4_METAL_V41_BLOCK_TXN");
+    if (kv && txn) return true;
+    fprintf(stderr, "ds4:   %s: NOT RUN - it tests the block transaction, which needs "
+            "DS4_METAL_V41_BLOCK_TXN=1 and the block-local KV (DS4_METAL_V41_BLOCK=1 or "
+            "DS4_METAL_V41_BLOCK_KV=1)\n", test);
+    return false;
+}
+
 static void ds41_force_miss_test(ds4_session *seed, const ds4_model *m,
                                  const ds4_weights *w) {
     const char *env = getenv("DS4_V41_FORCE_MISS_TEST");
     if (!env || !env[0]) return;
+    /* The park is what is tested, and only the device's residency check parks:
+     * without it the block reads the selected ids back and loads the miss before
+     * the layer runs. Checked passing only with the transaction on as well. */
+    if (!ds41_selftest_txn_ready("forced miss")) return;
+    if (!ds41_selftest_env_on("DS4_METAL_V41_BLOCK_RESIDENCY")) {
+        fprintf(stderr, "ds4:   forced miss: NOT RUN - only the device's residency check "
+                "parks a block, which needs DS4_METAL_V41_BLOCK_RESIDENCY=1\n");
+        return;
+    }
     const long layer = atol(env);
     if (layer < 0 || layer >= (long)DS4_N_LAYER) {
         fprintf(stderr, "ds4:   forced miss: layer %ld is outside 0..%u\n",
@@ -88390,6 +88421,7 @@ done:
 static void ds41_block_txn_chain_test(ds4_session *seed, const ds4_model *m,
                                       const ds4_weights *w) {
     if (!getenv("DS4_V41_BLOCK_TXN_CHAIN")) return;
+    if (!ds41_selftest_txn_ready("transaction chain")) return;
     /* (k, accept) per block. The pairs that matter are the ones where a block's
      * accept count changes what the next block starts on: nothing then
      * everything, everything then nothing, and either end of the range. */
@@ -89963,6 +89995,7 @@ done:
 static void ds41_block_txn_test(ds4_session *seed, const ds4_model *m,
                                 const ds4_weights *w) {
     if (!getenv("DS4_V41_BLOCK_TXN_TEST")) return;
+    if (!ds41_selftest_txn_ready("block transaction")) return;
     const uint32_t all = (1u << 9) - 1u;
     const char *bounds = getenv("DS4_V41_BLOCK_TXN_TEST_BOUNDS");
     if (bounds && bounds[0] && atoi(bounds) != 0) {
