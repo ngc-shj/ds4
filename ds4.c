@@ -76613,17 +76613,23 @@ static bool ds4_glm_streaming_resident_prefix_bytes(
  */
 static uint32_t g_ds41_admitted_budget;
 static uint32_t g_ds41_decode_budget;
+static uint64_t g_ds41_prefill_headroom_bytes;
 static int g_ds41_headroom_lent;
+static int g_ds41_headroom_lends_reserve;
 /* Set once the expert cache has been prewarmed. Per engine, not per process:
  * closing an engine empties the cache, so the next one opened prewarms again. */
 static int g_ds41_prewarmed;
 
 static void ds41_note_prefill_headroom(uint32_t budget,
-                                       uint64_t headroom_bytes,
-                                       uint64_t expert_bytes) {
+                                        uint64_t headroom_bytes,
+                                        uint64_t expert_bytes) {
     const char *on = getenv("DS4_METAL_V41_DECODE_LEND_HEADROOM");
     g_ds41_admitted_budget = budget;
     g_ds41_decode_budget = budget;
+    g_ds41_prefill_headroom_bytes = headroom_bytes;
+    /* 1 retains the historical logical-entry lending. 2 also lends the
+     * allocator's physical prefill reserve, restored before every prefill. */
+    g_ds41_headroom_lends_reserve = on && atoi(on) >= 2;
     if (!budget || !expert_bytes || !on || on[0] == '0') return;
     const uint64_t extra = headroom_bytes / expert_bytes;
     if (extra == 0 || extra > UINT32_MAX - budget) return;
@@ -76765,6 +76771,8 @@ static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
 static void ds41_lend_headroom_to_decode(void) {
     if (g_ds41_headroom_lent || g_ds41_decode_budget <= g_ds41_admitted_budget) return;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (g_ds41_headroom_lends_reserve)
+        ds4_gpu_set_memory_budget_reserve(0);
     ds4_gpu_move_streaming_expert_cache_budget(g_ds41_decode_budget);
 #endif
     g_ds41_headroom_lent = 1;
@@ -76777,6 +76785,8 @@ static void ds41_reclaim_headroom_for_prefill(void) {
     if (!g_ds41_headroom_lent) return;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds4_gpu_move_streaming_expert_cache_budget(g_ds41_admitted_budget);
+    if (g_ds41_headroom_lends_reserve)
+        ds4_gpu_set_memory_budget_reserve(g_ds41_prefill_headroom_bytes);
 #endif
     g_ds41_headroom_lent = 0;
 }
@@ -81148,7 +81158,9 @@ static void ds4_engine_close_internal(ds4_engine *e) {
     /* The expert cache these described is gone with the backend. */
     g_ds41_prewarmed = 0;
     g_ds41_headroom_lent = 0;
+    g_ds41_headroom_lends_reserve = 0;
     g_ds41_admitted_budget = g_ds41_decode_budget = 0;
+    g_ds41_prefill_headroom_bytes = 0;
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);

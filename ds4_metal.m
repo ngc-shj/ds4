@@ -5489,6 +5489,14 @@ void ds4_gpu_set_memory_budget(uint64_t bytes, uint64_t reserve) {
     g_memory_budget_reserve_bytes = reserve;
 }
 
+/* Move only the part held aside for a future prefill. Decode lends that
+ * headroom to the expert cache, while the total device budget stays fixed.
+ * Restoring it before prefill makes the normal allocation admission return
+ * cache slabs before the reserve is consumed. */
+void ds4_gpu_set_memory_budget_reserve(uint64_t reserve) {
+    g_memory_budget_reserve_bytes = reserve;
+}
+
 /* Bytes the device may still allocate under the budget. */
 static uint64_t ds4_gpu_memory_budget_room(void) {
     if (g_memory_budget_bytes == 0 || !g_device) return UINT64_MAX;
