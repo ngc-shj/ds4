@@ -1425,7 +1425,24 @@ typedef struct {
     uint16_t pins;
     uint8_t valid;
     uint8_t slab_backed;
+    /* The directory: g_stream_expert_cache[layer][expert] is the one record of
+     * where an expert's weights are. state is MISSING (address 0 in the
+     * table), LOADING, CACHED or PINNED (held until the engine closes, never
+     * evicted); gen moves every time the entry is published or invalidated,
+     * from one counter, so a generation names one residency of one expert. */
+    uint8_t state;
+    uint32_t gen;
 } ds4_gpu_stream_expert_cache_entry;
+
+enum { DS4_DIR_MISSING = 0, DS4_DIR_LOADING, DS4_DIR_CACHED, DS4_DIR_PINNED };
+static uint32_t g_dir_gen;
+/* What the batch lookup found, checked against the table it hands the
+ * device: pinned and cached hits, loads, a table slot that does not hold its
+ * entry's address, a missing expert with a non-zero slot, a selected expert
+ * left missing (a zero address the kernels would skip). */
+static unsigned long long g_dir_window_shrunk;   /* pinned experts the budget took back */
+static unsigned long long g_dir_pinned_hits, g_dir_cache_hits, g_dir_loads,
+                          g_dir_address_mismatch, g_dir_missing_nonzero, g_dir_selected_missing;
 
 typedef struct {
     __strong id<MTLBuffer> gate_buffer;
@@ -5409,6 +5426,41 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
 
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
     g_glm_streaming_prefill_full_layer_runtime = enabled ? 1 : 0;
+}
+
+/* pinned hits, cache hits, loads, table/entry address mismatches, missing
+ * entries with a non-zero slot, selected experts left missing, entries pinned
+ * now, directory generation. */
+/* Experts the cache already holds become PINNED: never a victim, held until
+ * the cache is cleared at close. The same entries, slabs, table slots and
+ * budget as any cached expert - a pinned window is not a second cache. Returns
+ * how many of the n were pinned; one that is not in the cache is not. */
+uint32_t ds4_gpu_expert_pin(uint32_t layer, const int32_t *ids, uint32_t n);
+uint32_t ds4_gpu_expert_pin(uint32_t layer, const int32_t *ids, uint32_t n) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !ids) return 0;
+    uint32_t pinned = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ids[i] < 0 || (uint32_t)ids[i] >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][ids[i]];
+        if (!e->valid || e->state == DS4_DIR_PINNED) continue;
+        e->pins++;
+        e->state = DS4_DIR_PINNED;
+        e->gen = ++g_dir_gen;
+        pinned++;
+    }
+    return pinned;
+}
+
+void ds4_gpu_expert_directory_counts(unsigned long long out[8]);
+void ds4_gpu_expert_directory_counts(unsigned long long out[8]) {
+    unsigned long long pinned = 0;
+    for (uint32_t l = 0; l < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; l++)
+        for (uint32_t x = 0; x < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; x++)
+            if (g_stream_expert_cache[l][x].valid && g_stream_expert_cache[l][x].state == DS4_DIR_PINNED)
+                pinned++;
+    out[0] = g_dir_pinned_hits; out[1] = g_dir_cache_hits; out[2] = g_dir_loads;
+    out[3] = g_dir_address_mismatch; out[4] = g_dir_missing_nonzero;
+    out[5] = g_dir_selected_missing; out[6] = pinned; out[7] = g_dir_gen;
 }
 
 /* budget, prefill reserve, peak allocated, slabs given back, allocations
@@ -10100,6 +10152,31 @@ void ds4_gpu_test_full_addr_admit(void);
 void ds4_gpu_test_full_addr_admit(void) { g_full_addr_test_admitted = 1; }
 void ds4_gpu_test_full_addr_expert_limit(uint32_t limit);
 void ds4_gpu_test_full_addr_expert_limit(uint32_t limit) { g_full_addr_test_expert_limit = limit; }
+/* Test hook: while set, a batch of exactly `rows` rows has its routed experts
+ * replaced by ids[rows * 6] in every layer before the lookup reads them - so a
+ * test can put experts inside and outside a pinned window into one block and
+ * know which it asked for. rows 0 turns it off. */
+static uint32_t g_test_forced_rows;
+static int32_t g_test_forced_ids[16 * 6];
+void ds4_gpu_test_force_selection(const int32_t *ids, uint32_t rows);
+void ds4_gpu_test_force_selection(const int32_t *ids, uint32_t rows) {
+    if (!ids || rows == 0 || rows > 16u) { g_test_forced_rows = 0; return; }
+    memcpy(g_test_forced_ids, ids, (size_t)rows * 6u * sizeof(int32_t));
+    g_test_forced_rows = rows;
+}
+
+/* Test hook: one directory entry's state (DS4_DIR_*), or -1 out of range. */
+int ds4_gpu_test_expert_state(uint32_t layer, uint32_t expert);
+int ds4_gpu_test_expert_state(uint32_t layer, uint32_t expert) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return -1;
+    const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+    return e->valid ? e->state : 0;
+}
+
+/* The pinned window size a test asked for; 0: a whole layer. */
+uint32_t ds4_gpu_expert_window(void);
+uint32_t ds4_gpu_expert_window(void) { return g_full_addr_test_expert_limit; }
 
 /* The device's working set and what is allocated against it, in bytes. */
 void ds4_gpu_test_working_set(unsigned long long *recommended, unsigned long long *allocated);
@@ -10164,19 +10241,6 @@ int ds4_gpu_use_metal4(void) {
     if (@available(macOS 26.0, *)) ready = ds4_mtl4_ready();
     if (!ready) {
         fprintf(stderr, "ds4: the Metal 4 backend is unavailable\n");
-        return 0;
-    }
-    /* Quarantined: the Metal 4 form of the full expert address table brought
-     * the machine down (a kernel panic in the GPU driver, three times, with
-     * the table enabled on the native batch). Until its residency is
-     * rebuilt and proven bounded, asking for it stops the engine here rather
-     * than running it or quietly running without it. */
-    if (!g_full_addr_test_admitted &&
-        getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
-        getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL) {
-        fprintf(stderr, "ds4: the full expert address table is quarantined under Metal 4 "
-                        "pending its residency fix; unset "
-                        "DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE\n");
         return 0;
     }
     if (g_queue) {
@@ -13668,6 +13732,16 @@ void ds4_gpu_cleanup(void) {
                     g_memory_budget_peak / 1073741824.0, g_memory_budget_bytes / 1073741824.0,
                     g_memory_budget_slabs_returned, g_memory_budget_refusals,
                     g_memory_budget_cache_stops);
+        if (g_dir_gen)
+            fprintf(stderr, "ds4: expert directory: %llu pinned hits, %llu cache hits, %llu loads; "
+                    "%llu address mismatches, %llu missing with a non-zero slot, %llu selected "
+                    "and missing; %llu pinned experts given back to the budget\n",
+                    g_dir_pinned_hits, g_dir_cache_hits, g_dir_loads,
+                    g_dir_address_mismatch, g_dir_missing_nonzero, g_dir_selected_missing,
+                    g_dir_window_shrunk);
+        g_dir_window_shrunk = 0;
+        g_dir_pinned_hits = g_dir_cache_hits = g_dir_loads = 0;
+        g_dir_address_mismatch = g_dir_missing_nonzero = g_dir_selected_missing = 0;
         g_memory_budget_refusals = g_memory_budget_slabs_returned = 0;
         g_memory_budget_cache_stops = 0;
         g_memory_budget_peak = 0;
@@ -16512,10 +16586,14 @@ static int ds4_gpu_stream_block_residency_requested(void) {
     return on || g_block_residency_forced;
 }
 
+/* The old full expert address table - per-expert views of the mapped model,
+ * a residency set of its own, the shared table overwritten whole - is off for
+ * good: it brought the machine down under Metal 4, and it was a second cache
+ * beside the first. DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE now asks
+ * for pinned windows in the one expert directory (ds41_expert_pin_windows in
+ * ds4.c), which every path already looks up. */
 static int ds4_gpu_stream_full_expert_addr_table_requested(void) {
-    return g_ssd_streaming_mode &&
-           getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL;
+    return 0;
 }
 
 unsigned long long ds4_gpu_full_addr_table_uses(void);
@@ -18161,6 +18239,8 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     e->inflight_seq = 0;
     e->slab_slot = 0;
     e->valid = 0;
+    e->state = DS4_DIR_MISSING;
+    e->gen = ++g_dir_gen;
     e->slab_backed = 0;
 
     if (g_stream_expert_cache_layer_count[layer] > 0) {
@@ -18200,6 +18280,8 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
         for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
             g_stream_expert_cache[layer][expert].inflight_seq = 0;
+            /* A pinned window lasts until the cache is cleared, which is this. */
+            g_stream_expert_cache[layer][expert].pins = 0;
             ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
         }
         ds4_gpu_stream_full_expert_addr_clear_layer(layer);
@@ -18358,6 +18440,24 @@ static int ds4_gpu_stream_expert_cache_return_slab_locked(void) {
     const uint32_t slab = g_stream_expert_cache_slab_count - 1;
     const uint32_t start = g_stream_expert_cache_slab_start_slot[slab];
     const uint32_t count = g_stream_expert_cache_slab_slot_count[slab];
+    /* The memory budget outranks a pinned window: a window expert in the slab
+     * being handed back goes back to being an ordinary cached entry (its pin
+     * dropped, a new generation) and is evicted with the rest - the window
+     * shrinks rather than the session being refused. A lease's pin is not a
+     * window's and still holds the slab. */
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+            if (e->valid && e->slab_backed && e->slab_slot >= start && e->slab_slot < start + count &&
+                e->state == DS4_DIR_PINNED && e->pins == 1 &&
+                !ds4_gpu_stream_expert_cache_entry_inflight(e)) {
+                e->pins = 0;
+                e->state = DS4_DIR_CACHED;
+                e->gen = ++g_dir_gen;
+                g_dir_window_shrunk++;
+            }
+        }
+    }
     for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
         for (uint32_t expert = 0; expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
             const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
@@ -18514,8 +18614,8 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t n_protect) {
     if (layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
-        ds4_gpu_stream_expert_cache_entry_inflight(
-                &g_stream_expert_cache[layer][expert])) {
+        (ds4_gpu_stream_expert_cache_entry_inflight(&g_stream_expert_cache[layer][expert]) ||
+         g_stream_expert_cache[layer][expert].pins)) {
         return 1;
     }
     return layer == protect_layer &&
@@ -19353,6 +19453,9 @@ ds4_gpu_stream_expert_cache_install_loaded(
     e->up_inner = up_inner;
     e->down_inner = down_inner;
     e->inflight_seq = 0;
+    e->gen = ++g_dir_gen;
+    e->state = e->pins ? DS4_DIR_PINNED : DS4_DIR_CACHED;
+    g_dir_loads++;
     uint32_t slab_slot = 0;
     if (gate_buf == up_buf &&
         gate_buf == down_buf &&
@@ -20903,6 +21006,14 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     const bool profile =
         getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_PROFILE") != NULL;
     const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
+    /* A test's forced routing replaces the router's choice in the tensor every
+     * later kernel reads, before anything reads it: the queue has just been
+     * drained, so nothing on the device is reading it now. */
+    if (g_test_forced_rows && n_tokens == g_test_forced_rows && n_selected == 6u &&
+        !ds4_gpu_tensor_write(selected, 0, g_test_forced_ids, n_ids * sizeof(int32_t))) {
+        free(ids);
+        return 0;
+    }
     int ok = ds4_gpu_tensor_read(selected,
                                  0,
                                  ids,
@@ -20913,6 +21024,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     uint32_t frequency[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { 0 };
     int32_t unique_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     uint32_t unique_count = 0;
+    const uint32_t dir_gen_at_entry = g_dir_gen;
     *n_resources = 0;
     *unique_out = 0;
     if (ok) {
@@ -21311,6 +21423,41 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         }
     }
     free(ids);
+
+    /* What the device will be handed, checked against the directory before it
+     * is: every selected expert's table slot holds its entry's address, and a
+     * selected expert that is still missing is reported rather than left to
+     * the kernels, which skip a zero address and drop the expert from the
+     * sum. A slot served by an overflow model view is not an entry's and is
+     * counted where it is written. */
+    if (ok && view_served == 0) {
+        id<MTLBuffer> sg = nil, su = nil, sd = nil;
+        if (ds4_gpu_stream_expert_cache_addr_seed(layer, &sg, &su, &sd)) {
+            const uint64_t *ga = (const uint64_t *)ds4_gpu_buffer_contents(sg);
+            const uint64_t *ua = (const uint64_t *)ds4_gpu_buffer_contents(su);
+            const uint64_t *da = (const uint64_t *)ds4_gpu_buffer_contents(sd);
+            for (uint32_t u = 0; u < unique_count; u++) {
+                const uint32_t x = (uint32_t)unique_ids[u];
+                const ds4_gpu_stream_expert_cache_entry *d = &g_stream_expert_cache[layer][x];
+                if (!d->valid) {
+                    g_dir_selected_missing++;
+                    if (ga[x] | ua[x] | da[x]) g_dir_missing_nonzero++;
+                    ok = 0;
+                    continue;
+                }
+                if (ga[x] != ds4_gpu_buffer_address(d->gate_buffer, d->gate_inner) ||
+                    ua[x] != ds4_gpu_buffer_address(d->up_buffer, d->up_inner) ||
+                    da[x] != ds4_gpu_buffer_address(d->down_buffer, d->down_inner))
+                    g_dir_address_mismatch++;
+                if (d->gen > dir_gen_at_entry) continue;     /* loaded by this call */
+                if (d->state == DS4_DIR_PINNED) g_dir_pinned_hits++;
+                else g_dir_cache_hits++;
+            }
+        }
+        if (!ok)
+            fprintf(stderr, "ds4: Metal streaming batch layer %u: a selected expert is "
+                    "missing from the directory after its load\n", layer);
+    }
 
     if (!ok || (*n_resources == 0 && view_served == 0)) {
         ds4_gpu_stream_expert_cache_clear_layer(layer);

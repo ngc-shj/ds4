@@ -1,46 +1,44 @@
-/* The full expert address table on Metal 4, brought up in stages.
+/* Pinned expert windows in the one expert directory, brought up in stages.
  *
- *   test_deepseek41_fulltable <model.gguf> plan|run [experts] [cache_experts] [steps] [parts]
+ *   test_deepseek41_fulltable <model.gguf> <window> [steps] [cache_experts] [forced]
  *
- * Run with the production environment plus
- * DS4_METAL_ENABLE_V41_STREAMING_SESSION_BATCH=1,
- * DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE=1 and
- * DS4_METAL_FULL_ADDR_LAYERS=<n>.
+ * Run through bench/gpurun.sh with the production environment plus
+ * DS4_METAL_ENABLE_V41_STREAMING_SESSION_BATCH=1, and - for the run under
+ * test - DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE=1 and
+ * DS4_METAL_FULL_ADDR_LAYERS=<n>. The same command without those two is the
+ * oracle: where a pinned expert's weights live changes nothing the model
+ * computes, so the two must agree on every token and every logit.
  *
- *   plan   open the engine and print the working set, what is allocated
- *          against it, and how many full-table layers would fit; run nothing
- *   run    two sessions decoded together through the native batch for `steps`
- *          steps, giving only the first `experts` experts of each admitted
- *          layer buffers of their own (0: all of them), then the table's
- *          residency ledger, the Metal 4 feedback errors and the token ids
+ * `window` experts of each asked layer are pinned at open (0: a whole layer).
+ * Two sessions decode together through the native batch for `steps` steps.
+ * With `forced` (the default) every layer's routing is replaced, in the same
+ * block, by experts 0..5 for the first row and 378..383 for the second, so a
+ * window covers the first row's and the cache serves the second's - and the
+ * directory's counts over the decode can be checked against what that implies:
+ * a hit on a pinned entry for every forced expert the directory holds pinned,
+ * a cache hit or a load for every other, no table slot that is not its entry's
+ * address, no missing expert with a slot, no selected expert left missing.
  *
- * The expert cache is sized by `cache_experts` (default 4096) so the table has
- * room. With `experts` below the layer's count the answer is not the model's:
- * the stage exists to load the residency, not to be compared. */
+ * Prints the device's holdings at open and after close, the directory check,
+ * and the token ids, every logit of both sessions after every step, and both
+ * saved states, hashed. Exits 1 if a check fails. */
 #include "../ds4.h"
 
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <mach/mach.h>
 
-/* Weak, so the same source builds against the frozen Metal 3 tree, which has
- * none of these: there the ledger lines are skipped and the table runs as that
- * build runs it. */
-void ds4_gpu_test_full_addr_admit(void) __attribute__((weak));
-void ds4_gpu_test_full_addr_expert_limit(uint32_t limit) __attribute__((weak));
-void ds4_gpu_test_working_set(unsigned long long *recommended, unsigned long long *allocated) __attribute__((weak));
-void ds4_gpu_full_addr_counts(unsigned long long out[8]) __attribute__((weak));
-void ds4_gpu_mtl4_health(unsigned long long out[8]) __attribute__((weak));
-void ds4_gpu_test_mtl4_parts(unsigned parts) __attribute__((weak));
+void ds4_gpu_test_full_addr_expert_limit(uint32_t limit);
+void ds4_gpu_test_force_selection(const int32_t *ids, uint32_t rows);
+int ds4_gpu_test_expert_state(uint32_t layer, uint32_t expert);
+void ds4_gpu_expert_directory_counts(unsigned long long out[8]);
+void ds4_gpu_test_lifecycle(unsigned long long out[14]);
+void ds4_gpu_memory_budget_counts(unsigned long long out[6]);
+void ds4_gpu_mtl4_health(unsigned long long out[8]);
 
-/* The Objective-C runtime's pool, from C: with a tenth argument each round
- * runs inside one, which tells a leak through autorelease apart from one
- * through a reference somebody still holds. */
-extern void *objc_autoreleasePoolPush(void);
-extern void objc_autoreleasePoolPop(void *pool);
+enum { DIR_PINNED = 3, LAYERS = 40 };
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     const unsigned char *c = p;
@@ -48,34 +46,11 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     return h;
 }
 
-/* What the process holds in physical memory, which every build can report. */
-static double footprint_gib(void) {
-    task_vm_info_data_t info;
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
-    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return -1.0;
-    return (double)info.phys_footprint / 1073741824.0;
-}
-
-static void ledger(const char *when) {
-    printf("%-8s footprint %.2f GiB\n", when, footprint_gib());
-    if (!ds4_gpu_full_addr_counts || !ds4_gpu_mtl4_health || !ds4_gpu_test_working_set) return;
-    unsigned long long f[8], h[8], ws = 0, al = 0;
-    ds4_gpu_full_addr_counts(f);
-    ds4_gpu_mtl4_health(h);
-    ds4_gpu_test_working_set(&ws, &al);
-    printf("%-8s full table: %llu allocations held (%.2f GiB), set reports %llu; adds %llu, "
-           "removes %llu, duplicate adds %llu; layers admitted %llu, refused %llu | Metal 4 "
-           "feedback errors %llu of %llu | allocated %.2f of %.2f GiB\n",
-           when, f[0], f[1] / 1073741824.0, f[7], f[2], f[3], f[4], f[5], f[6],
-           h[2], h[1], al / 1073741824.0, ws / 1073741824.0);
-}
-
-static int payload_hash(ds4_session *s, uint64_t *hash, uint64_t *bytes) {
+static int payload_hash(ds4_session *s, uint64_t *hash) {
     char err[256];
     FILE *fp = tmpfile();
     if (!fp) return 0;
     if (ds4_session_save_payload(s, fp, err, sizeof(err)) != 0) { fclose(fp); return 0; }
-    *bytes = (uint64_t)ftell(fp);
     rewind(fp);
     uint64_t h = 1469598103934665603ull;
     unsigned char chunk[1 << 16];
@@ -86,9 +61,41 @@ static int payload_hash(ds4_session *s, uint64_t *hash, uint64_t *bytes) {
     return 1;
 }
 
-/* Two sessions prefilled, then decoded together through the native batch:
- * token ids, every logit of both after every step, and both saved states. */
-static int one_round(ds4_engine *engine, int steps, int round) {
+static void holdings(const char *when) {
+    unsigned long long l[14], b[6], h[8];
+    ds4_gpu_test_lifecycle(l);
+    ds4_gpu_memory_budget_counts(b);
+    ds4_gpu_mtl4_health(h);
+    const double G = 1073741824.0;
+    printf("%-8s allocated %.2f GiB (budget %.2f, peak %.2f) | cache %llu entries in %llu slots | "
+           "expert set %llu, queue sets %llu, contexts %llu | residency held %llu\n",
+           when, l[0] / G, b[0] / G, b[2] / G, l[8], l[9], l[4], l[6], l[7], h[3]);
+}
+
+static volatile sig_atomic_t g_stop;
+static void on_term(int sig) { (void)sig; g_stop = 1; }
+
+int main(int argc, char **argv) {
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s model.gguf window [steps] [cache_experts] [forced]\n", argv[0]);
+        return 2;
+    }
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    signal(SIGTERM, on_term);
+    const uint32_t window = (uint32_t)atoi(argv[2]);
+    const int steps = argc > 3 ? atoi(argv[3]) : 16;
+    const unsigned cache = argc > 4 ? (unsigned)atoi(argv[4]) : 10268;
+    const int forced = argc > 5 ? atoi(argv[5]) != 0 : 1;
+    ds4_gpu_test_full_addr_expert_limit(window);
+    ds4_engine_options opt = {
+        .model_path = argv[1], .backend = DS4_BACKEND_METAL,
+        .ssd_streaming = true, .ssd_streaming_cache_experts = cache,
+        .context_size = 4096, .placement_ctx_hint = 4096,
+        .placement_session_count_hint = 2, .power_percent = 100,
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &opt) != 0) return 2;
+    holdings("opened");
     const int vocab = ds4_engine_vocab_size(engine);
     float *buf = malloc((size_t)vocab * sizeof(float));
     ds4_tokens pa = {0}, pb = {0};
@@ -99,90 +106,69 @@ static int one_round(ds4_engine *engine, int steps, int round) {
     ds4_chat_append_message(engine, &pb, "user", "Prove that the square root of two is irrational.");
     ds4_chat_append_assistant_prefix(engine, &pb, DS4_THINK_NONE);
     ds4_session *a = NULL, *b = NULL;
-    char err[256];
+    char err[256] = "";
     int ok = ds4_session_create(&a, engine, 4096) == 0 && ds4_session_create(&b, engine, 4096) == 0 &&
              ds4_session_sync(a, &pa, err, sizeof(err)) == 0 &&
              ds4_session_sync(b, &pb, err, sizeof(err)) == 0;
-    ledger("prefill");
+
+    /* The forced routing, and what the directory must report for it: the
+     * entries pinned now stay pinned, so a forced expert is a pinned hit in
+     * every step exactly when its entry is pinned here. */
+    int32_t ids[12];
+    for (int k = 0; k < 6; k++) { ids[k] = k; ids[6 + k] = 378 + k; }
+    unsigned long long want_pinned = 0, pinned_entries = 0;
+    for (uint32_t l = 0; l < LAYERS; l++)
+        for (uint32_t x = 0; x < 384; x++) {
+            const int st = ds4_gpu_test_expert_state(l, x);
+            if (st != DIR_PINNED) continue;
+            pinned_entries++;
+            for (int k = 0; k < 12; k++) if ((uint32_t)ids[k] == x) want_pinned++;
+        }
+    printf("window   %u asked; %llu entries pinned; forced routing %s\n", window, pinned_entries,
+           forced ? "rows 0..5 and 378..383" : "off");
+    if (forced) ds4_gpu_test_force_selection(ids, 2);
+    unsigned long long d0[8], d1[8];
+    ds4_gpu_expert_directory_counts(d0);
+
     uint64_t ha = 1469598103934665603ull, hb = ha, la = ha, lb = ha;
     int n = 0;
-    for (; ok && n < steps; n++) {
-        ds4_decode_item items[2] = {
-            { a, ds4_session_argmax(a) }, { b, ds4_session_argmax(b) },
-        };
+    for (; ok && !g_stop && n < steps; n++) {
+        ds4_decode_item items[2] = { { a, ds4_session_argmax(a) }, { b, ds4_session_argmax(b) } };
         ha = fnv(ha, &items[0].token, sizeof(int));
         hb = fnv(hb, &items[1].token, sizeof(int));
         ok = ds4_sessions_eval_batch(items, 2, err, sizeof(err)) == 0;
-        if (ok && ds4_session_copy_logits(a, buf, vocab) == vocab)
-            la = fnv(la, buf, (size_t)vocab * sizeof(float));
-        if (ok && ds4_session_copy_logits(b, buf, vocab) == vocab)
-            lb = fnv(lb, buf, (size_t)vocab * sizeof(float));
+        if (ok && ds4_session_copy_logits(a, buf, vocab) == vocab) la = fnv(la, buf, (size_t)vocab * sizeof(float));
+        if (ok && ds4_session_copy_logits(b, buf, vocab) == vocab) lb = fnv(lb, buf, (size_t)vocab * sizeof(float));
     }
-    if (!ok) printf("failed   round %d step %d: %s\n", round, n, err);
-    ledger("decoded");
-    uint64_t sa = 0, sb = 0, za = 0, zb = 0;
-    const int pa_ok = a && payload_hash(a, &sa, &za), pb_ok = b && payload_hash(b, &sb, &zb);
-    printf("ids      round %d, %d steps: a %016llx b %016llx | logits a %016llx b %016llx | "
-           "state a %016llx (%llu B) b %016llx (%llu B)%s\n", round, n,
-           (unsigned long long)ha, (unsigned long long)hb, (unsigned long long)la,
-           (unsigned long long)lb, (unsigned long long)sa, (unsigned long long)za,
-           (unsigned long long)sb, (unsigned long long)zb, pa_ok && pb_ok ? "" : " STATE-FAILED");
+    ds4_gpu_expert_directory_counts(d1);
+    ds4_gpu_test_force_selection(NULL, 0);
+    if (!ok) printf("failed   step %d: %s\n", n, err);
+
+    const unsigned long long pinned_hits = d1[0] - d0[0], cache_hits = d1[1] - d0[1];
+    const unsigned long long loads = d1[2] - d0[2], mismatch = d1[3] - d0[3];
+    const unsigned long long nonzero = d1[4] - d0[4], missing = d1[5] - d0[5];
+    const unsigned long long want_pin = forced ? want_pinned * (unsigned long long)n : 0;
+    const unsigned long long want_rest = forced ? 12ull * LAYERS * (unsigned long long)n - want_pin : 0;
+    int dir_ok = mismatch == 0 && nonzero == 0 && missing == 0 && d1[6] == pinned_entries;
+    if (forced) dir_ok = dir_ok && pinned_hits == want_pin && cache_hits + loads == want_rest;
+    printf("directory over %d steps: pinned hits %llu (want %llu), cache hits %llu + loads %llu "
+           "(want %llu); address mismatches %llu, missing with a slot %llu, selected and missing "
+           "%llu; %llu entries still pinned -> %s\n", n, pinned_hits, want_pin, cache_hits, loads,
+           want_rest, mismatch, nonzero, missing, d1[6], dir_ok ? "PASS" : "FAIL");
+
+    uint64_t sa = 0, sb = 0;
+    const int states = a && payload_hash(a, &sa) && b && payload_hash(b, &sb);
+    printf("ids      %d steps: a %016llx b %016llx | logits a %016llx b %016llx | state a %016llx "
+           "b %016llx%s\n", n, (unsigned long long)ha, (unsigned long long)hb,
+           (unsigned long long)la, (unsigned long long)lb, (unsigned long long)sa,
+           (unsigned long long)sb, states ? "" : " STATE-FAILED");
     ds4_session_free(a);
     ds4_session_free(b);
     ds4_tokens_free(&pa);
     ds4_tokens_free(&pb);
     free(buf);
-    return ok;
-}
-
-int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr, "usage: %s model.gguf plan|run [experts] [cache_experts] [steps] [parts] [rounds]\n",
-                argv[0]);
-        return 2;
-    }
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    const int run = strcmp(argv[2], "run") == 0;
-    const unsigned experts = argc > 3 ? (unsigned)atoi(argv[3]) : 0;
-    const unsigned cache = argc > 4 ? (unsigned)atoi(argv[4]) : 4096;
-    const int steps = argc > 5 ? atoi(argv[5]) : 16;
-    /* Every Metal 4 context encoded in this many command buffers; 0 leaves
-     * the build's own rule. */
-    if (argc > 6 && atoi(argv[6]) > 0 && ds4_gpu_test_mtl4_parts)
-        ds4_gpu_test_mtl4_parts((unsigned)atoi(argv[6]));
-    /* Engines opened, run and closed one after another in this process. */
-    const int rounds = argc > 7 ? atoi(argv[7]) : 1;
-    if (ds4_gpu_test_full_addr_admit) ds4_gpu_test_full_addr_admit();
-    if (ds4_gpu_test_full_addr_expert_limit) ds4_gpu_test_full_addr_expert_limit(experts);
-    ds4_engine_options opt = {
-        .model_path = argv[1], .backend = DS4_BACKEND_METAL,
-        .ssd_streaming = true, .ssd_streaming_cache_experts = cache,
-        .context_size = 4096, .placement_ctx_hint = 4096,
-        .placement_session_count_hint = 2, .power_percent = 100,
-    };
-    int ok = 1;
-    const int pooled = argc > 9 && atoi(argv[9]) != 0;
-    for (int r = 0; r < (run ? rounds : 1); r++) {
-        void *pool = pooled ? objc_autoreleasePoolPush() : NULL;
-        ds4_engine *engine = NULL;
-        if (ds4_engine_open(&engine, &opt) != 0) return 2;
-        ledger("opened");
-        const char *layers = getenv("DS4_METAL_FULL_ADDR_LAYERS");
-        unsigned long long ws = 0, al = 0;
-        if (ds4_gpu_test_working_set) ds4_gpu_test_working_set(&ws, &al);
-        /* A V4.1 layer's experts: 384 of them, gate, up and down, 9.49 MiB each. */
-        const double layer_gib = 384.0 * 9.49 / 1024.0;
-        const double room = (double)ws / 1073741824.0 - (double)al / 1073741824.0 - 8.0;
-        printf("plan     %s layers asked; a layer is %.2f GiB; room below the working set less "
-               "8 GiB: %.2f GiB, %d layers\n", layers ? layers : "all", layer_gib, room,
-               room > 0 ? (int)(room / layer_gib) : 0);
-        if (run) ok &= one_round(engine, steps, r);
-        ds4_engine_close(engine);
-        if (pool) objc_autoreleasePoolPop(pool);
-        ledger("closed");
-        /* With a ninth argument, hold still after each close so the process
-         * can be inspected from outside (vmmap, footprint). */
-        if (argc > 8) { printf("paused   %d s after round %d\n", atoi(argv[8]), r); sleep((unsigned)atoi(argv[8])); }
-    }
-    return ok ? 0 : 1;
+    ds4_engine_close(engine);
+    holdings("closed");
+    if (g_stop) return 4;
+    return ok && dir_ok && states ? 0 : 1;
 }
