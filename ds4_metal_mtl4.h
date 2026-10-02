@@ -275,6 +275,9 @@ API_AVAILABLE(macos(26.0))
      * slots once they are known (range index + 1, 0 for none). */
     uint32_t gate_lo, gate_hi;
     uint32_t reassert_range;
+    /* The address slots its head publishes, per layer; hi <= lo: none. */
+    uint32_t addr_lo[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+    uint32_t addr_hi[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 }
 /* The engine's handle for this context, and its recorder. */
 @property (nonatomic, strong) DS4Cmd *cmd;
@@ -427,6 +430,8 @@ enum {
     DS4_M4S_FENCES,             /* writes to queue-resident buffers, fenced */
     DS4_M4S_GATE_COPIES,        /* seed-to-live copies at a context's head */
     DS4_M4S_GATE_REUSE_WAITS,   /* seed slots that had to wait for their last copy */
+    DS4_M4S_ADDR_COPIES,        /* address-table layers published at a context's head */
+    DS4_M4S_ADDR_REUSE_WAITS,   /* address seed slots that waited for their last copy */
     DS4_M4S_KINDS
 };
 static unsigned long long g_m4s[DS4_M4S_KINDS];
@@ -1211,6 +1216,8 @@ static void ds4_m4_ctx_clear(DS4M4Ctx *c) {
     c->scratch_used = 0;
     c->gate_lo = c->gate_hi = 0;
     c->reassert_range = 0;
+    memset(c->addr_lo, 0, sizeof(c->addr_lo));
+    memset(c->addr_hi, 0, sizeof(c->addr_hi));
     c->stamp = 0;
     c->used = NO;
     c->n_nodes = c->n_addrs = c->n_ranges = 0;
@@ -1293,10 +1300,86 @@ static void ds4_mtl4_gate_slot_taken(uint32_t slot) {
     if (slot + 1u > c->gate_hi) c->gate_hi = slot + 1u;
 }
 
-/* At commit, before the barriers are placed: the copy of this context's seed
- * slots to live, as its first node, and its reassert bounded to them. */
+/* ---- the expert address tables' seed and live (see ds4_metal.m) ---------- */
+
+static int ds4_mtl4_addr_split(void) { return g_backend == 4; }
+
+/* The slots each layer's recent publishes copied, and their stamps: as for
+ * the gate seed, a slot is not written again under a copy still in flight. */
+#define DS4_ADDR_COPIED 4u
+static struct { uint32_t lo, hi; uint64_t stamp; }
+    g_addr_copied[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_ADDR_COPIED];
+
+static void ds4_mtl4_addr_slot_written(uint32_t layer, uint32_t expert) {
+    if (!ds4_mtl4_addr_split() || layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    for (uint32_t k = 0; k < DS4_ADDR_COPIED; k++) {
+        const uint64_t last = g_addr_copied[layer][k].stamp;
+        if (last > g_mtl4_done && expert >= g_addr_copied[layer][k].lo &&
+            expert < g_addr_copied[layer][k].hi) {
+            if (@available(macOS 26.0, *)) (void)ds4_mtl4_wait_to(last);
+            g_m4s[DS4_M4S_ADDR_REUSE_WAITS]++;
+        }
+    }
+    if (g_addr_dirty_hi[layer] == 0) {
+        g_addr_dirty_lo[layer] = expert;
+        g_addr_dirty_hi[layer] = expert + 1u;
+        return;
+    }
+    if (expert < g_addr_dirty_lo[layer]) g_addr_dirty_lo[layer] = expert;
+    if (expert + 1u > g_addr_dirty_hi[layer]) g_addr_dirty_hi[layer] = expert + 1u;
+}
+
+/* The slots written since the last publish, copied seed to live for each of
+ * the three tables. Returns the number of copy nodes recorded. */
+API_AVAILABLE(macos(26.0))
+static uint32_t ds4_m4_addr_publish(DS4M4Ctx *c) {
+    uint32_t nodes = 0;
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        const uint32_t lo = g_addr_dirty_lo[layer], hi = g_addr_dirty_hi[layer];
+        if (hi <= lo) continue;
+        id<MTLBuffer> seed[3] = { g_stream_expert_cache_gate_addr_seed[layer],
+                                  g_stream_expert_cache_up_addr_seed[layer],
+                                  g_stream_expert_cache_down_addr_seed[layer] };
+        id<MTLBuffer> live[3] = { g_stream_expert_cache_gate_addr_buffers[layer],
+                                  g_stream_expert_cache_up_addr_buffers[layer],
+                                  g_stream_expert_cache_down_addr_buffers[layer] };
+        const NSUInteger off = (NSUInteger)lo * sizeof(uint64_t);
+        const NSUInteger len = (NSUInteger)(hi - lo) * sizeof(uint64_t);
+        for (uint32_t t = 0; t < 3; t++)
+            if (seed[t] && live[t] && ds4_mtl4_copy(seed[t], off, live[t], off, len)) nodes++;
+        c->addr_lo[layer] = lo;
+        c->addr_hi[layer] = hi;
+        g_addr_dirty_lo[layer] = g_addr_dirty_hi[layer] = 0;
+        g_m4s[DS4_M4S_ADDR_COPIES]++;
+    }
+    return nodes;
+}
+
+/* At commit, before the barriers are placed: the copies of this context's gate
+ * seed slots and of the address slots written since the last commit, as its
+ * first nodes, and its reassert bounded to its gate slots. */
 API_AVAILABLE(macos(26.0))
 static void ds4_m4_gate_prologue(DS4M4Ctx *c) {
+    if (!ds4_mtl4_gate_split() && !ds4_mtl4_addr_split()) return;
+    const uint32_t first = c->n_nodes;
+    const uint8_t fence_next = c->fence_next;
+    c->fence_next = 0;
+    if (ds4_mtl4_addr_split()) (void)ds4_m4_addr_publish(c);
+    c->fence_next = fence_next;
+    const uint32_t addr_nodes = c->n_nodes - first;
+    if (addr_nodes) {
+        ds4_m4_node moved[3u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+        memcpy(moved, &c->nodes[first], addr_nodes * sizeof(ds4_m4_node));
+        memmove(&c->nodes[addr_nodes], &c->nodes[0], (size_t)first * sizeof(ds4_m4_node));
+        memcpy(&c->nodes[0], moved, addr_nodes * sizeof(ds4_m4_node));
+        for (uint32_t k = 0; k < addr_nodes; k++) c->nodes[k].fence = 0;
+        if (g_timeline_enabled && c->tl) {
+            ds4_timeline_rec trec[3u * DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+            memcpy(trec, &c->tl[first], addr_nodes * sizeof(ds4_timeline_rec));
+            memmove(&c->tl[addr_nodes], &c->tl[0], (size_t)first * sizeof(ds4_timeline_rec));
+            memcpy(&c->tl[0], trec, addr_nodes * sizeof(ds4_timeline_rec));
+        }
+    }
     if (!ds4_mtl4_gate_split()) return;
     const uint64_t slot_bytes = 3u * sizeof(uint32_t);
     if (c->reassert_range) {
@@ -1306,15 +1389,15 @@ static void ds4_m4_gate_prologue(DS4M4Ctx *c) {
         r->hi = hi > lo ? hi : lo;
     }
     if (c->gate_hi <= c->gate_lo) return;
-    const uint8_t fence_next = c->fence_next;
+    const uint8_t gate_fence_next = c->fence_next;
     c->fence_next = 0;
     const NSUInteger off = (NSUInteger)c->gate_lo * slot_bytes;
     const NSUInteger len = (NSUInteger)(c->gate_hi - c->gate_lo) * slot_bytes;
     if (!ds4_mtl4_copy(g_gate_seed, off, g_gate_grid, off, len)) {
-        c->fence_next = fence_next;
+        c->fence_next = gate_fence_next;
         return;
     }
-    c->fence_next = fence_next;
+    c->fence_next = gate_fence_next;
     /* Recorded last, run first: moved to the head of the graph. */
     ds4_m4_node copy = c->nodes[c->n_nodes - 1u];
     copy.fence = 0;
@@ -1345,6 +1428,19 @@ static void ds4_mtl4_gate_mark_reassert(void) {
 }
 
 static void ds4_m4_gate_epilogue(DS4M4Ctx *c) {
+    for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        if (c->addr_hi[layer] <= c->addr_lo[layer]) continue;
+        uint32_t k = 0;
+        for (uint32_t j = 1; j < DS4_ADDR_COPIED; j++)
+            if (g_addr_copied[layer][j].stamp < g_addr_copied[layer][k].stamp) k = j;
+        if (g_addr_copied[layer][k].stamp > g_mtl4_done) {
+            if (@available(macOS 26.0, *)) (void)ds4_mtl4_wait_to(g_addr_copied[layer][k].stamp);
+            g_m4s[DS4_M4S_ADDR_REUSE_WAITS]++;
+        }
+        g_addr_copied[layer][k].lo = c->addr_lo[layer];
+        g_addr_copied[layer][k].hi = c->addr_hi[layer];
+        g_addr_copied[layer][k].stamp = c->stamp;
+    }
     if (g_gate_layers && (c->gate_hi > c->gate_lo || c->reassert_range))
         g_gate_ring_stamp[g_gate_encode_slot % DS4_GATE_MISS_SLOTS] = c->stamp;
     if (!ds4_mtl4_gate_split() || c->gate_hi <= c->gate_lo) return;

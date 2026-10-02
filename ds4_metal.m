@@ -1470,6 +1470,21 @@ static uint32_t
 static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+/* The address tables are two buffers each on Metal 4, as the gate grid is.
+ * The arrays above are what the device reads. The host writes and reads the
+ * seed below - an install, an eviction, a repair - and records which slots it
+ * changed; the next context to commit copies those slots seed to live in a
+ * node at its head (ds4_m4_addr_prologue), so a table update is a node of the
+ * graph with its exact range, ordered before every dispatch of that context
+ * and never under one already running. On Metal 3 the seed is the live
+ * table. */
+static id<MTLBuffer> g_stream_expert_cache_gate_addr_seed[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static id<MTLBuffer> g_stream_expert_cache_up_addr_seed[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static id<MTLBuffer> g_stream_expert_cache_down_addr_seed[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint32_t g_addr_dirty_lo[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint32_t g_addr_dirty_hi[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];   /* 0: none */
+static void ds4_mtl4_addr_slot_written(uint32_t layer, uint32_t expert);   /* ds4_metal_mtl4.h */
+static int ds4_mtl4_addr_split(void);                                       /* ds4_metal_mtl4.h */
 static id<MTLBuffer> g_stream_expert_cache_slabs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS];
 /* Each slab's CPU address, read once when the slab is made. -contents returns
  * an inner pointer, so ARC retains and autoreleases the slab on every call:
@@ -13319,6 +13334,10 @@ void ds4_gpu_cleanup(void) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
             g_stream_expert_cache_up_addr_buffers[layer] = nil;
             g_stream_expert_cache_down_addr_buffers[layer] = nil;
+            g_stream_expert_cache_gate_addr_seed[layer] = nil;
+            g_stream_expert_cache_up_addr_seed[layer] = nil;
+            g_stream_expert_cache_down_addr_seed[layer] = nil;
+            g_addr_dirty_lo[layer] = g_addr_dirty_hi[layer] = 0;
             for (uint32_t slot = 0; slot < DS4_METAL_ROW_SLOTS; slot++) {
                 const uint32_t idx = layer * DS4_METAL_ROW_SLOTS + slot;
                 g_stream_compact_gate_addr_buffers[idx] = nil;
@@ -16685,32 +16704,44 @@ static int ds4_gpu_stream_expert_cache_ensure_addr_buffers(uint32_t layer) {
 
     const NSUInteger bytes =
         (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
-    id<MTLBuffer> buffers[3] = {
-        g_stream_expert_cache_gate_addr_buffers[layer],
-        g_stream_expert_cache_up_addr_buffers[layer],
-        g_stream_expert_cache_down_addr_buffers[layer],
+    __strong id<MTLBuffer> *slots[6] = {
+        &g_stream_expert_cache_gate_addr_buffers[layer],
+        &g_stream_expert_cache_up_addr_buffers[layer],
+        &g_stream_expert_cache_down_addr_buffers[layer],
+        &g_stream_expert_cache_gate_addr_seed[layer],
+        &g_stream_expert_cache_up_addr_seed[layer],
+        &g_stream_expert_cache_down_addr_seed[layer],
     };
-    for (uint32_t i = 0; i < 3; i++) {
-        if (buffers[i]) continue;
+    for (uint32_t i = 0; i < 6; i++) {
+        if (*slots[i]) continue;
         id<MTLBuffer> b = [g_device newBufferWithLength:bytes
                                                 options:MTLResourceStorageModeShared];
         if (!b) {
             fprintf(stderr, "ds4: Metal streaming expert address table allocation failed\n");
             return 0;
         }
-        b.label =
-            i == 0 ? @"ds4_stream_expert_gate_addresses" :
-            (i == 1 ? @"ds4_stream_expert_up_addresses" :
-                      @"ds4_stream_expert_down_addresses");
-        memset([b contents], 0, bytes);
-        if (i == 0) {
-            g_stream_expert_cache_gate_addr_buffers[layer] = b;
-        } else if (i == 1) {
-            g_stream_expert_cache_up_addr_buffers[layer] = b;
-        } else {
-            g_stream_expert_cache_down_addr_buffers[layer] = b;
-        }
+        static NSString *const names[6] = {
+            @"ds4_stream_expert_gate_addresses", @"ds4_stream_expert_up_addresses",
+            @"ds4_stream_expert_down_addresses", @"ds4_stream_expert_gate_address_seed",
+            @"ds4_stream_expert_up_address_seed", @"ds4_stream_expert_down_address_seed",
+        };
+        b.label = names[i];
+        memset(ds4_gpu_buffer_contents(b), 0, bytes);
+        *slots[i] = b;
     }
+    return 1;
+}
+
+/* The tables the host writes and reads: the seed on Metal 4, the live table
+ * itself on Metal 3. */
+static int ds4_gpu_stream_expert_cache_addr_seed(uint32_t layer, __strong id<MTLBuffer> *gate,
+                                                 __strong id<MTLBuffer> *up,
+                                                 __strong id<MTLBuffer> *down) {
+    if (!ds4_gpu_stream_expert_cache_ensure_addr_buffers(layer)) return 0;
+    const int split = ds4_mtl4_addr_split();
+    if (gate) *gate = split ? g_stream_expert_cache_gate_addr_seed[layer] : g_stream_expert_cache_gate_addr_buffers[layer];
+    if (up) *up = split ? g_stream_expert_cache_up_addr_seed[layer] : g_stream_expert_cache_up_addr_buffers[layer];
+    if (down) *down = split ? g_stream_expert_cache_down_addr_seed[layer] : g_stream_expert_cache_down_addr_buffers[layer];
     return 1;
 }
 
@@ -16721,15 +16752,14 @@ static void ds4_gpu_stream_expert_cache_zero_addr_slot(uint32_t layer, uint32_t 
         return;
     }
 
-    id<MTLBuffer> buffers[3] = {
-        g_stream_expert_cache_gate_addr_buffers[layer],
-        g_stream_expert_cache_up_addr_buffers[layer],
-        g_stream_expert_cache_down_addr_buffers[layer],
-    };
+    if (!g_stream_expert_cache_gate_addr_buffers[layer]) return;
+    id<MTLBuffer> buffers[3] = { nil, nil, nil };
+    if (!ds4_gpu_stream_expert_cache_addr_seed(layer, &buffers[0], &buffers[1], &buffers[2])) return;
+    ds4_mtl4_addr_slot_written(layer, expert);
     const NSUInteger off = (NSUInteger)expert * sizeof(uint64_t);
     for (uint32_t i = 0; i < 3; i++) {
         if (!buffers[i]) continue;
-        uint64_t *addr = (uint64_t *)((uint8_t *)[buffers[i] contents] + off);
+        uint64_t *addr = (uint64_t *)((uint8_t *)ds4_gpu_buffer_contents(buffers[i]) + off);
         *addr = 0;
     }
 }
@@ -16755,14 +16785,12 @@ static int ds4_gpu_stream_expert_cache_set_addr_slot_raw(
         return 0;
     }
 
-    id<MTLBuffer> buffers[3] = {
-        g_stream_expert_cache_gate_addr_buffers[layer],
-        g_stream_expert_cache_up_addr_buffers[layer],
-        g_stream_expert_cache_down_addr_buffers[layer],
-    };
+    id<MTLBuffer> buffers[3] = { nil, nil, nil };
+    if (!ds4_gpu_stream_expert_cache_addr_seed(layer, &buffers[0], &buffers[1], &buffers[2])) return 0;
+    ds4_mtl4_addr_slot_written(layer, expert);
     const NSUInteger off = (NSUInteger)expert * sizeof(uint64_t);
     for (uint32_t i = 0; i < 3; i++) {
-        uint64_t *addr = (uint64_t *)((uint8_t *)[buffers[i] contents] + off);
+        uint64_t *addr = (uint64_t *)((uint8_t *)ds4_gpu_buffer_contents(buffers[i]) + off);
         *addr = values[i];
     }
     return 1;
@@ -16958,7 +16986,7 @@ static int ds4_gpu_gate_repair_inner(const void *model_map, uint64_t model_size,
      * loader adds one and can evict another, so check the whole set against
      * the live table rather than assuming the addition stood. */
     id<MTLBuffer> tg = nil, tu = nil, td = nil;
-    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td)) return 0;
+    if (!ds4_gpu_stream_expert_cache_addr_seed(layer, &tg, &tu, &td)) return 0;
     const uint64_t *ga = (const uint64_t *)[tg contents];
     const uint64_t *ua = (const uint64_t *)[tu contents];
     const uint64_t *da = (const uint64_t *)[td contents];
@@ -17561,11 +17589,13 @@ static int ds4_gpu_stream_full_expert_addr_table_prepare(
             return 0;
         }
 
-        id<MTLBuffer> buffers[3] = {
-            g_stream_expert_cache_gate_addr_buffers[layer],
-            g_stream_expert_cache_up_addr_buffers[layer],
-            g_stream_expert_cache_down_addr_buffers[layer],
-        };
+        id<MTLBuffer> buffers[3] = { nil, nil, nil };
+        if (!ds4_gpu_stream_expert_cache_addr_seed(layer, &buffers[0], &buffers[1], &buffers[2])) {
+            ds4_gpu_stream_full_expert_addr_clear_layer(layer);
+            return 0;
+        }
+        for (uint32_t x = 0; x < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; x++)
+            ds4_mtl4_addr_slot_written(layer, x);
         uint64_t *gate_addr = (uint64_t *)[buffers[0] contents];
         uint64_t *up_addr = (uint64_t *)[buffers[1] contents];
         uint64_t *down_addr = (uint64_t *)[buffers[2] contents];
@@ -18174,17 +18204,23 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         }
         ds4_gpu_stream_full_expert_addr_clear_layer(layer);
         g_stream_expert_cache_layer_count[layer] = 0;
-        id<MTLBuffer> buffers[3] = {
+        /* Seed and live both: nothing is in flight when the whole cache is
+         * cleared, and nothing is left to publish. */
+        id<MTLBuffer> buffers[6] = {
             g_stream_expert_cache_gate_addr_buffers[layer],
             g_stream_expert_cache_up_addr_buffers[layer],
             g_stream_expert_cache_down_addr_buffers[layer],
+            g_stream_expert_cache_gate_addr_seed[layer],
+            g_stream_expert_cache_up_addr_seed[layer],
+            g_stream_expert_cache_down_addr_seed[layer],
         };
-        for (uint32_t i = 0; i < 3; i++) {
+        for (uint32_t i = 0; i < 6; i++) {
             if (!buffers[i]) continue;
             const NSUInteger bytes =
                 (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
-            memset([buffers[i] contents], 0, bytes);
+            memset(ds4_gpu_buffer_contents(buffers[i]), 0, bytes);
         }
+        g_addr_dirty_lo[layer] = g_addr_dirty_hi[layer] = 0;
     }
     g_stream_expert_cache_bytes = 0;
     g_stream_expert_cache_entry_count = 0;
@@ -23292,7 +23328,7 @@ int ds4_gpu_expert_acquire_set(uint32_t layer, const int32_t *ids, uint32_t n,
     lease->n = n;
     id<MTLBuffer> tg = nil, tu = nil, td = nil;
     const int have_tables =
-        ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td) && tg && tu && td;
+        ds4_gpu_stream_expert_cache_addr_seed(layer, &tg, &tu, &td) && tg && tu && td;
     const uint64_t *ga = have_tables ? (const uint64_t *)[tg contents] : NULL;
     const uint64_t *ua = have_tables ? (const uint64_t *)[tu contents] : NULL;
     const uint64_t *da = have_tables ? (const uint64_t *)[td contents] : NULL;
@@ -23321,7 +23357,7 @@ int ds4_gpu_expert_acquire_set(uint32_t layer, const int32_t *ids, uint32_t n,
 int ds4_gpu_expert_lease_repin(ds4_gpu_expert_lease *lease) {
     if (!lease || !lease->held) return 0;
     id<MTLBuffer> tg = nil, tu = nil, td = nil;
-    if (!ds4_gpu_stream_expert_cache_addr_buffers(lease->layer, &tg, &tu, &td) ||
+    if (!ds4_gpu_stream_expert_cache_addr_seed(lease->layer, &tg, &tu, &td) ||
         !tg || !tu || !td) return 0;
     const uint64_t *ga = (const uint64_t *)[tg contents];
     const uint64_t *ua = (const uint64_t *)[tu contents];
@@ -23362,7 +23398,7 @@ void ds4_gpu_expert_release_set(ds4_gpu_expert_lease *lease) {
 uint32_t ds4_gpu_expert_missing_mask(uint32_t layer, const int32_t *ids, uint32_t n) {
     if (!ids || n == 0 || n > 32u) return 0;
     id<MTLBuffer> tg = nil, tu = nil, td = nil;
-    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td) ||
+    if (!ds4_gpu_stream_expert_cache_addr_seed(layer, &tg, &tu, &td) ||
         !tg || !tu || !td) {
         return n >= 32u ? 0xffffffffu : (1u << n) - 1u;   /* nothing is reachable */
     }
@@ -45793,7 +45829,7 @@ static int ds4_gpu_routed_moe_one_gated(
  * read what it says it read. */
 uint32_t ds4_gpu_expert_addresses_live(uint32_t layer, const int32_t *ids, uint32_t n) {
     id<MTLBuffer> tg = nil, tu = nil, td = nil;
-    if (!ids || !ds4_gpu_stream_expert_cache_addr_buffers(layer, &tg, &tu, &td)) return 0;
+    if (!ids || !ds4_gpu_stream_expert_cache_addr_seed(layer, &tg, &tu, &td)) return 0;
     const uint64_t *ga = (const uint64_t *)[tg contents];
     const uint64_t *ua = (const uint64_t *)[tu contents];
     const uint64_t *da = (const uint64_t *)[td contents];
