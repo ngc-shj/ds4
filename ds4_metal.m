@@ -37285,11 +37285,13 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     ds4_enc_bytes(enc, act, sizeof(*act), 1);
+    /* One expert's matrix each, at a slot of a cache slab or a model view:
+     * no tensor starts there, so the length stated is the expert's. */
     for (uint32_t i = 0; i < 6; i++) {
-        ds4_enc_buf(enc, src0_a[i], src0_a_off[i], 2 + i);
+        ds4_enc_buf_n(enc, src0_a[i], src0_a_off[i], (NSUInteger)args->nb02, 2 + i);
     }
     for (uint32_t i = 0; i < 6; i++) {
-        ds4_enc_buf(enc, src0_b[i], src0_b_off[i], 8 + i);
+        ds4_enc_buf_n(enc, src0_b[i], src0_b_off[i], (NSUInteger)args->nb02, 8 + i);
     }
     ds4_enc_buf(enc, src1, src1_off, 14);
     ds4_enc_buf(enc, dst_a, dst_a_off, 15);
@@ -37331,7 +37333,7 @@ static int ds4_gpu_encode_mul_mv_slots6_sum6(
     ds4_enc_pso(enc, pipeline);
     ds4_enc_bytes(enc, args, sizeof(*args), 0);
     for (uint32_t i = 0; i < 6; i++) {
-        ds4_enc_buf(enc, src0[i], src0_off[i], 1 + i);
+        ds4_enc_buf_n(enc, src0[i], src0_off[i], (NSUInteger)args->nb02, 1 + i);
     }
     ds4_enc_buf(enc, src1, src1_off, 7);
     ds4_enc_buf(enc, dst, dst_off, 8);
