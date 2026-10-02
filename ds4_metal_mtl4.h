@@ -1252,10 +1252,14 @@ static int ds4_mtl4_commit_unpooled(void);
 
 /* ---- the gate's seed and live grid (see ds4_metal_gate.h) ---------------- */
 
-#define DS4_GATE_CHUNK 256u
-/* The stamp of the last context whose head copied from each chunk of seed
- * slots: a slot is not written again until that context has completed. */
-static uint64_t g_gate_chunk_stamp[DS4_GATE_MAX_SLOTS / DS4_GATE_CHUNK];
+/* The seed slots each recent context's head copies, and its stamp: a slot is
+ * not written again until the context that copies it has completed. Exact
+ * ranges, not chunks of slots - encode-ahead takes the slots right after the
+ * segment still running, and a chunk shared across that boundary made every
+ * segment wait for the one before it, which is the overlap encode-ahead is. */
+#define DS4_GATE_COPIED 16u
+static struct { uint32_t lo, hi; uint64_t stamp; } g_gate_copied[DS4_GATE_COPIED];
+static uint32_t g_gate_copied_next;
 /* The same for the miss and range rings: the stamp of the last context of the
  * segment that owned each ring entry. */
 static uint64_t g_gate_ring_stamp[DS4_GATE_MISS_SLOTS];
@@ -1275,10 +1279,12 @@ static int ds4_mtl4_gate_split(void) {
 
 static void ds4_mtl4_gate_slot_taken(uint32_t slot) {
     if (!ds4_mtl4_gate_split() || slot >= DS4_GATE_MAX_SLOTS) return;
-    const uint64_t last = g_gate_chunk_stamp[slot / DS4_GATE_CHUNK];
-    if (last > g_mtl4_done) {
-        if (@available(macOS 26.0, *)) (void)ds4_mtl4_wait_to(last);
-        g_m4s[DS4_M4S_GATE_REUSE_WAITS]++;
+    for (uint32_t k = 0; k < DS4_GATE_COPIED; k++) {
+        const uint64_t last = g_gate_copied[k].stamp;
+        if (last > g_mtl4_done && slot >= g_gate_copied[k].lo && slot < g_gate_copied[k].hi) {
+            if (@available(macOS 26.0, *)) (void)ds4_mtl4_wait_to(last);
+            g_m4s[DS4_M4S_GATE_REUSE_WAITS]++;
+        }
     }
     DS4M4Ctx *c = g_mtl4_cur;
     if (!c) return;
@@ -1342,8 +1348,15 @@ static void ds4_m4_gate_epilogue(DS4M4Ctx *c) {
     if (g_gate_layers && (c->gate_hi > c->gate_lo || c->reassert_range))
         g_gate_ring_stamp[g_gate_encode_slot % DS4_GATE_MISS_SLOTS] = c->stamp;
     if (!ds4_mtl4_gate_split() || c->gate_hi <= c->gate_lo) return;
-    for (uint32_t k = c->gate_lo / DS4_GATE_CHUNK; k <= (c->gate_hi - 1u) / DS4_GATE_CHUNK; k++)
-        g_gate_chunk_stamp[k] = c->stamp;
+    /* The entry this one replaces must not be forgotten while still in flight. */
+    const uint32_t k = g_gate_copied_next++ % DS4_GATE_COPIED;
+    if (g_gate_copied[k].stamp > g_mtl4_done) {
+        if (@available(macOS 26.0, *)) (void)ds4_mtl4_wait_to(g_gate_copied[k].stamp);
+        g_m4s[DS4_M4S_GATE_REUSE_WAITS]++;
+    }
+    g_gate_copied[k].lo = c->gate_lo;
+    g_gate_copied[k].hi = c->gate_hi;
+    g_gate_copied[k].stamp = c->stamp;
 }
 
 /* Encoding a context's graph and committing it is where the driver hands back
