@@ -1300,6 +1300,34 @@ static void ds4_mtl4_gate_slot_taken(uint32_t slot) {
     if (slot + 1u > c->gate_hi) c->gate_hi = slot + 1u;
 }
 
+/* ---- per-dispatch host data, staged and copied by a node ------------------- */
+
+/* Host data a dispatch reads from a device buffer - a layer's compact address
+ * row, the selected ids the host chose: written into this context's constant
+ * scratch, which nothing reuses before the context completes, and copied into
+ * `live` by a copy node recorded now, with the exact range written. The graph
+ * orders it after whatever read that range before and before what reads it
+ * after; the host never writes `live` itself. Opens a context if none is. */
+static unsigned long long g_stage_copies, g_stage_bytes;
+API_AVAILABLE(macos(26.0))
+static int ds4_mtl4_stage_copy(const void *data, NSUInteger len, id<MTLBuffer> live, NSUInteger off) {
+    if (!data || !live || len == 0 || !ds4_mtl4_begin()) return 0;
+    DS4M4Ctx *c = g_mtl4_cur;
+    if (!c) return 0;
+    const NSUInteger soff = (c->scratch_used + DS4_MTL4_SCRATCH_ALIGN - 1u) &
+                            ~(NSUInteger)(DS4_MTL4_SCRATCH_ALIGN - 1u);
+    if (soff + len > DS4_MTL4_SCRATCH_BYTES) {
+        fprintf(stderr, "ds4: Metal 4 scratch exhausted staging %lu bytes\n", (unsigned long)len);
+        abort();
+    }
+    memcpy((char *)[c->scratch contents] + soff, data, len);
+    c->scratch_used = soff + len;
+    if (!ds4_mtl4_copy(c->scratch, soff, live, off, len)) return 0;
+    g_stage_copies++;
+    g_stage_bytes += len;
+    return 1;
+}
+
 /* ---- the expert address tables' seed and live (see ds4_metal.m) ---------- */
 
 static int ds4_mtl4_addr_split(void) { return g_backend == 4; }

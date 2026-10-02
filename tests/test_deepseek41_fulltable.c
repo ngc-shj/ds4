@@ -1,6 +1,6 @@
 /* Pinned expert windows in the one expert directory, brought up in stages.
  *
- *   test_deepseek41_fulltable <model.gguf> <window> [steps] [cache_experts] [forced]
+ *   test_deepseek41_fulltable <model.gguf> <window> [steps] [cache_experts] [forced] [rows]
  *
  * Run through bench/gpurun.sh with the production environment plus
  * DS4_METAL_ENABLE_V41_STREAMING_SESSION_BATCH=1, and - for the run under
@@ -18,6 +18,12 @@
  * a hit on a pinned entry for every forced expert the directory holds pinned,
  * a cache hit or a load for every other, no table slot that is not its entry's
  * address, no missing expert with a slot, no selected expert left missing.
+ *
+ * With rows 1 a single session decodes one row at a time instead: with the
+ * gate off that is the single-row routed path, and a forced routing goes in as
+ * the host's own choice of ids - staged and copied into the device's buffer by
+ * a node - which the staging counts report. The row takes 0..2 and 378..380, so
+ * one dispatch reads a window's pinned experts and the cache's together.
  *
  * Prints the device's holdings at open and after close, the directory check,
  * and the token ids, every logit of both sessions after every step, and both
@@ -37,6 +43,7 @@ void ds4_gpu_expert_directory_counts(unsigned long long out[8]);
 void ds4_gpu_test_lifecycle(unsigned long long out[14]);
 void ds4_gpu_memory_budget_counts(unsigned long long out[6]);
 void ds4_gpu_mtl4_health(unsigned long long out[8]);
+void ds4_gpu_stage_counts(unsigned long long out[5]);
 
 enum { DIR_PINNED = 3, LAYERS = 40 };
 
@@ -86,6 +93,7 @@ int main(int argc, char **argv) {
     const int steps = argc > 3 ? atoi(argv[3]) : 16;
     const unsigned cache = argc > 4 ? (unsigned)atoi(argv[4]) : 10268;
     const int forced = argc > 5 ? atoi(argv[5]) != 0 : 1;
+    const int rows = argc > 6 && atoi(argv[6]) == 1 ? 1 : 2;
     ds4_gpu_test_full_addr_expert_limit(window);
     ds4_engine_options opt = {
         .model_path = argv[1], .backend = DS4_BACKEND_METAL,
@@ -114,21 +122,26 @@ int main(int argc, char **argv) {
     /* The forced routing, and what the directory must report for it: the
      * entries pinned now stay pinned, so a forced expert is a pinned hit in
      * every step exactly when its entry is pinned here. */
+    /* A single row takes three of each, so one dispatch reads pinned and
+     * cached experts together. */
     int32_t ids[12];
     for (int k = 0; k < 6; k++) { ids[k] = k; ids[6 + k] = 378 + k; }
+    if (rows == 1) for (int k = 3; k < 6; k++) ids[k] = 375 + k;
+    const int n_ids = rows == 1 ? 6 : 12;
     unsigned long long want_pinned = 0, pinned_entries = 0;
     for (uint32_t l = 0; l < LAYERS; l++)
         for (uint32_t x = 0; x < 384; x++) {
             const int st = ds4_gpu_test_expert_state(l, x);
             if (st != DIR_PINNED) continue;
             pinned_entries++;
-            for (int k = 0; k < 12; k++) if ((uint32_t)ids[k] == x) want_pinned++;
+            for (int k = 0; k < n_ids; k++) if ((uint32_t)ids[k] == x) want_pinned++;
         }
     printf("window   %u asked; %llu entries pinned; forced routing %s\n", window, pinned_entries,
-           forced ? "rows 0..5 and 378..383" : "off");
-    if (forced) ds4_gpu_test_force_selection(ids, 2);
-    unsigned long long d0[8], d1[8];
+           !forced ? "off" : rows == 1 ? "0..2 and 378..380" : "rows 0..5 and 378..383");
+    if (forced) ds4_gpu_test_force_selection(ids, (uint32_t)rows);
+    unsigned long long d0[8], d1[8], s0[5], s1[5];
     ds4_gpu_expert_directory_counts(d0);
+    ds4_gpu_stage_counts(s0);
 
     uint64_t ha = 1469598103934665603ull, hb = ha, la = ha, lb = ha;
     int n = 0;
@@ -136,11 +149,13 @@ int main(int argc, char **argv) {
         ds4_decode_item items[2] = { { a, ds4_session_argmax(a) }, { b, ds4_session_argmax(b) } };
         ha = fnv(ha, &items[0].token, sizeof(int));
         hb = fnv(hb, &items[1].token, sizeof(int));
-        ok = ds4_sessions_eval_batch(items, 2, err, sizeof(err)) == 0;
+        ok = rows == 1 ? ds4_session_eval(a, items[0].token, err, sizeof(err)) == 0
+                       : ds4_sessions_eval_batch(items, 2, err, sizeof(err)) == 0;
         if (ok && ds4_session_copy_logits(a, buf, vocab) == vocab) la = fnv(la, buf, (size_t)vocab * sizeof(float));
         if (ok && ds4_session_copy_logits(b, buf, vocab) == vocab) lb = fnv(lb, buf, (size_t)vocab * sizeof(float));
     }
     ds4_gpu_expert_directory_counts(d1);
+    ds4_gpu_stage_counts(s1);
     ds4_gpu_test_force_selection(NULL, 0);
     if (!ok) printf("failed   step %d: %s\n", n, err);
 
@@ -148,9 +163,28 @@ int main(int argc, char **argv) {
     const unsigned long long loads = d1[2] - d0[2], mismatch = d1[3] - d0[3];
     const unsigned long long nonzero = d1[4] - d0[4], missing = d1[5] - d0[5];
     const unsigned long long want_pin = forced ? want_pinned * (unsigned long long)n : 0;
-    const unsigned long long want_rest = forced ? 12ull * LAYERS * (unsigned long long)n - want_pin : 0;
+    const unsigned long long want_rest = forced ? (unsigned long long)n_ids * LAYERS * (unsigned long long)n - want_pin : 0;
     int dir_ok = mismatch == 0 && nonzero == 0 && missing == 0 && d1[6] == pinned_entries;
     if (forced) dir_ok = dir_ok && pinned_hits == want_pin && cache_hits + loads == want_rest;
+    /* A single row goes through the staged path instead: every layer of every
+     * step stages its forced ids once, four copies a compact row and one an id
+     * row, and nothing is refused. */
+    const unsigned long long st_compact = s1[0] - s0[0], st_ids = s1[1] - s0[1];
+    const unsigned long long st_rej = s1[2] - s0[2], st_copies = s1[3] - s0[3];
+    if (rows == 1) {
+        /* And since the process began: compact rows are only taken before the
+         * split path is ready, in the first tokens, outside the decode above. */
+        const int st_ok = st_rej == 0 && st_copies == 4ull * st_compact + st_ids &&
+                          s1[2] == 0 && s1[3] == 4ull * s1[0] + s1[1] &&
+                          (!forced || st_ids == (unsigned long long)LAYERS * (unsigned long long)n);
+        printf("staging  over %d steps: %llu compact rows, %llu id rows (want %llu), %llu refused, "
+               "%llu copy nodes (want %llu) -> %s\n", n, st_compact, st_ids,
+               forced ? (unsigned long long)LAYERS * (unsigned long long)n : st_ids, st_rej,
+               st_copies, 4ull * st_compact + st_ids, st_ok ? "PASS" : "FAIL");
+        printf("staging  since open: %llu compact rows, %llu id rows, %llu refused, %llu copy nodes "
+               "(want %llu)\n", s1[0], s1[1], s1[2], s1[3], 4ull * s1[0] + s1[1]);
+        dir_ok = dir_ok && st_ok;
+    }
     printf("directory over %d steps: pinned hits %llu (want %llu), cache hits %llu + loads %llu "
            "(want %llu); address mismatches %llu, missing with a slot %llu, selected and missing "
            "%llu; %llu entries still pinned -> %s\n", n, pinned_hits, want_pin, cache_hits, loads,

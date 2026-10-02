@@ -1441,6 +1441,9 @@ static uint32_t g_dir_gen;
  * entry's address, a missing expert with a non-zero slot, a selected expert
  * left missing (a zero address the kernels would skip). */
 static unsigned long long g_dir_window_shrunk;   /* pinned experts the budget took back */
+/* Staged per-dispatch host data: compact address rows and host-chosen selected
+ * ids engaged, and those refused because an entry was not current. */
+static unsigned long long g_stage_compact, g_stage_ids, g_stage_rejects;
 static unsigned long long g_dir_pinned_hits, g_dir_cache_hits, g_dir_loads,
                           g_dir_address_mismatch, g_dir_missing_nonzero, g_dir_selected_missing;
 
@@ -5447,6 +5450,14 @@ uint32_t ds4_gpu_expert_pin(uint32_t layer, const int32_t *ids, uint32_t n) {
         pinned++;
     }
     return pinned;
+}
+
+/* compact address rows staged, host-chosen id rows staged, rejected for a
+ * stale entry, copy nodes recorded for them, bytes copied. */
+void ds4_gpu_stage_counts(unsigned long long out[5]);
+void ds4_gpu_stage_counts(unsigned long long out[5]) {
+    out[0] = g_stage_compact; out[1] = g_stage_ids; out[2] = g_stage_rejects;
+    out[3] = g_stage_copies; out[4] = g_stage_bytes;
 }
 
 void ds4_gpu_expert_directory_counts(unsigned long long out[8]);
@@ -13396,6 +13407,19 @@ void ds4_gpu_cleanup(void) {
             g_addr_dirty_lo[layer] = g_addr_dirty_hi[layer] = 0;
             for (uint32_t slot = 0; slot < DS4_METAL_ROW_SLOTS; slot++) {
                 const uint32_t idx = layer * DS4_METAL_ROW_SLOTS + slot;
+                /* Registered whole when made (compact_addr_ensure_buffers,
+                 * selected_ids_prepare): out of the registry before they go. */
+                id<MTLBuffer> registered[5] = {
+                    g_stream_compact_gate_addr_buffers[idx], g_stream_compact_up_addr_buffers[idx],
+                    g_stream_compact_down_addr_buffers[idx], g_stream_compact_selected_buffers[idx],
+                    g_stream_selected_id_buffers[idx],
+                };
+                pthread_mutex_lock(&g_tensor_mu);
+                for (uint32_t r = 0; r < 5; r++)
+                    if (registered[r])
+                        ds4_extent_remove_locked((__bridge const void *)registered[r], 0,
+                                                 registered[r].length);
+                pthread_mutex_unlock(&g_tensor_mu);
                 g_stream_compact_gate_addr_buffers[idx] = nil;
                 g_stream_compact_up_addr_buffers[idx] = nil;
                 g_stream_compact_down_addr_buffers[idx] = nil;
@@ -13731,6 +13755,11 @@ void ds4_gpu_cleanup(void) {
                     g_dir_address_mismatch, g_dir_missing_nonzero, g_dir_selected_missing,
                     g_dir_window_shrunk);
         g_dir_window_shrunk = 0;
+        if (g_stage_compact || g_stage_ids || g_stage_rejects)
+            fprintf(stderr, "ds4: staged host data: %llu compact address rows, %llu selected-id "
+                    "rows, %llu refused as stale; %llu copy nodes, %llu bytes\n",
+                    g_stage_compact, g_stage_ids, g_stage_rejects, g_stage_copies, g_stage_bytes);
+        g_stage_compact = g_stage_ids = g_stage_rejects = 0;
         g_dir_pinned_hits = g_dir_cache_hits = g_dir_loads = 0;
         g_dir_address_mismatch = g_dir_missing_nonzero = g_dir_selected_missing = 0;
         g_memory_budget_refusals = g_memory_budget_slabs_returned = 0;
@@ -16597,6 +16626,30 @@ static uint64_t ds4_gpu_buffer_address(id<MTLBuffer> buffer, NSUInteger inner) {
     return 0;
 }
 
+static int ds4_gpu_stream_expert_cache_addr_seed(uint32_t layer, __strong id<MTLBuffer> *gate,
+                                                 __strong id<MTLBuffer> *up,
+                                                 __strong id<MTLBuffer> *down);
+
+/* Whether an entry a dispatch is about to bind is a live residency: valid,
+ * cached or pinned, with its buffers. */
+static int ds4_stage_entry_live(const ds4_gpu_stream_expert_cache_entry *e) {
+    return e && e->valid && (e->state == DS4_DIR_CACHED || e->state == DS4_DIR_PINNED) &&
+           e->gate_buffer && e->up_buffer && e->down_buffer;
+}
+
+/* And, for a dispatch that reads expert `x` through the layer's table, that
+ * the slot the host published holds this entry's address. */
+static int ds4_stage_slot_holds(uint32_t layer, uint32_t x, const ds4_gpu_stream_expert_cache_entry *e) {
+    id<MTLBuffer> sg = nil, su = nil, sd = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_seed(layer, &sg, &su, &sd)) return 0;
+    return ((const uint64_t *)ds4_gpu_buffer_contents(sg))[x] ==
+               ds4_gpu_buffer_address(e->gate_buffer, e->gate_inner) &&
+           ((const uint64_t *)ds4_gpu_buffer_contents(su))[x] ==
+               ds4_gpu_buffer_address(e->up_buffer, e->up_inner) &&
+           ((const uint64_t *)ds4_gpu_buffer_contents(sd))[x] ==
+               ds4_gpu_buffer_address(e->down_buffer, e->down_inner);
+}
+
 static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer) {
     if (!g_device || layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return 0;
 
@@ -16634,6 +16687,10 @@ static int ds4_gpu_stream_compact_addr_ensure_buffers(uint32_t layer) {
         }
         b.label = label;
         memset([b contents], 0, bytes);
+        /* Whole, so a binding of it states its length. */
+        pthread_mutex_lock(&g_tensor_mu);
+        ds4_extent_add_locked((__bridge const void *)b, 0, bytes);
+        pthread_mutex_unlock(&g_tensor_mu);
         switch (i) {
         case 0:
             g_stream_compact_gate_addr_buffers[ds4_row_scratch(layer)] = b;
@@ -16677,6 +16734,12 @@ static int ds4_gpu_stream_compact_addr_prepare(
         if (!e || !e->gate_buffer || !e->up_buffer || !e->down_buffer) {
             return 0;
         }
+        /* Still a live residency, or refused here before a dispatch could
+         * read through it. */
+        if (!ds4_stage_entry_live(e)) {
+            g_stage_rejects++;
+            return 0;
+        }
         gate_values[i] = ds4_gpu_buffer_address(e->gate_buffer, e->gate_inner);
         up_values[i] = ds4_gpu_buffer_address(e->up_buffer, e->up_inner);
         down_values[i] = ds4_gpu_buffer_address(e->down_buffer, e->down_inner);
@@ -16692,10 +16755,21 @@ static int ds4_gpu_stream_compact_addr_prepare(
     id<MTLBuffer> ub = g_stream_compact_up_addr_buffers[ds4_row_scratch(layer)];
     id<MTLBuffer> db = g_stream_compact_down_addr_buffers[ds4_row_scratch(layer)];
     id<MTLBuffer> ib = g_stream_compact_selected_buffers[ds4_row_scratch(layer)];
-    memcpy([gb contents], gate_values, addr_bytes);
-    memcpy([ub contents], up_values, addr_bytes);
-    memcpy([db contents], down_values, addr_bytes);
-    memcpy([ib contents], slot_ids, ids_bytes);
+    g_stage_compact++;
+    if (g_backend == 4) {
+        int staged = 0;
+        if (@available(macOS 26.0, *))
+            staged = ds4_mtl4_stage_copy(gate_values, addr_bytes, gb, 0) &&
+                     ds4_mtl4_stage_copy(up_values, addr_bytes, ub, 0) &&
+                     ds4_mtl4_stage_copy(down_values, addr_bytes, db, 0) &&
+                     ds4_mtl4_stage_copy(slot_ids, ids_bytes, ib, 0);
+        if (!staged) return 0;
+    } else {
+        memcpy([gb contents], gate_values, addr_bytes);
+        memcpy([ub contents], up_values, addr_bytes);
+        memcpy([db contents], down_values, addr_bytes);
+        memcpy([ib contents], slot_ids, ids_bytes);
+    }
 
     *gate_addrs = gb;
     *up_addrs = ub;
@@ -16704,10 +16778,33 @@ static int ds4_gpu_stream_compact_addr_prepare(
     return 1;
 }
 
+/* The entry a staged id's slot should name: the one this call loaded or took
+ * as a spare, or - for a hit, which the call reads straight through the
+ * table - the directory's own. Refuses, and counts, an id whose slot would be
+ * read stale or empty. */
+static int ds4_stage_id_check(uint32_t layer, int32_t id, const ds4_gpu_stream_expert_cache_entry *bound) {
+    const bool in_range = id >= 0 && (uint32_t)id < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+    const ds4_gpu_stream_expert_cache_entry *e = !in_range ? NULL :
+        bound ? bound : &g_stream_expert_cache[layer][id];
+    const char *why =
+        !in_range ? "out of range" :
+        !e->valid ? "entry not valid" :
+        !ds4_stage_entry_live(e) ? "entry neither cached nor pinned" :
+        !ds4_stage_slot_holds(layer, (uint32_t)id, e) ? "table slot is not the entry's" :
+        NULL;
+    if (!why) return 1;
+    if (g_stage_rejects++ == 0)
+        fprintf(stderr, "ds4: staged selected ids refused at layer %u, expert %d: %s "
+                "(state %d)\n", layer, id, why, e ? (int)e->state : -1);
+    return 0;
+}
+
 static int ds4_gpu_stream_selected_ids_prepare(
         uint32_t       layer,
         const int32_t *selected_ids,
+        ds4_gpu_stream_expert_cache_entry * const *entries,
         uint32_t       n_selected,
+        uint32_t       deferred_mask,
         __strong id<MTLBuffer> *selected_buf,
         NSUInteger    *selected_off) {
     if (!g_device ||
@@ -16731,12 +16828,31 @@ static int ds4_gpu_stream_selected_ids_prepare(
             return 0;
         }
         b.label = @"ds4_stream_selected_ids";
+        pthread_mutex_lock(&g_tensor_mu);
+        ds4_extent_add_locked((__bridge const void *)b, 0, bytes);
+        pthread_mutex_unlock(&g_tensor_mu);
         g_stream_selected_id_buffers[ds4_row_scratch(layer)] = b;
     }
 
     int32_t ids[DS4_METAL_MAX_ROUTED_EXPERT_USED] = {0};
     memcpy(ids, selected_ids, (size_t)n_selected * sizeof(ids[0]));
-    memcpy([b contents], ids, bytes);
+    /* Ids the host chose are read through the layer's address table: each
+     * must name the live entry this dispatch binds, at the address its slot
+     * publishes, or the dispatch would read a stale or empty slot. A position
+     * in deferred_mask is still loading: the resident pass masks it out, and
+     * the missing pass checks it once its load has published the slot. */
+    for (uint32_t i = 0; i < n_selected; i++) {
+        if (deferred_mask & (1u << i)) continue;
+        if (!ds4_stage_id_check(layer, ids[i], entries ? entries[i] : NULL)) return 0;
+    }
+    g_stage_ids++;
+    if (g_backend == 4) {
+        int staged = 0;
+        if (@available(macOS 26.0, *)) staged = ds4_mtl4_stage_copy(ids, bytes, b, 0);
+        if (!staged) return 0;
+    } else {
+        memcpy([b contents], ids, bytes);
+    }
 
     *selected_buf = b;
     *selected_off = 0;
@@ -18927,6 +19043,8 @@ ds4_gpu_stream_expert_cache_install_loaded(
                 spare_on ? ds4_gpu_stream_expert_take_spare(layer) : NULL;
             if (spare) {
                 spare->valid = 1;
+                spare->state = DS4_DIR_CACHED;
+                spare->gen = ++g_dir_gen;
                 spare->model_map = model_map;
                 spare->model_size = model_size;
                 spare->gate_abs_offset = gate_abs_offset;
@@ -45770,6 +45888,7 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
          * so the split below only adds the ones that were missing. */
         bool early_resident_pass = false;
         bool use_stream_expert_split_deferred = false;
+        bool stage_ids_deferred = false;
         bool stream_expert_split_completed = false;
         uint32_t stream_expert_resident_mask = 0;
         uint32_t stream_expert_missing_mask = 0;
@@ -46757,6 +46876,12 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                     ds4_gpu_moe_selected_capture_advance();
                     g_capture_slow_layers++;
                 }
+                /* A test's forced routing for a single row goes in as the
+                 * host's own choice of ids, every layer. */
+                if (g_test_forced_rows == 1 && n_expert == 6u) {
+                    memcpy(g_routed_moe_selected_override, g_test_forced_ids, 6u * sizeof(int32_t));
+                    g_routed_moe_selected_override_n = 6u;
+                }
                 const int replayed_selected_ids =
                     ds4_gpu_moe_selected_trace_replay(selected_ids, n_expert);
                 if (replayed_selected_ids < 0) {
@@ -47021,6 +47146,8 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                             continue;
                         }
                         stream_expert_resident_mask |= 1u << i;
+                        if (entry->state == DS4_DIR_PINNED) g_dir_pinned_hits++;
+                        else g_dir_cache_hits++;
                         stream_slot_entries[i] = entry;
                         gate_slot_bufs[i] = entry->gate_buffer;
                         gate_slot_offsets[i] = entry->gate_inner;
@@ -47226,12 +47353,16 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                     selected_exec_ids_from_host) {
                     if (!ds4_gpu_stream_selected_ids_prepare(layer_index,
                                                              selected_ids,
+                                                             stream_slot_entries,
                                                              n_expert,
+                                                             use_stream_expert_split_deferred ?
+                                                                 stream_expert_missing_mask : 0u,
                                                              &selected_exec_buf,
                                                              &selected_exec_off)) {
                         if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33239);
                         return 0;
                     }
+                    stage_ids_deferred = use_stream_expert_split_deferred;
                 }
             }
             if (selected_timing) {
@@ -47842,6 +47973,14 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                             stream_split_timing ?
                                 ds4_gpu_now_ms() - stream_split_missing_start_ms :
                                 0.0;
+                        /* The ids staged before the resident pass left these
+                         * positions unchecked; their slots are published now. */
+                        if (ok && stage_ids_deferred) {
+                            for (uint32_t i = 0; ok && i < n_expert; i++) {
+                                if ((stream_expert_missing_mask & (1u << i)) == 0) continue;
+                                ok = ds4_stage_id_check(layer_index, selected_ids[i], stream_slot_entries[i]);
+                            }
+                        }
                         ds4_gpu_stream_expert_split_args missing_pair_args = {
                             .active_mask = stream_expert_missing_mask,
                             .accumulate = 0u,
