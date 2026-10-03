@@ -18160,6 +18160,20 @@ static int ds4_gpu_stream_expert_cache_return_slab_locked(void) {
     return 1;
 }
 
+/* A logical budget reduction prevents new cache entries, but the slab
+ * allocator deliberately keeps its already allocated buffers for decode.
+ * Before a following prefill consumes the headroom that decode borrowed,
+ * return those physical slabs as well. This runs only between command
+ * batches; failure is reported to the caller rather than letting the prefill
+ * overlap the borrowed slabs and exceed the engine's memory plan. */
+int ds4_gpu_trim_streaming_expert_cache_budget(void) {
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    while (g_stream_expert_cache_slab_total_slots > budget) {
+        if (!ds4_gpu_stream_expert_cache_return_slab()) return 0;
+    }
+    return 1;
+}
+
 /* Every allocation the engine makes that can be large asks here first. The
  * ledger is the device's own count of what it has allocated - every buffer,
  * view, heap and command allocator once - so what is not asked about is still

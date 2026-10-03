@@ -304,6 +304,7 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 /* Same, but keeps the existing entries: raising only relaxes pruning and
  * lowering lets the next prune walk down. */
 void ds4_gpu_move_streaming_expert_cache_budget(uint32_t experts);
+int ds4_gpu_trim_streaming_expert_cache_budget(void);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 /* What the device may have allocated, with `reserve` held back for the
  * prefill's mapped expert layers; the expert cache and the full address table

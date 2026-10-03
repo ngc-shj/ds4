@@ -76781,14 +76781,20 @@ static void ds41_lend_headroom_to_decode(void) {
             g_ds41_admitted_budget, g_ds41_decode_budget);
 }
 
-static void ds41_reclaim_headroom_for_prefill(void) {
-    if (!g_ds41_headroom_lent) return;
+static bool ds41_reclaim_headroom_for_prefill(void) {
+    if (!g_ds41_headroom_lent) return true;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     ds4_gpu_move_streaming_expert_cache_budget(g_ds41_admitted_budget);
+    if (g_ds41_headroom_lends_reserve &&
+        !ds4_gpu_trim_streaming_expert_cache_budget()) {
+        fprintf(stderr, "ds4: cannot reclaim the decode cache slabs for V4.1 prefill\n");
+        return false;
+    }
     if (g_ds41_headroom_lends_reserve)
         ds4_gpu_set_memory_budget_reserve(g_ds41_prefill_headroom_bytes);
 #endif
     g_ds41_headroom_lent = 0;
+    return true;
 }
 
 static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
@@ -83990,7 +83996,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
         ds41_encoder_residency encoder = {0};
-        ds41_reclaim_headroom_for_prefill();
+        if (!ds41_reclaim_headroom_for_prefill()) {
+            s->checkpoint_valid = false;
+            snprintf(err, errlen, "V4.1 could not reclaim decode memory for prefill");
+            return 1;
+        }
         ds41_encoder_acquire(g, &e->model, &e->weights,
             (uint32_t)(prompt->len - s->checkpoint.len), &encoder, s->cancel, s->cancel_ud);
         for (int i = s->checkpoint.len; i < prompt->len;) {
