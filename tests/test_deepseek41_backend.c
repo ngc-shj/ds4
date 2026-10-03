@@ -288,14 +288,16 @@ int main(int argc, char **argv) {
            m3f[0], m3f[1], m3f[2], m3f[3]);
     /* No Metal 3 queue at all: the queue is made only when the Metal 3
      * backend first needs one, and V4.1 selects Metal 4 before that. */
-    /* The full expert address table runs on Metal 4 like everything else;
-     * the single-row decode never consults it, so it is used only when the
-     * environment enables it and a path that asks for it runs. The one
-     * refusal is the deliberate Metal 3-only call above. */
+    /* The full expert address table is removed from V4.1: the bounded expert
+     * directory serves every path, and the environment variable that once
+     * enabled the table is ignored here. Its counter stays as the audit that
+     * nothing reached it. The one refusal is the deliberate Metal 3-only call
+     * above. */
     const unsigned long long full_uses = ds4_gpu_full_addr_table_uses();
     printf("fulltable  full expert address table uses %llu; expert cache hits %llu, misses %llu\n",
            full_uses, (unsigned long long)hits, (unsigned long long)misses);
     CHECK(hits + misses > 0, "the ordinary expert-cache path did not engage");
+    CHECK(full_uses == 0, "the removed full expert address table was reached");
     CHECK(m3f[0] == 0 && m3f[1] == 1 && m3f[2] == 0 && m3f[3] == 0,
           "Metal 3 after selection, or queue counts not as expected");
     printf("%s\n", g_failures ? "FAIL" : "PASS");

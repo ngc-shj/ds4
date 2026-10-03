@@ -256,6 +256,12 @@ tests/test_deepseek41_budget.o: tests/test_deepseek41_budget.c ds4.h
 tests/test_deepseek41_budget: tests/test_deepseek41_budget.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_deepseek41_capacity.o: tests/test_deepseek41_capacity.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_deepseek41_capacity: tests/test_deepseek41_capacity.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_deepseek41_state.o: tests/test_deepseek41_state.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
