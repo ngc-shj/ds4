@@ -78834,10 +78834,11 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
  * in a watchdog panic (one came at 109.7 GiB wired of 128). Five eighths of
  * the host leaves an eighth below the 88 GiB (eleven sixteenths) at which a
  * run is stopped from outside, for the system's own wired memory and for
- * what sampling once a second cannot catch. The guarded 84 GiB production
- * run peaked at 83.9 GiB wired, still below that stop line. */
+ * what sampling once a second cannot catch. 84 GiB is available as a bounded
+ * experimental override, but is not the default: a long-prefill disk-KV run
+ * reached memory-pressure level 2 twice at 83.4-83.7 GiB wired. */
 static uint64_t ds41_memory_budget(const ds4_engine *e, uint64_t host, uint64_t recommended) {
-    uint64_t budget = e->ssd_streaming ? host / 32u * 21u : host / 8u * 7u;
+    uint64_t budget = e->ssd_streaming ? host / 8u * 5u : host / 8u * 7u;
     if (e->ssd_streaming) {
         const char *override = getenv("DS4_METAL_V41_STREAMING_MEMORY_BUDGET_GIB");
         if (override && override[0]) {
