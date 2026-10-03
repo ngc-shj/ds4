@@ -78834,9 +78834,25 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
  * in a watchdog panic (one came at 109.7 GiB wired of 128). Five eighths of
  * the host leaves an eighth below the 88 GiB (eleven sixteenths) at which a
  * run is stopped from outside, for the system's own wired memory and for
- * what sampling once a second cannot catch. */
+ * what sampling once a second cannot catch. The guarded 84 GiB production
+ * run peaked at 83.9 GiB wired, still below that stop line. */
 static uint64_t ds41_memory_budget(const ds4_engine *e, uint64_t host, uint64_t recommended) {
-    const uint64_t budget = e->ssd_streaming ? host / 8u * 5u : host / 8u * 7u;
+    uint64_t budget = e->ssd_streaming ? host / 32u * 21u : host / 8u * 7u;
+    if (e->ssd_streaming) {
+        const char *override = getenv("DS4_METAL_V41_STREAMING_MEMORY_BUDGET_GIB");
+        if (override && override[0]) {
+            char *end = NULL;
+            const unsigned long long gib = strtoull(override, &end, 10);
+            if (end != override && *end == '\0' && gib <= UINT64_MAX / UINT64_C(1073741824)) {
+                uint64_t asked = (uint64_t)gib * UINT64_C(1073741824);
+                /* Keep the experimental arm below the external 88 GiB wired
+                 * stop line: 84 GiB on a 128 GiB unified-memory machine. */
+                const uint64_t ceiling = host / 32u * 21u;
+                if (asked > ceiling) asked = ceiling;
+                if (asked != 0) budget = asked;
+            }
+        }
+    }
     return budget > recommended ? recommended : budget;
 }
 

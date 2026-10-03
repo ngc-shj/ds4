@@ -1715,9 +1715,11 @@ static int check_memory_plan(const char *path) {
     REQUIRE(ds4_engine_dynamic_expert_cache_bytes(&e) == e.ssd_streaming_cache_bytes);
     uint64_t planned = fixed + graph + 2 * gib +
         ds4_engine_dynamic_expert_cache_bytes(&e) + e.ssd_streaming_prefill_headroom_bytes;
-    /* Streamed, the budget is five eighths of the host, not the working set. */
-    REQUIRE(e.ssd_streaming_cache_experts > 0 && planned <= 80 * gib);
-    REQUIRE(planned + expert > 80 * gib);
+    /* Streamed, this is the selected host-memory budget, not the device's
+     * recommended working set. The bounded A/B override compares 80 and 84. */
+    const uint64_t streaming_budget = ds41_memory_budget(&e, 128 * gib, 110 * gib);
+    REQUIRE(e.ssd_streaming_cache_experts > 0 && planned <= streaming_budget);
+    REQUIRE(planned + expert > streaming_budget);
     const uint32_t fitted = e.ssd_streaming_cache_experts;
     REQUIRE(ds41_memory_admit_for_host(&e, graph, false, 128 * gib, 110 * gib));
     REQUIRE(!ds41_memory_admit_for_host(&e, graph + expert, false, 128 * gib, 110 * gib));
