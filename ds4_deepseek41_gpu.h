@@ -100,9 +100,6 @@ int ds4_gpu_moe_expert_major_enabled_host(void);
  * fallback, a write outside an arena, a generation violation. A harness takes a
  * delta around the descriptor path and requires every one to be zero. */
 void ds4_gpu_zero_conditions(uint64_t out[8]);
-/* Layer-blocks whose routed MoE took the full per-layer expert address table:
- * no selected readback and no cache pin, so no queue boundary either. */
-uint64_t ds4_gpu_full_addr_batch_layers(void);
 void ds4_gpu_enc_trace_mark(const char *what);
 
 /* The verify block's expert miss list, decided on the device. Reset before the

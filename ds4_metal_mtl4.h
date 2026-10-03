@@ -1769,52 +1769,6 @@ void ds4_mtl4_pacer_free(void *pacer) {
     if (pacer) { DS4MTL4Side *s = (__bridge_transfer DS4MTL4Side *)pacer; (void)s; }
 }
 
-/* ---- the full expert address table's prewire ---------------------------
-
-/* Every expert buffer the table names copied once into a scratch buffer, so
- * its pages are wired before decode rather than during it. Its own command
- * buffer, committed behind whatever is in flight and ahead of the context
- * being recorded, and waited for. The experts are resident through the
- * table's set on the queue; this submission's own set holds only the scratch.
- * The copies all land in one scratch buffer; what they leave there is never
- * read. */
-static int ds4_mtl4_prewire(NSArray<id<MTLBuffer>> *buffers, id<MTLBuffer> scratch) {
-    if (@available(macOS 26.0, *)) {
-        if (!g_mtl4_queue || !scratch) return 0;
-        static id<MTLResidencySet> scratch_set;
-        static __weak id<MTLBuffer> scratch_held;
-        if (!scratch_set || scratch_held != scratch) {
-            MTLResidencySetDescriptor *rd = [MTLResidencySetDescriptor new];
-            rd.label = @"ds4_mtl4_prewire_scratch";
-            scratch_set = [g_device newResidencySetWithDescriptor:rd error:nil];
-            if (!scratch_set) return 0;
-            [scratch_set addAllocation:scratch];
-            [scratch_set commit];
-            scratch_held = scratch;
-        }
-        id<MTL4CommandAllocator> alloc = [g_device newCommandAllocator];
-        id<MTL4CommandBuffer> cb = [g_device newCommandBuffer];
-        id<MTLSharedEvent> done = [g_device newSharedEvent];
-        if (!alloc || !cb || !done) return 0;
-        [cb beginCommandBufferWithAllocator:alloc];
-        [cb useResidencySet:scratch_set];
-        id<MTL4ComputeCommandEncoder> e = [cb computeCommandEncoder];
-        for (id<MTLBuffer> b in buffers) {
-            if ([b length] == 0) continue;
-            [e copyFromBuffer:b sourceOffset:0 toBuffer:scratch destinationOffset:0 size:[b length]];
-        }
-        [e endEncoding];
-        [cb endCommandBuffer];
-        id<MTL4CommandBuffer> one = cb;
-        DS4_M4_NOTE("full_expert_addr_prewire", DS4_BK_COMMIT);
-        [g_mtl4_queue commit:&one count:1];
-        [g_mtl4_queue signalEvent:done value:1];
-        DS4_M4_NOTE("full_expert_addr_prewire", DS4_BK_WAIT);
-        return [done waitUntilSignaledValue:1 timeoutMS:600000] ? 1 : 0;
-    }
-    return 0;
-}
-
 /* ---- teardown ----------------------------------------------------------- */
 
 /* What ds4_gpu_cleanup has to undo on this side, so an engine opened after it

@@ -5432,26 +5432,6 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
 /* pinned hits, cache hits, loads, table/entry address mismatches, missing
  * entries with a non-zero slot, selected experts left missing, entries pinned
  * now, directory generation. */
-/* Experts the cache already holds become PINNED: never a victim, held until
- * the cache is cleared at close. The same entries, slabs, table slots and
- * budget as any cached expert - a pinned window is not a second cache. Returns
- * how many of the n were pinned; one that is not in the cache is not. */
-uint32_t ds4_gpu_expert_pin(uint32_t layer, const int32_t *ids, uint32_t n);
-uint32_t ds4_gpu_expert_pin(uint32_t layer, const int32_t *ids, uint32_t n) {
-    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || !ids) return 0;
-    uint32_t pinned = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (ids[i] < 0 || (uint32_t)ids[i] >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
-        ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][ids[i]];
-        if (!e->valid || e->state == DS4_DIR_PINNED) continue;
-        e->pins++;
-        e->state = DS4_DIR_PINNED;
-        e->gen = ++g_dir_gen;
-        pinned++;
-    }
-    return pinned;
-}
-
 /* compact address rows staged, host-chosen id rows staged, rejected for a
  * stale entry, copy nodes recorded for them, bytes copied. */
 void ds4_gpu_stage_counts(unsigned long long out[5]);
@@ -10158,25 +10138,6 @@ static id<MTLCommandQueue> ds4_gpu_m3_queue(void) {
     return g_queue;
 }
 
-/* Test hook for the staged bring-up of pinned windows
- * (tests/test_deepseek41_fulltable.c): pin only the first `limit` experts of
- * each asked layer; the rest are the cache's. 0 means every expert. */
-static uint32_t g_full_addr_test_expert_limit;
-void ds4_gpu_test_full_addr_expert_limit(uint32_t limit);
-void ds4_gpu_test_full_addr_expert_limit(uint32_t limit) { g_full_addr_test_expert_limit = limit; }
-/* Test hook: while set, a batch of exactly `rows` rows has its routed experts
- * replaced by ids[rows * 6] in every layer before the lookup reads them - so a
- * test can put experts inside and outside a pinned window into one block and
- * know which it asked for. rows 0 turns it off. */
-static uint32_t g_test_forced_rows;
-static int32_t g_test_forced_ids[16 * 6];
-void ds4_gpu_test_force_selection(const int32_t *ids, uint32_t rows);
-void ds4_gpu_test_force_selection(const int32_t *ids, uint32_t rows) {
-    if (!ids || rows == 0 || rows > 16u) { g_test_forced_rows = 0; return; }
-    memcpy(g_test_forced_ids, ids, (size_t)rows * 6u * sizeof(int32_t));
-    g_test_forced_rows = rows;
-}
-
 /* Test hook: one directory entry's state (DS4_DIR_*), or -1 out of range. */
 int ds4_gpu_test_expert_state(uint32_t layer, uint32_t expert);
 int ds4_gpu_test_expert_state(uint32_t layer, uint32_t expert) {
@@ -10185,10 +10146,6 @@ int ds4_gpu_test_expert_state(uint32_t layer, uint32_t expert) {
     const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
     return e->valid ? e->state : 0;
 }
-
-/* The pinned window size a test asked for; 0: a whole layer. */
-uint32_t ds4_gpu_expert_window(void);
-uint32_t ds4_gpu_expert_window(void) { return g_full_addr_test_expert_limit; }
 
 /* The device's working set and what is allocated against it, in bytes. */
 void ds4_gpu_test_working_set(unsigned long long *recommended, unsigned long long *allocated);
@@ -16614,13 +16571,13 @@ static int ds4_gpu_stream_block_residency_requested(void) {
     return on || g_block_residency_forced;
 }
 
-/* The old full expert address table - per-expert views of the mapped model,
- * a residency set of its own, the shared table overwritten whole - is gone: it
- * brought the machine down under Metal 4, and it was a second cache beside the
- * first. DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE asks for pinned
- * windows in the one expert directory (ds41_expert_pin_windows in ds4.c),
- * which every path already looks up. Its use count stays, at zero, as the
- * evidence a report can print. */
+/* The old V4.1 full expert address table is formally removed. Its per-expert
+ * views and second residency set duplicated the bounded streaming cache, the
+ * Metal 3 implementation produced incorrect native-batch output, and its
+ * attempted Metal 4 replacement caused severe cache pollution. V4.1 always
+ * uses the single budgeted expert directory. The generic environment variable
+ * remains meaningful to other model backends, but is intentionally ignored by
+ * V4.1. This counter remains zero as audit evidence. */
 unsigned long long ds4_gpu_full_addr_table_uses(void);
 unsigned long long ds4_gpu_full_addr_table_uses(void) { return g_full_addr_table_uses; }
 
@@ -17373,10 +17330,6 @@ static int ds4_gpu_stream_expert_cache_addr_buffers(
            g_stream_expert_cache_down_addr_buffers[layer];
 }
 
-/* The per-expert buffers a full address table hands the GPU are never named by
- * a dispatch -- the kernel reaches them through the table -- so they are
- * declared resident once on the queue instead. */
-static uint64_t g_ds41_full_addr_batch_layers;
 static uint64_t g_ds41_resident_addr_batch_layers;
 /* The two per-row loops left in this file. Counted rather than guessed at:
  * ds4.c's tally accounts for its own sites, and the difference from the global
@@ -17394,10 +17347,6 @@ void ds4_gpu_view_sites_metal(uint64_t out[2]) {
 void ds4_gpu_enc_trace_mark(const char *what) {
     g_enc_trace_armed = 1;
     ds4_enc_trace("mark %s\n", what ? what : "?");
-}
-
-uint64_t ds4_gpu_full_addr_batch_layers(void) {
-    return g_ds41_full_addr_batch_layers;
 }
 
 uint64_t ds4_gpu_resident_addr_batch_layers(void) {
@@ -20674,14 +20623,6 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     const bool profile =
         getenv("DS4_METAL_STREAMING_PREFILL_BATCH_SELECTED_ADDR_PROFILE") != NULL;
     const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
-    /* A test's forced routing replaces the router's choice in the tensor every
-     * later kernel reads, before anything reads it: the queue has just been
-     * drained, so nothing on the device is reading it now. */
-    if (g_test_forced_rows && n_tokens == g_test_forced_rows && n_selected == 6u &&
-        !ds4_gpu_tensor_write(selected, 0, g_test_forced_ids, n_ids * sizeof(int32_t))) {
-        free(ids);
-        return 0;
-    }
     int ok = ds4_gpu_tensor_read(selected,
                                  0,
                                  ids,
@@ -46897,12 +46838,6 @@ static int ds4_gpu_routed_moe_one_tensor_impl(
                      * follows will hand back the same ids anyway. */
                     ds4_gpu_moe_selected_capture_advance();
                     g_capture_slow_layers++;
-                }
-                /* A test's forced routing for a single row goes in as the
-                 * host's own choice of ids, every layer. */
-                if (g_test_forced_rows == 1 && n_expert == 6u) {
-                    memcpy(g_routed_moe_selected_override, g_test_forced_ids, 6u * sizeof(int32_t));
-                    g_routed_moe_selected_override_n = 6u;
                 }
                 const int replayed_selected_ids =
                     ds4_gpu_moe_selected_trace_replay(selected_ids, n_expert);

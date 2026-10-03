@@ -41559,8 +41559,7 @@ static void ds41_decode_path_report(void) {
         /* Which address source the routed layers took. A drain count that did
          * not move while this reads zero is a branch that never engaged, not a
          * boundary that could not be removed. */
-        fprintf(stderr, " full_addr_layers=%llu resident_addr_layers=%llu",
-                (unsigned long long)ds4_gpu_full_addr_batch_layers(),
+        fprintf(stderr, " resident_addr_layers=%llu",
                 (unsigned long long)ds4_gpu_resident_addr_batch_layers());
         fprintf(stderr, "\n");
         ds41_view_site_report();
@@ -76652,8 +76651,6 @@ extern int ds4_gpu_expert_load_set(const void *model_map, uint64_t model_size, u
                                    uint64_t down_offset, uint64_t gate_expert_bytes,
                                    uint64_t down_expert_bytes, uint32_t missing_mask,
                                    unsigned long long *bytes_loaded);
-extern uint32_t ds4_gpu_expert_pin(uint32_t layer, const int32_t *ids, uint32_t n);
-extern uint32_t ds4_gpu_expert_window(void);
 extern uint32_t ds4_gpu_expert_missing_mask(uint32_t layer, const int32_t *ids, uint32_t n);
 
 /* Load ids[0..n) of a layer into the expert cache through the ordinary loader,
@@ -76672,50 +76669,6 @@ static bool ds41_expert_load_ids(const ds4_model *m, const ds4_weights *w, uint3
                                    down_row * DS4_N_EMBD, missing, bytes) != 0;
 }
 
-/* The full expert address table, as windows pinned in the one expert
- * directory: for each of the first DS4_METAL_FULL_ADDR_LAYERS layers (all when
- * unset), its first `window` experts are loaded like any miss and then pinned
- * - resident, never evicted, held to the same budget and in the same slabs and
- * table slots as every cached expert - and every expert outside a window is
- * the cache's as before. The window is all of a layer's experts, or the test
- * hook's size. The windows end where pinning more would leave the cache less
- * than two layers' worth of experts: a batch layer protects every expert it
- * selects while it loads them, up to all of a layer's, so a cache smaller than
- * that cannot make progress (a 40-layer ask once pinned the whole budget and
- * the first prefill could load nothing). A smaller resident window, not a
- * refusal, and the rest of the model through the cache. Pinned before the
- * prewarm, so the windows sit in the first slabs and the slabs a budget may
- * hand back are the cache's. */
-static void ds41_expert_pin_windows(const ds4_model *m, const ds4_weights *w) {
-    if (!getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") ||
-        getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE")) return;
-    const char *le = getenv("DS4_METAL_FULL_ADDR_LAYERS");
-    uint32_t layers = le && le[0] ? (uint32_t)strtoul(le, NULL, 10) : DS4_N_LAYER;
-    if (layers == 0 || layers > DS4_N_LAYER) layers = DS4_N_LAYER;
-    uint32_t window = ds4_gpu_expert_window();
-    if (window == 0 || window > DS4_N_EXPERT) window = DS4_N_EXPERT;
-    unsigned long long bytes = 0;
-    uint32_t pinned = 0, full_layers = 0;
-    int32_t ids[6];
-    const double t0 = now_sec();
-    bool out_of_room = false;
-    for (uint32_t l = 0; l < layers && !out_of_room; l++) {
-        uint32_t layer_pinned = 0;
-        for (uint32_t x = 0; x < window; x += 6u) {
-            const uint32_t n = window - x < 6u ? window - x : 6u;
-            for (uint32_t k = 0; k < n; k++) ids[k] = (int32_t)(x + k);
-            if (!ds4_gpu_stream_expert_cache_has_room(n + 2u * DS4_N_EXPERT) ||
-                !ds41_expert_load_ids(m, w, l, ids, n, &bytes)) { out_of_room = true; break; }
-            layer_pinned += ds4_gpu_expert_pin(l, ids, n);
-        }
-        pinned += layer_pinned;
-        if (layer_pinned == window) full_layers++;
-    }
-    fprintf(stderr, "ds4: expert directory: pinned windows of %u experts on %u of %u layers "
-            "asked (%u experts, %.2f GiB, %.2f s)%s\n", window, full_layers, layers, pinned,
-            (double)bytes / (1024.0 * 1024.0 * 1024.0), now_sec() - t0,
-            out_of_room ? "; ended there to leave the cache two layers of room" : "");
-}
 #endif
 
 static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
@@ -76724,7 +76677,6 @@ static void ds41_expert_prewarm(const ds4_model *m, const ds4_weights *w) {
 #else
     if (g_ds41_prewarmed) return;
     g_ds41_prewarmed = 1;
-    ds41_expert_pin_windows(m, w);
     const char *cap_s = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
     const uint32_t cap = cap_s && cap_s[0] ? (uint32_t)strtoul(cap_s, NULL, 10) : 0u;
     if (cap == 0 || DS4_N_LAYER > 64u) return;
