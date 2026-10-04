@@ -46262,11 +46262,13 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
      * the server's 128-token mixed quantum must not become scalar prefill. */
     if (!g->streaming && g->tp_world == 1) minimum = 8u;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    /* With at least half the experts cached, warm short appends beat a full
-     * disk sweep. Leave a token-major tail to warm the following decode too. */
-    if (g->streaming && g->pos &&
-        ds4_gpu_stream_expert_cache_configured_count() >= DS4_N_LAYER * DS4_N_EXPERT / 2u)
-        minimum = 1024u;
+    /* A streaming append shorter than 1024 rows runs token-major: warm short
+     * appends beat a full disk sweep, and the tail warms the following
+     * decode. This once applied only with half the experts cached, but the
+     * token-major and layer-major paths round differently, so the cache's
+     * size changed the model's output. It is unconditional now, as it was
+     * at the baseline's production cache (9648 of 15360). */
+    if (g->streaming && g->pos) minimum = 1024u;
 #endif
     if (remaining < minimum) return 1;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
