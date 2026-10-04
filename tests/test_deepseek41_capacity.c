@@ -14,7 +14,8 @@
  * be compared with and without evictions. A story argument of "text:..." is
  * the user message itself, for the backend test's short prompts. The file
  * holds the logits after prefill and after each greedy step, vocab floats
- * each. */
+ * each; the line printed at the end also hashes the session's saved payload,
+ * its KV cache and carried state, as test_deepseek41_state does. */
 #include "../ds4.h"
 
 #include <signal.h>
@@ -27,6 +28,22 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     const unsigned char *c = p;
     for (size_t i = 0; i < n; i++) { h ^= c[i]; h *= 1099511628211ull; }
     return h;
+}
+
+static int payload_hash(ds4_session *s, uint64_t *hash, uint64_t *bytes) {
+    char err[256];
+    FILE *fp = tmpfile();
+    if (!fp) return 0;
+    if (ds4_session_save_payload(s, fp, err, sizeof(err)) != 0) { fclose(fp); return 0; }
+    *bytes = (uint64_t)ftell(fp);
+    rewind(fp);
+    uint64_t h = 1469598103934665603ull;
+    unsigned char chunk[1 << 16];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), fp)) > 0) h = fnv(h, chunk, n);
+    fclose(fp);
+    *hash = h;
+    return 1;
 }
 
 static volatile sig_atomic_t g_stop;
@@ -87,9 +104,12 @@ int main(int argc, char **argv) {
         ok = ds4_session_eval(s, t, err, sizeof(err)) == 0;
     }
     fclose(out);
+    uint64_t sh = 0, sb = 0;
+    if (ok) ok = payload_hash(s, &sh, &sb);
     printf("capacity %u experts: prompt %d tokens, %d evaluations written, ids %016llx, "
-           "logits %016llx%s%s\n", cache, prompt.len, i + (ok ? 1 : 0),
-           (unsigned long long)ids, (unsigned long long)lh, ok ? "" : " FAILED: ", ok ? "" : err);
+           "logits %016llx, state %016llx (%llu bytes)%s%s\n", cache, prompt.len, i + (ok ? 1 : 0),
+           (unsigned long long)ids, (unsigned long long)lh, (unsigned long long)sh,
+           (unsigned long long)sb, ok ? "" : " FAILED: ", ok ? "" : err);
     ds4_session_free(s);
     ds4_tokens_free(&prompt);
     free(buf);

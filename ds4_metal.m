@@ -221,10 +221,10 @@ void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
             (unsigned long long)g_bk_pacer_commits_m4);
 }
 
-/* A Metal 3 mechanism that has no Metal 4 form here - tensor parallelism, the
- * V4 graph's readback overlap, the resident-layer service. None is on the V4.1
- * production path; under the Metal 4 backend each refuses rather than
- * submitting to a queue nothing else is ordered against. */
+/* A Metal 3 mechanism that has no Metal 4 form here - tensor parallelism and
+ * the V4 graph's readback overlap. Neither is a V4.1 path; under the Metal 4
+ * backend each refuses rather than submitting to a queue nothing else is
+ * ordered against. (The V4.1 resident-layer service was removed, cc07b86.) */
 static _Atomic unsigned long long g_bk_m3_refusals;
 static int ds4_gpu_metal3_only(const char *what) {
     fprintf(stderr, "ds4: %s is Metal 3 only and the Metal 4 backend is selected\n", what);

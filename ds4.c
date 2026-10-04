@@ -46249,7 +46249,9 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC"));
 }
 
-static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
+/* *tail is set when the streaming-append rule below, and nothing else, makes
+ * the rows token-major: the case whose path once depended on the cache size. */
+static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining, bool *tail) {
     /* TP batches use the bulk protocol; row-gate ablations stay token-major. */
     if (!ds41_tp_batch_enabled(g) || g->imatrix ||
         getenv("DS4_METAL_DISABLE_V41_LAYER_PREFILL")) return 1;
@@ -46268,7 +46270,10 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
      * token-major and layer-major paths round differently, so the cache's
      * size changed the model's output. It is unconditional now, as it was
      * at the baseline's production cache (9648 of 15360). */
-    if (g->streaming && g->pos) minimum = 1024u;
+    if (g->streaming && g->pos) {
+        if (remaining >= minimum && remaining < 1024u) *tail = true;
+        minimum = 1024u;
+    }
 #endif
     if (remaining < minimum) return 1;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -83949,6 +83954,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = false;
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
+        bool tail_noted = false;
         ds41_encoder_residency encoder = {0};
         if (!ds41_reclaim_headroom_for_prefill()) {
             s->checkpoint_valid = false;
@@ -83967,9 +83973,15 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds41_encoder_release(g, &e->model, &encoder);
             const uint32_t short_count = decoder_pending ? 0u :
                 ds41_short_prefill_count(g, &e->weights, remaining);
+            bool tail = false;
             const uint32_t count = short_count ? short_count : g->encoder_resident ?
                 (remaining - 512u < g->prefill_cap ? remaining - 512u : g->prefill_cap) :
-                ds41_prefill_count(g, remaining);
+                ds41_prefill_count(g, remaining, &tail);
+            if (tail && !tail_noted) {
+                tail_noted = true;
+                fprintf(stderr, "ds4: V4.1 prefill tail of %u rows at position %d runs token-major\n",
+                        remaining, i);
+            }
             const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
                 remaining - count >= 8192u &&
                 !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") &&
