@@ -68,6 +68,16 @@ void ds4_test_v41_tail_block(int on) __attribute__((weak));
  * block attention - arm A production; both read experts through the mapped
  * descriptor. */
 static int g_prev;
+/* "q8": arm B groups two output rows a threadgroup in the four-row Q8_0 tile,
+ * not eight. */
+void ds4_test_v41_q8_nr8(int on) __attribute__((weak));
+int ds4_test_engine_q8_tiles(ds4_engine *e);
+static int g_q8;
+/* "full": each arm prefills the whole prompt from position 0 in a new session
+ * (the 4096-row layer-major prefix and the tail), not the tail from the
+ * snapshot. */
+static int g_full;
+static ds4_engine *g_engine;
 void ds4_test_expert_touch(int on);
 unsigned ds4_test_expert_touch_count(void);
 
@@ -100,15 +110,20 @@ static int payload_hash(ds4_session *s, uint64_t *hash) {
 
 typedef struct { double wall; uint64_t logits, state, hits, misses, evictions, em; unsigned long long loads; double host[8]; } arm_result;
 
-static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_tokens *prompt,
+static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4_tokens *prompt,
                    int b, float *buf, int vocab, arm_result *r) {
     char err[256];
-    if (ds4_session_load_snapshot(s, snap, err, sizeof(err)) != 0) {
+    if (g_full) {
+        ds4_session_free(*sp);
+        *sp = NULL;
+        if (ds4_session_create(sp, g_engine, 8192) != 0) return 0;
+    } else if (ds4_session_load_snapshot(*sp, snap, err, sizeof(err)) != 0) {
         fprintf(stderr, "snapshot load: %s\n", err);
         return 0;
     }
     if (g_em) ds4_gpu_moe_expert_major_override(b);
     if (g_blk) block_switches(b);
+    if (g_q8) ds4_test_v41_q8_nr8(!b);
     if (g_prev) {
         ds4_test_expert_read_cached(1);
         ds4_test_v41_tail_block(!b);
@@ -116,7 +131,8 @@ static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_t
     }
     if (g_benv_name[0]) { if (b) setenv(g_benv_name, g_benv_value, 1); else unsetenv(g_benv_name); }
     if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
-    else if (!g_em && !g_prev && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    else if (!g_em && !g_prev && !g_q8 && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    ds4_session *s = *sp;
     uint64_t h0, m0, e0, h1, m1, e1;
     const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
     unsigned long long d0[8], d1[8];
@@ -136,6 +152,7 @@ static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_t
     if (g_em) ds4_gpu_moe_expert_major_override(-1);
     if (g_blk) block_switches(0);
     if (g_prev) { ds4_test_expert_read_cached(1); ds4_test_v41_tail_block(1); }
+    if (g_q8) ds4_test_v41_q8_nr8(1);
     if (g_benv_name[0]) unsetenv(g_benv_name);
     if (rc != 0) { fprintf(stderr, "sync: %s\n", err); return 0; }
     if (ds4_session_copy_logits(s, buf, vocab) != vocab) return 0;
@@ -163,7 +180,12 @@ int main(int argc, char **argv) {
         /* blk: BLOCK, ATTN_K and ATTN_RAW; blkN: the switches whose bits are set
          * in N - 1 BLOCK, 2 ATTN_K, 4 ATTN_RAW, 8 ROW_GATHER, 16 BLOCK_KV,
          * 32 BLOCK_LEVELS, 64 BLOCK_LOW_BATCH. */
-        if (strcmp(argv[a], "prev") == 0) {
+        if (strcmp(argv[a], "q8") == 0) {
+            if (!ds4_test_v41_q8_nr8) return 2;
+            g_q8 = 1;
+        } else if (strcmp(argv[a], "full") == 0) {
+            g_full = 1;
+        } else if (strcmp(argv[a], "prev") == 0) {
             if (!ds4_test_expert_read_cached || !ds4_test_v41_tail_block || !ds4_test_v41_tail_rows)
                 return 2;
             g_prev = 1;
@@ -196,6 +218,16 @@ int main(int argc, char **argv) {
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 2;
+    g_engine = engine;
+    /* "tiles": only the Q8_0 row-tile check on the model's weights. */
+    for (int a = 5; a < argc; a++)
+        if (strcmp(argv[a], "tiles") == 0) {
+            const int bad = ds4_test_engine_q8_tiles(engine);
+            printf("tiles    %d combination(s) differ from the single-row arithmetic -> %s\n",
+                   bad, bad == 0 ? "PASS" : "FAIL");
+            ds4_engine_close(engine);
+            return bad == 0 ? 0 : 1;
+        }
     const int vocab = ds4_engine_vocab_size(engine);
     float *buf = malloc((size_t)vocab * sizeof(float));
     ds4_tokens prompt = {0}, prefix = {0};
@@ -212,12 +244,14 @@ int main(int argc, char **argv) {
     ds4_session_snapshot snap = {0};
     ok = ok && ds4_session_save_snapshot(s, &snap, err, sizeof(err)) == 0;
     printf("prefix   4096 rows layer-major in %.3f s (cold), %.2f ms a row; tail %d rows; "
-           "%s\n", p1 - p0, (p1 - p0) * 1000.0 / 4096.0, prompt.len - 4096,
+           "%s%s\n", p1 - p0, (p1 - p0) * 1000.0 / 4096.0, prompt.len - 4096,
+           g_q8 ? "B = Q8_0 four-row tile, two outputs a threadgroup" :
            g_prev ? "B = the batched tail before (32 rows, no block attention, cached reads)" :
            g_blk ? "B = block executor attention" :
            g_em && g_rows[0] ? "rows as asked, B expert-major" :
            g_em ? "B = expert-major gate/up" : g_rows[0] ? "A and B batched, rows as asked" :
-           ds4_test_v41_token_major_tail ? "B = token-major" : "none (A twice: the ruler's spread)");
+           ds4_test_v41_token_major_tail ? "B = token-major" : "none (A twice: the ruler's spread)",
+           g_full ? "; arms prefill the whole prompt" : "");
 
     arm_result ref = {0}, r;
     int bad = 0;
@@ -225,13 +259,13 @@ int main(int argc, char **argv) {
     int cnt[2] = {0, 0};
     /* Warm-up: each arm once, unmeasured; the first A is the reference. */
     ds4_test_expert_touch(1);
-    ok = ok && run_arm(s, &snap, &prompt, 0, buf, vocab, &ref);
+    ok = ok && run_arm(&s, &snap, &prompt, 0, buf, vocab, &ref);
     const unsigned touched = ds4_test_expert_touch_count();
     ds4_test_expert_touch(0);
     printf("touched  the tail used %u distinct experts of %d (%.1f GiB at 9.49 MiB each); "
            "%llu loads, %llu misses\n", touched, 40 * 384, touched * 9.49 / 1024.0,
            ref.loads, (unsigned long long)ref.misses);
-    ok = ok && run_arm(s, &snap, &prompt, 1, buf, vocab, &r);
+    ok = ok && run_arm(&s, &snap, &prompt, 1, buf, vocab, &r);
     if (ok && (r.logits != ref.logits || r.state != ref.state)) bad++;
     printf("host     A: drain %.2f, prepare %.2f (load prepare %.2f, pread %.2f, install %.2f, "
            "slot buffers %.2f, readahead %.2f, reuse scan %.2f) s\n", ref.host[0], ref.host[1],
@@ -245,7 +279,7 @@ int main(int argc, char **argv) {
     for (int k = 0; ok && !g_stop && k < rounds; k++) {
         for (int j = 0; ok && j < 4; j++) {
             const int b = order[k & 1][j];
-            ok = run_arm(s, &snap, &prompt, b, buf, vocab, &r);
+            ok = run_arm(&s, &snap, &prompt, b, buf, vocab, &r);
             if (!ok) break;
             const int same = r.logits == ref.logits && r.state == ref.state;
             bad += !same;

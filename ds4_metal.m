@@ -23345,7 +23345,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(
         uint32_t              row_tile,
         int                   round_bf16) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (row_tile != 2u && row_tile != 4u && row_tile != 8u) return 0;
+    if (row_tile != 2u && row_tile != 4u && row_tile != 8u && row_tile != 48u) return 0;
     if (!out || !x || !model_map || n_rows == 0 ||
         n_rows > INT32_MAX || in_dim == 0 || out_dim == 0 ||
         (in_dim & 31u) != 0 || in_dim > UINT32_MAX ||
@@ -23382,9 +23382,18 @@ int ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(
         args.nr0 = dispatch.nr0;
         args.round_bf16 = round_bf16 ? 1 : 0;
 
+        /* 48: the four-row tile with eight output rows a threadgroup. */
+        const bool nr8 = row_tile == 48u;
+        if (nr8) {
+            dispatch.nr0 = 8;
+            args.nr0 = 8;
+            dispatch.smem = 32u * 8u * sizeof(float);
+            row_tile = 4u;
+        }
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
                 row_tile == 2u ? "kernel_mul_mv_q8_0_f32_rows2" :
-                row_tile == 4u ? "kernel_mul_mv_q8_0_f32_rows4"
+                row_tile == 4u ? (nr8 ? "kernel_mul_mv_q8_0_f32_rows4_nr8" :
+                                        "kernel_mul_mv_q8_0_f32_rows4")
                                : "kernel_mul_mv_q8_0_f32_rows8",
                 dispatch.nsg);
         if (!pipeline) return 0;

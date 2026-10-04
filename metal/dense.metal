@@ -142,9 +142,12 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device const float * y = (device const float *) (src1 + offset1);
 
+    // An output row past the last one reads the last row's weights and is
+    // never stored, so nothing outside the matrix is read.
     device const block_q8_0 * ax[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        const int orow = r0 + row < args.ne01 ? r0 + row : args.ne01 - 1;
+        const uint64_t offset0 = (uint64_t)orow*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
         ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
     }
@@ -259,9 +262,14 @@ void kernel_mul_mv_q8_0_f32_rows_impl(
         y[b] = (device const float *) (src1 + offset1);
     }
 
+    // An output row past the last one reads the last row's weights and its
+    // result is never stored (the reduction writes only r0 + row < ne01), so
+    // a last group of fewer than NR0 rows reads nothing outside the matrix
+    // and every stored row is computed exactly as before.
     device const block_q8_0 * ax[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        const int orow = r0 + row < args.ne01 ? r0 + row : args.ne01 - 1;
+        const uint64_t offset0 = (uint64_t)orow*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
         ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
     }
@@ -338,6 +346,26 @@ void kernel_mul_mv_q8_0_f32_rows_impl(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+// The four-row tile with eight output rows a threadgroup instead of two: the
+// threadgroup's activations are read for four times as many outputs. Which
+// outputs share a threadgroup changes nothing an output computes - its K walk,
+// its sums and its reduction are its own - so this is bit-identical too.
+// Checked, not assumed (ds4_test_q8_tiles compares every output's bits on the
+// model's shapes): register pressure can change the order the compiler
+// evaluates a sum in, and an F16 tile of the same 8 x 4 shape did differ.
+[[host_name("kernel_mul_mv_q8_0_f32_rows4_nr8")]]
+kernel void kernel_mul_mv_q8_0_f32_rows4_nr8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_rows_impl<8, 4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("kernel_mul_mv_q8_0_f32_rows2")]]
