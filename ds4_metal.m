@@ -20627,6 +20627,27 @@ static int ds4_gpu_capture_all_cached(
     return 1;
 }
 
+/* While an interleaved prefill tail runs, its layer is the one the prefix has
+ * just mapped whole: a selected expert the cache does not hold is addressed in
+ * that mapping, as an overflow expert is, rather than read into a slot. The
+ * kernels read the same bytes either way. */
+static int g_stream_expert_view_serve_misses;
+/* The slots it addressed in the mapping. That mapping is the prefill's, so
+ * when the tail hands back - its work finished - they are zeroed: a decode
+ * that later found one would read through a view the prefill has let go. */
+static uint32_t g_stream_expert_view_served[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * 4u][2];
+static uint32_t g_stream_expert_view_served_n;
+static void ds4_gpu_stream_expert_cache_zero_addr_slot(uint32_t layer, uint32_t expert);
+void ds4_gpu_stream_expert_view_serve_misses(int on) {
+    if (!on) {
+        for (uint32_t i = 0; i < g_stream_expert_view_served_n; i++)
+            ds4_gpu_stream_expert_cache_zero_addr_slot(g_stream_expert_view_served[i][0],
+                                                       g_stream_expert_view_served[i][1]);
+        g_stream_expert_view_served_n = 0;
+    }
+    g_stream_expert_view_serve_misses = on;
+}
+
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const void    *model_map,
         uint64_t       model_size,
@@ -20869,6 +20890,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 unique_entries[u] = entry;
                 continue;
             }
+            if (g_stream_expert_view_serve_misses) continue;
 
             const int force_reuse =
                 cache_budget != 0 && reserved_entries >= cache_budget;
@@ -21066,6 +21088,17 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     break;
                 }
                 view_served++;
+                if (g_stream_expert_view_serve_misses) {
+                    /* More slots than a layer has means hand-overs were
+                     * missed; refuse rather than leave one unzeroed. */
+                    if (g_stream_expert_view_served_n ==
+                        DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * 4u) {
+                        ok = 0;
+                        break;
+                    }
+                    g_stream_expert_view_served[g_stream_expert_view_served_n][0] = layer;
+                    g_stream_expert_view_served[g_stream_expert_view_served_n++][1] = expert;
+                }
                 ds4_test_touch(layer, expert);
                 continue;
             }

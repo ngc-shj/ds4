@@ -44,6 +44,7 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_set_exact_rows_scope(int on);
+void ds4_gpu_stream_expert_view_serve_misses(int on);
 void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);

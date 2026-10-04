@@ -41388,6 +41388,143 @@ static int g_ds41_tail_block_off;
 static int g_ds41_q8_nr8_off;
 void ds4_test_v41_q8_nr8(int on);
 void ds4_test_v41_q8_nr8(int on) { g_ds41_q8_nr8_off = !on; }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Layer-interleaved prefill. A layer-major prefix and the batched tail after
+ * it run prefix layer L, then the tail's layer L, rather than the whole prefix
+ * and then the whole tail: the tail reads layer L while the prefix has just
+ * mapped it, read its experts into the file cache and seeded the expert cache
+ * from it, instead of after 39 other layers have pushed it out.
+ *
+ * Nothing either side computes changes. The tail's layer L needs from the
+ * prefix only what the prefix's layer L leaves - its KV window, and at a source
+ * layer the compressed rows, index rows and compressor carry, which that layer
+ * alone writes - and no prefix row reads a position past its own, so the tail's
+ * rows cannot reach the prefix. The tail is the same step on a thread of its
+ * own; the two strictly alternate, one waiting while the other encodes, so the
+ * encoder, the command batch and every global stay single-threaded. What both
+ * sides move on the session - its position, Engram history and valid bit, the
+ * batch arena and the exact-rows scope - is swapped at each hand-over. The
+ * tail's rows sit in the arena from DS41_IL_ROW0 on, past the prefix's chunk. */
+static void ds41_view_cache_purge(struct ds41_view_entry *cache, uint32_t *count,
+                                  const ds41_prefill_row *bases) {
+    if (!cache || !count) return;
+    uint32_t keep = 0;
+    for (uint32_t i = 0; i < *count; i++) {
+        bool owned = false;
+#define DS41_IL_OWNED(name, width) owned |= cache[i].base == bases->name;
+        DS41_PREFILL_ROWS(DS41_IL_OWNED)
+#undef DS41_IL_OWNED
+        if (owned) ds4_gpu_tensor_free(cache[i].view);
+        else cache[keep++] = cache[i];
+    }
+    *count = keep;
+}
+
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    /* Prefix layers finished; DS4_N_LAYER + 1 once the prefix has returned. */
+    uint32_t allow;
+    /* The layer the tail is waiting at. */
+    uint32_t reached;
+    bool done, abort, tail_ok, installed, cmds;
+    ds41_gpu_graph *g;
+    const ds4_model *m;
+    const ds4_weights *w;
+    const int *tokens;
+    uint32_t count, row0;
+    /* The tail's session fields, and the prefix's while the tail runs. */
+    uint32_t pos, p_pos;
+    ds4_engram_history history, p_history;
+    bool p_valid;
+    ds41_prefill_row arena, tail_arena, *rows_view;
+} ds41_interleave;
+static ds41_interleave *g_ds41_il;
+static __thread bool g_ds41_il_tail;
+static int g_ds41_interleave_off;
+void ds4_test_v41_interleave(int on);
+void ds4_test_v41_interleave(int on) { g_ds41_interleave_off = !on; }
+
+static void ds41_il_install(ds41_interleave *il) {
+    ds41_gpu_graph *g = il->g;
+    il->p_pos = g->pos; il->p_history = g->history; il->p_valid = g->valid;
+    g->pos = il->pos; g->history = il->history; g->valid = true;
+    g->batch = il->tail_arena;
+    g->rows_view = il->rows_view + il->row0;
+    g_ds41_exact_rows_scope = 1;
+    ds4_gpu_set_exact_rows_scope(1);
+    ds4_gpu_stream_expert_view_serve_misses(1);
+    il->installed = true;
+}
+
+static void ds41_il_uninstall(ds41_interleave *il, bool keep_session) {
+    ds41_gpu_graph *g = il->g;
+    il->pos = g->pos; il->history = g->history;
+    if (!keep_session) { g->pos = il->p_pos; g->history = il->p_history; g->valid = il->p_valid; }
+    g->batch = il->arena;
+    g->rows_view = il->rows_view;
+    g_ds41_exact_rows_scope = 0;
+    ds4_gpu_set_exact_rows_scope(0);
+    ds4_gpu_stream_expert_view_serve_misses(0);
+    il->installed = false;
+}
+
+/* The tail, at the top of its layer `layer` (DS4_N_LAYER: before its head). */
+static bool ds41_il_tail_yield(uint32_t layer) {
+    ds41_interleave *il = g_ds41_il;
+    pthread_mutex_lock(&il->mu);
+    const bool wait = il->allow < layer + 1u && !il->abort;
+    pthread_mutex_unlock(&il->mu);
+    if (!wait) return !il->abort;
+    il->cmds = ds4_gpu_commands_active() != 0;
+    if (il->cmds && !ds4_gpu_end_commands()) return false;
+    pthread_mutex_lock(&il->mu);
+    ds41_il_uninstall(il, false);
+    il->reached = layer;
+    pthread_cond_broadcast(&il->cv);
+    while (il->allow < layer + 1u && !il->abort) pthread_cond_wait(&il->cv, &il->mu);
+    const bool ok = !il->abort;
+    if (ok) ds41_il_install(il);
+    pthread_mutex_unlock(&il->mu);
+    return ok && (!il->cmds || ds4_gpu_begin_commands());
+}
+
+/* The prefix, after its layer allow - 1, or with DS4_N_LAYER + 1 once it has
+ * returned: let the tail run up to there and wait for it. */
+static bool ds41_il_prefix_turn(ds41_interleave *il, uint32_t allow) {
+    pthread_mutex_lock(&il->mu);
+    il->allow = allow;
+    pthread_cond_broadcast(&il->cv);
+    while (!il->done && il->reached < allow) pthread_cond_wait(&il->cv, &il->mu);
+    const bool ok = !il->done || il->tail_ok;
+    pthread_mutex_unlock(&il->mu);
+    return ok;
+}
+
+static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_weights *w, const int *tokens, uint32_t count);
+
+static void *ds41_il_tail_main(void *arg) {
+    ds41_interleave *il = arg;
+    g_ds41_il_tail = true;
+    pthread_mutex_lock(&il->mu);
+    while (il->allow < 1u && !il->abort) pthread_cond_wait(&il->cv, &il->mu);
+    bool ok = !il->abort;
+    if (ok) ds41_il_install(il);
+    pthread_mutex_unlock(&il->mu);
+    if (ok) ok = ds41_graph_short_prefill(il->g, il->m, il->w, il->tokens, il->count);
+    pthread_mutex_lock(&il->mu);
+    /* Finished, the tail's position and history are the session's; failed,
+     * the prefix gets its own back to fail with. */
+    if (il->installed) ds41_il_uninstall(il, ok);
+    il->done = true;
+    il->tail_ok = ok;
+    pthread_cond_broadcast(&il->cv);
+    pthread_mutex_unlock(&il->mu);
+    return NULL;
+}
+#endif
 static uint64_t g_ds41_kblock_positions;
 /* Fail-closed. park is how many owner carries a block held back, publish how
  * many the accepted prefix named, hold how many kept the committed value
@@ -46607,6 +46744,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
         return false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* An interleaved tail starts from the history this prefix ends with. */
+    if (g_ds41_il && !g_ds41_il_tail && g_ds41_il->g == g) g_ds41_il->history = next_history;
+#endif
     const uint32_t initial_start = g->pos;
     g->valid = false;
     ds41_gpu_graph row = *g;
@@ -46883,6 +47024,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 row.pre = g->rows_view[count - 1u].ffn_split;
             }
         }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* Layer il is complete for every prefix row: the interleaved tail
+         * runs its own layer il now, while this one is still mapped. */
+        if (ok && g_ds41_il && !g_ds41_il_tail && g_ds41_il->g == g)
+            ok = ds41_il_prefix_turn(g_ds41_il, il + 1u);
+#endif
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -47830,6 +47977,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+        /* An interleaved tail waits here until the prefix has finished il. */
+        if (g_ds41_il_tail && !(ok = ds41_il_tail_yield(il))) break;
+#endif
         /* Layers behind the resume point ran in the pass that stopped; their KV,
          * compressed rows and carry versions are in the transaction already. */
         if (resuming && il + 1u < resume_layer) continue;
@@ -48475,6 +48626,11 @@ resume_routed_entry:
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* ...and here until the prefix has returned: its final row and position
+     * are written first, so the tail's are the session's. */
+    if (ok && g_ds41_il_tail) ok = ds41_il_tail_yield(DS4_N_LAYER);
+#endif
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
     /* A pass that stopped at a layer's routed phase has no head to run: its rows
@@ -50547,6 +50703,87 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
     if (!ok) g->valid = false;
     return ok;
 }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* The tail's rows in the batch arena: after every row a prefix chunk uses. */
+#define DS41_IL_ROW0(g) ((g)->prefill_cap - DS41_EXACT_ROWS_MAX)
+
+/* Can the prefix of `count` rows from g->pos and the `tail` rows after it run
+ * interleaved? The tail must be exactly what the scheduler would run next as
+ * one batched step, and its rows must fit past the prefix's in the arena. */
+static bool ds41_interleave_fits(const ds41_gpu_graph *g, uint32_t count, uint32_t tail) {
+    const uint32_t chunk = ds41_encoder_chunk_cap(g, count);
+    const uint32_t prefix_rows = count < chunk ? count : chunk;
+    return !g_ds41_interleave_off && !g_ds41_token_major_tail && g->streaming &&
+        g->tp_world == 1 && !g->image_count && !g->encoder_resident && !g->imatrix &&
+        tail >= 256u && tail < 1024u && tail <= DS41_EXACT_ROWS_MAX &&
+        (!g_ds41_tail_rows || tail <= g_ds41_tail_rows) &&
+        g->prefill_cap > DS41_EXACT_ROWS_MAX && prefix_rows <= DS41_IL_ROW0(g) &&
+        count < 8192u && count + tail <= g->ctx - g->pos;
+}
+
+static bool ds41_graph_prefill_interleaved(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_weights *w, const int *tokens, uint32_t count,
+                              uint32_t tail, ds4_session_progress_fn progress,
+                              void *progress_ud, int total, ds4_session_cancel_fn cancel,
+                              void *cancel_ud) {
+    ds41_interleave il = {0};
+    il.g = g; il.m = m; il.w = w; il.tokens = tokens + count; il.count = tail;
+    il.row0 = DS41_IL_ROW0(g);
+    il.pos = g->pos + count;
+    il.arena = g->batch;
+    il.rows_view = g->rows_view;
+    bool ok = true;
+#define DS41_IL_VIEW(name, width) \
+    if (ok) ok = (il.tail_arena.name = ds4_gpu_tensor_view(g->batch.name, \
+        (uint64_t)il.row0 * (width) * 4u, \
+        (uint64_t)(g->prefill_cap - il.row0) * (width) * 4u)) != NULL;
+    DS41_PREFILL_ROWS(DS41_IL_VIEW)
+#undef DS41_IL_VIEW
+    /* As ds41_graph_short_prefill does, before anything is encoded. */
+    if (ok && !g->wide_selected_kv)
+        ok = (g->wide_selected_kv = ds4_gpu_tensor_alloc((uint64_t)DS41_EXACT_ROWS_MAX *
+            DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM * sizeof(float))) != NULL;
+    pthread_t thread;
+    pthread_attr_t attr;
+    bool started = false;
+    if (ok) {
+        pthread_mutex_init(&il.mu, NULL);
+        pthread_cond_init(&il.cv, NULL);
+        pthread_attr_init(&attr);
+        /* The step's per-row arrays are on the heap, but it is deep. */
+        pthread_attr_setstacksize(&attr, (size_t)64 << 20);
+        g_ds41_il = &il;
+        started = pthread_create(&thread, &attr, ds41_il_tail_main, &il) == 0;
+        pthread_attr_destroy(&attr);
+        if (!started) g_ds41_il = NULL;
+        ok = started;
+    }
+    if (ok) ok = ds41_graph_prefill(g, m, w, tokens, count, progress, progress_ud,
+                                    total, cancel, cancel_ud);
+    if (started) {
+        if (ok) ok = ds41_il_prefix_turn(&il, DS4_N_LAYER + 1u);
+        pthread_mutex_lock(&il.mu);
+        if (!il.done) { il.abort = true; pthread_cond_broadcast(&il.cv); }
+        pthread_mutex_unlock(&il.mu);
+        pthread_join(thread, NULL);
+        ok = ok && il.tail_ok;
+        g_ds41_il = NULL;
+        pthread_cond_destroy(&il.cv);
+        pthread_mutex_destroy(&il.mu);
+    }
+    ds41_view_cache_purge(g->views, &g->view_count, &il.tail_arena);
+#define DS41_IL_FREE(name, width) ds4_gpu_tensor_free(il.tail_arena.name);
+    DS41_PREFILL_ROWS(DS41_IL_FREE)
+#undef DS41_IL_FREE
+    g->batch = il.arena;
+    g->rows_view = il.rows_view;
+    if (!ok) g->valid = false;
+    else fprintf(stderr, "ds4: V4.1 prefill of %u rows interleaved layer by layer with the "
+                 "%u-row tail after it\n", count, tail);
+    return ok;
+}
+#endif
 /* The row lists stay defined: the verify executor further down walks the same
  * fields. */
 #undef DS41_CARRY_ROWS
@@ -84247,7 +84484,26 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             /* Never add an encoder sweep just to defer the decoder. A short
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
-            const bool ok = short_count ?
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            /* A prefix followed by the tail the next pass would batch: run them
+             * layer by layer, the tail's layer after the prefix's. */
+            const uint32_t il_tail = !short_count && layer_major && !defer_decoder &&
+                !decoder_pending && remaining > count ? remaining - count : 0u;
+            const bool interleave = il_tail && ds41_interleave_fits(g, count, il_tail);
+            if (interleave) {
+                if (!exact_blocks) exact_pos = (uint32_t)i + count;
+                exact_rows += il_tail;
+                exact_blocks++;
+            }
+#else
+            const bool interleave = false;
+            const uint32_t il_tail = 0;
+#endif
+            const uint32_t ran = count + (interleave ? il_tail : 0u);
+            const bool ok = interleave ?
+                ds41_graph_prefill_interleaved(g, &e->model, &e->weights, prompt->v + i, count,
+                    il_tail, s->progress, s->progress_ud, prompt->len, s->cancel, s->cancel_ud) :
+                short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
                 layer_major ?
                 (defer_decoder || decoder_pending ?
@@ -84267,9 +84523,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "V4.1 prefill failed at position %d", i);
                 return 1;
             }
-            for (uint32_t t = 0; t < count; t++)
+            for (uint32_t t = 0; t < ran; t++)
                 token_vec_push(&s->checkpoint, prompt->v[i + (int)t]);
-            i += (int)count;
+            i += (int)ran;
             decoder_pending = defer_decoder;
             pending_logits = true;
             s->checkpoint_valid = false;

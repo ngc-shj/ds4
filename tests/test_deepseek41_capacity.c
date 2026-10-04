@@ -1,7 +1,7 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
  *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out>
- *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2]]
+ *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2] [noil]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -32,6 +32,7 @@ void ds4_test_expert_read_cached(int on) __attribute__((weak));
 void ds4_test_v41_tail_block(int on) __attribute__((weak));
 void ds4_test_v41_tail_rows(uint32_t rows) __attribute__((weak));
 void ds4_test_v41_q8_nr8(int on) __attribute__((weak));
+void ds4_test_v41_interleave(int on) __attribute__((weak));
 void ds4_test_expert_reads(double out[3]) __attribute__((weak));
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) __attribute__((weak));
 
@@ -135,6 +136,10 @@ int main(int argc, char **argv) {
              * batched tail as it was built. */
             if (!ds4_test_v41_q8_nr8) return 2;
             ds4_test_v41_q8_nr8(0);
+        } else if (strcmp(argv[a], "noil") == 0) {
+            /* The prefix, then the tail: not layer by layer. */
+            if (!ds4_test_v41_interleave) return 2;
+            ds4_test_v41_interleave(0);
         } else if (strncmp(argv[a], "parts=", 6) == 0) {
             if (!ds4_gpu_test_mtl4_parts) return 2;
             ds4_gpu_test_mtl4_parts((unsigned)atoi(argv[a] + 6));
