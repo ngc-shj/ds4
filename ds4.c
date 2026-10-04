@@ -47556,8 +47556,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const char *row_gather_e = getenv("DS4_METAL_V41_ROW_GATHER");
     const bool row_gather_wanted = block_all || prefill_block ||
                                    (row_gather_e && row_gather_e[0] && atoi(row_gather_e) != 0);
-    if (row_gather_wanted && wide && !g->wide_selected_kv)
-        g->wide_selected_kv = ds4_gpu_tensor_alloc((uint64_t)DS41_EXACT_ROWS_MAX * gather_bytes);
+    /* The wide slices are made by ds41_graph_short_prefill before its command
+     * batch opens, where the budget can still take a slab back from the cache;
+     * without them the step attends without row gathers. */
     ds4_gpu_tensor *const sel_kv = wide ? g->wide_selected_kv : g->block_selected_kv;
     const bool row_gather = row_gather_wanted && sel_kv != NULL;
     for (int i = 0; ok && i < count; i++) {
@@ -50409,6 +50410,11 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
     for (uint32_t i = 0; i < count; i++) graphs[i] = g;
     const bool wide = count > DS4_TP_BATCH_MAX_ROWS;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* Before the batch opens: an allocation inside it cannot make the expert
+     * cache give a slab back, so near the budget it would be refused mid-step. */
+    if (wide && g->streaming && g->tp_world == 1 && !g->wide_selected_kv)
+        g->wide_selected_kv = ds4_gpu_tensor_alloc((uint64_t)DS41_EXACT_ROWS_MAX *
+            DS4_N_INDEXER_TOP_K * DS4_N_HEAD_DIM * sizeof(float));
     if (wide) { g_ds41_exact_rows_scope = 1; ds4_gpu_set_exact_rows_scope(1); }
 #endif
     bool ok = ds4_gpu_begin_commands() && ds41_graph_step_batch(graphs, tokens,
@@ -84082,9 +84088,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * consecutive rows: the same per-row arithmetic as single steps,
              * bit for bit, with each step's experts loaded once rather than
              * once a row. */
+            /* Only the rows the streaming-append rule made token-major - 256 to
+             * 1023 of them; a shorter append was single steps at the baseline
+             * too, and the verifier's tests are written against that. A session
+             * holding an image keeps single steps: its rows are not all text. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
             const bool exact_tail = !g_ds41_token_major_tail && !decoder_pending &&
-                g->streaming && g->pos && remaining < 1024u && remaining >= 2u;
+                g->streaming && g->pos && remaining < 1024u && remaining >= 256u &&
+                !g->image_count;
 #else
             const bool exact_tail = false;
 #endif
