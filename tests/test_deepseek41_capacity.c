@@ -1,6 +1,7 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
- *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out> [bytes [token-major|prev] [parts=N]]
+ *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out>
+ *       [bytes [token-major|prev] [cached] [noblock] [rows=N] [parts=N]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -30,6 +31,7 @@ void ds4_gpu_test_mtl4_parts(unsigned parts) __attribute__((weak));
 void ds4_test_expert_read_cached(int on) __attribute__((weak));
 void ds4_test_v41_tail_block(int on) __attribute__((weak));
 void ds4_test_v41_tail_rows(uint32_t rows) __attribute__((weak));
+void ds4_test_expert_reads(double out[3]) __attribute__((weak));
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) __attribute__((weak));
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
@@ -113,6 +115,18 @@ int main(int argc, char **argv) {
             ds4_test_expert_read_cached(1);
             ds4_test_v41_tail_block(0);
             ds4_test_v41_tail_rows(32);
+        } else if (strcmp(argv[a], "cached") == 0) {
+            /* Experts read through the mapped descriptor, via the page cache. */
+            if (!ds4_test_expert_read_cached) return 2;
+            ds4_test_expert_read_cached(1);
+        } else if (strcmp(argv[a], "noblock") == 0) {
+            /* The prefill rows' batch steps without the block attention. */
+            if (!ds4_test_v41_tail_block) return 2;
+            ds4_test_v41_tail_block(0);
+        } else if (strncmp(argv[a], "rows=", 5) == 0) {
+            /* Rows a batched prefill tail step takes. */
+            if (!ds4_test_v41_tail_rows) return 2;
+            ds4_test_v41_tail_rows((uint32_t)atoi(argv[a] + 5));
         } else if (strncmp(argv[a], "parts=", 6) == 0) {
             if (!ds4_gpu_test_mtl4_parts) return 2;
             ds4_gpu_test_mtl4_parts((unsigned)atoi(argv[a] + 6));
@@ -120,11 +134,19 @@ int main(int argc, char **argv) {
     }
     struct timespec t0, t1;
     int ok = ds4_session_create(&s, engine, 8192) == 0;
+    double r0[3] = {0, 0, 0};
+    if (ds4_test_expert_reads) ds4_test_expert_reads(r0);
     clock_gettime(CLOCK_MONOTONIC, &t0);
     ok = ok && ds4_session_sync(s, &prompt, err, sizeof(err)) == 0;
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (ok) printf("prefill  %d tokens in %.3f s (cold, this process's first)\n", prompt.len,
                    (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9);
+    if (ok && ds4_test_expert_reads) {
+        double r[3];
+        ds4_test_expert_reads(r);
+        printf("reads    during the prefill: %.0f loads, %.2f GiB pread, %.2f s of read-thread "
+               "time\n", r[2] - r0[2], (r[0] - r0[0]) / 1073741824.0, (r[1] - r0[1]) / 1000.0);
+    }
     uint64_t ids = 1469598103934665603ull, lh = ids;
     int i = 0;
     for (; ok && !g_stop; i++) {

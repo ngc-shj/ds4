@@ -57080,3 +57080,12 @@ void ds4_test_moe_host_ms(double out[8]) {
     out[6] = g_stream_expert_timing_readahead_ms; out[7] = g_stream_expert_timing_reuse_scan_ms;
 }
 
+
+/* Expert reads since the process started: bytes pread, the threads' summed
+ * milliseconds in pread, and cache misses (each a load). */
+void ds4_test_expert_reads(double out[3]);
+void ds4_test_expert_reads(double out[3]) {
+    out[0] = (double)g_stream_expert_cache_pread_bytes;
+    out[1] = g_stream_expert_cache_pread_ms;
+    out[2] = (double)g_stream_expert_cache_misses;
+}
