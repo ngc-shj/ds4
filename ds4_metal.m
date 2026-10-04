@@ -36472,6 +36472,13 @@ static int g_moe_em_force = -1;
 
 void ds4_gpu_moe_expert_major_override(int mode) { g_moe_em_force = mode; }
 
+/* Test hook: encode a wide step's routed gate/up this many times. The repeats
+ * rewrite the same values, so the output does not change and the difference
+ * in wall time is what the dispatch costs in place. */
+static uint32_t g_test_moe_gateup_reps = 1;
+void ds4_test_moe_gateup_reps(uint32_t n);
+void ds4_test_moe_gateup_reps(uint32_t n) { g_test_moe_gateup_reps = n ? n : 1; }
+
 static bool ds4_gpu_moe_expert_major_enabled(void) {
     if (g_moe_em_force >= 0) return g_moe_em_force != 0;
     const char *e = getenv("DS4_METAL_V41_MOE_EXPERT_MAJOR");
@@ -49694,6 +49701,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                         weightsbuf, ds4_gpu_tensor_offset(weights), gate_smem,
                         stream_overflow_gate, stream_overflow_up);
             } else
+            for (uint32_t rep = 0; rep < (n_tokens >= 64u ? g_test_moe_gateup_reps : 1u) &&
+                                   (rep == 0 || ok); rep++)
             ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
                     cb,
                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,

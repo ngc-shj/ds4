@@ -77,6 +77,13 @@ static int g_q8;
  * (the 4096-row layer-major prefix and the tail), not the tail from the
  * snapshot. */
 static int g_full;
+/* "gu2": arm B encodes the wide step's routed gate/up twice - what it costs. */
+void ds4_test_moe_gateup_reps(uint32_t n) __attribute__((weak));
+static int g_gu2;
+/* "drop:<pagecache tool>": arm B starts with the model file dropped from the
+ * file cache, outside the timed span - what the arm's reads cost from the SSD. */
+static const char *g_drop_tool;
+static const char *g_model_path;
 static ds4_engine *g_engine;
 void ds4_test_expert_touch(int on);
 unsigned ds4_test_expert_touch_count(void);
@@ -124,6 +131,12 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_em) ds4_gpu_moe_expert_major_override(b);
     if (g_blk) block_switches(b);
     if (g_q8) ds4_test_v41_q8_nr8(!b);
+    if (g_gu2) ds4_test_moe_gateup_reps(b ? 2u : 1u);
+    if (g_drop_tool && b) {
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd), "'%s' '%s' drop 1>&2", g_drop_tool, g_model_path);
+        if (system(cmd) != 0) return 0;
+    }
     if (g_prev) {
         ds4_test_expert_read_cached(1);
         ds4_test_v41_tail_block(!b);
@@ -131,7 +144,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     }
     if (g_benv_name[0]) { if (b) setenv(g_benv_name, g_benv_value, 1); else unsetenv(g_benv_name); }
     if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
-    else if (!g_em && !g_prev && !g_q8 && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
     ds4_session *s = *sp;
     uint64_t h0, m0, e0, h1, m1, e1;
     const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
@@ -153,6 +166,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_blk) block_switches(0);
     if (g_prev) { ds4_test_expert_read_cached(1); ds4_test_v41_tail_block(1); }
     if (g_q8) ds4_test_v41_q8_nr8(1);
+    if (g_gu2) ds4_test_moe_gateup_reps(1);
     if (g_benv_name[0]) unsetenv(g_benv_name);
     if (rc != 0) { fprintf(stderr, "sync: %s\n", err); return 0; }
     if (ds4_session_copy_logits(s, buf, vocab) != vocab) return 0;
@@ -183,6 +197,11 @@ int main(int argc, char **argv) {
         if (strcmp(argv[a], "q8") == 0) {
             if (!ds4_test_v41_q8_nr8) return 2;
             g_q8 = 1;
+        } else if (strcmp(argv[a], "gu2") == 0) {
+            if (!ds4_test_moe_gateup_reps) return 2;
+            g_gu2 = 1;
+        } else if (strncmp(argv[a], "drop:", 5) == 0) {
+            g_drop_tool = argv[a] + 5;
         } else if (strcmp(argv[a], "full") == 0) {
             g_full = 1;
         } else if (strcmp(argv[a], "prev") == 0) {
@@ -219,6 +238,7 @@ int main(int argc, char **argv) {
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) return 2;
     g_engine = engine;
+    g_model_path = argv[1];
     /* "tiles": only the Q8_0 row-tile check on the model's weights. */
     for (int a = 5; a < argc; a++)
         if (strcmp(argv[a], "tiles") == 0) {
