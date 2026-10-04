@@ -40497,6 +40497,11 @@ typedef struct {
     ds4_gpu_tensor *exec_state;             /* scratch for reordering node rows */
     ds4_gpu_tensor *exec_perm;              /* the reordering, new row -> old row */
     ds4_gpu_tensor *exec_logits;            /* a vocabulary row a node */
+    /* The per-row gather slices of a batch step wider than
+     * DS4_TP_BATCH_MAX_ROWS: DS41_EXACT_ROWS_MAX of them, made the first time
+     * such a step gathers and kept until the graph goes (a cached view must
+     * never outlive its tensor, so it is not regrown). */
+    ds4_gpu_tensor *wide_selected_kv;
     uint32_t exec_orig[DS4_TP_BATCH_MAX_ROWS]; /* caller node id of each row after parks */
     uint32_t exec_live;                        /* rows that ran to the head; the rest pruned */
 } ds41_gpu_graph;
@@ -40591,6 +40596,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_tensor_free(g->exec_perm);
     ds4_gpu_tensor_free(g->exec_logits);
     g->exec_perm = g->exec_logits = NULL;
+    ds4_gpu_tensor_free(g->wide_selected_kv);
+    g->wide_selected_kv = NULL;
     g->exec_tree_path = g->exec_scores = g->exec_tree = g->exec_pair_a = NULL;
     g->exec_pair_b = g->exec_comp_positions = g->exec_engram_rows2 = g->exec_state = NULL;
     ds41_view_cache_free(g->views, &g->view_count);
@@ -41368,6 +41375,14 @@ static uint64_t g_ds41_single_steps;
 static double g_ds41_single_ms;
 static uint64_t g_ds41_kblock_steps;
 static uint64_t g_ds41_kblock_rows[DS4_TP_BATCH_MAX_ROWS + 1];
+/* A single session's prefill rows may go through one batch step above
+ * DS4_TP_BATCH_MAX_ROWS, up to this many, while g_ds41_exact_rows_scope is
+ * open: the projections and the HC mix that change kernels past 32 rows keep
+ * the single-row arithmetic for that step whatever its rows. The routed
+ * experts' address path holds it to 800 rows (its selected-address maximum). */
+#define DS41_EXACT_ROWS_MAX 800u
+static int g_ds41_exact_rows_scope;
+static int g_ds41_tail_block_off;
 static uint64_t g_ds41_kblock_positions;
 /* Fail-closed. park is how many owner carries a block held back, publish how
  * many the accepted prefix named, hold how many kept the committed value
@@ -41792,7 +41807,7 @@ static bool ds41_matmul_batch_ex(ds4_gpu_tensor *out, const ds4_model *m,
      * reduction here too. DS4_METAL_V41_EXACT_VOCAB_ROWS=1 sends the head
      * through it; if the answer matches, the difference was a dispatch policy
      * and not arithmetic. */
-    if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
+    if (count >= 2 && (count <= DS4_TP_BATCH_MAX_ROWS || g_ds41_exact_rows_scope) &&
 #ifdef __APPLE__
         (outputs != DS4_N_VOCAB || exact_vocab) &&
 #endif
@@ -41801,7 +41816,8 @@ static bool ds41_matmul_batch_ex(ds4_gpu_tensor *out, const ds4_model *m,
         if (outputs == DS4_N_VOCAB) g_ds41_head_exact++;
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, m->map, m->size,
             weight->abs_offset, width, outputs, in, count);
-    } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F16) {
+    } else if (count >= 2 && (count <= DS4_TP_BATCH_MAX_ROWS || g_ds41_exact_rows_scope) &&
+               weight->type == DS4_TENSOR_F16) {
         ds41_wread_note_full(weight, count, 1, 3, round);
         ok = ds4_gpu_dsv41_projection_rows(out, m->map, m->size,
             weight->abs_offset, width, outputs, count, in);
@@ -43980,7 +43996,7 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
     const ds4_gpu_tensor *input = ffn ? b->after_attn : b->residual;
     const bool projected =
 #ifdef __APPLE__
-        fn->type == DS4_TENSOR_F16 && count > DS4_TP_BATCH_MAX_ROWS ?
+        fn->type == DS4_TENSOR_F16 && count > DS4_TP_BATCH_MAX_ROWS && !g_ds41_exact_rows_scope ?
         ds4_gpu_hc_rms_scale_project_f16_tensor(b->mix, b->flat_norm,
             m->map, m->size, fn->abs_offset, DS4_N_HC * DS4_N_EMBD, 24u,
             input, count, DS4_RMS_EPS) :
@@ -46254,12 +46270,17 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
 static int g_ds41_token_major_tail;
 void ds4_test_v41_token_major_tail(int on);
 void ds4_test_v41_token_major_tail(int on) { g_ds41_token_major_tail = on; }
-/* Test hook: rows a batched tail step takes, 2..DS4_TP_BATCH_MAX_ROWS (0: the
- * maximum), to see how the tail's wall follows its number of steps. */
+/* Test hook: rows a batched tail step takes, 2..DS41_EXACT_ROWS_MAX (0: the
+ * production DS41_EXACT_ROWS_MAX), to see how the tail's wall follows its
+ * number of steps. */
 static uint32_t g_ds41_tail_rows;
 void ds4_test_v41_tail_rows(uint32_t rows);
+/* Test hook: one session's prefill batch steps without the block attention
+ * they take by default, for the comparison. */
+void ds4_test_v41_tail_block(int on);
+void ds4_test_v41_tail_block(int on) { g_ds41_tail_block_off = !on; }
 void ds4_test_v41_tail_rows(uint32_t rows) {
-    g_ds41_tail_rows = rows >= 2u && rows <= DS4_TP_BATCH_MAX_ROWS ? rows : 0u;
+    g_ds41_tail_rows = rows >= 2u && rows <= DS41_EXACT_ROWS_MAX ? rows : 0u;
 }
 
 /* *tail is set when the streaming-append rule below, and nothing else, makes
@@ -46876,7 +46897,9 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
                                    total, cancel, cancel_ud, false, false);
 }
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
-    if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
+    if (!graphs || count < 2 ||
+        count > (g_ds41_exact_rows_scope ? (int)DS41_EXACT_ROWS_MAX : DS4_TP_BATCH_MAX_ROWS))
+        return NULL;
     ds41_gpu_graph *largest = NULL;
     for (int i = 0; i < count; i++) {
         ds41_gpu_graph *g = graphs[i];
@@ -47408,10 +47431,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                                          ds41_block_accept *acc,
                                                          ds41_step_mode mode) {
     ds41_step_config();
-    if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
-        prefill_rows > (uint32_t)count) return false;
+    /* Above DS4_TP_BATCH_MAX_ROWS only one session's consecutive prefill rows,
+     * single host, under the exact-rows scope its caller opens: the TP wire
+     * format and the verifier's per-row state stay at that cap. */
+    const bool wide = count > DS4_TP_BATCH_MAX_ROWS;
+    if (!graphs || !tokens || count < 2 || prefill_rows > (uint32_t)count ||
+        count > (int)DS41_EXACT_ROWS_MAX ||
+        (wide && (mode != DS41_STEP_PREFILL || prefill_rows != (uint32_t)count ||
+                  !g_ds41_exact_rows_scope || graphs[0]->tp_world != 1))) return false;
+    for (int i = 1; wide && i < count; i++) if (graphs[i] != graphs[0]) return false;
     g_ds41_kblock_steps++;
-    g_ds41_kblock_rows[count]++;
+    g_ds41_kblock_rows[wide ? DS4_TP_BATCH_MAX_ROWS : count]++;
     g_ds41_kblock_positions += (uint64_t)count;
     /* Sparse block masks scale with context, even when prefill caps match.
      * Attention and Engram history remain private to each session. */
@@ -47453,8 +47483,33 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
     const bool batch_stream_experts = g->streaming && g->tp_world == 1 &&
         (!bse_e || !bse_e[0] || atoi(bse_e) != 0);
     ds41_prefill_row active = {0};
-    ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
-    uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
+    /* Every per-row array of the step, on the heap and sized by the rows: at
+     * the exact-rows cap they are far past a worker thread's stack. */
+    const size_t nrow = (size_t)count;
+    void *row_arena = calloc(1, nrow * (3u * sizeof(ds4_gpu_tensor *) + sizeof(double) +
+                                        sizeof(ds4_engram_history) +
+                                        DS4_MAX_EXPERT_USED * sizeof(int32_t) +
+                                        8u * sizeof(uint32_t) + sizeof(int)));
+    char *row_at = row_arena;
+#define DS41_ROW_ARRAY(type, name) \
+    type *name = (type *)(void *)row_at; row_at += nrow * sizeof(type);
+    DS41_ROW_ARRAY(ds4_gpu_tensor *, queries)
+    DS41_ROW_ARRAY(ds4_gpu_tensor *, heads)
+    DS41_ROW_ARRAY(ds4_gpu_tensor *, gathers)
+    DS41_ROW_ARRAY(double, row_ms_all)
+    DS41_ROW_ARRAY(ds4_engram_history, history)
+    int32_t (*row_ids_all)[DS4_MAX_EXPERT_USED] = (int32_t (*)[DS4_MAX_EXPERT_USED])(void *)row_at;
+    row_at += nrow * sizeof(*row_ids_all);
+    DS41_ROW_ARRAY(uint32_t, positions)
+    DS41_ROW_ARRAY(uint32_t, hp_all)
+    DS41_ROW_ARRAY(uint32_t, nr_all)
+    DS41_ROW_ARRAY(uint32_t, rs_all)
+    DS41_ROW_ARRAY(uint32_t, ncv_all)
+    DS41_ROW_ARRAY(uint32_t, nr2_all)
+    DS41_ROW_ARRAY(uint32_t, rs2_all)
+    DS41_ROW_ARRAY(uint32_t, park_all)
+    DS41_ROW_ARRAY(int, row_missed_all)
+#undef DS41_ROW_ARRAY
     /* Only the leading prefill rows share a session. Keep their disk reads
      * and hash history distinct until the final row is published. */
     float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = prefill_rows > 1 ?
@@ -47465,10 +47520,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * stack and at sixteen it did not, arriving as SIGBUS with subtype "thread
      * stack size exceeded" from this function's own entry probe. */
     ds41_gpu_graph *moe_rows = NULL;
-    ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
-    ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
-    ds4_gpu_tensor *gathers[DS4_TP_BATCH_MAX_ROWS] = {0};
-    bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
+    bool ok = row_arena && rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds41_view(g, g->batch.name, 0, \
         (uint64_t)rows * (width) * sizeof(float))) != NULL;
@@ -47493,16 +47545,26 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * prices pieces that are each below the noise. */
     const char *block_all_e = getenv("DS4_METAL_V41_BLOCK");
     const bool block_all = block_all_e && block_all_e[0] && atoi(block_all_e) != 0;
+    /* One session's prefill rows take the block attention by default - the row
+     * gathers, block-local KV and attention by level, whose low projection is
+     * the exact four-row tile - because every row's arithmetic is the single
+     * row's and the rows stop waiting on each other. (The batched low
+     * projection that rounds differently stays behind its switch.) */
+    bool prefill_block = mode == DS41_STEP_PREFILL && prefill_rows == (uint32_t)count &&
+                         g->streaming && g->tp_world == 1 && !g_ds41_tail_block_off;
+    for (int i = 1; prefill_block && i < count; i++) prefill_block = graphs[i] == graphs[0];
     const char *row_gather_e = getenv("DS4_METAL_V41_ROW_GATHER");
-    const bool row_gather = (block_all ||
-                             (row_gather_e && row_gather_e[0] && atoi(row_gather_e) != 0)) &&
-                            g->block_selected_kv != NULL;
+    const bool row_gather_wanted = block_all || prefill_block ||
+                                   (row_gather_e && row_gather_e[0] && atoi(row_gather_e) != 0);
+    if (row_gather_wanted && wide && !g->wide_selected_kv)
+        g->wide_selected_kv = ds4_gpu_tensor_alloc((uint64_t)DS41_EXACT_ROWS_MAX * gather_bytes);
+    ds4_gpu_tensor *const sel_kv = wide ? g->wide_selected_kv : g->block_selected_kv;
+    const bool row_gather = row_gather_wanted && sel_kv != NULL;
     for (int i = 0; ok && i < count; i++) {
         queries[i] = ds41_view(g, g->batch.q, (uint64_t)i * head_bytes, head_bytes);
         heads[i] = ds41_view(g, g->batch.heads, (uint64_t)i * head_bytes, head_bytes);
         if (row_gather)
-            gathers[i] = ds41_view(g, g->block_selected_kv,
-                                   (uint64_t)i * gather_bytes, gather_bytes);
+            gathers[i] = ds41_view(g, sel_kv, (uint64_t)i * gather_bytes, gather_bytes);
         ok = queries[i] && heads[i] && (!row_gather || gathers[i]);
     }
     const float initial_pre[] = {1, 0, 0, 0};
@@ -47572,11 +47634,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
      * the order the rows ran in. */
     const char *block_kv_e = getenv("DS4_METAL_V41_BLOCK_KV");
     const bool block_kv = block_ok && !block_attn &&
-                          (block_all || (block_kv_e && block_kv_e[0] && atoi(block_kv_e) != 0));
+                          (block_all || prefill_block ||
+                           (block_kv_e && block_kv_e[0] && atoi(block_kv_e) != 0));
     const char *block_lv_e = getenv("DS4_METAL_V41_BLOCK_LEVELS");
     const bool block_levels = block_kv &&
-                              (block_all || (block_lv_e && block_lv_e[0] &&
-                                             atoi(block_lv_e) != 0));
+                              (block_all || prefill_block ||
+                               (block_lv_e && block_lv_e[0] && atoi(block_lv_e) != 0));
     const char *bak_e = getenv("DS4_METAL_V41_BLOCK_ATTN_K");
     const bool block_attn_k = bak_e && bak_e[0] && atoi(bak_e) != 0;
     /* Layers 0 and 1 hold no compressed KV, so their rows differ only in how
@@ -47881,7 +47944,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
             const char *wb_e = getenv("DS4_METAL_V41_BLOCK_WRITE_BATCH");
             const bool write_batch = wb_e && wb_e[0] && atoi(wb_e) != 0;
             if (ok && write_batch) {
-                uint32_t hp[DS4_TP_BATCH_MAX_ROWS];
+                uint32_t *hp = hp_all;
                 for (int i = 0; i < count; i++) hp[i] = positions[i];
                 ok = ds4_gpu_tensor_write(g->block_positions, 0, hp,
                                           (uint64_t)count * sizeof(uint32_t)) != 0;
@@ -48006,8 +48069,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                      * prefix every row has in common is staged K times.
                      * DS4_METAL_V41_BLOCK_ATTN_K=1. */
                     if (ok && block_attn_k) {
-                        uint32_t nr[DS4_TP_BATCH_MAX_ROWS], rs[DS4_TP_BATCH_MAX_ROWS];
-                        uint32_t ncv[DS4_TP_BATCH_MAX_ROWS];
+                        uint32_t *nr = nr_all, *rs = rs_all;
+                        uint32_t *ncv = ncv_all;
                         for (int i = 0; i < count; i++) {
                             const uint32_t nc = (positions[i] + 1u) / ratio_l;
                             ncv[i] = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
@@ -48022,7 +48085,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                         ok = ds4_gpu_attention_decode_heads_block_tensor(active.heads,
                                 model->map, model->size, sinks_off, active.q,
                                 g->raw_prefill, raw_cap, nr, rs,
-                                g->block_selected_kv, gather_bytes, ncv,
+                                sel_kv, gather_bytes, ncv,
                                 heads_n, DS4_N_HEAD_DIM, rows) != 0;
                         DS41_LEVEL_BREAK();
                     }
@@ -48059,6 +48122,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                         DS41_LEVEL_BREAK();
                         if (ok) ok = ds41_bf16(active.low,
                                                rows * DS4_N_OUT_GROUP * DS4_N_LORA_O);
+                    } else if (g->tp_world == 1) {
+                        /* The rows in tiles of four over one weight read, each
+                         * with its own accumulator in the single-row order:
+                         * bit-identical to the per-row loop below, and the 36 MB
+                         * a layer is read a quarter as often. The caller's
+                         * rounding is the same BF16 pass the loop's rows get. */
+                        ds41_wread_note_full(l->attn_output_a, rows, 4, 7, true);
+                        ok = ds4_gpu_dsv41_attention_output_low_rows(active.low,
+                                model->map, model->size, l->attn_output_a->abs_offset,
+                                active.heads, rows, 4) != 0;
+                        DS41_LEVEL_BREAK();
+                        for (int i = 0; ok && i < count; i++)
+                            ok = ds41_bf16(g->rows_view[i].low, groups * DS4_N_LORA_O);
                     } else {
                         for (int i = 0; ok && i < count; i++)
                             ds41_wread_note_full(l->attn_output_a, 1, 1, 7, true);
@@ -48085,7 +48161,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
              * bases are avail-min(avail,SWA) over consecutive positions, which
              * is the single stride nb13 can carry. */
             if (ok && !levelled && ratio_l == 0u && block_attn_raw) {
-                uint32_t nr[DS4_TP_BATCH_MAX_ROWS], rs[DS4_TP_BATCH_MAX_ROWS];
+                uint32_t *nr = nr2_all, *rs = rs2_all;
                 for (int i = 0; i < count; i++) {
                     const uint32_t avail = previous + (uint32_t)i + 1u;
                     nr[i] = avail < 128u ? avail : 128u;
@@ -48289,7 +48365,7 @@ resume_routed_entry:
                 /* One stall for the whole batch: the rows' ids come back
                  * together, so the per-token cost of the round trip falls with
                  * every extra row. */
-                int32_t row_ids[DS4_TP_BATCH_MAX_ROWS][DS4_MAX_EXPERT_USED];
+                int32_t (*row_ids)[DS4_MAX_EXPERT_USED] = row_ids_all;
                 if (ok) ok = ds4_gpu_end_commands() != 0;
                 for (int i = 0; ok && i < count; i++)
                     ok = ds4_gpu_tensor_read(moe_rows[i].selected, 0, row_ids[i],
@@ -48330,8 +48406,10 @@ resume_routed_entry:
                 if (wave < 0) wave = getenv("DS4_METAL_V41_WAVE_PROBE") != NULL;
                 static double w_ms_miss, w_ms_res;
                 static unsigned long long w_steps, w_partial, w_reported;
-                double row_ms[DS4_TP_BATCH_MAX_ROWS] = { 0 };
-                int row_missed[DS4_TP_BATCH_MAX_ROWS] = { 0 };
+                double *row_ms = row_ms_all;
+                int *row_missed = row_missed_all;
+                memset(row_ms, 0, nrow * sizeof(*row_ms));
+                memset(row_missed, 0, nrow * sizeof(*row_missed));
                 for (int i = 0; ok && i < count; i++) {
                     const uint64_t m0 = wave ? ds4_gpu_stream_expert_cache_miss_count() : 0;
                     const double t0 = wave ? now_sec() : 0.0;
@@ -48550,11 +48628,11 @@ pass_done:
      * the caller re-runs once the misses have been serviced. */
     if (ok) {
         uint32_t records[DS41_BLOCK_MISS_MAX * 4];
-        uint32_t park_layers[DS4_TP_BATCH_MAX_ROWS] = {0};
+        uint32_t *park_layers = park_all;
         uint32_t misses = 0, parked = 0, invalid = 0, dropped = 0;
         if (!ds4_gpu_moe_block_miss_read(records, DS41_BLOCK_MISS_MAX,
                                          &misses, &parked, &invalid, &dropped,
-                                         park_layers, DS4_TP_BATCH_MAX_ROWS)) {
+                                         park_layers, (uint32_t)count)) {
             ok = false;
         } else if (misses || parked || invalid || dropped) {
             g_ds41_park_blocks++;
@@ -48623,6 +48701,7 @@ pass_done:
         for (int i = 0; i < 8; i++) g_ds41_zc_block[i] += zc_after[i] - zc_before[i];
         g_ds41_zc_blocks++;
     }
+    free(row_arena);
     return ok;
 }
 
@@ -50323,12 +50402,21 @@ done:
 
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_weights *w, const int *tokens, uint32_t count) {
-    if (!g->valid || count < 2u || count > DS4_TP_BATCH_MAX_ROWS ||
+    if (!g->valid || count < 2u || count > DS41_EXACT_ROWS_MAX ||
         g->pos > g->ctx || count > g->ctx - g->pos) return false;
-    ds41_gpu_graph *graphs[DS4_TP_BATCH_MAX_ROWS];
+    ds41_gpu_graph **graphs = malloc((size_t)count * sizeof(*graphs));
+    if (!graphs) return false;
     for (uint32_t i = 0; i < count; i++) graphs[i] = g;
+    const bool wide = count > DS4_TP_BATCH_MAX_ROWS;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (wide) { g_ds41_exact_rows_scope = 1; ds4_gpu_set_exact_rows_scope(1); }
+#endif
     bool ok = ds4_gpu_begin_commands() && ds41_graph_step_batch(graphs, tokens,
         (int)count, count, m, w);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (wide) { g_ds41_exact_rows_scope = 0; ds4_gpu_set_exact_rows_scope(0); }
+#endif
+    free(graphs);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) g->valid = false;
@@ -83990,18 +84078,20 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint32_t remaining = (uint32_t)(prompt->len - i);
             if (g->encoder_resident && remaining < 768u)
                 ds41_encoder_release(g, &e->model, &encoder);
-            /* A streaming append's token-major rows run as batch steps of up to
-             * DS4_TP_BATCH_MAX_ROWS consecutive rows: the same per-row
-             * arithmetic as single steps, bit for bit, with each block's
-             * experts loaded once rather than once a row (699 rows of the
-             * long prompt: 22 steps, about 35% less wall). */
+            /* A streaming append's token-major rows run as batch steps of
+             * consecutive rows: the same per-row arithmetic as single steps,
+             * bit for bit, with each step's experts loaded once rather than
+             * once a row. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
             const bool exact_tail = !g_ds41_token_major_tail && !decoder_pending &&
                 g->streaming && g->pos && remaining < 1024u && remaining >= 2u;
 #else
             const bool exact_tail = false;
 #endif
-            const uint32_t block_rows = g_ds41_tail_rows ? g_ds41_tail_rows : DS4_TP_BATCH_MAX_ROWS;
+            /* One step for the whole append up to DS41_EXACT_ROWS_MAX rows: each
+             * layer's experts are prepared and read once for every row, and
+             * the layer waits on the device once. */
+            const uint32_t block_rows = g_ds41_tail_rows ? g_ds41_tail_rows : DS41_EXACT_ROWS_MAX;
             const uint32_t short_count = decoder_pending ? 0u : exact_tail ?
                 (remaining < block_rows ? remaining : block_rows) :
                 ds41_short_prefill_count(g, &e->weights, remaining);

@@ -3,9 +3,10 @@
  *   test_deepseek41_tailab <model.gguf> <story.txt> [rounds] [cache_experts] [rows_a rows_b]
  *
  * With rows_a and rows_b both arms are batched, in steps of that many rows
- * (2..32, through ds4_test_v41_tail_rows); without them B is token-major. A
- * fifth argument "em" instead makes B the expert-major routed gate/up
- * (ds4_gpu_moe_expert_major_override), A the default pair-major one.
+ * (2..800, through ds4_test_v41_tail_rows); without them B is token-major. A
+ * further argument "em" makes B the expert-major routed gate/up
+ * (ds4_gpu_moe_expert_major_override), A the default pair-major one; rows and
+ * "em" combine.
  *
  * Prefills the first 4096 tokens of the backend test's long prompt once and
  * keeps the session as a snapshot. Each arm then restores that snapshot and
@@ -41,10 +42,31 @@ void ds4_test_v41_tail_rows(uint32_t rows) __attribute__((weak));
 void ds4_gpu_moe_expert_major_override(int mode) __attribute__((weak));
 uint64_t ds4_gpu_moe_expert_major_dispatches(void) __attribute__((weak));
 static uint32_t g_rows[2];
-static int g_em;
+static int g_em, g_blk;
+/* "benv:NAME=VALUE": an engine switch read at every call, set only while arm B
+ * runs (both arms otherwise as asked). */
+static char g_benv_name[128], g_benv_value[128];
+/* "blk": arm B runs the block executor's batched attention, through the
+ * switches the engine reads at every step (DS4_METAL_V41_BLOCK and its
+ * ATTN_K / ATTN_RAW parts), set only while that arm runs. */
+static void block_switches(int on) {
+    static const char *names[] = { "DS4_METAL_V41_BLOCK", "DS4_METAL_V41_BLOCK_ATTN_K",
+                                    "DS4_METAL_V41_BLOCK_ATTN_RAW", "DS4_METAL_V41_ROW_GATHER",
+                                    "DS4_METAL_V41_BLOCK_KV", "DS4_METAL_V41_BLOCK_LEVELS",
+                                    "DS4_METAL_V41_BLOCK_LOW_BATCH" };
+    for (int i = 0; i < 7; i++) {
+        if (on && (g_blk & (1 << i))) setenv(names[i], "1", 1); else unsetenv(names[i]);
+    }
+}
 void ds4_gpu_stream_expert_cache_counters(uint64_t *hits, uint64_t *misses, uint64_t *evictions,
                                           uint32_t *entries, uint32_t *budget);
 void ds4_gpu_expert_directory_counts(unsigned long long out[8]);
+void ds4_test_moe_host_ms(double out[8]) __attribute__((weak));
+void ds4_test_expert_read_cached(int on) __attribute__((weak));
+void ds4_test_v41_tail_block(int on) __attribute__((weak));
+/* "prev": arm B is the batched tail before this change - 32-row steps, no block
+ * attention, expert reads through the mapped descriptor - arm A production. */
+static int g_prev;
 void ds4_test_expert_touch(int on);
 unsigned ds4_test_expert_touch_count(void);
 
@@ -75,7 +97,7 @@ static int payload_hash(ds4_session *s, uint64_t *hash) {
     return 1;
 }
 
-typedef struct { double wall; uint64_t logits, state, hits, misses, evictions, em; unsigned long long loads; } arm_result;
+typedef struct { double wall; uint64_t logits, state, hits, misses, evictions, em; unsigned long long loads; double host[8]; } arm_result;
 
 static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_tokens *prompt,
                    int b, float *buf, int vocab, arm_result *r) {
@@ -85,21 +107,35 @@ static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_t
         return 0;
     }
     if (g_em) ds4_gpu_moe_expert_major_override(b);
-    else if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
-    else if (ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    if (g_blk) block_switches(b);
+    if (g_prev) {
+        ds4_test_expert_read_cached(b);
+        ds4_test_v41_tail_block(!b);
+        ds4_test_v41_tail_rows(b ? 32u : 0u);
+    }
+    if (g_benv_name[0]) { if (b) setenv(g_benv_name, g_benv_value, 1); else unsetenv(g_benv_name); }
+    if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
+    else if (!g_em && !g_prev && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
     uint64_t h0, m0, e0, h1, m1, e1;
     const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
     unsigned long long d0[8], d1[8];
     ds4_gpu_stream_expert_cache_counters(&h0, &m0, &e0, NULL, NULL);
     ds4_gpu_expert_directory_counts(d0);
+    double h0ms[8] = {0}, h1ms[8] = {0};
+    if (ds4_test_moe_host_ms) ds4_test_moe_host_ms(h0ms);
     const double t0 = now_s();
     const int rc = ds4_session_sync(s, prompt, err, sizeof(err));
     const double t1 = now_s();
     ds4_gpu_stream_expert_cache_counters(&h1, &m1, &e1, NULL, NULL);
     ds4_gpu_expert_directory_counts(d1);
+    if (ds4_test_moe_host_ms) ds4_test_moe_host_ms(h1ms);
+    for (int k = 0; k < 8; k++) r->host[k] = (h1ms[k] - h0ms[k]) / 1000.0;
     if (ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(0);
     if (ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(0);
     if (g_em) ds4_gpu_moe_expert_major_override(-1);
+    if (g_blk) block_switches(0);
+    if (g_prev) { ds4_test_expert_read_cached(0); ds4_test_v41_tail_block(1); }
+    if (g_benv_name[0]) unsetenv(g_benv_name);
     if (rc != 0) { fprintf(stderr, "sync: %s\n", err); return 0; }
     if (ds4_session_copy_logits(s, buf, vocab) != vocab) return 0;
     r->wall = t1 - t0;
@@ -121,10 +157,29 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_term);
     const int rounds = argc > 3 ? atoi(argv[3]) : 2;
     const unsigned cache = argc > 4 ? (unsigned)atoi(argv[4]) : 10268;
-    if (argc > 5 && strcmp(argv[5], "em") == 0) {
-        if (!ds4_gpu_moe_expert_major_override) return 2;
-        g_em = 1;
-    } else if (argc > 6) { g_rows[0] = (uint32_t)atoi(argv[5]); g_rows[1] = (uint32_t)atoi(argv[6]); }
+    /* [rows_a rows_b] [em]: either or both. */
+    for (int a = 5; a < argc; a++) {
+        /* blk: BLOCK, ATTN_K and ATTN_RAW; blkN: the switches whose bits are set
+         * in N - 1 BLOCK, 2 ATTN_K, 4 ATTN_RAW, 8 ROW_GATHER, 16 BLOCK_KV,
+         * 32 BLOCK_LEVELS, 64 BLOCK_LOW_BATCH. */
+        if (strcmp(argv[a], "prev") == 0) {
+            if (!ds4_test_expert_read_cached || !ds4_test_v41_tail_block || !ds4_test_v41_tail_rows)
+                return 2;
+            g_prev = 1;
+        } else if (strncmp(argv[a], "benv:", 5) == 0) {
+            const char *eq = strchr(argv[a] + 5, '=');
+            if (!eq || (size_t)(eq - argv[a] - 5) >= sizeof(g_benv_name)) return 2;
+            memcpy(g_benv_name, argv[a] + 5, (size_t)(eq - argv[a] - 5));
+            snprintf(g_benv_value, sizeof(g_benv_value), "%s", eq + 1);
+        } else if (strncmp(argv[a], "blk", 3) == 0) {
+            g_blk = argv[a][3] ? atoi(argv[a] + 3) : 7;
+        } else if (strcmp(argv[a], "em") == 0) {
+            if (!ds4_gpu_moe_expert_major_override) return 2;
+            g_em = 1;
+        } else if (a + 1 < argc) {
+            g_rows[0] = (uint32_t)atoi(argv[a]); g_rows[1] = (uint32_t)atoi(argv[a + 1]); a++;
+        }
+    }
     FILE *f = fopen(argv[2], "rb");
     if (!f) return 2;
     char *story = calloc(1, 22000 + 64);
@@ -157,6 +212,9 @@ int main(int argc, char **argv) {
     ok = ok && ds4_session_save_snapshot(s, &snap, err, sizeof(err)) == 0;
     printf("prefix   4096 rows layer-major in %.3f s (cold), %.2f ms a row; tail %d rows; "
            "%s\n", p1 - p0, (p1 - p0) * 1000.0 / 4096.0, prompt.len - 4096,
+           g_prev ? "B = the batched tail before (32 rows, no block attention, cached reads)" :
+           g_blk ? "B = block executor attention" :
+           g_em && g_rows[0] ? "rows as asked, B expert-major" :
            g_em ? "B = expert-major gate/up" : g_rows[0] ? "A and B batched, rows as asked" :
            ds4_test_v41_token_major_tail ? "B = token-major" : "none (A twice: the ruler's spread)");
 
@@ -174,6 +232,12 @@ int main(int argc, char **argv) {
            ref.loads, (unsigned long long)ref.misses);
     ok = ok && run_arm(s, &snap, &prompt, 1, buf, vocab, &r);
     if (ok && (r.logits != ref.logits || r.state != ref.state)) bad++;
+    printf("host     A: drain %.2f, prepare %.2f (load prepare %.2f, pread %.2f, install %.2f, "
+           "slot buffers %.2f, readahead %.2f, reuse scan %.2f) s\n", ref.host[0], ref.host[1],
+           ref.host[2], ref.host[3], ref.host[4], ref.host[5], ref.host[6], ref.host[7]);
+    printf("host     B: drain %.2f, prepare %.2f (load prepare %.2f, pread %.2f, install %.2f, "
+           "slot buffers %.2f, readahead %.2f, reuse scan %.2f) s\n", r.host[0], r.host[1],
+           r.host[2], r.host[3], r.host[4], r.host[5], r.host[6], r.host[7]);
     printf("warm-up  A %.3f s, B %.3f s; reference logits %016llx state %016llx\n", ref.wall,
            r.wall, (unsigned long long)ref.logits, (unsigned long long)ref.state);
     static const int order[2][4] = { {0, 1, 1, 0}, {1, 0, 0, 1} };

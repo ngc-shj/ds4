@@ -998,6 +998,13 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+/* Missing experts are read through a second open of the model file with
+ * F_NOCACHE and no read-ahead: through the mapped descriptor every read went
+ * via the unified buffer cache, one copy more and the file cache churned by
+ * every miss, and a long prompt's prefill tail read 37 GiB at 11.6 GiB/s
+ * instead of 19. g_expert_read_cached is the test hook's way back. */
+static int g_model_read_fd = -1;
+static int g_expert_read_cached;
 /* Where a miss's repair time goes, cumulative ms: readahead advice, slot
  * preparation (buffer and mlock), the reads, and installing the entries. */
 static double g_rep_ra_ms, g_rep_prep_ms, g_rep_read_ms, g_rep_install_ms;
@@ -1071,6 +1078,9 @@ static double g_stream_expert_timing_split_missing_addr_ms;
 static double g_stream_expert_timing_split_missing_wait_ms;
 static uint64_t g_stream_expert_timing_load_calls;
 static double g_stream_expert_timing_load_prepare_ms;
+/* Development timers for a routed batch wider than 32 rows: the drain before
+ * it prepares its experts, and the preparation itself. */
+static double g_test_moe_wait_ms, g_test_moe_prepare_ms;
 static double g_stream_expert_timing_load_pread_ms;
 static double g_stream_expert_timing_load_install_ms;
 static uint64_t g_stream_expert_timing_prepare_batch_reuse_calls;
@@ -2042,6 +2052,11 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 /* The GPU's own span for whatever a drain waits on, so commit-to-done can be
  * split into the GPU running and the GPU not running without mixing a host
  * clock with Metal's: only differences within one clock are taken. */
+/* Open while ds4.c runs one session's prefill rows past 32 through a batch
+ * step: the F32 projection keeps its exact-rows kernel at any row count. */
+static int g_exact_rows_scope;
+void ds4_gpu_set_exact_rows_scope(int on) { g_exact_rows_scope = on; }
+
 static double g_gpu_span_accum_ms;
 static uint64_t g_gpu_span_cbs;
 double ds4_gpu_take_span_ms(void);
@@ -13641,6 +13656,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_q4_down_slots_buffer = nil;
         g_attn_out_group_ids_buffer = nil;
         g_model_fd = -1;
+        if (g_model_read_fd >= 0) { close(g_model_read_fd); g_model_read_fd = -1; }
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -14628,9 +14644,25 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 }
 
 int ds4_gpu_set_model_fd(int fd) {
+    if (g_model_read_fd >= 0 && fd != g_model_fd) { close(g_model_read_fd); g_model_read_fd = -1; }
     g_model_fd = fd;
+    if (fd >= 0 && g_model_read_fd < 0) {
+        char path[MAXPATHLEN];
+        if (fcntl(fd, F_GETPATH, path) == 0) {
+            const int rfd = open(path, O_RDONLY | O_CLOEXEC);
+            if (rfd >= 0 && fcntl(rfd, F_NOCACHE, 1) == 0 && fcntl(rfd, F_RDAHEAD, 0) == 0)
+                g_model_read_fd = rfd;
+            else if (rfd >= 0) close(rfd);
+        }
+        if (g_model_read_fd < 0)
+            fprintf(stderr, "ds4: expert reads go through the mapped model descriptor "
+                    "(no uncached descriptor: %s)\n", strerror(errno));
+    }
     return 1;
 }
+
+void ds4_test_expert_read_cached(int on);
+void ds4_test_expert_read_cached(int on) { g_expert_read_cached = on; }
 
 static int ds4_gpu_model_views_cover_range(
         const void *model_map,
@@ -15303,7 +15335,8 @@ static int ds4_gpu_stream_expert_pread_into(
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+            nread = pread(g_model_read_fd >= 0 && !g_expert_read_cached ?
+                          g_model_read_fd : g_model_fd, dst + pos, want, (off_t)(offset + pos));
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             fail_errno = nread < 0 ? errno : 0;
@@ -25572,7 +25605,7 @@ static int ds4_gpu_matmul_f32_round_tensor(
          * single-row dispatches - 320 a verify block at forty layers.
          * DS4_METAL_DISABLE_V41_F32_EXACT_ROWS=1 goes back to that loop. */
         const bool f32_exact_rows =
-            n_tok >= 2u && n_tok <= 32u &&
+            n_tok >= 2u && (n_tok <= 32u || g_exact_rows_scope) &&
             getenv("DS4_METAL_DISABLE_V41_F32_EXACT_ROWS") == NULL;
         if (n_tok == 1 || f32_exact_rows) {
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
@@ -36494,7 +36527,8 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(
         id<MTLBuffer> dst_mid, NSUInteger dst_mid_off,
         id<MTLBuffer> ids,    NSUInteger ids_off,
         id<MTLBuffer> weights, NSUInteger weights_off,
-        NSUInteger threadgroup_bytes) {
+        NSUInteger threadgroup_bytes,
+        id<MTLBuffer> overflow_gate, id<MTLBuffer> overflow_up) {
     if (!cb || !args || !act || !gate_addrs || !up_addrs || !src1 || !dst_a ||
         !dst_b || !dst_mid || !ids || !weights || args->ne00 <= 0 ||
         args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0 || args->ne02 <= 0)
@@ -36539,6 +36573,16 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(
     ds4_enc_buf(enc, g_moe_em_counts, 0, 10);
     ds4_enc_buf(enc, g_moe_em_lists, 0, 11);
     ds4_enc_bytes(enc, &max_rows, sizeof(max_rows), 12);
+    /* The experts are read through the tables' raw addresses: declare what they
+     * point into, as the pair encode does - cache entries and, when a layer's
+     * selected set is wider than the cache, the mapped model views. */
+    for (uint32_t i = 0; entries && i < n_entries; i++) {
+        if (!entries[i]) continue;
+        ds4_enc_use(enc, entries[i]->gate_buffer, MTLResourceUsageRead);
+        ds4_enc_use(enc, entries[i]->up_buffer, MTLResourceUsageRead);
+    }
+    if (overflow_gate) ds4_enc_use(enc, overflow_gate, MTLResourceUsageRead);
+    if (overflow_up) ds4_enc_use(enc, overflow_up, MTLResourceUsageRead);
     if (threadgroup_bytes) ds4_enc_tgmem(enc, threadgroup_bytes, 0);
     ds4_gpu_dispatch(enc, MTLSizeMake(row_groups, 1, n_expert), MTLSizeMake(32, nsg, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -49287,10 +49331,14 @@ int ds4_gpu_routed_moe_batch_tensor(
         }
         if (use_cached_batch) {
             const int had_batch = g_batch_cmd != nil;
+            const double tw0 = ds4_gpu_now_ms();
             if (had_batch && ds4_gpu_end_commands() == 0) {
                 return 0;
             }
+            const double tw1 = ds4_gpu_now_ms();
             g_stream_prefill_batch_selected_addr_building++;
+            const bool timed_prepare = n_tokens > 32u;
+            if (timed_prepare) g_test_moe_wait_ms += tw1 - tw0;
             if (!ds4_gpu_stream_expert_cache_prepare_selected_batch(
                         model_map,
                         model_size,
@@ -49316,6 +49364,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 g_stream_prefill_batch_selected_addr_building--;
                 return 0;
             }
+            if (timed_prepare) g_test_moe_prepare_ms += ds4_gpu_now_ms() - tw1;
             g_stream_prefill_batch_selected_addr_building--;
             if (stream_unique == 0) {
                 ds4_gpu_stream_expert_cache_clear_layer(layer_index);
@@ -49624,8 +49673,7 @@ int ds4_gpu_routed_moe_batch_tensor(
              * wiring expert-major only into the later branch left it at zero
              * dispatches twice. */
             const bool em_sel = ds4_gpu_moe_expert_major_enabled() && n_tokens > 1 &&
-                                g_tp_split_world <= 1 && !stream_overflow_gate &&
-                                !stream_overflow_up;
+                                g_tp_split_world <= 1;
             if (em_sel) {
                 ok = ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(cb, &gate_args, &act_args,
                         stream_entries_arg, stream_resource_count,
@@ -49633,7 +49681,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                         xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
                         upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
                         selectedbuf, ds4_gpu_tensor_offset(selected),
-                        weightsbuf, ds4_gpu_tensor_offset(weights), gate_smem);
+                        weightsbuf, ds4_gpu_tensor_offset(weights), gate_smem,
+                        stream_overflow_gate, stream_overflow_up);
             } else
             ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
                     cb,
@@ -49786,8 +49835,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 .weight_stride = sizeof(float), .clamp_value = clamp,
             };
             const bool em = ds4_gpu_moe_expert_major_enabled() && n_tokens > 1 &&
-                            g_tp_split_world <= 1 && !stream_overflow_gate &&
-                            !stream_overflow_up;
+                            g_tp_split_world <= 1;
             ok = em ?
                 ds4_gpu_encode_mul_mv_addr_iq2_em_swiglu(cb, &gate_args, &act_args,
                     stream_resources, stream_resource_count,
@@ -49795,7 +49843,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                     xbuf, ds4_gpu_tensor_offset(x), gatebuf, ds4_gpu_tensor_offset(gate),
                     upbuf, ds4_gpu_tensor_offset(up), midbuf, ds4_gpu_tensor_offset(mid),
                     selectedbuf, ds4_gpu_tensor_offset(selected),
-                    weightsbuf, ds4_gpu_tensor_offset(weights), gate_smem) :
+                    weightsbuf, ds4_gpu_tensor_offset(weights), gate_smem,
+                    stream_overflow_gate, stream_overflow_up) :
                 ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(cb,
                 g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline, &gate_args, &act_args,
                 stream_resources, stream_resource_count, stream_gate_addr_buf, stream_up_addr_buf,
@@ -57018,3 +57067,16 @@ int ds4_gpu_dsv41_hc_expand_tail_tensor(
 void ds4_gpu_stream_expert_seed_hotness(uint32_t layer, uint32_t expert, uint32_t amount) {
     ds4_gpu_stream_expert_cache_note_route_hotness(layer, expert, amount);
 }
+
+/* Development: cumulative milliseconds - drain before a wide batch's expert
+ * preparation, that preparation, and the expert loader's prepare / pread /
+ * install, slot buffers, readahead and reuse scan. The loader's own figures
+ * are kept only with DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY set. */
+void ds4_test_moe_host_ms(double out[8]);
+void ds4_test_moe_host_ms(double out[8]) {
+    out[0] = g_test_moe_wait_ms; out[1] = g_test_moe_prepare_ms;
+    out[2] = g_stream_expert_timing_load_prepare_ms; out[3] = g_stream_expert_timing_load_pread_ms;
+    out[4] = g_stream_expert_timing_load_install_ms; out[5] = g_stream_expert_timing_prepare_buffer_ms;
+    out[6] = g_stream_expert_timing_readahead_ms; out[7] = g_stream_expert_timing_reuse_scan_ms;
+}
+
