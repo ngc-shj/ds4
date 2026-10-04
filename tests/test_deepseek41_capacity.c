@@ -1,6 +1,6 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
- *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out> [bytes [token-major]]
+ *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out> [bytes [token-major] [parts=N]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -26,6 +26,8 @@
 #include <time.h>
 
 void ds4_test_v41_token_major_tail(int on) __attribute__((weak));
+void ds4_gpu_test_mtl4_parts(unsigned parts) __attribute__((weak));
+void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) __attribute__((weak));
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     const unsigned char *c = p;
@@ -94,9 +96,16 @@ int main(int argc, char **argv) {
     char err[256] = "";
     /* A seventh argument "token-major" runs a streaming append's tail as the
      * engine did before it was batched, for a cold time-to-first-token pair. */
-    if (argc > 7 && strcmp(argv[7], "token-major") == 0) {
-        if (!ds4_test_v41_token_major_tail) return 2;
-        ds4_test_v41_token_major_tail(1);
+    /* "parts=N" encodes every Metal 4 context in N parts where its graph
+     * can be cut that often - N=1 is the single-part encoding. */
+    for (int a = 7; a < argc; a++) {
+        if (strcmp(argv[a], "token-major") == 0) {
+            if (!ds4_test_v41_token_major_tail) return 2;
+            ds4_test_v41_token_major_tail(1);
+        } else if (strncmp(argv[a], "parts=", 6) == 0) {
+            if (!ds4_gpu_test_mtl4_parts) return 2;
+            ds4_gpu_test_mtl4_parts((unsigned)atoi(argv[a] + 6));
+        } else return 2;
     }
     struct timespec t0, t1;
     int ok = ds4_session_create(&s, engine, 8192) == 0;
@@ -124,6 +133,7 @@ int main(int argc, char **argv) {
            "logits %016llx, state %016llx (%llu bytes)%s%s\n", cache, prompt.len, i + (ok ? 1 : 0),
            (unsigned long long)ids, (unsigned long long)lh, (unsigned long long)sh,
            (unsigned long long)sb, ok ? "" : " FAILED: ", ok ? "" : err);
+    if (ds4_gpu_backend_report) ds4_gpu_backend_report("capacity", (unsigned long long)i);
     ds4_session_free(s);
     ds4_tokens_free(&prompt);
     free(buf);

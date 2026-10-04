@@ -197,7 +197,9 @@ void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) {
     ds4_report_boundaries(tag);
     if (g_backend == 4) {
         extern void ds4_gpu_mtl4_coarse_report(FILE *f, unsigned max_lines);
+        extern void ds4_gpu_mtl4_parts_report(FILE *f);
         ds4_gpu_mtl4_coarse_report(stderr, 20);
+        ds4_gpu_mtl4_parts_report(stderr);
     }
     static unsigned long long late_seen, late_ns_seen;
     fprintf(stderr, "ds4: backend %s Metal 4 feedback after completion: %llu waits, %.3f ms\n",

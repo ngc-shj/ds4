@@ -435,11 +435,28 @@ enum {
     DS4_M4S_KINDS
 };
 static unsigned long long g_m4s[DS4_M4S_KINDS];
+/* How contexts were cut: by part count, nodes in all of them, the commits
+ * that carried more than one buffer, contexts that asked for more parts than
+ * the graph had barriers to cut at, and parts that came out empty or did not
+ * add up to their context - the last two must stay at zero. */
+static unsigned long long g_m4_parts_hist[DS4_MTL4_PARTS + 1u], g_m4_parts_nodes,
+    g_m4_parts_multi_commits, g_m4_parts_short, g_m4_parts_bad;
 void ds4_gpu_mtl4_structure(unsigned long long out[16]);
 void ds4_gpu_mtl4_structure(unsigned long long out[16]) {
     for (int i = 0; i < 16; i++) out[i] = g_m4s[i];
 }
 unsigned long long ds4_gpu_mtl4_fences(void) { return g_m4s[DS4_M4S_FENCES]; }
+
+/* How contexts were cut into parts and committed, since the process started. */
+void ds4_gpu_mtl4_parts_report(FILE *f);
+void ds4_gpu_mtl4_parts_report(FILE *f) {
+    fprintf(f, "ds4: Metal 4 parts: contexts in 1/2/3/4 parts %llu/%llu/%llu/%llu, %llu nodes; "
+            "%llu commit:count: calls with more than one buffer, %llu command buffers in all; "
+            "%llu contexts cut short of their parts, %llu empty or mismatched parts\n",
+            g_m4_parts_hist[1], g_m4_parts_hist[2], g_m4_parts_hist[3], g_m4_parts_hist[4],
+            g_m4_parts_nodes, g_m4_parts_multi_commits, g_m4s[DS4_M4S_BUFFERS],
+            g_m4_parts_short, g_m4_parts_bad);
+}
 
 /* The call sites whose bindings still carry no length, most used first,
  * counted since the process started. */
@@ -885,9 +902,11 @@ static void ds4_m4_encode_part(DS4M4Ctx *c, unsigned part, uint32_t from, uint32
  * then a part per DS4_MTL4_PART_MIN up to DS4_MTL4_PARTS, cut only where the
  * graph has a barrier. ds4_gpu_test_mtl4_parts forces a count regardless of
  * size, so a test can put every context through the split. */
-/* Held at one part while the kernel panic seen with the full expert address
- * table is isolated: the binary that took the machine down had both. */
-static unsigned g_mtl4_parts_max = 1u;
+/* Up to DS4_MTL4_PARTS. It was held at one while the kernel panic seen with
+ * the full expert address table was isolated; that table is gone (e56ab96).
+ * Decode contexts are far below DS4_MTL4_PART_MIN nodes and stay in one part;
+ * a prefill sweep's are not. */
+static unsigned g_mtl4_parts_max = DS4_MTL4_PARTS;
 static unsigned g_mtl4_parts_forced;
 void ds4_gpu_test_mtl4_parts(unsigned parts);
 void ds4_gpu_test_mtl4_parts(unsigned parts) {
@@ -1528,6 +1547,21 @@ static int ds4_mtl4_commit_unpooled(void) {
         }
         uint32_t bounds[DS4_MTL4_PARTS + 1u];
         const unsigned parts = ds4_m4_split(c, bounds);
+        {
+            unsigned want = c->n_nodes / DS4_MTL4_PART_MIN;
+            if (want > g_mtl4_parts_max) want = g_mtl4_parts_max;
+            if (g_mtl4_parts_forced) want = g_mtl4_parts_forced;
+            if (parts < want) g_m4_parts_short++;
+            uint32_t sum = 0;
+            for (unsigned p = 0; p < parts; p++) {
+                if (bounds[p + 1u] <= bounds[p]) g_m4_parts_bad++;
+                sum += bounds[p + 1u] - bounds[p];
+            }
+            if (sum != c->n_nodes || bounds[0] != 0) g_m4_parts_bad++;
+            g_m4_parts_hist[parts <= DS4_MTL4_PARTS ? parts : 0]++;
+            g_m4_parts_nodes += c->n_nodes;
+            if (parts > 1u) g_m4_parts_multi_commits++;
+        }
         if (parts == 1) {
             ds4_m4_encode_part(c, 0, 0, c->n_nodes);
         } else {
