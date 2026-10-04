@@ -49910,6 +49910,9 @@ int ds4_test_q8_tiles(const ds4_model *m, const ds4_weights *w) {
                         !ds4_gpu_matmul_q8_0_decode_rows_reuse_round_tensor(tst, m->map, m->size,
                             t->abs_offset, width, outputs, in, rows, tiles[ti], 0) ||
                         !ds4_gpu_end_commands() || !ds4_gpu_tensor_read(tst, 0, b, out_bytes)) {
+                        /* A refusal leaves the batch open; close it, or every
+                         * later combination fails with it. */
+                        if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
                         fprintf(stderr, "  %-14s %llux%llu rows=%u tile=%u refused\n", shapes[si].name,
                                 (unsigned long long)width, (unsigned long long)outputs, rows, tiles[ti]);
                         bad++;
@@ -49934,13 +49937,13 @@ int ds4_test_q8_tiles(const ds4_model *m, const ds4_weights *w) {
     }
     fprintf(stderr, "ds4: Q8_0 row tiles against the single-row arithmetic: %d of %d "
             "combinations differ\n", bad, cases);
-    /* Each tile's time for 699 rows on each shape, 3 laps a pass, the tiles
-     * alternating forward and back. */
+    /* Each tile's time for 699 and 2048 rows (the tail, a prefix chunk) on
+     * each shape, 3 laps a pass, the tiles alternating forward and back. */
     for (size_t si = 0; si < sizeof(shapes) / sizeof(shapes[0]); si++) {
         const ds4_tensor *t = shapes[si].t;
         if (!t || t->type != DS4_TENSOR_Q8_0) continue;
         const uint64_t width = (uint64_t)t->dim[0], outputs = (uint64_t)t->dim[1];
-        const uint32_t rows = 699;
+        for (uint32_t rows = 699; rows <= 2048; rows += 1349) {
         ds4_gpu_tensor *in = ds4_gpu_tensor_alloc((uint64_t)rows * width * sizeof(float));
         ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)rows * outputs * sizeof(float));
         if (!in || !out) { ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(out); continue; }
@@ -49956,12 +49959,13 @@ int ds4_test_q8_tiles(const ds4_model *m, const ds4_weights *w) {
                 (void)ds4_gpu_end_commands();
                 if (pass) ms[ti] += (now_sec() - t0) * 1000.0 / 3.0;
             }
-        fprintf(stderr, "ds4:   %-14s %5llux%-6llu 699 rows:", shapes[si].name,
-                (unsigned long long)width, (unsigned long long)outputs);
+        fprintf(stderr, "ds4:   %-14s %5llux%-6llu %4u rows:", shapes[si].name,
+                (unsigned long long)width, (unsigned long long)outputs, rows);
         for (size_t ti = 0; ti < sizeof(tiles) / sizeof(tiles[0]); ti++)
             fprintf(stderr, " t%u %.2f", tiles[ti], ms[ti] / 3.0);
         fprintf(stderr, " ms\n");
         ds4_gpu_tensor_free(in); ds4_gpu_tensor_free(out);
+        }
     }
     return bad;
 }
