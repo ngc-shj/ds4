@@ -16961,6 +16961,28 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
         uint64_t down_expert_bytes, uint32_t missing_mask,
         ds4_gpu_stream_expert_cache_entry **entries);
 
+/* Test hook: which experts the routed path touched - a hit, a load or a
+ * mapped view - while it is on, for the prefill tail's I/O bound
+ * (tests/test_deepseek41_tailab.c). */
+static uint8_t g_test_touch[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static int g_test_touch_on;
+static inline void ds4_test_touch(uint32_t layer, uint32_t expert) {
+    if (g_test_touch_on && layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
+        expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) g_test_touch[layer][expert] = 1;
+}
+void ds4_test_expert_touch(int on);
+void ds4_test_expert_touch(int on) {
+    if (on) memset(g_test_touch, 0, sizeof(g_test_touch));
+    g_test_touch_on = on;
+}
+unsigned ds4_test_expert_touch_count(void);
+unsigned ds4_test_expert_touch_count(void) {
+    unsigned n = 0;
+    for (uint32_t l = 0; l < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; l++)
+        for (uint32_t x = 0; x < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; x++) n += g_test_touch[l][x];
+    return n;
+}
+
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
         const void *model_map, uint64_t model_size, uint32_t layer, uint32_t expert,
         uint32_t n_total_expert, uint32_t n_selected, uint64_t gate_abs_offset,
@@ -18963,6 +18985,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
     e->use_count++;
     g_stream_expert_cache_hits++;
     g_stream_expert_cache_layer_hits[layer]++;
+    ds4_test_touch(layer, expert);
     return e;
 }
 
@@ -19098,6 +19121,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
     }
     g_stream_expert_cache_misses++;
     g_stream_expert_cache_layer_misses[layer]++;
+    ds4_test_touch(layer, expert);
     g_stream_expert_cache_wraps += 3;
     return e;
 }
@@ -19142,6 +19166,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
         e->use_count++;
         g_stream_expert_cache_hits++;
         g_stream_expert_cache_layer_hits[layer]++;
+        ds4_test_touch(layer, expert);
         return e;
     }
 
@@ -21005,8 +21030,10 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     break;
                 }
                 view_served++;
+                ds4_test_touch(layer, expert);
                 continue;
             }
+            ds4_test_touch(layer, expert);
             const uint32_t extra_uses =
                 frequency[expert] > 0 ? frequency[expert] - 1u : 0;
             if (extra_uses != 0) {

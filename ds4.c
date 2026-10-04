@@ -46249,6 +46249,12 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC"));
 }
 
+/* Test hook: runs a streaming append token-major again, as before the batched
+ * tail, so the two can be compared in one process (test_deepseek41_tailab). */
+static int g_ds41_token_major_tail;
+void ds4_test_v41_token_major_tail(int on);
+void ds4_test_v41_token_major_tail(int on) { g_ds41_token_major_tail = on; }
+
 /* *tail is set when the streaming-append rule below, and nothing else, makes
  * the rows token-major: the case whose path once depended on the cache size. */
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining, bool *tail) {
@@ -83960,6 +83966,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         uint32_t tail_rows = 0;
         int tail_pos = 0;
         uint64_t tail_steps0 = 0;
+        uint32_t exact_rows = 0, exact_blocks = 0, exact_pos = 0;
         ds41_encoder_residency encoder = {0};
         if (!ds41_reclaim_headroom_for_prefill()) {
             s->checkpoint_valid = false;
@@ -83976,8 +83983,25 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint32_t remaining = (uint32_t)(prompt->len - i);
             if (g->encoder_resident && remaining < 768u)
                 ds41_encoder_release(g, &e->model, &encoder);
-            const uint32_t short_count = decoder_pending ? 0u :
+            /* A streaming append's token-major rows run as batch steps of up to
+             * DS4_TP_BATCH_MAX_ROWS consecutive rows: the same per-row
+             * arithmetic as single steps, bit for bit, with each block's
+             * experts loaded once rather than once a row (699 rows of the
+             * long prompt: 22 steps, about 35% less wall). */
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+            const bool exact_tail = !g_ds41_token_major_tail && !decoder_pending &&
+                g->streaming && g->pos && remaining < 1024u && remaining >= 2u;
+#else
+            const bool exact_tail = false;
+#endif
+            const uint32_t short_count = decoder_pending ? 0u : exact_tail ?
+                (remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS) :
                 ds41_short_prefill_count(g, &e->weights, remaining);
+            if (exact_tail) {
+                if (!exact_blocks) exact_pos = (uint32_t)i;
+                exact_rows += short_count;
+                exact_blocks++;
+            }
             bool tail = false;
             const uint32_t count = short_count ? short_count : g->encoder_resident ?
                 (remaining - 512u < g->prefill_cap ? remaining - 512u : g->prefill_cap) :
@@ -84028,6 +84052,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             fprintf(stderr, "ds4: V4.1 prefill tail of %u rows at position %d ran %llu "
                     "token-major steps\n", tail_rows, tail_pos,
                     (unsigned long long)(g_ds41_single_steps - tail_steps0));
+        if (exact_blocks)
+            fprintf(stderr, "ds4: V4.1 prefill tail at position %u ran %u rows as %u batch "
+                    "steps\n", exact_pos, exact_rows, exact_blocks);
         ds41_encoder_release(g, &e->model, &encoder);
         if (decoder_pending) {
             s->checkpoint_valid = false;

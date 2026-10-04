@@ -1,6 +1,6 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
- *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out> [bytes]
+ *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out> [bytes [token-major]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+void ds4_test_v41_token_major_tail(int on) __attribute__((weak));
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     const unsigned char *c = p;
@@ -89,8 +92,19 @@ int main(int argc, char **argv) {
     ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
     ds4_session *s = NULL;
     char err[256] = "";
-    int ok = ds4_session_create(&s, engine, 8192) == 0 &&
-             ds4_session_sync(s, &prompt, err, sizeof(err)) == 0;
+    /* A seventh argument "token-major" runs a streaming append's tail as the
+     * engine did before it was batched, for a cold time-to-first-token pair. */
+    if (argc > 7 && strcmp(argv[7], "token-major") == 0) {
+        if (!ds4_test_v41_token_major_tail) return 2;
+        ds4_test_v41_token_major_tail(1);
+    }
+    struct timespec t0, t1;
+    int ok = ds4_session_create(&s, engine, 8192) == 0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ok = ok && ds4_session_sync(s, &prompt, err, sizeof(err)) == 0;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    if (ok) printf("prefill  %d tokens in %.3f s (cold, this process's first)\n", prompt.len,
+                   (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9);
     uint64_t ids = 1469598103934665603ull, lh = ids;
     int i = 0;
     for (; ok && !g_stop; i++) {
