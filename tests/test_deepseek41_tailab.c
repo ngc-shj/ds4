@@ -1,6 +1,11 @@
 /* The long prompt's prefill tail, two ways, in one process.
  *
- *   test_deepseek41_tailab <model.gguf> <story.txt> [rounds] [cache_experts]
+ *   test_deepseek41_tailab <model.gguf> <story.txt> [rounds] [cache_experts] [rows_a rows_b]
+ *
+ * With rows_a and rows_b both arms are batched, in steps of that many rows
+ * (2..32, through ds4_test_v41_tail_rows); without them B is token-major. A
+ * fifth argument "em" instead makes B the expert-major routed gate/up
+ * (ds4_gpu_moe_expert_major_override), A the default pair-major one.
  *
  * Prefills the first 4096 tokens of the backend test's long prompt once and
  * keeps the session as a snapshot. Each arm then restores that snapshot and
@@ -32,6 +37,11 @@
 #include <time.h>
 
 void ds4_test_v41_token_major_tail(int on) __attribute__((weak));
+void ds4_test_v41_tail_rows(uint32_t rows) __attribute__((weak));
+void ds4_gpu_moe_expert_major_override(int mode) __attribute__((weak));
+uint64_t ds4_gpu_moe_expert_major_dispatches(void) __attribute__((weak));
+static uint32_t g_rows[2];
+static int g_em;
 void ds4_gpu_stream_expert_cache_counters(uint64_t *hits, uint64_t *misses, uint64_t *evictions,
                                           uint32_t *entries, uint32_t *budget);
 void ds4_gpu_expert_directory_counts(unsigned long long out[8]);
@@ -65,7 +75,7 @@ static int payload_hash(ds4_session *s, uint64_t *hash) {
     return 1;
 }
 
-typedef struct { double wall; uint64_t logits, state, hits, misses, evictions; unsigned long long loads; } arm_result;
+typedef struct { double wall; uint64_t logits, state, hits, misses, evictions, em; unsigned long long loads; } arm_result;
 
 static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_tokens *prompt,
                    int b, float *buf, int vocab, arm_result *r) {
@@ -74,8 +84,11 @@ static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_t
         fprintf(stderr, "snapshot load: %s\n", err);
         return 0;
     }
-    if (ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    if (g_em) ds4_gpu_moe_expert_major_override(b);
+    else if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
+    else if (ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
     uint64_t h0, m0, e0, h1, m1, e1;
+    const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
     unsigned long long d0[8], d1[8];
     ds4_gpu_stream_expert_cache_counters(&h0, &m0, &e0, NULL, NULL);
     ds4_gpu_expert_directory_counts(d0);
@@ -85,11 +98,14 @@ static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_t
     ds4_gpu_stream_expert_cache_counters(&h1, &m1, &e1, NULL, NULL);
     ds4_gpu_expert_directory_counts(d1);
     if (ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(0);
+    if (ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(0);
+    if (g_em) ds4_gpu_moe_expert_major_override(-1);
     if (rc != 0) { fprintf(stderr, "sync: %s\n", err); return 0; }
     if (ds4_session_copy_logits(s, buf, vocab) != vocab) return 0;
     r->wall = t1 - t0;
     r->logits = fnv(1469598103934665603ull, buf, (size_t)vocab * sizeof(float));
     r->hits = h1 - h0; r->misses = m1 - m0; r->evictions = e1 - e0; r->loads = d1[2] - d0[2];
+    r->em = (ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0) - em0;
     return payload_hash(s, &r->state);
 }
 
@@ -105,6 +121,10 @@ int main(int argc, char **argv) {
     signal(SIGTERM, on_term);
     const int rounds = argc > 3 ? atoi(argv[3]) : 2;
     const unsigned cache = argc > 4 ? (unsigned)atoi(argv[4]) : 10268;
+    if (argc > 5 && strcmp(argv[5], "em") == 0) {
+        if (!ds4_gpu_moe_expert_major_override) return 2;
+        g_em = 1;
+    } else if (argc > 6) { g_rows[0] = (uint32_t)atoi(argv[5]); g_rows[1] = (uint32_t)atoi(argv[6]); }
     FILE *f = fopen(argv[2], "rb");
     if (!f) return 2;
     char *story = calloc(1, 22000 + 64);
@@ -137,6 +157,7 @@ int main(int argc, char **argv) {
     ok = ok && ds4_session_save_snapshot(s, &snap, err, sizeof(err)) == 0;
     printf("prefix   4096 rows layer-major in %.3f s (cold), %.2f ms a row; tail %d rows; "
            "%s\n", p1 - p0, (p1 - p0) * 1000.0 / 4096.0, prompt.len - 4096,
+           g_em ? "B = expert-major gate/up" : g_rows[0] ? "A and B batched, rows as asked" :
            ds4_test_v41_token_major_tail ? "B = token-major" : "none (A twice: the ruler's spread)");
 
     arm_result ref = {0}, r;
@@ -165,10 +186,11 @@ int main(int argc, char **argv) {
             bad += !same;
             sum[b] += r.wall; cnt[b]++;
             printf("round %d %c  %.3f s  logits %016llx state %016llx %s | hits %llu misses %llu "
-                   "loads %llu evictions %llu\n", k, b ? 'B' : 'A', r.wall,
+                   "loads %llu evictions %llu, expert-major dispatches %llu\n", k, b ? 'B' : 'A', r.wall,
                    (unsigned long long)r.logits, (unsigned long long)r.state,
                    same ? "same" : "DIFFERENT", (unsigned long long)r.hits,
-                   (unsigned long long)r.misses, r.loads, (unsigned long long)r.evictions);
+                   (unsigned long long)r.misses, r.loads, (unsigned long long)r.evictions,
+                   (unsigned long long)r.em);
         }
     }
     if (ok && cnt[0] && cnt[1])

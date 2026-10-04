@@ -46254,6 +46254,13 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
 static int g_ds41_token_major_tail;
 void ds4_test_v41_token_major_tail(int on);
 void ds4_test_v41_token_major_tail(int on) { g_ds41_token_major_tail = on; }
+/* Test hook: rows a batched tail step takes, 2..DS4_TP_BATCH_MAX_ROWS (0: the
+ * maximum), to see how the tail's wall follows its number of steps. */
+static uint32_t g_ds41_tail_rows;
+void ds4_test_v41_tail_rows(uint32_t rows);
+void ds4_test_v41_tail_rows(uint32_t rows) {
+    g_ds41_tail_rows = rows >= 2u && rows <= DS4_TP_BATCH_MAX_ROWS ? rows : 0u;
+}
 
 /* *tail is set when the streaming-append rule below, and nothing else, makes
  * the rows token-major: the case whose path once depended on the cache size. */
@@ -83994,8 +84001,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 #else
             const bool exact_tail = false;
 #endif
+            const uint32_t block_rows = g_ds41_tail_rows ? g_ds41_tail_rows : DS4_TP_BATCH_MAX_ROWS;
             const uint32_t short_count = decoder_pending ? 0u : exact_tail ?
-                (remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS) :
+                (remaining < block_rows ? remaining : block_rows) :
                 ds41_short_prefill_count(g, &e->weights, remaining);
             if (exact_tail) {
                 if (!exact_blocks) exact_pos = (uint32_t)i;
