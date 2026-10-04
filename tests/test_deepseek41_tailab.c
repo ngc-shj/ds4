@@ -64,8 +64,9 @@ void ds4_gpu_expert_directory_counts(unsigned long long out[8]);
 void ds4_test_moe_host_ms(double out[8]) __attribute__((weak));
 void ds4_test_expert_read_cached(int on) __attribute__((weak));
 void ds4_test_v41_tail_block(int on) __attribute__((weak));
-/* "prev": arm B is the batched tail before this change - 32-row steps, no block
- * attention, expert reads through the mapped descriptor - arm A production. */
+/* "prev": arm B is the batched tail before the wide step - 32-row steps, no
+ * block attention - arm A production; both read experts through the mapped
+ * descriptor. */
 static int g_prev;
 void ds4_test_expert_touch(int on);
 unsigned ds4_test_expert_touch_count(void);
@@ -109,7 +110,7 @@ static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_t
     if (g_em) ds4_gpu_moe_expert_major_override(b);
     if (g_blk) block_switches(b);
     if (g_prev) {
-        ds4_test_expert_read_cached(b);
+        ds4_test_expert_read_cached(1);
         ds4_test_v41_tail_block(!b);
         ds4_test_v41_tail_rows(b ? 32u : 0u);
     }
@@ -134,7 +135,7 @@ static int run_arm(ds4_session *s, const ds4_session_snapshot *snap, const ds4_t
     if (ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(0);
     if (g_em) ds4_gpu_moe_expert_major_override(-1);
     if (g_blk) block_switches(0);
-    if (g_prev) { ds4_test_expert_read_cached(0); ds4_test_v41_tail_block(1); }
+    if (g_prev) { ds4_test_expert_read_cached(1); ds4_test_v41_tail_block(1); }
     if (g_benv_name[0]) unsetenv(g_benv_name);
     if (rc != 0) { fprintf(stderr, "sync: %s\n", err); return 0; }
     if (ds4_session_copy_logits(s, buf, vocab) != vocab) return 0;

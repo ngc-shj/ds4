@@ -998,13 +998,14 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
-/* Missing experts are read through a second open of the model file with
- * F_NOCACHE and no read-ahead: through the mapped descriptor every read went
- * via the unified buffer cache, one copy more and the file cache churned by
- * every miss, and a long prompt's prefill tail read 37 GiB at 11.6 GiB/s
- * instead of 19. g_expert_read_cached is the test hook's way back. */
+/* A second open of the model file with F_NOCACHE and no read-ahead, for
+ * reading missing experts: through the mapped descriptor every read goes via
+ * the unified buffer cache, one copy more and the file cache churned by every
+ * miss - a long prompt's prefill tail read 37 GiB at 11.6 GiB/s instead of 19.
+ * Not the default until a prefill and decode A/B of its own adopts it; the
+ * test hook ds4_test_expert_read_cached(0) selects it. */
 static int g_model_read_fd = -1;
-static int g_expert_read_cached;
+static int g_expert_read_cached = 1;
 /* Where a miss's repair time goes, cumulative ms: readahead advice, slot
  * preparation (buffer and mlock), the reads, and installing the entries. */
 static double g_rep_ra_ms, g_rep_prep_ms, g_rep_read_ms, g_rep_install_ms;

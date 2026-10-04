@@ -1,7 +1,7 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
  *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out>
- *       [bytes [token-major|prev] [cached] [noblock] [rows=N] [parts=N]]
+ *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -115,10 +115,11 @@ int main(int argc, char **argv) {
             ds4_test_expert_read_cached(1);
             ds4_test_v41_tail_block(0);
             ds4_test_v41_tail_rows(32);
-        } else if (strcmp(argv[a], "cached") == 0) {
-            /* Experts read through the mapped descriptor, via the page cache. */
+        } else if (strcmp(argv[a], "cached") == 0 || strcmp(argv[a], "uncached") == 0) {
+            /* Experts read through the mapped descriptor, via the page cache,
+             * or through the uncached second descriptor. */
             if (!ds4_test_expert_read_cached) return 2;
-            ds4_test_expert_read_cached(1);
+            ds4_test_expert_read_cached(strcmp(argv[a], "cached") == 0);
         } else if (strcmp(argv[a], "noblock") == 0) {
             /* The prefill rows' batch steps without the block attention. */
             if (!ds4_test_v41_tail_block) return 2;
@@ -149,6 +150,8 @@ int main(int argc, char **argv) {
     }
     uint64_t ids = 1469598103934665603ull, lh = ids;
     int i = 0;
+    struct timespec d0, d1;
+    clock_gettime(CLOCK_MONOTONIC, &d0);
     for (; ok && !g_stop; i++) {
         ok = ds4_session_copy_logits(s, buf, vocab) == vocab &&
              fwrite(buf, sizeof(float), (size_t)vocab, out) == (size_t)vocab;
@@ -160,6 +163,11 @@ int main(int argc, char **argv) {
         ok = ds4_session_eval(s, t, err, sizeof(err)) == 0;
     }
     fclose(out);
+    clock_gettime(CLOCK_MONOTONIC, &d1);
+    if (ok && steps > 0)
+        printf("decode   %d steps in %.3f s, %.2f ms a token (logits copied and written each step)\n",
+               steps, (double)(d1.tv_sec - d0.tv_sec) + (double)(d1.tv_nsec - d0.tv_nsec) * 1e-9,
+               ((double)(d1.tv_sec - d0.tv_sec) + (double)(d1.tv_nsec - d0.tv_nsec) * 1e-9) * 1000.0 / steps);
     uint64_t sh = 0, sb = 0;
     if (ok) ok = payload_hash(s, &sh, &sb);
     printf("capacity %u experts: prompt %d tokens, %d evaluations written, ids %016llx, "
