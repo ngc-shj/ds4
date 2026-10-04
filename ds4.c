@@ -83954,7 +83954,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = false;
         }
         bool pending_logits = false, interrupted = false, decoder_pending = false;
+        /* A tail that runs token-major because of the streaming-append rule:
+         * its rows, its position, and the single steps it then took. */
         bool tail_noted = false;
+        uint32_t tail_rows = 0;
+        int tail_pos = 0;
+        uint64_t tail_steps0 = 0;
         ds41_encoder_residency encoder = {0};
         if (!ds41_reclaim_headroom_for_prefill()) {
             s->checkpoint_valid = false;
@@ -83979,8 +83984,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 ds41_prefill_count(g, remaining, &tail);
             if (tail && !tail_noted) {
                 tail_noted = true;
-                fprintf(stderr, "ds4: V4.1 prefill tail of %u rows at position %d runs token-major\n",
-                        remaining, i);
+                tail_rows = remaining;
+                tail_pos = i;
+                tail_steps0 = g_ds41_single_steps;
             }
             const bool defer_decoder = !g->encoder_resident && count >= 16384u &&
                 remaining - count >= 8192u &&
@@ -84018,6 +84024,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (s->progress)
                 s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
+        if (tail_noted)
+            fprintf(stderr, "ds4: V4.1 prefill tail of %u rows at position %d ran %llu "
+                    "token-major steps\n", tail_rows, tail_pos,
+                    (unsigned long long)(g_ds41_single_steps - tail_steps0));
         ds41_encoder_release(g, &e->model, &encoder);
         if (decoder_pending) {
             s->checkpoint_valid = false;
