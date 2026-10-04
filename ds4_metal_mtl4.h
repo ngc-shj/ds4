@@ -51,6 +51,8 @@
 /* Parts a graph may be encoded in, and the smallest part worth a thread. */
 #define DS4_MTL4_PARTS         4u
 #define DS4_MTL4_PART_MIN      1024u
+/* Nodes a timeline counter heap holds: two timestamps each, 4096 at most. */
+#define DS4_TL_HEAP_NODES      2048u
 
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_wait_committed(void);
@@ -261,10 +263,11 @@ API_AVAILABLE(macos(26.0))
     /* The next node must wait for everything before it: set after a fence. */
     uint8_t fence_next;
     /* The encoder timeline (DS4_METAL_ENCODER_TIMELINE), when it is on: a
-     * record a node, and a heap its start and end timestamps go into. */
+     * record a node, and the heaps its start and end timestamps go into -
+     * DS4_TL_HEAP_NODES nodes a heap, the device's limit being 4096 entries. */
     ds4_timeline_rec *tl;
     uint32_t tl_cap;
-    id<MTL4CounterHeap> tl_heap;
+    NSMutableArray *tl_heaps;
     NSUInteger tl_heap_cap;
     uint64_t tl_seq;
     /* The decode ledger's record of this submission (DS4_METAL_LEDGER). */
@@ -853,16 +856,18 @@ static void ds4_m4_encode_part(DS4M4Ctx *c, unsigned part, uint32_t from, uint32
         if (n->barrier && i != from)
             [enc barrierAfterEncoderStages:MTLStageAll beforeEncoderStages:MTLStageAll
                          visibilityOptions:vis];
-        if (c->tl_heap)
+        if (c->tl_heaps)
             [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                                      intoHeap:c->tl_heap atIndex:2u * i];
+                                      intoHeap:c->tl_heaps[i / DS4_TL_HEAP_NODES]
+                                       atIndex:2u * (i % DS4_TL_HEAP_NODES)];
         if (n->kind == DS4_M4_NODE_COPY) {
             [enc copyFromBuffer:(__bridge id<MTLBuffer>)n->src sourceOffset:n->soff
                        toBuffer:(__bridge id<MTLBuffer>)n->dst destinationOffset:n->doff
                            size:n->size];
-            if (c->tl_heap)
+            if (c->tl_heaps)
                 [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                                          intoHeap:c->tl_heap atIndex:2u * i + 1u];
+                                          intoHeap:c->tl_heaps[i / DS4_TL_HEAP_NODES]
+                                           atIndex:2u * (i % DS4_TL_HEAP_NODES) + 1u];
             continue;
         }
         if (n->pso != cur_pso) {
@@ -887,9 +892,10 @@ static void ds4_m4_encode_part(DS4M4Ctx *c, unsigned part, uint32_t from, uint32
             [enc dispatchThreadgroupsWithIndirectBuffer:n->indirect threadsPerThreadgroup:n->b];
             break;
         }
-        if (c->tl_heap)
+        if (c->tl_heaps)
             [enc writeTimestampWithGranularity:MTL4TimestampGranularityPrecise
-                                      intoHeap:c->tl_heap atIndex:2u * i + 1u];
+                                      intoHeap:c->tl_heaps[i / DS4_TL_HEAP_NODES]
+                                       atIndex:2u * (i % DS4_TL_HEAP_NODES) + 1u];
     }
     /* What this part wrote is visible to what follows it on the queue, and to
      * the host once the completion is seen. */
@@ -1020,9 +1026,15 @@ static void ds4_mtl4_release_completed(void) {
 API_AVAILABLE(macos(26.0))
 static void ds4_m4_timeline_resolve(DS4M4Ctx *c) {
     if (!g_timeline_file || !c->n_nodes) return;
-    NSData *d = [c->tl_heap resolveCounterRange:NSMakeRange(0, 2u * c->n_nodes)];
-    if (!d || d.length < 2u * c->n_nodes * sizeof(MTL4TimestampHeapEntry)) return;
-    const MTL4TimestampHeapEntry *ts = (const MTL4TimestampHeapEntry *)d.bytes;
+    NSMutableData *all = [NSMutableData dataWithCapacity:2u * c->n_nodes * sizeof(MTL4TimestampHeapEntry)];
+    for (uint32_t h = 0; h * DS4_TL_HEAP_NODES < c->n_nodes; h++) {
+        const uint32_t n = c->n_nodes - h * DS4_TL_HEAP_NODES < DS4_TL_HEAP_NODES ?
+            c->n_nodes - h * DS4_TL_HEAP_NODES : DS4_TL_HEAP_NODES;
+        NSData *d = [c->tl_heaps[h] resolveCounterRange:NSMakeRange(0, 2u * n)];
+        if (!d || d.length < 2u * n * sizeof(MTL4TimestampHeapEntry)) return;
+        [all appendData:d];
+    }
+    const MTL4TimestampHeapEntry *ts = (const MTL4TimestampHeapEntry *)all.bytes;
     static double ns_per_tick;
     if (ns_per_tick == 0.0) {
         const uint64_t hz = [g_device queryTimestampFrequency];
@@ -1107,7 +1119,7 @@ static int ds4_mtl4_wait_to(uint64_t value) {
             return 0;
         }
         if (atomic_load(&slot->fb_failed)) good = 0;
-        if (g_timeline_enabled && slot->tl_heap) ds4_m4_timeline_resolve(slot);
+        if (g_timeline_enabled && slot->tl_heaps) ds4_m4_timeline_resolve(slot);
         /* The union of the submissions' spans, not their sum: with the next
          * one committed before the current one is read, their spans overlap.
          * Stamps are waited in order. */
@@ -1530,19 +1542,24 @@ static int ds4_mtl4_commit_unpooled(void) {
             if (held > g_mtl4_res_peak) g_mtl4_res_peak = held;
         }
         if (g_timeline_enabled && c->n_nodes) {
-            if (!c->tl_heap || c->tl_heap_cap < 2u * c->n_nodes) {
+            if (!c->tl_heaps) c->tl_heaps = [NSMutableArray array];
+            while (c->tl_heap_cap < c->n_nodes) {
                 MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new];
                 hd.type = MTL4CounterHeapTypeTimestamp;
-                hd.count = 2u * c->n_nodes;
+                hd.count = 2u * DS4_TL_HEAP_NODES;
                 NSError *herr = nil;
-                c->tl_heap = [g_device newCounterHeapWithDescriptor:hd error:&herr];
-                c->tl_heap_cap = c->tl_heap ? hd.count : 0;
-                if (!c->tl_heap)
+                id<MTL4CounterHeap> heap = [g_device newCounterHeapWithDescriptor:hd error:&herr];
+                if (!heap) {
                     fprintf(stderr, "ds4: Metal 4 timeline heap: %s\n", herr.description.UTF8String);
+                    c->tl_heaps = nil; c->tl_heap_cap = 0;
+                    break;
+                }
+                [c->tl_heaps addObject:heap];
+                c->tl_heap_cap += DS4_TL_HEAP_NODES;
             }
             c->tl_seq = ++g_timeline_seq;
-        } else if (c->tl_heap) {
-            c->tl_heap = nil;
+        } else if (c->tl_heaps) {
+            c->tl_heaps = nil;
             c->tl_heap_cap = 0;
         }
         uint32_t bounds[DS4_MTL4_PARTS + 1u];
