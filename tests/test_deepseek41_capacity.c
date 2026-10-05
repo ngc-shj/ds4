@@ -39,6 +39,8 @@ void ds4_test_v41_attn_rows(int on) __attribute__((weak));
 void ds4_test_v41_attn_rows_check(int on) __attribute__((weak));
 void ds4_test_v41_attn_rows_counts(unsigned long long out[2]) __attribute__((weak));
 void ds4_gpu_dsv41_compare_counts(uint32_t out[16]) __attribute__((weak));
+void ds4_test_v41_moe_pair(int on) __attribute__((weak));
+unsigned long long ds4_test_v41_moe_pair_layers(void) __attribute__((weak));
 static int g_attnchk;
 void ds4_test_expert_reads(double out[3]) __attribute__((weak));
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) __attribute__((weak));
@@ -154,9 +156,12 @@ int main(int argc, char **argv) {
             /* With "prev q8nr2": the 32-row batched tail as it was built, the
              * prefill paths added since - layer interleave, the batched
              * indexer top-k, the every-block selection, the attention row
-             * tiles - all off. The cold time-to-first-token baseline. */
+             * tiles, the paired prefix routed experts - all off. The cold
+             * time-to-first-token baseline. */
             if (!ds4_test_v41_interleave || !ds4_test_v41_topk_batch ||
-                !ds4_test_v41_every_block || !ds4_test_v41_attn_rows) return 2;
+                !ds4_test_v41_every_block || !ds4_test_v41_attn_rows ||
+                !ds4_test_v41_moe_pair) return 2;
+            ds4_test_v41_moe_pair(0);
             ds4_test_v41_interleave(0);
             ds4_test_v41_topk_batch(0);
             ds4_test_v41_every_block(0);
@@ -179,6 +184,9 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &t1);
     if (ok) printf("prefill  %d tokens in %.3f s (cold, this process's first)\n", prompt.len,
                    (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9);
+    if (ok && ds4_test_v41_moe_pair_layers)
+        printf("pairing  %llu prefix layers ran both chunks' routed experts in one dispatch\n",
+               ds4_test_v41_moe_pair_layers());
     if (ok && ds4_test_expert_reads) {
         double r[3];
         ds4_test_expert_reads(r);
