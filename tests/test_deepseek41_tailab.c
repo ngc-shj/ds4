@@ -84,6 +84,9 @@ static int g_gu2;
  * layer. */
 void ds4_test_v41_interleave(int on) __attribute__((weak));
 static int g_il;
+/* "f32x2": arm B encodes every F32-weight batch projection twice. */
+void ds4_test_v41_f32_reps(uint32_t n) __attribute__((weak));
+static int g_f32;
 /* "drop:<pagecache tool>": arm B starts with the model file dropped from the
  * file cache, outside the timed span - what the arm's reads cost from the SSD. */
 static const char *g_drop_tool;
@@ -137,6 +140,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_q8) ds4_test_v41_q8_nr8(!b);
     if (g_gu2) ds4_test_moe_gateup_reps(b ? 2u : 1u);
     if (g_il) ds4_test_v41_interleave(!b);
+    if (g_f32) ds4_test_v41_f32_reps(b ? 2u : 1u);
     if (g_drop_tool && b) {
         char cmd[2048];
         snprintf(cmd, sizeof(cmd), "'%s' '%s' drop 1>&2", g_drop_tool, g_model_path);
@@ -149,7 +153,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     }
     if (g_benv_name[0]) { if (b) setenv(g_benv_name, g_benv_value, 1); else unsetenv(g_benv_name); }
     if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
-    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && !g_f32 && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
     ds4_session *s = *sp;
     uint64_t h0, m0, e0, h1, m1, e1;
     const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
@@ -173,6 +177,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_q8) ds4_test_v41_q8_nr8(1);
     if (g_gu2) ds4_test_moe_gateup_reps(1);
     if (g_il) ds4_test_v41_interleave(1);
+    if (g_f32) ds4_test_v41_f32_reps(1);
     if (g_benv_name[0]) unsetenv(g_benv_name);
     if (rc != 0) { fprintf(stderr, "sync: %s\n", err); return 0; }
     if (ds4_session_copy_logits(s, buf, vocab) != vocab) return 0;
@@ -203,6 +208,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[a], "q8") == 0) {
             if (!ds4_test_v41_q8_nr8) return 2;
             g_q8 = 1;
+        } else if (strcmp(argv[a], "f32x2") == 0) {
+            if (!ds4_test_v41_f32_reps) return 2;
+            g_f32 = 1;
         } else if (strcmp(argv[a], "il") == 0) {
             if (!ds4_test_v41_interleave) return 2;
             g_il = 1;

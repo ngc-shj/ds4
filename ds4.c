@@ -42004,10 +42004,21 @@ static bool ds41_matmul_batch_ex(ds4_gpu_tensor *out, const ds4_model *m,
     return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
 }
 
+/* Test hook: encode every F32-weight batch projection this many times. The
+ * repeats write the same values, so the output does not change and the wall
+ * difference is what those projections cost in place. */
+static uint32_t g_ds41_f32_reps = 1;
+void ds4_test_v41_f32_reps(uint32_t n);
+void ds4_test_v41_f32_reps(uint32_t n) { g_ds41_f32_reps = n ? n : 1; }
+
 static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
                               const ds4_tensor *weight, const ds4_gpu_tensor *in,
                               uint32_t count, bool round) {
-    return ds41_matmul_batch_ex(out, m, weight, in, count, round, -1);
+    const uint32_t reps = weight->type == DS4_TENSOR_F32 && !round ? g_ds41_f32_reps : 1u;
+    bool ok = true;
+    for (uint32_t r = 0; ok && r < reps; r++)
+        ok = ds41_matmul_batch_ex(out, m, weight, in, count, round, -1);
+    return ok;
 }
 
 static bool ds41_matmul_rows_batch(ds4_gpu_tensor *out, const ds4_model *m,
