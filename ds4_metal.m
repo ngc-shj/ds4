@@ -22404,6 +22404,14 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
                                                  scale);
 }
 
+/* Indexer top-k calls, argsort/merge dispatches and rows sorted: the count
+ * of what the many small sort dispatches in a prefill are. */
+static unsigned long long g_test_topk[3];
+void ds4_test_topk_counts(unsigned long long out[3]);
+void ds4_test_topk_counts(unsigned long long out[3]) {
+    for (int i = 0; i < 3; i++) out[i] = g_test_topk[i];
+}
+
 /* selected_stride is the destination's row stride in indices, 0 meaning the
  * result's own top_k. A block writes its rows into a buffer allocated for the
  * largest top-k the context allows, so batching them needs the buffer's stride
@@ -22510,6 +22518,7 @@ static int ds4_gpu_indexer_topk_tensor_impl_strided(
         ds4_enc_tgmem(enc, smem, 0);
         ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1), MTLSizeMake((NSUInteger)nth, 1, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
+        g_test_topk[0]++; g_test_topk[1]++; g_test_topk[2] += n_tokens;
 
         int32_t len = block_top_k;
         while (len < work_width) {
@@ -22551,6 +22560,7 @@ static int ds4_gpu_indexer_topk_tensor_impl_strided(
                           final_merge ? ds4_tensor_tail(selected, ds4_gpu_tensor_offset(selected)) : (NSUInteger)scratch_row_bytes * n_tokens, 3);
             ds4_gpu_dispatch(enc, MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1), MTLSizeMake(merge_threads, 1, 1));
             ds4_gpu_end_compute_encoder(cb, enc);
+            g_test_topk[1]++;
 
             const NSUInteger tmp = cur_off;
             cur_off = next_off;

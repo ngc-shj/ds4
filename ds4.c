@@ -43047,21 +43047,30 @@ static uint64_t g_ds41_abl_skips, g_ds41_abl_copies;
  *
  * Capture, control and replay are the block ablation's arms. The KV and
  * compressed writes, the index cache and the window run in every arm. */
-enum { DS41_PABL_ROUTED = 1, DS41_PABL_ATTN = 2 };
+/*   PRE     the HC mixes - RMS, projection and Sinkhorn - before both
+ *           sublayers: both splits (the weighted sums, norms, expands, RoPE
+ *           and quantize run; two norms a chunk would not fit the budget)
+ *   ROUTER  the router's expert selection (its projection runs): selected
+ *           and the route weights
+ *
+ * Stages are bits: an arm restores the outputs of every stage in the set and
+ * skips those in its skip set, so several arms of one run copy the same bytes
+ * and differ only in what they skip. */
+enum { DS41_PABL_ROUTED = 1, DS41_PABL_ATTN = 2, DS41_PABL_PRE = 4, DS41_PABL_ROUTER = 8 };
 enum { DS41_PABL_CAPTURE = 1, DS41_PABL_CONTROL = 2, DS41_PABL_REPLAY = 3 };
-static int g_ds41_pabl_stage, g_ds41_pabl_mode;
+static int g_ds41_pabl_stage, g_ds41_pabl_mode, g_ds41_pabl_skipset;
 static uint32_t g_ds41_pabl_chunk;
-static ds4_gpu_tensor *g_ds41_pabl_saved[DS41_ABLATE_MAX_LAYER * 3][2];
+static ds4_gpu_tensor *g_ds41_pabl_saved[DS41_ABLATE_MAX_LAYER * 3][8];
 static uint64_t g_ds41_pabl_skips, g_ds41_pabl_copies;
 
 static bool ds41_pabl_skip(int stage) {
-    return g_ds41_pabl_stage == stage && g_ds41_pabl_mode == DS41_PABL_REPLAY;
+    return (g_ds41_pabl_skipset & stage) && g_ds41_pabl_mode == DS41_PABL_REPLAY;
 }
 
 /* Save (capture) or restore (control, replay) one output of the stage. */
 static bool ds41_pabl_io(uint32_t il, int stage, int slot, ds4_gpu_tensor *live,
                          uint64_t bytes) {
-    if (g_ds41_pabl_stage != stage || !g_ds41_pabl_mode) return true;
+    if (!(g_ds41_pabl_stage & stage) || !g_ds41_pabl_mode) return true;
     if (il >= DS41_ABLATE_MAX_LAYER || g_ds41_pabl_chunk > 2u) return false;
     ds4_gpu_tensor *saved = g_ds41_pabl_saved[il * 3u + g_ds41_pabl_chunk][slot];
     if (!saved || ds4_gpu_tensor_bytes(saved) < bytes) return false;
@@ -43071,25 +43080,37 @@ static bool ds41_pabl_io(uint32_t il, int stage, int slot, ds4_gpu_tensor *live,
     return ds4_gpu_tensor_copy(live, 0, saved, 0, bytes) != 0;
 }
 
-void ds4_test_v41_pabl(int stage, int mode);
-void ds4_test_v41_pabl(int stage, int mode) {
-    if (stage && mode == DS41_PABL_CAPTURE && !g_ds41_pabl_saved[0][0]) {
+void ds4_test_v41_pabl_set(int stages, int mode, int skip);
+void ds4_test_v41_pabl_set(int stages, int mode, int skip) {
+    if (stages && mode == DS41_PABL_CAPTURE) {
+        /* slot: 0 routed or block, 1 selected_comp, 2 attn split, 3 attn norm,
+         * 4 ffn split, 5 ffn norm, 6 selected, 7 route weights. */
+        const uint64_t width[8] = { DS4_N_EMBD, DS4_N_INDEXER_TOP_K, 24, DS4_N_EMBD, 24,
+                                    DS4_N_EMBD, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED };
+        const int owner[8] = { DS41_PABL_ROUTED | DS41_PABL_ATTN, DS41_PABL_ATTN,
+                               DS41_PABL_PRE, 0, DS41_PABL_PRE, 0,
+                               DS41_PABL_ROUTER, DS41_PABL_ROUTER };
         for (uint32_t k = 0; k < DS4_N_LAYER * 3u; k++) {
             const uint64_t rows = k % 3u == 2u ? DS41_EXACT_ROWS_MAX : 2048u;
-            g_ds41_pabl_saved[k][0] = ds4_gpu_tensor_alloc(rows * DS4_N_EMBD * sizeof(float));
-            if (stage == DS41_PABL_ATTN)
-                g_ds41_pabl_saved[k][1] = ds4_gpu_tensor_alloc(rows * DS4_N_INDEXER_TOP_K *
-                                                              sizeof(int32_t));
+            for (int slot = 0; slot < 8; slot++)
+                if ((stages & owner[slot]) && !g_ds41_pabl_saved[k][slot])
+                    g_ds41_pabl_saved[k][slot] = ds4_gpu_tensor_alloc(rows * width[slot] * 4u);
         }
     }
-    g_ds41_pabl_stage = stage;
+    g_ds41_pabl_stage = stages;
     g_ds41_pabl_mode = mode;
-    if (!stage) {
+    g_ds41_pabl_skipset = skip;
+    if (!stages) {
         fprintf(stderr, "ds4: whole-prompt replay: %llu stage runs skipped, %llu outputs "
                 "restored\n", (unsigned long long)g_ds41_pabl_skips,
                 (unsigned long long)g_ds41_pabl_copies);
         g_ds41_pabl_skips = g_ds41_pabl_copies = 0;
     }
+}
+
+void ds4_test_v41_pabl(int stage, int mode);
+void ds4_test_v41_pabl(int stage, int mode) {
+    ds4_test_v41_pabl_set(stage, mode, mode == DS41_PABL_REPLAY ? stage : 0);
 }
 
 static bool ds41_abl_live(uint32_t il) {
@@ -44238,7 +44259,10 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
             return false;
     }
-    if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
+    if (ds41_pabl_skip(DS41_PABL_PRE)) g_ds41_pabl_skips++;
+    else if (!ds41_hc_mix_batch(b, m, l, false, count)) return false;
+    if (!ds41_pabl_io(il, DS41_PABL_PRE, 2, b->attn_split, (uint64_t)count * 24u * 4u))
+        return false;
     /* V4.1 consumes the preceding sublayer's mixer, not the newly computed one. */
     const bool fuse = ds41_batch_fuse();
     const bool mixed = il ?
@@ -44256,15 +44280,20 @@ static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
 }
 
 static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
-                                        const ds4_layer_weights *l, uint32_t count) {
+                                        const ds4_layer_weights *l, uint32_t count,
+                                        uint32_t il) {
     const bool fuse = ds41_batch_fuse();
-    return (fuse ? ds4_gpu_hc_expand_split_bf16_tensor(b->after_attn, b->block, b->residual,
+    const bool expanded = (fuse ? ds4_gpu_hc_expand_split_bf16_tensor(b->after_attn, b->block, b->residual,
                        b->attn_split, DS4_N_EMBD, DS4_N_HC)
                  : (ds4_gpu_hc_expand_split_tensor(b->after_attn, b->block, b->residual,
                         b->attn_split, DS4_N_EMBD, DS4_N_HC) &&
                     ds4_gpu_dsv41_quantize(b->after_attn, DS4_N_EMBD * DS4_N_HC, count,
-                        DS4_V41_BF16))) &&
-        ds41_hc_mix_batch(b, m, l, true, count) &&
+                        DS4_V41_BF16)));
+    const bool pre_skip = ds41_pabl_skip(DS41_PABL_PRE);
+    if (pre_skip) g_ds41_pabl_skips++;
+    return expanded &&
+        (pre_skip || ds41_hc_mix_batch(b, m, l, true, count)) &&
+        ds41_pabl_io(il, DS41_PABL_PRE, 4, b->ffn_split, (uint64_t)count * 24u * 4u) &&
         (fuse ? ds4_gpu_hc_weighted_sum_split_bf16_tensor(b->x, b->after_attn, b->attn_split,
                     DS4_N_EMBD, DS4_N_HC)
               : (ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->after_attn, b->attn_split,
@@ -44367,6 +44396,17 @@ static bool ds41_attention_publish_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
         (ds41_tag_batch(g, owner, first, rows, ratio), true);
 }
 
+/* Rows whose indexer selection went as one causal dispatch, and a row at a
+ * time; test hook ds4_test_v41_topk_batch(0) keeps every row a call. */
+static uint64_t g_ds41_topk_rows[2];
+static int g_ds41_topk_batch_off;
+void ds4_test_v41_topk_batch(int on);
+void ds4_test_v41_topk_batch(int on) { g_ds41_topk_batch_off = !on; }
+void ds4_test_v41_topk_rows(unsigned long long out[2]);
+void ds4_test_v41_topk_rows(unsigned long long out[2]) {
+    out[0] = g_ds41_topk_rows[0]; out[1] = g_ds41_topk_rows[1];
+}
+
 static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
     const uint32_t start = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -44422,6 +44462,36 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
             const uint32_t pos = start + off + t;
             const uint32_t row_comp = ratio ? (pos + 1u) / ratio : 0u;
             if (!row_comp || !ds41_index_source(il)) continue;
+            /* From the first row that sees more than DS4_N_INDEXER_TOP_K
+             * compressed keys, the rest of the window - wider still - takes
+             * the filter and the top-k as one causal dispatch each. Every row
+             * keeps its visible width, (pos + 1) / ratio, which both kernels
+             * derive from the start and the row exactly as the row call is
+             * handed it, its top-k of DS4_N_INDEXER_TOP_K and its sort and tie
+             * order. The rows before stay a call each: a narrower row picks
+             * fewer than DS4_N_INDEXER_TOP_K, and the causal sort refuses a
+             * window no wider than half its block. Layer 20's block selection
+             * sorts ceil(width / 8) blocks a row, which the causal form cannot
+             * derive, and stays a row at a time. */
+            if (!g_ds41_topk_batch_off && il != 20u && (ratio == 1u || ratio == 2u) &&
+                row_comp > DS4_N_INDEXER_TOP_K) {
+                const uint32_t n = rows - t;
+                const uint64_t score_off = (uint64_t)t * n_comp;
+                ds4_gpu_tensor *sel = ds41_view(g, b->selected_comp,
+                    (uint64_t)(off + t) * DS4_N_INDEXER_TOP_K * sizeof(int32_t),
+                    (uint64_t)n * DS4_N_INDEXER_TOP_K * sizeof(int32_t));
+                ds4_gpu_tensor *mask = il > 20u ? ds41_view(g, b->block_mask,
+                    (uint64_t)(off + t) * mask_row * sizeof(float),
+                    (uint64_t)n * mask_row * sizeof(float)) : NULL;
+                ok = sel && (il < 20u || mask) &&
+                    (il < 20u || ds4_gpu_dsv41_candidate_filter_rows(g->index_scores, mask,
+                        n_comp, n, pos, ratio, mask_row, score_off)) &&
+                    ds4_gpu_dsv41_indexer_topk_rows(sel, g->index_scores, n_comp, n,
+                        DS4_N_INDEXER_TOP_K, pos, ratio, DS4_N_INDEXER_TOP_K, score_off);
+                g_ds41_topk_rows[0] += n;
+                break;
+            }
+            g_ds41_topk_rows[1]++;
             const uint32_t row_blocks = (row_comp + 7u) / 8u;
             const uint32_t row_top = row_comp < DS4_N_INDEXER_TOP_K ?
                                      row_comp : DS4_N_INDEXER_TOP_K;
@@ -44817,8 +44887,14 @@ static bool ds41_moe_batch_phase(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t abl_eb = (uint64_t)count * DS4_N_EMBD * sizeof(float);
     const bool shared_here_abl = !(shared_owner && g->tp_rank != (il & 1u));
     if (phase & DS41_MOE_FRONT) {
+    const bool route_skip = ds41_pabl_skip(DS41_PABL_ROUTER);
+    if (route_skip) g_ds41_pabl_skips++;
     if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
-        !ds41_route_batch(g, m, l, count) ||
+        !(route_skip || ds41_route_batch(g, m, l, count)) ||
+        !ds41_pabl_io(il, DS41_PABL_ROUTER, 6, b->selected,
+                      (uint64_t)count * DS4_N_EXPERT_USED * 4u) ||
+        !ds41_pabl_io(il, DS41_PABL_ROUTER, 7, b->route_weights,
+                      (uint64_t)count * DS4_N_EXPERT_USED * 4u) ||
         !ds41_moe_union_note(b, il, count) ||
         !ds41_wread_note_route_batch(b, count) ||
         !ds41_moe_split_note(split_ms, &split_t0, il, count, "router")) return false;
@@ -47040,7 +47116,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 if (ok) ok = ds41_pabl_io(il, DS41_PABL_ATTN, 0, g->batch.block,
                                           (uint64_t)count * DS4_N_EMBD * sizeof(float));
                 DS41_STAGE("attention output");
-                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count);
+                if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, il);
                 DS41_STAGE("hc/ffn norm");
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                     row.pos = start + t;
@@ -48582,7 +48658,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         if (!stage_split_attn) DS41_BSTAGE(stage_attn);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
-            ds41_after_attention_batch(&active, model, l, rows);
+            ds41_after_attention_batch(&active, model, l, rows, il);
 resume_routed_entry:
         if (ok) {
             /* The batched routed kernels bind resident expert tensors. The
@@ -87755,7 +87831,7 @@ static bool ds41_exec_pass(ds41_exec *x, uint32_t r0, uint32_t m, uint32_t from,
             if (ok) DS41_EXEC_AT("layer %u router", il);
             ok = ok && ds41_sum_partial_batch(g, a.block, il, m) &&
                  ds4_gpu_dsv41_quantize(a.block, DS4_N_EMBD, m, DS4_V41_BF16) &&
-                 ds41_after_attention_batch(&a, md, l, m) &&
+                 ds41_after_attention_batch(&a, md, l, m, il) &&
                  ds41_moe_batch_phase(g, md, l, il, m, false, false, DS41_MOE_FRONT);
             /* The same stop the block step honours: a layer's routed stage, so the
              * two can be compared field for field at one point. */

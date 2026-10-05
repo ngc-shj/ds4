@@ -33,6 +33,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -94,6 +95,23 @@ static int g_f32;
  * (replay); B - A is what the stage costs in the prompt. */
 void ds4_test_v41_pabl(int stage, int mode) __attribute__((weak));
 static int g_pabl, g_pabl_runs;
+/* "abl3" (with "full"): one capture of the pre-attention mixes and norms and
+ * the router's selection, then four arms in the order C P R PR PR R P C -
+ * control, pre-attention skipped, router selection skipped, both - each
+ * restoring both stages' outputs, so the arms differ only in what they skip;
+ * and the indexer top-k's sort dispatches each arm encodes. */
+void ds4_test_v41_pabl_set(int stages, int mode, int skip) __attribute__((weak));
+void ds4_test_topk_counts(unsigned long long out[3]) __attribute__((weak));
+static int g_abl3;
+/* "cool:N": sleep N seconds before each arm, outside the timed span - a
+ * row of whole-prompt runs heats the machine past any order's cancelling. */
+static unsigned g_cool;
+/* "topk1" (with "full"): arm B selects the indexer's top-k a row at a time,
+ * A batches the wide rows; both print the rows each way and the sort
+ * dispatches. */
+void ds4_test_v41_topk_batch(int on) __attribute__((weak));
+void ds4_test_v41_topk_rows(unsigned long long out[2]) __attribute__((weak));
+static int g_topk1;
 /* "drop:<pagecache tool>": arm B starts with the model file dropped from the
  * file cache, outside the timed span - what the arm's reads cost from the SSD. */
 static const char *g_drop_tool;
@@ -134,6 +152,7 @@ typedef struct { double wall; uint64_t logits, state, hits, misses, evictions, e
 static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4_tokens *prompt,
                    int b, float *buf, int vocab, arm_result *r) {
     char err[256];
+    if (g_cool) sleep(g_cool);
     if (g_full) {
         ds4_session_free(*sp);
         *sp = NULL;
@@ -148,6 +167,9 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_gu2) ds4_test_moe_gateup_reps(b ? 2u : 1u);
     if (g_il) ds4_test_v41_interleave(!b);
     if (g_f32) ds4_test_v41_f32_reps(b ? 2u : 1u);
+    if (g_topk1) ds4_test_v41_topk_batch(!b);
+    unsigned long long tk0[3] = {0}, tr0[2] = {0};
+    if (g_topk1) { ds4_test_topk_counts(tk0); ds4_test_v41_topk_rows(tr0); }
     if (g_pabl) ds4_test_v41_pabl(g_pabl, g_pabl_runs++ == 0 ? 1 : b ? 3 : 2);
     if (g_drop_tool && b) {
         char cmd[2048];
@@ -161,7 +183,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     }
     if (g_benv_name[0]) { if (b) setenv(g_benv_name, g_benv_value, 1); else unsetenv(g_benv_name); }
     if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
-    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && !g_f32 && !g_pabl && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && !g_f32 && !g_pabl && !g_topk1 && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
     ds4_session *s = *sp;
     uint64_t h0, m0, e0, h1, m1, e1;
     const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
@@ -186,6 +208,14 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_gu2) ds4_test_moe_gateup_reps(1);
     if (g_il) ds4_test_v41_interleave(1);
     if (g_f32) ds4_test_v41_f32_reps(1);
+    if (g_topk1) {
+        unsigned long long tk1[3], tr1[2];
+        ds4_test_topk_counts(tk1); ds4_test_v41_topk_rows(tr1);
+        ds4_test_v41_topk_batch(1);
+        printf("topk     arm %c: %llu rows batched, %llu a row; %llu top-k calls, %llu sort "
+               "dispatches\n", b ? 'B' : 'A', tr1[0] - tr0[0], tr1[1] - tr0[1],
+               tk1[0] - tk0[0], tk1[1] - tk0[1]);
+    }
     if (g_pabl) ds4_test_v41_pabl(0, 0);
     if (g_benv_name[0]) unsetenv(g_benv_name);
     if (rc != 0) { fprintf(stderr, "sync: %s\n", err); return 0; }
@@ -222,6 +252,15 @@ int main(int argc, char **argv) {
             g_pabl = strcmp(argv[a] + 4, "routed") == 0 ? 1 :
                      strcmp(argv[a] + 4, "attn") == 0 ? 2 : 0;
             if (!g_pabl) return 2;
+        } else if (strncmp(argv[a], "cool:", 5) == 0) {
+            g_cool = (unsigned)atoi(argv[a] + 5);
+        } else if (strcmp(argv[a], "topk1") == 0) {
+            if (!ds4_test_v41_topk_batch || !ds4_test_v41_topk_rows || !ds4_test_topk_counts)
+                return 2;
+            g_topk1 = 1;
+        } else if (strcmp(argv[a], "abl3") == 0) {
+            if (!ds4_test_v41_pabl_set || !ds4_test_topk_counts) return 2;
+            g_abl3 = 1;
         } else if (strcmp(argv[a], "f32x2") == 0) {
             if (!ds4_test_v41_f32_reps) return 2;
             g_f32 = 1;
@@ -315,6 +354,41 @@ int main(int argc, char **argv) {
 
     arm_result ref = {0}, r;
     int bad = 0;
+    if (ok && g_abl3) {
+        enum { PRE = 4, ROUTER = 8 };
+        static const int skip[4] = { 0, PRE, ROUTER, PRE | ROUTER };
+        static const char *const name[4] = { "C ", "P ", "R ", "PR" };
+        static const int order[8] = { 0, 1, 2, 3, 3, 2, 1, 0 };
+        double wall[4] = {0};
+        ds4_test_v41_pabl_set(PRE | ROUTER, 1, 0);
+        ok = run_arm(&s, &snap, &prompt, 0, buf, vocab, &ref);
+        ds4_test_v41_pabl_set(0, 0, 0);
+        printf("capture  %.3f s; reference logits %016llx state %016llx\n", ref.wall,
+               (unsigned long long)ref.logits, (unsigned long long)ref.state);
+        for (int j = 0; ok && !g_stop && j < 8; j++) {
+            const int k = order[j];
+            unsigned long long t0[3], t1[3];
+            ds4_test_topk_counts(t0);
+            ds4_test_v41_pabl_set(PRE | ROUTER, k ? 3 : 2, skip[k]);
+            ok = run_arm(&s, &snap, &prompt, 0, buf, vocab, &r);
+            ds4_test_v41_pabl_set(0, 0, 0);
+            ds4_test_topk_counts(t1);
+            if (!ok) break;
+            const int same = r.logits == ref.logits && r.state == ref.state;
+            bad += !same;
+            wall[k] += r.wall / 2.0;
+            printf("arm %s   %.3f s  %s | top-k %llu calls, %llu sort dispatches, %llu rows\n",
+                   name[k], r.wall, same ? "same" : "DIFFERENT", t1[0] - t0[0], t1[1] - t0[1],
+                   t1[2] - t0[2]);
+        }
+        if (ok)
+            printf("abl3     C %.3f, P %.3f, R %.3f, PR %.3f s: pre-attention %.3f, router "
+                   "selection %.3f, both %.3f (sum %.3f) s; %d arm(s) differing -> %s\n",
+                   wall[0], wall[1], wall[2], wall[3], wall[0] - wall[1], wall[0] - wall[2],
+                   wall[0] - wall[3], (wall[0] - wall[1]) + (wall[0] - wall[2]), bad,
+                   bad ? "FAIL" : "PASS");
+        goto cleanup;
+    }
     double sum[2] = {0, 0};
     int cnt[2] = {0, 0};
     /* Warm-up: each arm once, unmeasured; the first A is the reference. */
@@ -356,6 +430,7 @@ int main(int argc, char **argv) {
         printf("tail     A mean %.3f s, B mean %.3f s, B - A %+.3f s over %d rounds; %d arm(s) "
                "differing from the reference -> %s\n", sum[0] / cnt[0], sum[1] / cnt[1],
                sum[1] / cnt[1] - sum[0] / cnt[0], rounds, bad, bad ? "FAIL" : "PASS");
+cleanup:
     if (!ok) printf("failed   %s\n", err);
     ds4_session_snapshot_free(&snap);
     ds4_session_free(s);
