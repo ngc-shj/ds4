@@ -99363,6 +99363,37 @@ bool ds4_test_dspark_prefix_capture(ds4_engine *engine, const ds4_tokens *prompt
 }
 #endif
 
+/* What one wide prefix's carry copies cost: ds41_carry_copy for a 2048-row
+ * chunk, store then load, on a session's own carry, 5 laps after 1 warm-up,
+ * timed alone. A replay that skips a copy and restores its result moves the
+ * same bytes, so it cannot price one; this times the operation itself. The
+ * session's carry contents are left as the laps leave them: call it on a
+ * session that is thrown away afterwards. out[0] store, out[1] load, ms a
+ * call. */
+int ds4_test_v41_carry_ms(ds4_session *s, double out[2]);
+int ds4_test_v41_carry_ms(ds4_session *s, double out[2]) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    ds41_gpu_graph *g = &s->ds41_graph;
+    const uint32_t rows = 2048u;
+    if (g->carry_cap < 2u * rows || g->prefill_cap < rows) return -1;
+    for (int dir = 0; dir < 2; dir++) {
+        double total = 0;
+        for (int lap = 0; lap < 6; lap++) {
+            if (!ds4_gpu_begin_commands()) return -1;
+            const double t0 = now_sec();
+            const bool ok = ds41_carry_copy(g, rows, rows, dir == 0);
+            if (!ds4_gpu_end_commands() || !ok) return -1;
+            if (lap) total += (now_sec() - t0) * 1000.0;
+        }
+        out[dir] = total / 5.0;
+    }
+    return 0;
+#else
+    (void)s; (void)out;
+    return -1;
+#endif
+}
+
 int ds4_test_engine_q8_tiles(ds4_engine *e) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     return e ? ds4_test_q8_tiles(&e->model, &e->weights) : -1;

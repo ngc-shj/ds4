@@ -72,6 +72,7 @@ static int g_prev;
  * not eight. */
 void ds4_test_v41_q8_nr8(int on) __attribute__((weak));
 int ds4_test_engine_q8_tiles(ds4_engine *e);
+int ds4_test_v41_carry_ms(ds4_session *s, double out[2]);
 static int g_q8;
 /* "full": each arm prefills the whole prompt from position 0 in a new session
  * (the 4096-row layer-major prefix and the tail), not the tail from the
@@ -291,6 +292,15 @@ int main(int argc, char **argv) {
     const double p0 = now_s();
     ok = ok && ds4_session_sync(s, &prefix, err, sizeof(err)) == 0;
     const double p1 = now_s();
+    /* "carry": time the wide prefix's carry copies on this session, then stop. */
+    for (int a = 5; ok && a < argc; a++)
+        if (strcmp(argv[a], "carry") == 0) {
+            double ms[2] = {0, 0};
+            const int rc = ds4_test_v41_carry_ms(s, ms);
+            printf("carry    2048 rows: store %.3f ms, load %.3f ms a call (rc %d)\n",
+                   ms[0], ms[1], rc);
+            return rc == 0 ? 0 : 1;
+        }
     ds4_session_snapshot snap = {0};
     ok = ok && ds4_session_save_snapshot(s, &snap, err, sizeof(err)) == 0;
     printf("prefix   4096 rows layer-major in %.3f s (cold), %.2f ms a row; tail %d rows; "
