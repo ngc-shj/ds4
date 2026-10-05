@@ -621,6 +621,20 @@ kernel void kernel_dsv41_candidate_filter(
         ? scores[offset] : -INFINITY;
 }
 
+// Layer 20's mask when every block is kept: 0 over each row's visible blocks,
+// [0, ceil(((start + row + 1) / ratio) / 8)), what the top-k mask of all of
+// them writes; nothing past a row's visible blocks is touched.
+kernel void kernel_dsv41_mask_visible_zero(
+        constant ds4_metal_args_dsv41_candidates &args,
+        device float *mask,
+        uint2 tg_ [[threadgroup_position_in_grid]], uint2 tid_ [[thread_position_in_threadgroup]], uint2 ntg_ [[threads_per_threadgroup]]) {
+    const uint2 index = tg_ * ntg_ + tid_; /* through the threadgroup: see kernel_swiglu_flat_f32 */
+    if (index.y >= args.rows) return;
+    const uint visible = min(args.width, (args.start + index.y + 1u) / args.ratio);
+    if (index.x >= (visible + 7u) / 8u) return;
+    mask[(ulong)index.y * args.mask_stride + index.x] = 0.0f;
+}
+
 struct ds4_metal_args_dsv41_carry {
     uint width, rows, words, format, pack;
 };

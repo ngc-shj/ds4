@@ -1,7 +1,7 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
  *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out>
- *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2] [noil]]
+ *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2] [noil] [attnchk]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -33,6 +33,10 @@ void ds4_test_v41_tail_block(int on) __attribute__((weak));
 void ds4_test_v41_tail_rows(uint32_t rows) __attribute__((weak));
 void ds4_test_v41_q8_nr8(int on) __attribute__((weak));
 void ds4_test_v41_interleave(int on) __attribute__((weak));
+void ds4_test_v41_attn_rows_check(int on) __attribute__((weak));
+void ds4_test_v41_attn_rows_counts(unsigned long long out[2]) __attribute__((weak));
+void ds4_gpu_dsv41_compare_counts(uint32_t out[16]) __attribute__((weak));
+static int g_attnchk;
 void ds4_test_expert_reads(double out[3]) __attribute__((weak));
 void ds4_gpu_backend_report(const char *tag, unsigned long long tokens) __attribute__((weak));
 
@@ -136,6 +140,13 @@ int main(int argc, char **argv) {
              * batched tail as it was built. */
             if (!ds4_test_v41_q8_nr8) return 2;
             ds4_test_v41_q8_nr8(0);
+        } else if (strcmp(argv[a], "attnchk") == 0) {
+            /* The tail's attention levels in row tiles and then a row at a
+             * time over the same rows, every heads word compared. */
+            if (!ds4_test_v41_attn_rows_check || !ds4_test_v41_attn_rows_counts ||
+                !ds4_gpu_dsv41_compare_counts) return 2;
+            ds4_test_v41_attn_rows_check(1);
+            g_attnchk = 1;
         } else if (strcmp(argv[a], "noil") == 0) {
             /* The prefix, then the tail: not layer by layer. */
             if (!ds4_test_v41_interleave) return 2;
@@ -191,6 +202,15 @@ int main(int argc, char **argv) {
     ds4_tokens_free(&prompt);
     free(buf);
     free(story);
+    if (g_attnchk) {
+        unsigned long long rows[2];
+        uint32_t cmp[16];
+        ds4_test_v41_attn_rows_counts(rows);
+        ds4_gpu_dsv41_compare_counts(cmp);
+        printf("attnchk  %llu rows tiled, %llu a row; heads words differing %u\n",
+               rows[0], rows[1], cmp[11]);
+        if (cmp[11]) ok = 0;
+    }
     ds4_engine_close(engine);
     return ok && !g_stop ? 0 : 1;
 }

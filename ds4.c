@@ -41382,6 +41382,19 @@ static uint64_t g_ds41_kblock_rows[DS4_TP_BATCH_MAX_ROWS + 1];
  * experts' address path holds it to 800 rows (its selected-address maximum). */
 #define DS41_EXACT_ROWS_MAX 800u
 static int g_ds41_exact_rows_scope;
+/* The block attention levels' row tiles: rows that went a tile at a call and
+ * rows that went singly; ds4_test_v41_attn_rows(0) takes every row singly. */
+#define DS41_ATTN_TILE 32
+static uint64_t g_ds41_attn_rows[2];
+static int g_ds41_attn_rows_off, g_ds41_attn_rows_check;
+void ds4_test_v41_attn_rows_check(int on);
+void ds4_test_v41_attn_rows_check(int on) { g_ds41_attn_rows_check = on; }
+void ds4_test_v41_attn_rows(int on);
+void ds4_test_v41_attn_rows(int on) { g_ds41_attn_rows_off = !on; }
+void ds4_test_v41_attn_rows_counts(unsigned long long out[2]);
+void ds4_test_v41_attn_rows_counts(unsigned long long out[2]) {
+    out[0] = g_ds41_attn_rows[0]; out[1] = g_ds41_attn_rows[1];
+}
 static int g_ds41_tail_block_off;
 /* Test hook: 0 keeps Q8_0 projections of 64 rows and more on the four-row tile
  * with two output rows a threadgroup, as before the eight-row one. */
@@ -42711,12 +42724,50 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
+/* Rows of layer 20 whose selection took the every-block fill and rows that
+ * fell back to the top-k, mask and filter: [0] [1] the prefix, [2] [3] a
+ * batched tail's rows, [4] [5] the rest - decode and token-major rows.
+ * ds4_test_v41_every_block(0) makes every row fall back. */
+static uint64_t g_ds41_every_block[6];
+static int g_ds41_every_block_off;
+void ds4_test_v41_every_block(int on);
+void ds4_test_v41_every_block(int on) { g_ds41_every_block_off = !on; }
+void ds4_test_v41_every_block_counts(unsigned long long out[6]);
+void ds4_test_v41_every_block_counts(unsigned long long out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = g_ds41_every_block[i];
+}
+
+/* Zero `floats` of dst in the command stream - a copy from a zeroed buffer -
+ * so it lands after whatever is already encoded against dst, as a host fill
+ * would not. */
+static bool ds41_zero_encoded(ds4_gpu_tensor *dst, uint64_t floats) {
+    static ds4_gpu_tensor *zeros;
+    static uint64_t zeros_floats;
+    if (zeros_floats < floats) {
+        ds4_gpu_tensor_free(zeros);
+        zeros = ds4_gpu_tensor_alloc(floats * sizeof(float));
+        zeros_floats = zeros && ds4_gpu_tensor_fill_f32(zeros, 0.0f, floats) ? floats : 0;
+        if (!zeros_floats) return false;
+    }
+    return ds4_gpu_tensor_copy(dst, 0, zeros, 0, floats * sizeof(float)) != 0;
+}
+
 static bool ds41_attention_candidates(ds41_gpu_graph *g, uint32_t il) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
+        const uint32_t blocks = (n_comp + 7u) / 8u;
+        /* Every block kept (see ds41_index_batch): the mask is the top-k
+         * mask of all of them, 0 over [0, blocks), and the filter keeps every
+         * score the row sees. */
+        const int site = g_ds41_exact_rows_scope ? 2 : 4;
+        if (blocks <= 2048u && !g_ds41_every_block_off) {
+            if (il == 20) g_ds41_every_block[site]++;
+            return il != 20 || ds41_zero_encoded(g->block_mask, blocks);
+        }
+        if (il == 20) g_ds41_every_block[site + 1]++;
         if (il == 20) {
-            const uint32_t blocks = (n_comp + 7u) / 8u, top = blocks < 2048u ? blocks : 2048u;
+            const uint32_t top = blocks < 2048u ? blocks : 2048u;
             if (!ds4_gpu_dsv41_candidate_blocks(g->block_scores, g->index_scores, n_comp, 1, pos, ratio) ||
                 !ds4_gpu_indexer_topk_tensor(g->block_selected, g->block_scores, blocks, 1, top) ||
                 !ds4_gpu_dsv4_topk_mask_tensor(g->block_mask, g->block_selected, blocks, 1, top)) return false;
@@ -44501,6 +44552,21 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
          * block of 32 at start=31 - so it holds at long context and not here,
          * and swapping kernels is a change that has to be verified on its own. */
         const uint32_t mask_row = (g->ctx + 7u) / 8u;
+        /* Layer 20 keeps a row's best min(blocks, 2048) blocks of eight keys,
+         * so while no row sees more than 2048 blocks it keeps every visible
+         * block: the mask is 0 over each row's visible blocks, and the filter
+         * the later layers apply changes nothing a row can see - and every
+         * sort here reads only its row's visible width. The selection is then
+         * one fill of the window's masks, and the filter is not run. A mask
+         * past a row's visible blocks is never read. */
+        const bool every_block = (n_comp + 7u) / 8u <= 2048u && !g_ds41_every_block_off;
+        if (il == 20u) g_ds41_every_block[every_block ? 0 : 1] += rows;
+        if (ok && every_block && il == 20u && ds41_index_source(il)) {
+            ds4_gpu_tensor *mask = ds41_view(g, b->block_mask,
+                (uint64_t)off * mask_row * sizeof(float), (uint64_t)rows * mask_row * sizeof(float));
+            ok = mask && ds4_gpu_dsv41_mask_visible_zero(mask, n_comp, rows, start + off,
+                                                         ratio, mask_row);
+        }
         for (uint32_t t = 0; ok && t < rows; t++) {
             const uint32_t pos = start + off + t;
             const uint32_t row_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -44526,8 +44592,9 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
                 ds4_gpu_tensor *mask = il > 20u ? ds41_view(g, b->block_mask,
                     (uint64_t)(off + t) * mask_row * sizeof(float),
                     (uint64_t)n * mask_row * sizeof(float)) : NULL;
-                ok = sel && (il < 20u || mask) &&
-                    (il < 20u || ds4_gpu_dsv41_candidate_filter_rows(g->index_scores, mask,
+                ok = sel && (il < 20u || every_block || mask) &&
+                    (il < 20u || every_block ||
+                     ds4_gpu_dsv41_candidate_filter_rows(g->index_scores, mask,
                         n_comp, n, pos, ratio, mask_row, score_off)) &&
                     ds4_gpu_dsv41_indexer_topk_rows(sel, g->index_scores, n_comp, n,
                         DS4_N_INDEXER_TOP_K, pos, ratio, DS4_N_INDEXER_TOP_K, score_off);
@@ -44539,7 +44606,8 @@ static bool ds41_index_batch(ds41_gpu_graph *g, const ds4_model *m,
             const uint32_t row_top = row_comp < DS4_N_INDEXER_TOP_K ?
                                      row_comp : DS4_N_INDEXER_TOP_K;
             const uint64_t score_off = (uint64_t)t * n_comp;
-            if (il == 20u) {
+            if (every_block) {
+            } else if (il == 20u) {
                 const uint32_t btop = row_blocks < 2048u ? row_blocks : 2048u;
                 ok = ds4_gpu_dsv41_candidate_blocks_rows(g->block_scores, g->index_scores,
                          row_comp, 1, pos, ratio, mask_row, score_off) &&
@@ -48459,26 +48527,95 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
                                 heads_n, DS4_N_HEAD_DIM, rows) != 0;
                         DS41_LEVEL_BREAK();
                     }
-                    for (int ph = 1; ok && !block_attn_k && ph <= 5; ph++) {
-                        for (int i = 0; ok && i < count; i++) {
-                            const uint32_t nc = (positions[i] + 1u) / ratio_l;
-                            const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
-                            const uint32_t avail = previous + (uint32_t)i + 1u;
-                            const uint32_t n_raw = avail < 128u ? avail : 128u;
-                            ok = ds4_gpu_attention_decode_heads_phase_tensor(heads[i],
-                                    model->map, model->size, sinks_off, queries[i],
-                                    g->raw_prefill, n_raw, raw_cap, avail - n_raw,
-                                    gathers[i], 0, att, NULL, 0, heads_n, DS4_N_HEAD_DIM,
-                                    (uint32_t)i, rows, slot_keys, ph) != 0;
+                    /* ds4_test_v41_attn_rows_check(1): the tiled levels, then
+                     * the row-at-a-time levels over the same rows, and every
+                     * word of the heads they leave compared (compare slot 11). */
+                    const int attn_passes = g_ds41_attn_rows_check ? 2 : 1;
+                    static ds4_gpu_tensor *attn_shadow;
+                    static uint64_t attn_shadow_bytes;
+                    const uint64_t attn_heads_bytes = (uint64_t)rows * heads_n * DS4_N_HEAD_DIM * 4u;
+                    for (int pass = 0; ok && pass < attn_passes; pass++) {
+                    const int rows_off_was = g_ds41_attn_rows_off;
+                    if (pass == 1) g_ds41_attn_rows_off = 1;
+                        /* Each level a tile of up to DS41_ATTN_TILE rows at a call:
+                         * consecutive rows with the same raw and compressed key
+                         * counts, so the same flash shape, each in its own slot
+                         * (ds4_gpu_attention_decode_heads_phase_rows_tensor). A
+                         * tile the call refuses, and a row whose shape differs
+                         * from its neighbour's, goes a row at a time. */
+                        for (int ph = 1; ok && !block_attn_k && ph <= 5; ph++) {
+                            for (int i = 0; ok && i < count;) {
+                                const uint32_t nc = (positions[i] + 1u) / ratio_l;
+                                const uint32_t att = nc < DS4_N_INDEXER_TOP_K ? nc : DS4_N_INDEXER_TOP_K;
+                                const uint32_t avail = previous + (uint32_t)i + 1u;
+                                const uint32_t n_raw = avail < 128u ? avail : 128u;
+                                int n = 1;
+                                while (!g_ds41_attn_rows_off && i + n < count && n < DS41_ATTN_TILE) {
+                                    const uint32_t nc2 = (positions[i + n] + 1u) / ratio_l;
+                                    const uint32_t att2 = nc2 < DS4_N_INDEXER_TOP_K ? nc2 : DS4_N_INDEXER_TOP_K;
+                                    const uint32_t avail2 = previous + (uint32_t)(i + n) + 1u;
+                                    const uint32_t n_raw2 = avail2 < 128u ? avail2 : 128u;
+                                    if (att2 != att || n_raw2 != n_raw) break;
+                                    n++;
+                                }
+                                bool tiled = false;
+                                if (n > 1) {
+                                    ds4_gpu_tensor *tile_kv = ds41_view(g, sel_kv,
+                                        (uint64_t)i * gather_bytes, (uint64_t)n * gather_bytes);
+                                    tiled = tile_kv && ds4_gpu_attention_decode_heads_phase_rows_tensor(
+                                        heads[i], model->map, model->size, sinks_off, queries[i],
+                                        g->raw_prefill, n_raw, raw_cap, avail - n_raw, tile_kv,
+                                        gather_bytes, att, heads_n, DS4_N_HEAD_DIM, (uint32_t)i,
+                                        rows, slot_keys, (uint32_t)n, ph) != 0;
+                                }
+                                if (ph == 4) g_ds41_attn_rows[tiled ? 0 : 1] += (uint64_t)n;
+                                for (int j = i; ok && !tiled && j < i + n; j++) {
+                                    const uint32_t ncj = (positions[j] + 1u) / ratio_l;
+                                    const uint32_t attj = ncj < DS4_N_INDEXER_TOP_K ? ncj : DS4_N_INDEXER_TOP_K;
+                                    const uint32_t availj = previous + (uint32_t)j + 1u;
+                                    const uint32_t n_rawj = availj < 128u ? availj : 128u;
+                                    ok = ds4_gpu_attention_decode_heads_phase_tensor(heads[j],
+                                            model->map, model->size, sinks_off, queries[j],
+                                            g->raw_prefill, n_rawj, raw_cap, availj - n_rawj,
+                                            gathers[j], 0, attj, NULL, 0, heads_n, DS4_N_HEAD_DIM,
+                                            (uint32_t)j, rows, slot_keys, ph) != 0;
+                                }
+                                i += n;
+                            }
+                            DS41_LEVEL_BREAK();
                         }
-                        DS41_LEVEL_BREAK();
+                        /* The rounding and the inverse RoPE are a row's own, at its
+                         * own position; the block's rows are consecutive. */
+                        if (ok && !g_ds41_attn_rows_off) {
+                            ok = ds4_gpu_dsv41_quantize(active.heads, heads_n * DS4_N_HEAD_DIM,
+                                                        rows, DS4_V41_BF16) != 0;
+                            DS41_LEVEL_BREAK();
+                            if (ok) ok = ds4_gpu_dsv41_rope(active.heads, DS4_N_HEAD_DIM, heads_n,
+                                                            rows, positions[0],
+                                                            ds4_layer_compress_ratio(il) != 0, true) != 0;
+                            DS41_LEVEL_BREAK();
+                        } else {
+                            for (int i = 0; ok && i < count; i++)
+                                ok = ds41_bf16(heads[i], heads_n * DS4_N_HEAD_DIM);
+                            DS41_LEVEL_BREAK();
+                            for (int i = 0; ok && i < count; i++)
+                                ok = ds41_rope(heads[i], heads_n, DS4_N_HEAD_DIM, il, positions[i], true);
+                            DS41_LEVEL_BREAK();
+                        }
+                    g_ds41_attn_rows_off = rows_off_was;
+                    if (ok && attn_passes == 2 && pass == 0) {
+                        if (attn_shadow_bytes < attn_heads_bytes) {
+                            ds4_gpu_tensor_free(attn_shadow);
+                            attn_shadow = ds4_gpu_tensor_alloc(attn_heads_bytes);
+                            attn_shadow_bytes = attn_shadow ? attn_heads_bytes : 0;
+                        }
+                        ok = attn_shadow && ds4_gpu_tensor_copy(attn_shadow, 0, active.heads, 0,
+                                                                attn_heads_bytes) != 0;
                     }
-                    for (int i = 0; ok && i < count; i++)
-                        ok = ds41_bf16(heads[i], heads_n * DS4_N_HEAD_DIM);
-                    DS41_LEVEL_BREAK();
-                    for (int i = 0; ok && i < count; i++)
-                        ok = ds41_rope(heads[i], heads_n, DS4_N_HEAD_DIM, il, positions[i], true);
-                    DS41_LEVEL_BREAK();
+                    }
+                    if (ok && attn_passes == 2)
+                        ok = ds4_gpu_dsv41_words_compare(active.heads, attn_shadow,
+                                (uint32_t)(attn_heads_bytes / 4u), 11) != 0;
                     /* attn_output_a is 8 x 1024 rows of 4096 Q8 - about 36 MB
                      * a layer - and every row reads all of it. One dispatch for
                      * the block with the rows as a dimension reads it once.

@@ -112,6 +112,27 @@ static unsigned g_cool;
 void ds4_test_v41_topk_batch(int on) __attribute__((weak));
 void ds4_test_v41_topk_rows(unsigned long long out[2]) __attribute__((weak));
 static int g_topk1;
+/* "eb" (with "full"): arm B runs layer 20's block selection and the later
+ * layers' filter; A takes the fill when every block is kept. */
+void ds4_test_v41_every_block(int on) __attribute__((weak));
+void ds4_test_v41_every_block_counts(unsigned long long out[6]) __attribute__((weak));
+static int g_eb;
+/* "attnrows": arm B takes the block attention levels a row at a time, A in
+ * row tiles. "attnchk": every arm runs the tiles and then the rows and
+ * compares every word of the heads (compare slot 11). */
+void ds4_test_v41_attn_rows(int on) __attribute__((weak));
+void ds4_test_v41_attn_rows_check(int on) __attribute__((weak));
+void ds4_test_v41_attn_rows_counts(unsigned long long out[2]) __attribute__((weak));
+void ds4_gpu_dsv41_compare_counts(uint32_t out[16]) __attribute__((weak));
+static int g_attn;
+/* "append:N:M": sync the prompt's first N tokens, then append the next M with
+ * the attention check on - an append at a short position, where rows have
+ * different compressed key counts - print the rows and the differing words,
+ * and stop. */
+static uint32_t g_app_n, g_app_m;
+/* "pkg" (with "full"): the package of exact changes as one arm - A with the
+ * every-block selection and the attention row tiles, B with neither. */
+static int g_pkg;
 /* "drop:<pagecache tool>": arm B starts with the model file dropped from the
  * file cache, outside the timed span - what the arm's reads cost from the SSD. */
 static const char *g_drop_tool;
@@ -168,6 +189,20 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_il) ds4_test_v41_interleave(!b);
     if (g_f32) ds4_test_v41_f32_reps(b ? 2u : 1u);
     if (g_topk1) ds4_test_v41_topk_batch(!b);
+    if (g_pkg) { ds4_test_v41_every_block(!b); ds4_test_v41_attn_rows(!b); }
+    unsigned long long pk_eb0[6] = {0}, pk_ar0[2] = {0};
+    if (g_pkg) { ds4_test_v41_every_block_counts(pk_eb0); ds4_test_v41_attn_rows_counts(pk_ar0); }
+    if (g_eb) ds4_test_v41_every_block(!b);
+    unsigned long long ek0[3] = {0}, eb0[6] = {0};
+    if (g_eb) { ds4_test_topk_counts(ek0); ds4_test_v41_every_block_counts(eb0); }
+    unsigned long long ar0[2] = {0};
+    uint32_t ac0[16] = {0};
+    if (g_attn) {
+        ds4_test_v41_attn_rows(g_attn == 2 || !b);
+        ds4_test_v41_attn_rows_check(g_attn == 2);
+        ds4_test_v41_attn_rows_counts(ar0);
+        ds4_gpu_dsv41_compare_counts(ac0);
+    }
     unsigned long long tk0[3] = {0}, tr0[2] = {0};
     if (g_topk1) { ds4_test_topk_counts(tk0); ds4_test_v41_topk_rows(tr0); }
     if (g_pabl) ds4_test_v41_pabl(g_pabl, g_pabl_runs++ == 0 ? 1 : b ? 3 : 2);
@@ -183,7 +218,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     }
     if (g_benv_name[0]) { if (b) setenv(g_benv_name, g_benv_value, 1); else unsetenv(g_benv_name); }
     if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
-    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && !g_f32 && !g_pabl && !g_topk1 && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && !g_f32 && !g_pabl && !g_topk1 && !g_eb && !g_attn && !g_pkg && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
     ds4_session *s = *sp;
     uint64_t h0, m0, e0, h1, m1, e1;
     const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
@@ -208,6 +243,37 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_gu2) ds4_test_moe_gateup_reps(1);
     if (g_il) ds4_test_v41_interleave(1);
     if (g_f32) ds4_test_v41_f32_reps(1);
+    if (g_eb) {
+        unsigned long long ek1[3], eb1[6];
+        ds4_test_topk_counts(ek1);
+        ds4_test_v41_every_block_counts(eb1);
+        ds4_test_v41_every_block(1);
+        printf("eb       arm %c: layer-20 rows fast/fallback prefix %llu/%llu, tail %llu/%llu, "
+               "other %llu/%llu; %llu top-k calls, %llu sort dispatches\n", b ? 'B' : 'A',
+               eb1[0] - eb0[0], eb1[1] - eb0[1], eb1[2] - eb0[2], eb1[3] - eb0[3],
+               eb1[4] - eb0[4], eb1[5] - eb0[5], ek1[0] - ek0[0], ek1[1] - ek0[1]);
+    }
+    if (g_attn) {
+        unsigned long long ar1[2];
+        uint32_t ac1[16];
+        ds4_test_v41_attn_rows_counts(ar1);
+        ds4_gpu_dsv41_compare_counts(ac1);
+        ds4_test_v41_attn_rows(1);
+        ds4_test_v41_attn_rows_check(0);
+        printf("attn     arm %c: %llu rows tiled, %llu a row; heads words differing %u\n",
+               b ? 'B' : 'A', ar1[0] - ar0[0], ar1[1] - ar0[1], ac1[11] - ac0[11]);
+    }
+    if (g_pkg) {
+        unsigned long long eb1[6], ar1[2];
+        ds4_test_v41_every_block_counts(eb1);
+        ds4_test_v41_attn_rows_counts(ar1);
+        ds4_test_v41_every_block(1);
+        ds4_test_v41_attn_rows(1);
+        printf("pkg      arm %c: layer-20 fast/fallback prefix %llu/%llu tail %llu/%llu other "
+               "%llu/%llu; attention rows tiled %llu, a row %llu\n", b ? 'B' : 'A',
+               eb1[0] - pk_eb0[0], eb1[1] - pk_eb0[1], eb1[2] - pk_eb0[2], eb1[3] - pk_eb0[3],
+               eb1[4] - pk_eb0[4], eb1[5] - pk_eb0[5], ar1[0] - pk_ar0[0], ar1[1] - pk_ar0[1]);
+    }
     if (g_topk1) {
         unsigned long long tk1[3], tr1[2];
         ds4_test_topk_counts(tk1); ds4_test_v41_topk_rows(tr1);
@@ -254,6 +320,22 @@ int main(int argc, char **argv) {
             if (!g_pabl) return 2;
         } else if (strncmp(argv[a], "cool:", 5) == 0) {
             g_cool = (unsigned)atoi(argv[a] + 5);
+        } else if (strcmp(argv[a], "eb") == 0) {
+            if (!ds4_test_v41_every_block || !ds4_test_v41_every_block_counts || !ds4_test_topk_counts)
+                return 2;
+            g_eb = 1;
+        } else if (strncmp(argv[a], "append:", 7) == 0) {
+            if (sscanf(argv[a] + 7, "%u:%u", &g_app_n, &g_app_m) != 2 || !g_app_n || !g_app_m)
+                return 2;
+            if (!ds4_test_v41_attn_rows_check || !ds4_test_v41_attn_rows_counts ||
+                !ds4_gpu_dsv41_compare_counts) return 2;
+        } else if (strcmp(argv[a], "attnrows") == 0 || strcmp(argv[a], "attnchk") == 0) {
+            if (!ds4_test_v41_attn_rows || !ds4_test_v41_attn_rows_check ||
+                !ds4_test_v41_attn_rows_counts || !ds4_gpu_dsv41_compare_counts) return 2;
+            g_attn = argv[a][4] == 'c' ? 2 : 1;
+        } else if (strcmp(argv[a], "pkg") == 0) {
+            if (!ds4_test_v41_every_block || !ds4_test_v41_attn_rows) return 2;
+            g_pkg = 1;
         } else if (strcmp(argv[a], "topk1") == 0) {
             if (!ds4_test_v41_topk_batch || !ds4_test_v41_topk_rows || !ds4_test_topk_counts)
                 return 2;
@@ -328,6 +410,27 @@ int main(int argc, char **argv) {
     ds4_session *s = NULL;
     char err[256] = "";
     int ok = ds4_session_create(&s, engine, 8192) == 0 && prompt.len > 4096;
+    if (ok && g_app_n) {
+        ds4_tokens head = {0}, both = {0};
+        for (uint32_t i = 0; i < g_app_n && (int)i < prompt.len; i++) ds4_tokens_push(&head, prompt.v[i]);
+        for (uint32_t i = 0; i < g_app_n + g_app_m && (int)i < prompt.len; i++)
+            ds4_tokens_push(&both, prompt.v[i]);
+        ok = ds4_session_sync(s, &head, err, sizeof(err)) == 0;
+        unsigned long long r0[2], r1[2];
+        uint32_t c0[16], c1[16];
+        ds4_test_v41_attn_rows_counts(r0);
+        ds4_gpu_dsv41_compare_counts(c0);
+        ds4_test_v41_attn_rows_check(1);
+        ok = ok && ds4_session_sync(s, &both, err, sizeof(err)) == 0;
+        ds4_test_v41_attn_rows_check(0);
+        ds4_test_v41_attn_rows_counts(r1);
+        ds4_gpu_dsv41_compare_counts(c1);
+        printf("append   %u then %u tokens: %llu rows tiled, %llu a row; heads words differing %u%s\n",
+               g_app_n, g_app_m, r1[0] - r0[0], r1[1] - r0[1], c1[11] - c0[11],
+               ok ? "" : " (sync failed)");
+        ds4_tokens_free(&head); ds4_tokens_free(&both);
+        return ok && c1[11] == c0[11] ? 0 : 1;
+    }
     for (int i = 0; ok && i < 4096; i++) ds4_tokens_push(&prefix, prompt.v[i]);
     const double p0 = now_s();
     ok = ok && ds4_session_sync(s, &prefix, err, sizeof(err)) == 0;

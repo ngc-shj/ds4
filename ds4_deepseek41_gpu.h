@@ -361,6 +361,8 @@ int ds4_gpu_dsv41_carry_copy(ds4_gpu_tensor *packed, uint32_t row_offset,
                             ds4_gpu_tensor *plain, uint32_t width, uint32_t rows,
                             uint32_t format, bool pack);
 /* Batched F16 projections with the same arithmetic as individual matvecs. */
+int ds4_gpu_dsv41_mask_visible_zero(ds4_gpu_tensor *mask, uint32_t width, uint32_t rows,
+                                    uint32_t start, uint32_t ratio, uint32_t mask_stride);
 int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
                                  const void *model_map, uint64_t model_size,
                                  uint64_t weight_offset, uint32_t width,

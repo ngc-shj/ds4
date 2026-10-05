@@ -33364,6 +33364,17 @@ enum {
     DS4_FLASH_PHASE_REDUCE,
 };
 
+/* A tile of consecutive block rows in one call: rows slot .. slot + tile - 1,
+ * row r with raw_start + r, its compressed keys g_flash_comp_row_stride bytes
+ * after row r - 1's, its q and heads rows after the last. Each row keeps its
+ * own KV slot, partials and reduction; the attend takes the rows on the vec
+ * kernel's batch axis (ne03, ne_12_3) and the reduce on its row axis, so every
+ * (row, head, split) is the single row's. 1 is the single row. Shapes a tile
+ * cannot share - a KV pad, the packed or RoPE-fused forms, a mask to fill, a
+ * KV source DAG - are refused for a tile, and the caller takes rows singly. */
+static uint32_t g_flash_rows = 1;
+static uint64_t g_flash_comp_row_stride;
+
 static int ds4_gpu_encode_flash_attention_gathered_heads(
         DS4Cmd *  cb,
         ds4_gpu_tensor      *heads,
@@ -33388,6 +33399,9 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         const ds4_gpu_kv_source_dag *dag) {
     if (slots == 0u) slots = 1u;
     if (slot >= slots) return 0;
+    const uint32_t tile = g_flash_rows ? g_flash_rows : 1u;
+    if (tile > 1u && (slot + tile > slots || dag || use_mask || raw_start + tile > raw_cap))
+        return 0;
     const uint32_t n_keys = n_raw + n_comp;
     /* The slot stride has to be the block's widest row, not this row's. Sizing
      * it per row lets a later row grow the scratch, and ds4_gpu_ensure_scratch_buffer
@@ -33575,6 +33589,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     }
 
     const bool all = phase == DS4_FLASH_PHASE_ALL;
+    if (tile > 1u && (all || has_kvpad || use_packed || !use_persistent_zero_mask ||
+                      g_decode_attn_rope_fuse)) return 0;
     /* Staging the KV and padding its tail are two dispatches with a dependency
      * between them, so they are two levels, not one. */
     const bool do_mask = all || phase == DS4_FLASH_PHASE_MASK;
@@ -33600,29 +33616,31 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     }
 
     bool pad_fused = false;
-    if (do_stage && !ds4_gpu_encode_flash_kv_stage_f16(
+    for (uint32_t r = 0; do_stage && r < tile; r++) {
+        if (!ds4_gpu_encode_flash_kv_stage_f16(
             cb,
             rawbuf,
             ds4_gpu_tensor_offset(raw_kv),
             raw_cap,
-            raw_start,
+            raw_start + r,
             n_raw,
             compbuf,
-            ds4_gpu_tensor_offset(comp_kv),
+            ds4_gpu_tensor_offset(comp_kv) + (NSUInteger)(r * g_flash_comp_row_stride),
             comp_kv_f16 != 0,
             n_comp,
             head_dim,
             g_flash_attn_kv_buffer,
-            kv_off,
+            kv_off + (NSUInteger)r * kv_stride,
             flash_mask_buffer,
             mask_off,
             g_flash_attn_pad_buffer,
-            pad_off,
+            pad_off + (NSUInteger)r * pad_bytes,
             all && has_kvpad,
             use_shared_kvpad,
             &pad_fused,
             dag)) {
-        return 0;
+            return 0;
+        }
     }
 
     id<MTLComputePipelineState> pad_pipeline = nil;
@@ -33664,21 +33682,21 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     ds4_gpu_flash_attn_vec_args vec_args = {
         .ne01 = 1,
         .ne02 = (int32_t)n_head,
-        .ne03 = 1,
+        .ne03 = (int32_t)tile,
         .nb01 = (uint64_t)n_head * row_bytes,
         .nb02 = row_bytes,
         .nb03 = (uint64_t)n_head * row_bytes,
         .ne11 = (int32_t)n_keys,
         .ne_12_2 = 1,
-        .ne_12_3 = 1,
+        .ne_12_3 = (int32_t)tile,
         .ns10 = (int32_t)head_dim,
         .nb11 = row_bytes_f16,
         .nb12 = (uint64_t)n_keys * row_bytes_f16,
-        .nb13 = (uint64_t)n_keys * row_bytes_f16,
+        .nb13 = tile > 1u ? (uint64_t)kv_stride : (uint64_t)n_keys * row_bytes_f16,
         .ns20 = (int32_t)head_dim,
         .nb21 = row_bytes_f16,
         .nb22 = (uint64_t)n_keys * row_bytes_f16,
-        .nb23 = (uint64_t)n_keys * row_bytes_f16,
+        .nb23 = tile > 1u ? (uint64_t)kv_stride : (uint64_t)n_keys * row_bytes_f16,
         .ne31 = 1,
         .ne32 = 1,
         .ne33 = 1,
@@ -33687,7 +33705,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         .nb33 = mask_bytes,
         .ne1 = (int32_t)n_head,
         .ne2 = 1,
-        .ne3 = 1,
+        .ne3 = (int32_t)tile,
         .scale = 1.0f / sqrtf((float)head_dim),
         .max_bias = 0.0f,
         .m0 = 0.0f,
@@ -33726,20 +33744,20 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         ds4_enc_pso(enc, vec_pipeline);
         ds4_enc_bytes(enc, &vec_args, sizeof(vec_args), 0);
         ds4_enc_buf_n(enc, qbuf, ds4_gpu_tensor_offset(q), ds4_tensor_tail(q, ds4_gpu_tensor_offset(q)), 1);
-        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride, 2);
-        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride, 3);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride * tile, 2);
+        ds4_enc_buf_n(enc, g_flash_attn_kv_buffer, kv_off, kv_stride * tile, 3);
         ds4_enc_buf_n(enc, flash_mask_buffer, mask_off, use_persistent_zero_mask ? mask_bytes : mask_stride, 4);
         ds4_enc_buf(enc, sinks_buf, sinks_offset, 5);
-        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, pad_off, pad_bytes, 6);
-        ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, tmp_off, tmp_bytes, 7);
+        ds4_enc_buf_n(enc, g_flash_attn_pad_buffer, pad_off, pad_bytes * tile, 6);
+        ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, tmp_off, tmp_bytes * tile, 7);
         ds4_enc_tgmem(enc, shared_bytes, 0);
-        ds4_gpu_dispatch(enc, MTLSizeMake(1, n_head, nwg), MTLSizeMake(32, nsg, 1));
+        ds4_gpu_dispatch(enc, MTLSizeMake(1, n_head, (NSUInteger)nwg * tile), MTLSizeMake(32, nsg, 1));
         ds4_gpu_end_compute_encoder(cb, enc);
     }
     if (!do_reduce) return 1;
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {
-        .nrows = (int32_t)nrows,
+        .nrows = (int32_t)(nrows * tile),
     };
     /* When ds4.c defers the inverse RoPE tail, the reduce threadgroup that owns
      * a head's whole row rotates it in place, removing a dispatch per layer. */
@@ -33755,12 +33773,12 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     DS4Enc *enc = ds4_gpu_compute_encoder(cb);
     ds4_enc_pso(enc, reduce_pso);
     ds4_enc_bytes(enc, &reduce_args, sizeof(reduce_args), 0);
-    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, tmp_off, tmp_bytes, 1);
+    ds4_enc_buf_n(enc, g_flash_attn_tmp_buffer, tmp_off, tmp_bytes * tile, 1);
     ds4_enc_buf_n(enc, headsbuf, ds4_gpu_tensor_offset(heads), ds4_tensor_tail(heads, ds4_gpu_tensor_offset(heads)), 2);
     if (fuse_rope) {
         ds4_enc_bytes(enc, &g_decode_attn_rope_args, sizeof(g_decode_attn_rope_args), 3);
     }
-    ds4_gpu_dispatch(enc, MTLSizeMake(nrows, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
+    ds4_gpu_dispatch(enc, MTLSizeMake(nrows * tile, 1, 1), MTLSizeMake(32u * nwg, 1, 1));
     ds4_gpu_end_compute_encoder(cb, enc);
 
     return 1;
@@ -35643,6 +35661,26 @@ int ds4_gpu_attention_decode_heads_phase_dag_tensor(
     return ds4_gpu_attention_decode_heads_impl(heads, model_map, model_size,
         sinks_offset, q, raw_kv, n_raw, raw_cap, raw_start, comp_kv, 0,
         n_comp, NULL, 0, n_head, head_dim, slot, slots, slot_keys, phase, dag);
+}
+
+/* ds4_gpu_attention_decode_heads_phase_tensor for `rows` consecutive block
+ * rows from `slot` (see g_flash_rows); 0 when the tile cannot share a call. */
+int ds4_gpu_attention_decode_heads_phase_rows_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        const ds4_gpu_tensor *comp_kv, uint64_t comp_row_bytes, uint32_t n_comp,
+        uint32_t n_head, uint32_t head_dim, uint32_t slot, uint32_t slots,
+        uint32_t slot_keys, uint32_t rows, int phase) {
+    if (n_comp == 0u || phase == DS4_FLASH_PHASE_ALL || rows < 1u) return 0;
+    g_flash_rows = rows;
+    g_flash_comp_row_stride = comp_row_bytes;
+    const int ok = ds4_gpu_attention_decode_heads_impl(heads, model_map, model_size,
+        sinks_offset, q, raw_kv, n_raw, raw_cap, raw_start, comp_kv, 0, n_comp, NULL, 0,
+        n_head, head_dim, slot, slots, slot_keys, phase, NULL);
+    g_flash_rows = 1;
+    g_flash_comp_row_stride = 0;
+    return ok;
 }
 
 int ds4_gpu_attention_decode_heads_phase_tensor(
@@ -54268,6 +54306,34 @@ int ds4_gpu_dsv41_candidate_blocks_rows(ds4_gpu_tensor *blocks,
                                   uint64_t scores_elem_off) {
     return dsv41_candidates_strided(blocks, scores, NULL, width, rows, start, ratio,
                                     blocks_row_stride, 0, scores_elem_off, 0);
+}
+
+/* 0 over each row's visible blocks of `mask` (rows of mask_stride floats),
+ * in the command stream; see kernel_dsv41_mask_visible_zero. */
+int ds4_gpu_dsv41_mask_visible_zero(ds4_gpu_tensor *mask, uint32_t width, uint32_t rows,
+                                    uint32_t start, uint32_t ratio, uint32_t mask_stride) {
+    if (!mask || !width || width > UINT32_MAX - 7u || !rows || !ratio ||
+        rows > UINT32_MAX - start || mask_stride < (width + 7u) / 8u ||
+        !dsv41_tensor_has_floats(mask, (uint64_t)mask_stride * rows)) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_mask_visible_zero");
+        if (!pipeline) return 0;
+        const uint32_t args[] = {width, rows, start, ratio, 0, mask_stride};
+        int owned = 0;
+        DS4Cmd *cb = ds4_gpu_command_buffer(&owned);
+        DS4Enc *enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+        if (!enc) return 0;
+        ds4_enc_pso(enc, pipeline);
+        ds4_enc_bytes(enc, args, sizeof(args), 0);
+        ds4_enc_buf_n(enc, ds4_gpu_tensor_buffer(mask), ds4_gpu_tensor_offset(mask),
+                      ds4_tensor_tail(mask, ds4_gpu_tensor_offset(mask)), 1);
+        const uint32_t blocks = (width + 7u) / 8u;
+        const NSUInteger tw = MIN(blocks, 256u);
+        ds4_gpu_dispatch(enc, MTLSizeMake((blocks + tw - 1u) / tw, rows, 1), MTLSizeMake(tw, 1, 1));
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 visible mask");
+    }
 }
 
 int ds4_gpu_dsv41_candidate_filter_rows(ds4_gpu_tensor *scores,

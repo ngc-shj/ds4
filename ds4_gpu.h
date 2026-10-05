@@ -2472,6 +2472,13 @@ int ds4_gpu_attention_decode_heads_raw_rows_tensor(
         uint64_t                    *staged_keys);
 
 
+int ds4_gpu_attention_decode_heads_phase_rows_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
+        uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        const ds4_gpu_tensor *comp_kv, uint64_t comp_row_bytes, uint32_t n_comp,
+        uint32_t n_head, uint32_t head_dim, uint32_t slot, uint32_t slots,
+        uint32_t slot_keys, uint32_t rows, int phase);
 int ds4_gpu_attention_decode_heads_phase_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
