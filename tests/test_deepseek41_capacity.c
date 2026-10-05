@@ -1,7 +1,7 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
  *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out>
- *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2] [noil] [attnchk]]
+ *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2] [noil] [base] [attnchk]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -33,6 +33,9 @@ void ds4_test_v41_tail_block(int on) __attribute__((weak));
 void ds4_test_v41_tail_rows(uint32_t rows) __attribute__((weak));
 void ds4_test_v41_q8_nr8(int on) __attribute__((weak));
 void ds4_test_v41_interleave(int on) __attribute__((weak));
+void ds4_test_v41_topk_batch(int on) __attribute__((weak));
+void ds4_test_v41_every_block(int on) __attribute__((weak));
+void ds4_test_v41_attn_rows(int on) __attribute__((weak));
 void ds4_test_v41_attn_rows_check(int on) __attribute__((weak));
 void ds4_test_v41_attn_rows_counts(unsigned long long out[2]) __attribute__((weak));
 void ds4_gpu_dsv41_compare_counts(uint32_t out[16]) __attribute__((weak));
@@ -147,6 +150,17 @@ int main(int argc, char **argv) {
                 !ds4_gpu_dsv41_compare_counts) return 2;
             ds4_test_v41_attn_rows_check(1);
             g_attnchk = 1;
+        } else if (strcmp(argv[a], "base") == 0) {
+            /* With "prev q8nr2": the 32-row batched tail as it was built, the
+             * prefill paths added since - layer interleave, the batched
+             * indexer top-k, the every-block selection, the attention row
+             * tiles - all off. The cold time-to-first-token baseline. */
+            if (!ds4_test_v41_interleave || !ds4_test_v41_topk_batch ||
+                !ds4_test_v41_every_block || !ds4_test_v41_attn_rows) return 2;
+            ds4_test_v41_interleave(0);
+            ds4_test_v41_topk_batch(0);
+            ds4_test_v41_every_block(0);
+            ds4_test_v41_attn_rows(0);
         } else if (strcmp(argv[a], "noil") == 0) {
             /* The prefix, then the tail: not layer by layer. */
             if (!ds4_test_v41_interleave) return 2;
