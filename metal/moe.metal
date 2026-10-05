@@ -9830,16 +9830,20 @@ kernel void kernel_mul_mm_id_mpp_packed(
     for (uint16_t i = 0; i < acc.get_capacity(); ++i)
         if (acc.is_valid_element(i)) acc[i] = 0;
 
+    // Two threads a weight row, in strides of the threadgroup: one pass at
+    // M = 64, as many as a taller tile needs. The values are the same
+    // dequantisation whichever thread makes them.
     auto stage = [&](int k, threadgroup half *tile) {
-        if (tid >= M*2) return;
-        const int row = min((int)tid/2, nr0 - 1);
-        const int col = k + 16*(tid%2);
-        device const block_q *w = (device const block_q *)(src0 +
-            (uint64_t)(expert - args.tp_expert_base)*args.nb02 +
-            (r0 + row)*args.nb01);
-        half4x4 values;
-        dequantize_func(w + col/(16*nl), (col/16)%nl, values);
-        *((threadgroup half4x4 *)(tile + (tid/2)*K + 16*(tid%2))) = values;
+        for (int t = tid; t < M*2; t += 128) {
+            const int row = min(t/2, nr0 - 1);
+            const int col = k + 16*(t%2);
+            device const block_q *w = (device const block_q *)(src0 +
+                (uint64_t)(expert - args.tp_expert_base)*args.nb02 +
+                (r0 + row)*args.nb01);
+            half4x4 values;
+            dequantize_func(w + col/(16*nl), (col/16)%nl, values);
+            *((threadgroup half4x4 *)(tile + (t/2)*K + 16*(t%2))) = values;
+        }
     };
     stage(0, sa);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9871,6 +9875,17 @@ template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed")]] kernel mm_id_packed_t
 template [[host_name("kernel_mul_mm_id_mxfp4_mpp_packed")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n128")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 32, 128>;
 template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed_m32n128")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K, 32, 128>;
+// Other tiles of the same kernel, for the prefill's routed experts: M weight
+// rows by N rows of an expert a threadgroup. Every output is the same K walk
+// in the same 32-wide matmul2d steps from the same dequantised halves.
+template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m64n64")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 64, 64>;
+template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed_m64n64")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K, 64, 64>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m128n32")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 128, 32>;
+template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed_m128n32")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K, 128, 32>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m128n64")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 128, 64>;
+template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed_m128n64")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K, 128, 64>;
+template [[host_name("kernel_mul_mm_id_iq2_xxs_mpp_packed_m32n64")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_iq2_xxs, QK_NL, dequantize_iq2_xxs, 32, 64>;
+template [[host_name("kernel_mul_mm_id_q2_K_mpp_packed_m32n64")]] kernel mm_id_packed_t kernel_mul_mm_id_mpp_packed<block_q2_K, QK_NL, dequantize_q2_K, 32, 64>;
 
 // Routed-expert grouped matmul on the Metal4 TensorOps/MPP pipeline. The
 // barrier after mm.run prevents the next K iteration from replacing staged

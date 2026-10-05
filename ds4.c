@@ -46845,6 +46845,74 @@ static bool ds41_carry_copy(ds41_gpu_graph *g, uint32_t offset, uint32_t count, 
     return ok;
 }
 
+/* The prefix's routed experts for a layer's two chunks in one dispatch, every
+ * expert's rows of both together: each expert's weights are dequantised once a
+ * layer rather than once a chunk, and its tiles fill. A row's routed output is
+ * the same whichever dispatch and tile it is in (the MPP kernels accumulate an
+ * output's K in the same order at any tile shape), so nothing changes.
+ *
+ * The first chunk runs its router and shared expert, then moves what its
+ * routed experts and its HC expansion need - norm, selection, route weights,
+ * shared output, after_attn - to the rows past it in the same fields. Those
+ * fields are rewritten within a layer by every pass, the interleaved tail's
+ * rows included, so nothing that outlives a layer is there; the fields a
+ * layer leaves for the next (the carried ones) are not touched. The second
+ * chunk runs its own router and shared expert, the routed experts for both,
+ * its own expansion, and then the first chunk's, which goes to the carry. */
+static uint64_t g_ds41_moe_pair_layers;
+static int g_ds41_moe_pair_off;
+void ds4_test_v41_moe_pair(int on);
+void ds4_test_v41_moe_pair(int on) { g_ds41_moe_pair_off = !on; }
+unsigned long long ds4_test_v41_moe_pair_layers(void);
+unsigned long long ds4_test_v41_moe_pair_layers(void) { return g_ds41_moe_pair_layers; }
+
+static bool ds41_moe_pair_stash(ds41_gpu_graph *g, uint32_t count) {
+    ds41_prefill_row *b = &g->batch;
+    bool ok = true;
+#define DS41_PAIR_STASH(t, width)     if (ok) ok = ds4_gpu_tensor_copy((t), (uint64_t)count * (width) * sizeof(float), (t), 0,                                      (uint64_t)count * (width) * sizeof(float)) != 0;
+    DS41_PAIR_STASH(b->norm, DS4_N_EMBD)
+    DS41_PAIR_STASH(b->selected, DS4_N_EXPERT_USED)
+    DS41_PAIR_STASH(b->route_weights, DS4_N_EXPERT_USED)
+    DS41_PAIR_STASH(b->shared, DS4_N_EMBD)
+    DS41_PAIR_STASH(b->after_attn, DS4_N_HC * DS4_N_EMBD)
+#undef DS41_PAIR_STASH
+    return ok;
+}
+
+/* The first chunk's HC expansion from the rows it was moved to; the residual
+ * is made in q (dead once the routed sum has read the expert outputs) and
+ * goes to the carry at the chunk's offset, unless this is the last layer,
+ * where the sweep stores no carry. */
+static bool ds41_moe_pair_finish(ds41_gpu_graph *g, uint32_t offset, uint32_t count,
+                                 bool store) {
+    ds41_prefill_row *b = &g->batch;
+    const uint64_t row = (uint64_t)count * DS4_N_EMBD * sizeof(float);
+    const uint64_t hc_row = (uint64_t)count * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *block = ds4_gpu_tensor_view(b->block, row, row);
+    ds4_gpu_tensor *shared = ds4_gpu_tensor_view(b->shared, row, row);
+    ds4_gpu_tensor *after = ds4_gpu_tensor_view(b->after_attn, hc_row, hc_row);
+    ds4_gpu_tensor *split = ds4_gpu_tensor_view(g->carry.ffn_split,
+        (uint64_t)offset * 24u * sizeof(float), (uint64_t)count * 24u * sizeof(float));
+    ds4_gpu_tensor *residual = ds4_gpu_tensor_view(b->q, 0, hc_row);
+    bool ok = block && shared && after && split && residual &&
+        ds4_gpu_add_tensor(block, block, shared, count * DS4_N_EMBD) &&
+        ds4_gpu_dsv41_quantize(block, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        ds4_gpu_hc_expand_split_tensor(residual, block, after, split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
+    if (ok && store)
+        ok = g->compact_carry ?
+            ds4_gpu_dsv41_carry_copy(g->carry.residual, offset, residual, DS4_N_HC * DS4_N_EMBD,
+                                     count, DS4_V41_CARRY_BF16, true) != 0 :
+            ds4_gpu_tensor_copy(g->carry.residual, (uint64_t)offset * DS4_N_HC * DS4_N_EMBD *
+                                sizeof(float), residual, 0, hc_row) != 0;
+    ds4_gpu_tensor_free(block);
+    ds4_gpu_tensor_free(shared);
+    ds4_gpu_tensor_free(after);
+    ds4_gpu_tensor_free(split);
+    ds4_gpu_tensor_free(residual);
+    return ok;
+}
+
 /* Decoder attention reads all encoder compressed keys, but only the previous
  * 127 decoder inputs. Publish the former for the entire prefix; warm the latter
  * before evaluating each shrinking suffix. No old decoder output is needed. */
@@ -47090,6 +47158,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         /* Keep the decoder suffix's established matrix partitions; unlike
          * the encoder, its shrinking tail is not aligned to large tiles. */
         const uint32_t chunk = wide && il >= 20u && encoder_chunk > 2048u ? 2048u : encoder_chunk;
+        const bool moe_pair = !g_ds41_moe_pair_off && batch_moe && batch_hc && batch_attention &&
+            g->tp_world == 1 && !stage_profile && !encoder_only && wide &&
+            total_count - first == 2u * chunk && 2u * chunk <= g->prefill_cap &&
+            !g_ds41_pabl_mode && !ds41_abl_live(il);
+        if (moe_pair) g_ds41_moe_pair_layers++;
         for (uint32_t off = first; ok && off < total_count; off += chunk) {
             if (cancel && cancel(cancel_ud)) { ok = false; break; }
             const uint32_t count = total_count - off < chunk ? total_count - off : chunk;
@@ -47242,15 +47315,30 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 }
             }
             if (ok && batch_moe) {
-                ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
+                const bool pair_first = moe_pair && off == first;
+                const bool pair_second = moe_pair && off != first;
+                if (pair_first) {
+                    ok = ds41_moe_batch_phase(g, m, &w->layer[il], il, count, false, true,
+                                              DS41_MOE_FRONT) &&
+                        ds41_moe_pair_stash(g, count);
+                } else if (pair_second) {
+                    ok = ds41_moe_batch_phase(g, m, &w->layer[il], il, count, false, true,
+                                              DS41_MOE_FRONT) &&
+                        ds41_moe_batch_phase(g, m, &w->layer[il], il, 2u * count, false, true,
+                                             DS41_MOE_ROUTED);
+                } else {
+                    ok = ds41_moe_batch(g, m, &w->layer[il], il, count, false, true);
+                }
                 DS41_STAGE("shared/routed ffn");
-                if (ok && batch_hc) {
+                if (ok && batch_hc && !pair_first) {
                     ok = ds4_gpu_add_tensor(active.block, active.routed, active.shared, count * DS4_N_EMBD) &&
                         ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, count, DS4_V41_BF16) &&
                         ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                             active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
                         ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, count, DS4_V41_BF16);
                 }
+                if (ok && pair_second)
+                    ok = ds41_moe_pair_finish(g, first, count, il + 1u < DS4_N_LAYER);
                 for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
 #define DS41_USE_MOE_ROW(name, width) row.name = g->rows_view[t].name;
                     DS41_PREFILL_ROWS(DS41_USE_MOE_ROW)

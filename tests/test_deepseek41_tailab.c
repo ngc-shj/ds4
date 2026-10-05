@@ -133,6 +133,26 @@ static uint32_t g_app_n, g_app_m;
 /* "pkg" (with "full"): the package of exact changes as one arm - A with the
  * every-block selection and the attention row tiles, B with neither. */
 static int g_pkg;
+/* "mt:GU:DN" (with "full"): arm A runs the prefill's packed routed matmuls
+ * with gate/up tile GU and down tile DN (M * 1000 + N, 0 = 64 x 32), B with
+ * production's 64 x 32. "mtchk:GU:DN": every arm runs the tiles and then the
+ * 64 x 32 kernel, and compares every word (compare slots 12 gate, 13 up,
+ * 14 down). */
+void ds4_test_moe_packed_tiles(uint32_t gate_up, uint32_t down, int check) __attribute__((weak));
+uint64_t ds4_test_moe_packed_tile_layers(void) __attribute__((weak));
+static uint32_t g_mt_gu, g_mt_dn;
+/* "preps:S[:N]" (with "full"): arm B encodes stage S of the prefill's packed
+ * routed MoE N times (default 2) (1 map and pack, 2 gate, 3 up, 4 SwiGLU, 5 down, 6 sum). */
+void ds4_test_moe_packed_reps(int stage, uint32_t n) __attribute__((weak));
+static int g_preps;
+static unsigned g_preps_n = 2;
+static int g_mt;
+/* "mp" (with "full"): arm A runs the prefix's routed experts for a layer's
+ * two chunks in one dispatch, B a chunk at a time; both print the layers
+ * paired. */
+void ds4_test_v41_moe_pair(int on) __attribute__((weak));
+unsigned long long ds4_test_v41_moe_pair_layers(void) __attribute__((weak));
+static int g_mp;
 /* "drop:<pagecache tool>": arm B starts with the model file dropped from the
  * file cache, outside the timed span - what the arm's reads cost from the SSD. */
 static const char *g_drop_tool;
@@ -193,6 +213,17 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     unsigned long long pk_eb0[6] = {0}, pk_ar0[2] = {0};
     if (g_pkg) { ds4_test_v41_every_block_counts(pk_eb0); ds4_test_v41_attn_rows_counts(pk_ar0); }
     if (g_eb) ds4_test_v41_every_block(!b);
+    if (g_mp) ds4_test_v41_moe_pair(!b);
+    const unsigned long long mp0 = g_mp ? ds4_test_v41_moe_pair_layers() : 0;
+    if (g_preps) ds4_test_moe_packed_reps(g_preps, b ? g_preps_n : 1u);
+    uint64_t mt0 = 0;
+    uint32_t mc0[16] = {0};
+    if (g_mt) {
+        const int on = g_mt == 2 || !b;
+        ds4_test_moe_packed_tiles(on ? g_mt_gu : 0, on ? g_mt_dn : 0, g_mt == 2);
+        mt0 = ds4_test_moe_packed_tile_layers();
+        ds4_gpu_dsv41_compare_counts(mc0);
+    }
     unsigned long long ek0[3] = {0}, eb0[6] = {0};
     if (g_eb) { ds4_test_topk_counts(ek0); ds4_test_v41_every_block_counts(eb0); }
     unsigned long long ar0[2] = {0};
@@ -218,7 +249,7 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     }
     if (g_benv_name[0]) { if (b) setenv(g_benv_name, g_benv_value, 1); else unsetenv(g_benv_name); }
     if (g_rows[0] && ds4_test_v41_tail_rows) ds4_test_v41_tail_rows(g_rows[b]);
-    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && !g_f32 && !g_pabl && !g_topk1 && !g_eb && !g_attn && !g_pkg && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
+    else if (!g_em && !g_prev && !g_q8 && !g_gu2 && !g_drop_tool && !g_il && !g_f32 && !g_pabl && !g_topk1 && !g_eb && !g_attn && !g_pkg && !g_mt && !g_preps && !g_mp && ds4_test_v41_token_major_tail) ds4_test_v41_token_major_tail(b);
     ds4_session *s = *sp;
     uint64_t h0, m0, e0, h1, m1, e1;
     const uint64_t em0 = ds4_gpu_moe_expert_major_dispatches ? ds4_gpu_moe_expert_major_dispatches() : 0;
@@ -243,6 +274,24 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_gu2) ds4_test_moe_gateup_reps(1);
     if (g_il) ds4_test_v41_interleave(1);
     if (g_f32) ds4_test_v41_f32_reps(1);
+    if (g_mp) {
+        printf("mp       arm %c: %llu layers paired\n", b ? 'B' : 'A',
+               ds4_test_v41_moe_pair_layers() - mp0);
+        ds4_test_v41_moe_pair(1);
+    }
+    if (g_preps) {
+        ds4_test_moe_packed_reps(g_preps, 1u);
+        printf("preps    arm %c: stage %d encoded %u times\n", b ? 'B' : 'A', g_preps, b ? g_preps_n : 1u);
+    }
+    if (g_mt) {
+        uint32_t mc1[16];
+        ds4_gpu_dsv41_compare_counts(mc1);
+        const uint64_t mt1 = ds4_test_moe_packed_tile_layers();
+        ds4_test_moe_packed_tiles(0, 0, 0);
+        printf("mt       arm %c: %llu layer-chunks tiled; words differing gate %u up %u down %u\n",
+               b ? 'B' : 'A', (unsigned long long)(mt1 - mt0), mc1[12] - mc0[12],
+               mc1[13] - mc0[13], mc1[14] - mc0[14]);
+    }
     if (g_eb) {
         unsigned long long ek1[3], eb1[6];
         ds4_test_topk_counts(ek1);
@@ -333,6 +382,21 @@ int main(int argc, char **argv) {
             if (!ds4_test_v41_attn_rows || !ds4_test_v41_attn_rows_check ||
                 !ds4_test_v41_attn_rows_counts || !ds4_gpu_dsv41_compare_counts) return 2;
             g_attn = argv[a][4] == 'c' ? 2 : 1;
+        } else if (strcmp(argv[a], "mp") == 0) {
+            if (!ds4_test_v41_moe_pair || !ds4_test_v41_moe_pair_layers) return 2;
+            g_mp = 1;
+        } else if (strncmp(argv[a], "preps:", 6) == 0) {
+            if (!ds4_test_moe_packed_reps) return 2;
+            g_preps = atoi(argv[a] + 6);
+            const char *n = strchr(argv[a] + 6, ':');
+            if (n) g_preps_n = (unsigned)atoi(n + 1);
+            if (g_preps_n < 2 || g_preps_n > 16) return 2;
+            if (g_preps < 1 || g_preps > 6) return 2;
+        } else if (strncmp(argv[a], "mt:", 3) == 0 || strncmp(argv[a], "mtchk:", 6) == 0) {
+            if (!ds4_test_moe_packed_tiles || !ds4_test_moe_packed_tile_layers ||
+                !ds4_gpu_dsv41_compare_counts) return 2;
+            g_mt = argv[a][2] == 'c' ? 2 : 1;
+            if (sscanf(strchr(argv[a], ':') + 1, "%u:%u", &g_mt_gu, &g_mt_dn) != 2) return 2;
         } else if (strcmp(argv[a], "pkg") == 0) {
             if (!ds4_test_v41_every_block || !ds4_test_v41_attn_rows) return 2;
             g_pkg = 1;
