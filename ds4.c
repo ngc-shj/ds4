@@ -43056,11 +43056,20 @@ static uint64_t g_ds41_abl_skips, g_ds41_abl_copies;
  * Stages are bits: an arm restores the outputs of every stage in the set and
  * skips those in its skip set, so several arms of one run copy the same bytes
  * and differ only in what they skip. */
-enum { DS41_PABL_ROUTED = 1, DS41_PABL_ATTN = 2, DS41_PABL_PRE = 4, DS41_PABL_ROUTER = 8 };
+/*   SHARED  the shared expert: its output, BF16-rounded already, kept packed
+ *   PROJ    the q_a and kv projections with their norms and roundings: qr
+ *           and kv, BF16 already, packed (q_b is not here: its output is
+ *           128 KiB a row, too much to keep for a prompt, and only the
+ *           attention reads it, so it goes with ATTN and TATTN)
+ *   TATTN   the tail's attention reads - the gathers, the attention by level
+ *           and both output projections - and its q_b: the block, packed; the
+ *           tail's KV writes, its selection and the window commit run */
+enum { DS41_PABL_ROUTED = 1, DS41_PABL_ATTN = 2, DS41_PABL_PRE = 4, DS41_PABL_ROUTER = 8,
+       DS41_PABL_SHARED = 16, DS41_PABL_PROJ = 32, DS41_PABL_TATTN = 64 };
 enum { DS41_PABL_CAPTURE = 1, DS41_PABL_CONTROL = 2, DS41_PABL_REPLAY = 3 };
 static int g_ds41_pabl_stage, g_ds41_pabl_mode, g_ds41_pabl_skipset;
 static uint32_t g_ds41_pabl_chunk;
-static ds4_gpu_tensor *g_ds41_pabl_saved[DS41_ABLATE_MAX_LAYER * 3][8];
+static ds4_gpu_tensor *g_ds41_pabl_saved[DS41_ABLATE_MAX_LAYER * 3][9];
 static uint64_t g_ds41_pabl_skips, g_ds41_pabl_copies;
 
 static bool ds41_pabl_skip(int stage) {
@@ -43080,21 +43089,46 @@ static bool ds41_pabl_io(uint32_t il, int stage, int slot, ds4_gpu_tensor *live,
     return ds4_gpu_tensor_copy(live, 0, saved, 0, bytes) != 0;
 }
 
+/* The same for an output that is BF16 already: saved as its upper halves,
+ * which restores it bit for bit. */
+static bool ds41_pabl_io16(uint32_t il, int stage, int slot, ds4_gpu_tensor *live,
+                           uint32_t width, uint32_t rows) {
+    if (!(g_ds41_pabl_stage & stage) || !g_ds41_pabl_mode) return true;
+    if (il >= DS41_ABLATE_MAX_LAYER || g_ds41_pabl_chunk > 2u) return false;
+    ds4_gpu_tensor *saved = g_ds41_pabl_saved[il * 3u + g_ds41_pabl_chunk][slot];
+    if (!saved || ds4_gpu_tensor_bytes(saved) < (uint64_t)rows * ((width + 1u) / 2u) * 4u)
+        return false;
+    if (g_ds41_pabl_mode != DS41_PABL_CAPTURE) g_ds41_pabl_copies++;
+    return ds4_gpu_dsv41_carry_copy(saved, 0, live, width, rows, DS4_V41_CARRY_BF16,
+                                    g_ds41_pabl_mode == DS41_PABL_CAPTURE) != 0;
+}
+
 void ds4_test_v41_pabl_set(int stages, int mode, int skip);
 void ds4_test_v41_pabl_set(int stages, int mode, int skip) {
     if (stages && mode == DS41_PABL_CAPTURE) {
-        /* slot: 0 routed or block, 1 selected_comp, 2 attn split, 3 attn norm,
-         * 4 ffn split, 5 ffn norm, 6 selected, 7 route weights. */
-        const uint64_t width[8] = { DS4_N_EMBD, DS4_N_INDEXER_TOP_K, 24, DS4_N_EMBD, 24,
-                                    DS4_N_EMBD, DS4_N_EXPERT_USED, DS4_N_EXPERT_USED };
-        const int owner[8] = { DS41_PABL_ROUTED | DS41_PABL_ATTN, DS41_PABL_ATTN,
-                               DS41_PABL_PRE, 0, DS41_PABL_PRE, 0,
-                               DS41_PABL_ROUTER, DS41_PABL_ROUTER };
+        /* slot: 0 routed (f32) or block (packed), 1 selected_comp, 2 attn split,
+         * 3 shared (packed), 4 ffn split, 5 qr (packed), 6 selected, 7 route
+         * weights, 8 kv (packed). Bytes a row. */
+        const bool block_f32 = (stages & DS41_PABL_ROUTED) != 0;
+        const uint64_t bytes[9] = { block_f32 ? DS4_N_EMBD * 4u : DS4_N_EMBD * 2u,
+            DS4_N_INDEXER_TOP_K * 4u, 24u * 4u, DS4_N_EMBD * 2u, 24u * 4u,
+            (DS4_N_LORA_Q + 1u) / 2u * 4u, DS4_N_EXPERT_USED * 4u, DS4_N_EXPERT_USED * 4u,
+            (DS4_N_HEAD_DIM + 1u) / 2u * 4u };
+        const int owner[9] = { DS41_PABL_ROUTED | DS41_PABL_ATTN | DS41_PABL_TATTN,
+            DS41_PABL_ATTN, DS41_PABL_PRE, DS41_PABL_SHARED, DS41_PABL_PRE, DS41_PABL_PROJ,
+            DS41_PABL_ROUTER, DS41_PABL_ROUTER, DS41_PABL_PROJ };
         for (uint32_t k = 0; k < DS4_N_LAYER * 3u; k++) {
             const uint64_t rows = k % 3u == 2u ? DS41_EXACT_ROWS_MAX : 2048u;
-            for (int slot = 0; slot < 8; slot++)
-                if ((stages & owner[slot]) && !g_ds41_pabl_saved[k][slot])
-                    g_ds41_pabl_saved[k][slot] = ds4_gpu_tensor_alloc(rows * width[slot] * 4u);
+            for (int slot = 0; slot < 9; slot++) {
+                if (!(stages & owner[slot])) continue;
+                if (g_ds41_pabl_saved[k][slot] &&
+                    ds4_gpu_tensor_bytes(g_ds41_pabl_saved[k][slot]) < rows * bytes[slot]) {
+                    ds4_gpu_tensor_free(g_ds41_pabl_saved[k][slot]);
+                    g_ds41_pabl_saved[k][slot] = NULL;
+                }
+                if (!g_ds41_pabl_saved[k][slot])
+                    g_ds41_pabl_saved[k][slot] = ds4_gpu_tensor_alloc(rows * bytes[slot]);
+            }
         }
     }
     g_ds41_pabl_stage = stages;
@@ -44303,19 +44337,28 @@ static bool ds41_after_attention_batch(ds41_prefill_row *b, const ds4_model *m,
 }
 
 static bool ds41_attention_project_batch(ds41_gpu_graph *g, const ds4_model *m,
-                                         const ds4_layer_weights *l, uint32_t count) {
+                                         const ds4_layer_weights *l, uint32_t count,
+                                         uint32_t il) {
     ds41_prefill_row *b = &g->batch;
     const uint32_t q_dim = DS4_N_HEAD / g->tp_world * DS4_N_HEAD_DIM;
-    return ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
+    const bool skip_proj = ds41_pabl_skip(DS41_PABL_PROJ);
+    const bool skip_qb = ds41_pabl_skip(g_ds41_pabl_chunk == 2u ? DS41_PABL_TATTN
+                                                                : DS41_PABL_ATTN);
+    if (skip_proj) g_ds41_pabl_skips++;
+    return (skip_proj ||
+        (ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->qr, b->qr, m->map, m->size,
             l->attn_q_a_norm->abs_offset, DS4_N_LORA_Q, count, DS4_RMS_EPS) &&
-        ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16) &&
-        ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
-                               g->tp_rank * q_dim, q_dim, count) &&
-        ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
+        ds4_gpu_dsv41_quantize(b->qr, DS4_N_LORA_Q, count, DS4_V41_BF16))) &&
+        ds41_pabl_io16(il, DS41_PABL_PROJ, 5, b->qr, DS4_N_LORA_Q, count) &&
+        (skip_qb || ds41_matmul_rows_batch(b->q, m, l->attn_q_b, b->qr,
+                               g->tp_rank * q_dim, q_dim, count)) &&
+        (skip_proj ||
+        (ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, count, true) &&
         ds4_gpu_rms_norm_weight_rows_tensor(b->kv, b->kv, m->map, m->size,
             l->attn_kv_a_norm->abs_offset, DS4_N_HEAD_DIM, count, DS4_RMS_EPS) &&
-        ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16);
+        ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, count, DS4_V41_BF16))) &&
+        ds41_pabl_io16(il, DS41_PABL_PROJ, 8, b->kv, DS4_N_HEAD_DIM, count);
 }
 
 static bool ds41_project_rows(ds4_gpu_tensor *out, const ds4_model *m,
@@ -44902,7 +44945,8 @@ static bool ds41_moe_batch_phase(ds41_gpu_graph *g, const ds4_model *m,
      * in every arm - it writes the selection later stages and the next token
      * need - so its cost is in no figure. */
     if (shared_here_abl) {
-        if (!ds41_abl_skip(il, DS41_ABL_SHARED)) {
+        if (ds41_pabl_skip(DS41_PABL_SHARED)) g_ds41_pabl_skips++;
+        else if (!ds41_abl_skip(il, DS41_ABL_SHARED)) {
             if (!ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) ||
                 !ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) ||
                 !ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
@@ -44917,6 +44961,7 @@ static bool ds41_moe_batch_phase(ds41_gpu_graph *g, const ds4_model *m,
             if (!ds41_abl_move(b->shared, g_ds41_abl[il].shared, abl_eb, false)) return false;
             g_ds41_abl_copies++;
         }
+        if (!ds41_pabl_io16(il, DS41_PABL_SHARED, 3, b->shared, DS4_N_EMBD, count)) return false;
     }
     if (!ds41_moe_split_note(split_ms, &split_t0, il, count, "shared")) return false;
     }
@@ -47081,7 +47126,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_attention) {
                 const ds4_layer_weights *l = &w->layer[il];
-                ok = ds41_attention_project_batch(g, m, l, count);
+                ok = ds41_attention_project_batch(g, m, l, count, il);
                 DS41_STAGE("attention projections");
                 if (ok && batch_core) ok = ds41_attention_batch(g, m, l, il, count);
                 for (uint32_t t = 0; ok && !batch_core && t < count; t++) {
@@ -47113,8 +47158,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     if (ok) ok = ds41_matmul_batch(g->batch.block, m, l->attn_output_b,
                                                    g->batch.low, count, true);
                 }
-                if (ok) ok = ds41_pabl_io(il, DS41_PABL_ATTN, 0, g->batch.block,
-                                          (uint64_t)count * DS4_N_EMBD * sizeof(float));
+                if (ok) ok = ds41_pabl_io16(il, DS41_PABL_ATTN, 0, g->batch.block,
+                                            DS4_N_EMBD, count);
                 DS41_STAGE("attention output");
                 if (ok && batch_hc) ok = ds41_after_attention_batch(&active, m, l, count, il);
                 DS41_STAGE("hc/ffn norm");
@@ -48188,7 +48233,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
          * DS41_ABL_PRE_FIELDS; a field missing from it shows up as DIVERGED. */
         if (ok && !ds41_abl_skip(il, DS41_ABL_PRE))
             ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
-                ds41_attention_project_batch(g, model, l, rows);
+                ds41_attention_project_batch(g, model, l, rows, il);
         else if (ok) g_ds41_abl_skips++;
         if (ok && ds41_abl_capture(il)) ok = ds41_abl_pre_move(&active, il, rows, true);
         if (ok && ds41_abl_copy(il, DS41_ABL_PRE)) {
@@ -48338,8 +48383,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
              * bit-identical to canonical single decode. Needs the per-row
              * gather slices and a compressed store on every row; the raw-only
              * shape declines and falls through. */
-            bool levelled = false;
-            if (ok && block_levels && row_gather) {
+            /* The tail's attention reads, skipped whole by the replay. */
+            const bool tattn_skip = ds41_pabl_skip(DS41_PABL_TATTN);
+            if (tattn_skip) g_ds41_pabl_skips++;
+            bool levelled = tattn_skip;
+            if (ok && !levelled && block_levels && row_gather) {
                 bool all_comp = true;
                 for (int i = 0; i < count; i++)
                     if (!(ratio_l && (positions[i] + 1u) / ratio_l)) all_comp = false;
@@ -48658,6 +48706,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch_logits(ds41_gpu_graph *const 
         if (!stage_split_attn) DS41_BSTAGE(stage_attn);
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
+            ds41_pabl_io16(il, DS41_PABL_TATTN, 0, active.block, DS4_N_EMBD, rows) &&
             ds41_after_attention_batch(&active, model, l, rows, il);
 resume_routed_entry:
         if (ok) {
@@ -87813,7 +87862,7 @@ static bool ds41_exec_pass(ds41_exec *x, uint32_t r0, uint32_t m, uint32_t from,
             const bool comp = ratio != 0;
             const uint32_t heads_all = DS4_N_HEAD / g->tp_world;
             ok = ds41_before_attention_batch(g, &a, md, l, il, m) &&
-                 ds41_attention_project_batch(g, md, l, m) &&
+                 ds41_attention_project_batch(g, md, l, m, il) &&
                  ds4_gpu_dsv41_rope_nodes(a.q, DS4_N_HEAD_DIM, heads_all, m, g->block_positions,
                                           r0, comp, false) &&
                  ds4_gpu_dsv41_rope_nodes(a.kv, DS4_N_HEAD_DIM, 1, m, g->block_positions,

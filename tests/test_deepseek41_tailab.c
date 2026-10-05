@@ -258,9 +258,10 @@ int main(int argc, char **argv) {
             if (!ds4_test_v41_topk_batch || !ds4_test_v41_topk_rows || !ds4_test_topk_counts)
                 return 2;
             g_topk1 = 1;
-        } else if (strcmp(argv[a], "abl3") == 0) {
+        } else if (strcmp(argv[a], "abl3") == 0 || strcmp(argv[a], "run1") == 0 ||
+                   strcmp(argv[a], "run2") == 0) {
             if (!ds4_test_v41_pabl_set || !ds4_test_topk_counts) return 2;
-            g_abl3 = 1;
+            g_abl3 = argv[a][0] == 'a' ? 3 : argv[a][3] - '0';
         } else if (strcmp(argv[a], "f32x2") == 0) {
             if (!ds4_test_v41_f32_reps) return 2;
             g_f32 = 1;
@@ -355,21 +356,35 @@ int main(int argc, char **argv) {
     arm_result ref = {0}, r;
     int bad = 0;
     if (ok && g_abl3) {
-        enum { PRE = 4, ROUTER = 8 };
-        static const int skip[4] = { 0, PRE, ROUTER, PRE | ROUTER };
-        static const char *const name[4] = { "C ", "P ", "R ", "PR" };
-        static const int order[8] = { 0, 1, 2, 3, 3, 2, 1, 0 };
+        /* run1: routed and shared expert; run2: the prefix's attention (with
+         * q_b), the q_a/kv projections, the tail's attention (with q_b). Each
+         * against the one control of its own run, in mirrored order. */
+        enum { ROUTED = 1, ATTN = 2, PRE = 4, ROUTER = 8, SHARED = 16, PROJ = 32, TATTN = 64 };
+        static const int skip3[4] = { 0, PRE, ROUTER, PRE | ROUTER };
+        static const int skip1[4] = { 0, ROUTED, SHARED, 0 };
+        static const int skip2[4] = { 0, ATTN, TATTN, PROJ };
+        static const char *const name3[4] = { "C ", "P ", "R ", "PR" };
+        static const char *const name1[4] = { "C ", "Ro", "Sh", "" };
+        static const char *const name2[4] = { "C ", "At", "Ta", "Pj" };
+        const int *skip = g_abl3 == 1 ? skip1 : g_abl3 == 2 ? skip2 : skip3;
+        const char *const *name = g_abl3 == 1 ? name1 : g_abl3 == 2 ? name2 : name3;
+        const int stages = g_abl3 == 1 ? ROUTED | SHARED : g_abl3 == 2 ? ATTN | TATTN | PROJ :
+                           PRE | ROUTER;
+        const int arms = g_abl3 == 1 ? 3 : 4;
+        static const int order4[8] = { 0, 1, 2, 3, 3, 2, 1, 0 };
+        static const int order3[6] = { 0, 1, 2, 2, 1, 0 };
+        const int *order = arms == 3 ? order3 : order4;
         double wall[4] = {0};
-        ds4_test_v41_pabl_set(PRE | ROUTER, 1, 0);
+        ds4_test_v41_pabl_set(stages, 1, 0);
         ok = run_arm(&s, &snap, &prompt, 0, buf, vocab, &ref);
         ds4_test_v41_pabl_set(0, 0, 0);
         printf("capture  %.3f s; reference logits %016llx state %016llx\n", ref.wall,
                (unsigned long long)ref.logits, (unsigned long long)ref.state);
-        for (int j = 0; ok && !g_stop && j < 8; j++) {
+        for (int j = 0; ok && !g_stop && j < 2 * arms; j++) {
             const int k = order[j];
             unsigned long long t0[3], t1[3];
             ds4_test_topk_counts(t0);
-            ds4_test_v41_pabl_set(PRE | ROUTER, k ? 3 : 2, skip[k]);
+            ds4_test_v41_pabl_set(stages, k ? 3 : 2, skip[k]);
             ok = run_arm(&s, &snap, &prompt, 0, buf, vocab, &r);
             ds4_test_v41_pabl_set(0, 0, 0);
             ds4_test_topk_counts(t1);
@@ -381,7 +396,12 @@ int main(int argc, char **argv) {
                    name[k], r.wall, same ? "same" : "DIFFERENT", t1[0] - t0[0], t1[1] - t0[1],
                    t1[2] - t0[2]);
         }
-        if (ok)
+        if (ok && g_abl3 != 3) {
+            printf("run%d     C %.3f s", g_abl3, wall[0]);
+            for (int k = 1; k < arms; k++)
+                printf("; %s %.3f s, C - %s %+.3f s", name[k], wall[k], name[k], wall[0] - wall[k]);
+            printf("; %d arm(s) differing -> %s\n", bad, bad ? "FAIL" : "PASS");
+        } else if (ok)
             printf("abl3     C %.3f, P %.3f, R %.3f, PR %.3f s: pre-attention %.3f, router "
                    "selection %.3f, both %.3f (sum %.3f) s; %d arm(s) differing -> %s\n",
                    wall[0], wall[1], wall[2], wall[3], wall[0] - wall[1], wall[0] - wall[2],
