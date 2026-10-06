@@ -1642,8 +1642,13 @@ kernel void kernel_dsv41_route_schedule(
                                       (threadgroup char *)(mv_shmem + 32*cluster), false);
     }
 
-    // Publish this group's rows; the last group to arrive finalizes.
+    // Publish this group's rows; the last group to arrive finalizes. Cluster
+    // 1's row is stored by col 256, not col 0, so every store has to be
+    // ordered before col 0's arrival by a barrier, not by the storing
+    // thread's own fence alone: without it the last group could validate a
+    // stale odd row, the previous layer's logit.
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    threadgroup_barrier(mem_flags::mem_device);
     if (col == 0) {
         const uint old = atomic_fetch_add_explicit(completion, 1u, memory_order_relaxed);
         is_last = old + 1u == args.n_groups ? 1u : 0u;
