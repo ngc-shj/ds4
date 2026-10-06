@@ -147,11 +147,11 @@ void ds4_test_moe_packed_reps(int stage, uint32_t n) __attribute__((weak));
 static int g_preps;
 static unsigned g_preps_n = 2;
 static int g_mt;
-/* "mp" (with "full"): arm A runs the prefix's routed experts for a layer's
- * two chunks in one dispatch, B a chunk at a time; both print the layers
- * paired. */
-void ds4_test_v41_moe_pair(int on) __attribute__((weak));
-unsigned long long ds4_test_v41_moe_pair_layers(void) __attribute__((weak));
+/* "mp" (with "full"): arm A runs a 4096-row prefix's two chunks as one
+ * superbatch (every row-independent step once over both, attention a chunk at
+ * a time), B a chunk at a time; both print the layers run so. */
+void ds4_test_v41_superbatch(int on) __attribute__((weak));
+unsigned long long ds4_test_v41_superbatch_layers(void) __attribute__((weak));
 static int g_mp;
 /* "drop:<pagecache tool>": arm B starts with the model file dropped from the
  * file cache, outside the timed span - what the arm's reads cost from the SSD. */
@@ -213,8 +213,8 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     unsigned long long pk_eb0[6] = {0}, pk_ar0[2] = {0};
     if (g_pkg) { ds4_test_v41_every_block_counts(pk_eb0); ds4_test_v41_attn_rows_counts(pk_ar0); }
     if (g_eb) ds4_test_v41_every_block(!b);
-    if (g_mp) ds4_test_v41_moe_pair(!b);
-    const unsigned long long mp0 = g_mp ? ds4_test_v41_moe_pair_layers() : 0;
+    if (g_mp) ds4_test_v41_superbatch(!b);
+    const unsigned long long mp0 = g_mp ? ds4_test_v41_superbatch_layers() : 0;
     if (g_preps) ds4_test_moe_packed_reps(g_preps, b ? g_preps_n : 1u);
     uint64_t mt0 = 0;
     uint32_t mc0[16] = {0};
@@ -275,9 +275,9 @@ static int run_arm(ds4_session **sp, const ds4_session_snapshot *snap, const ds4
     if (g_il) ds4_test_v41_interleave(1);
     if (g_f32) ds4_test_v41_f32_reps(1);
     if (g_mp) {
-        printf("mp       arm %c: %llu layers paired\n", b ? 'B' : 'A',
-               ds4_test_v41_moe_pair_layers() - mp0);
-        ds4_test_v41_moe_pair(1);
+        printf("mp       arm %c: %llu layers superbatched\n", b ? 'B' : 'A',
+               ds4_test_v41_superbatch_layers() - mp0);
+        ds4_test_v41_superbatch(1);
     }
     if (g_preps) {
         ds4_test_moe_packed_reps(g_preps, 1u);
@@ -383,7 +383,7 @@ int main(int argc, char **argv) {
                 !ds4_test_v41_attn_rows_counts || !ds4_gpu_dsv41_compare_counts) return 2;
             g_attn = argv[a][4] == 'c' ? 2 : 1;
         } else if (strcmp(argv[a], "mp") == 0) {
-            if (!ds4_test_v41_moe_pair || !ds4_test_v41_moe_pair_layers) return 2;
+            if (!ds4_test_v41_superbatch || !ds4_test_v41_superbatch_layers) return 2;
             g_mp = 1;
         } else if (strncmp(argv[a], "preps:", 6) == 0) {
             if (!ds4_test_moe_packed_reps) return 2;
