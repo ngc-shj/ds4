@@ -11385,7 +11385,31 @@ int ds4_gpu_parallel_ffn_finish(void) {
  * committed first; one held by a buffer that is already on the queue just needs
  * waiting for, and committing early there costs a command buffer boundary for
  * nothing. */
+/* Cache events for the per-token history (ds4.c ds41_hist_record): installs,
+ * early loads begun, finished and cleared, spares taken. Counted on the host
+ * thread that does them; read after the token's drain. */
+static unsigned long long g_hist_counts[5];
+
+/* Invariant: an expert's bytes and its slab slot change - a load, an install,
+ * an eviction - only while the queue has nothing in flight. Gated reads mark
+ * no entry in flight, so this is the whole of their protection (the gate's
+ * repair waits for its segment first). Counted, with the first site, never
+ * enforced: a violation is the race the history is there to catch. */
+static unsigned long long g_cache_busy_mutations, g_cache_busy_checks;
+static const char *g_cache_busy_first;
+static void ds4_cache_busy_check(const char *where) {
+    if (g_backend != 4 || !g_mtl4_event) return;
+    g_cache_busy_checks++;
+    if (g_mtl4_event.signaledValue < g_mtl4_stamp && g_cache_busy_mutations++ == 0) {
+        g_cache_busy_first = where;
+        fprintf(stderr, "ds4: expert cache changed while the GPU was busy: %s (stamp %llu, "
+                "signalled %llu)\n", where, (unsigned long long)g_mtl4_stamp,
+                (unsigned long long)g_mtl4_event.signaledValue);
+    }
+}
+
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_take_spare(uint32_t layer) {
+    g_hist_counts[4]++;
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return NULL;
     for (uint32_t n = 0; n < DS4_METAL_STREAM_EXPERT_SPARE_PER_LAYER; n++) {
         const uint32_t i = (g_stream_expert_spare_next[layer] + n) %
@@ -17843,6 +17867,7 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
         return;
     }
+    ds4_cache_busy_check("eviction");
     /* Out of the set before the buffers go: an allocation is only safe to drop
      * once nothing in flight can reach it, which the inflight check above is. */
     ds4_gpu_expert_residency_update(e, 0);
@@ -19042,6 +19067,8 @@ ds4_gpu_stream_expert_cache_install_loaded(
         NSUInteger     gate_inner,
         NSUInteger     up_inner,
         NSUInteger     down_inner) {
+    g_hist_counts[0]++;
+    ds4_cache_busy_check("install");
     if (!gate_buf || !up_buf || !down_buf ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
@@ -19429,6 +19456,7 @@ static int ds4_gpu_stream_expert_pending_load_finish(
         ds4_gpu_stream_expert_cache_entry *entries[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED]) {
     ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
     if (!p->active) return 1;
+    g_hist_counts[2]++;
 
     const double start_ms = p->start_ms;
     if (!ds4_gpu_stream_expert_pread_pool_wait()) {
@@ -19453,6 +19481,7 @@ static int ds4_gpu_stream_expert_pending_load_finish(
 }
 
 static void ds4_gpu_stream_expert_pending_load_clear(void) {
+    if (g_stream_expert_pending_load.active) g_hist_counts[3]++;
     if (!g_stream_expert_pending_load.active) {
         ds4_gpu_stream_expert_pending_load_release_buffers(
                 &g_stream_expert_pending_load);
@@ -19622,6 +19651,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         return 1;
     }
     if (!table) return 0;
+    g_hist_counts[1]++;
     const void *model_map = table->model_map;
     const uint64_t model_size = table->model_size;
     const uint32_t layer = table->layer;
@@ -19947,6 +19977,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         int            gpu_copy_source,
         ds4_gpu_stream_expert_cache_entry **entries) {
     uint64_t tl_ra0 = 0, tl_rd0 = 0, tl_rd1 = 0;
+    if (missing_mask) ds4_cache_busy_check("load");
     if (!g_ssd_streaming_mode ||
         !model_map ||
         !selected_ids ||
@@ -57329,4 +57360,32 @@ void ds4_test_expert_reads(double out[3]) {
     out[0] = (double)g_stream_expert_cache_pread_bytes;
     out[1] = g_stream_expert_cache_pread_ms;
     out[2] = (double)g_stream_expert_cache_misses;
+}
+
+/* The per-token history's view of the cache: the event counts above, the
+ * directory's address mismatches, and one expert's record - valid, state,
+ * generation, slab slot, the address its gate bytes are at, and what the
+ * gate table holds for it (the host's seed, then the device's live copy). */
+void ds4_gpu_history_counts(unsigned long long out[8]);
+void ds4_gpu_history_counts(unsigned long long out[8]) {
+    for (int i = 0; i < 5; i++) out[i] = g_hist_counts[i];
+    out[5] = g_dir_address_mismatch;
+    out[6] = g_cache_busy_mutations;
+    out[7] = g_cache_busy_checks;
+}
+
+int ds4_gpu_stream_expert_probe(uint32_t layer, uint32_t expert, unsigned long long out[7]);
+int ds4_gpu_stream_expert_probe(uint32_t layer, uint32_t expert, unsigned long long out[7]) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        expert >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) return 0;
+    const ds4_gpu_stream_expert_cache_entry *e = &g_stream_expert_cache[layer][expert];
+    out[0] = e->valid; out[1] = e->state; out[2] = e->gen; out[3] = e->slab_slot;
+    out[4] = e->valid && e->gate_buffer ? ds4_gpu_buffer_address(e->gate_buffer, e->gate_inner) : 0;
+    out[5] = out[6] = 0;
+    id<MTLBuffer> seed = g_stream_expert_cache_gate_addr_seed[layer];
+    id<MTLBuffer> live = g_stream_expert_cache_gate_addr_buffers[layer];
+    if (!ds4_mtl4_addr_split()) seed = live;
+    if (seed) out[5] = ((const uint64_t *)ds4_gpu_buffer_contents(seed))[expert];
+    if (live) out[6] = ((const uint64_t *)ds4_gpu_buffer_contents(live))[expert];
+    return 1;
 }

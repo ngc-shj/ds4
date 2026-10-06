@@ -60,6 +60,8 @@ static void chat_prompt(ds4_engine *e, const char *text, ds4_tokens *out) {
 void ds4_test_v41_trace(uint32_t lo, uint32_t hi) __attribute__((weak));
 int ds4_test_v41_trace_read(ds4_session *s, uint32_t pos, uint32_t il, float *out)
     __attribute__((weak));
+void ds4_test_v41_history_dump(ds4_session *s, uint32_t last, const char *tag)
+    __attribute__((weak));
 static uint32_t g_trace_lo, g_trace_hi, g_cache_experts = 10268;
 static int g_short_only;
 
@@ -127,6 +129,12 @@ static void paired(ds4_engine *e, const char *name, const char *text, int steps,
         }
         if (!same_logits(a, b, la, lb, vocab)) {
             diff_steps++;
+            /* The first divergence: both sessions' last three tokens of cache
+             * history, while they are still the ones that produced it. */
+            if (first_diff < 0 && ds4_test_v41_history_dump) {
+                ds4_test_v41_history_dump(a, 3, "A");
+                ds4_test_v41_history_dump(b, 3, "B");
+            }
             if (first_diff < 0) first_diff = n + 1;
         }
     }
@@ -136,6 +144,11 @@ static void paired(ds4_engine *e, const char *name, const char *text, int steps,
            (unsigned long long)ha, (unsigned long long)hb);
     CHECK(diff_steps == 0 && token_diff < 0 && ha == hb, "%s: sessions disagree", name);
     if (g_trace_hi && ds4_test_v41_trace_read) trace_compare(a, b);
+    /* The last token's history of each, so a run shows its hooks ran. */
+    if (g_short_only && ds4_test_v41_history_dump) {
+        ds4_test_v41_history_dump(a, 1, "A-last");
+        ds4_test_v41_history_dump(b, 1, "B-last");
+    }
     free(la); free(lb);
     ds4_session_free(a);
     ds4_session_free(b);

@@ -476,6 +476,8 @@ void ds4_gpu_gate_token_begin(void) {
 }
 
 uint32_t ds4_gpu_gate_encode_slot(void) { return g_gate_encode_slot; }
+uint32_t ds4_gpu_gate_seg_seq(void);
+uint32_t ds4_gpu_gate_seg_seq(void) { return g_gate_seg_seq; }
 
 /* A speculative segment that is dropped must give its slots back, or the
  * cursor climbs across the token until it passes DS4_GATE_MAX_SLOTS and

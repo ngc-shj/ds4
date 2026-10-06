@@ -40357,6 +40357,22 @@ struct ds41_view_entry {
     ds4_gpu_tensor       *view;
 };
 
+/* Per-token history of a session's gated decode, kept on the host after the
+ * token's last command buffer has completed and before its cache accounting:
+ * the eval sequence, the gate's segment and slot counters, the cache's event
+ * counts, and for every layer's six routed experts the directory's record -
+ * state, generation, slab slot, address - and whether the gate table's seed
+ * and live slots still hold that address at the token's end. No GPU work and
+ * no allocation per token; the ring is made with the graph. */
+enum { DS41_HIST_TOKENS = 32 };
+struct ds41_hist_rec {
+    unsigned long long seq, counts[8];
+    uint32_t pos, token, seg_seq, encode_slot, bad;
+    int32_t ids[DS4_MAX_LAYER][6];
+    uint32_t state[DS4_MAX_LAYER][6], gen[DS4_MAX_LAYER][6], slot[DS4_MAX_LAYER][6];
+    unsigned long long addr[DS4_MAX_LAYER][6];
+    uint8_t ok[DS4_MAX_LAYER][6];
+};
 typedef struct {
     uint32_t ctx, pos, prefill_cap, carry_cap;
     uint64_t allocation_bytes;
@@ -40460,6 +40476,9 @@ typedef struct {
      * not in the arena rows a 4096-row prefix superbatch also uses. The tail's
      * other fields are rewritten in each of its layers and share the arena. */
     ds41_prefill_row il_carry;
+    /* The last DS41_HIST_TOKENS gated tokens' history (ds41_hist_record). */
+    struct ds41_hist_rec *hist;
+    uint32_t hist_n;
     ds4_gpu_tensor *prefill_tokens;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
@@ -40614,6 +40633,8 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_decode_graphs_invalidate();
 #endif
     ds4_gpu_tensor_free(g->tp_logits_half);
+    free(g->hist);
+    g->hist = NULL;
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
 #define DS41_ROW_FREE(name, count) ds4_gpu_tensor_free(g->rows_view[i].name);
         DS41_PREFILL_ROWS(DS41_ROW_FREE)
@@ -40733,8 +40754,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     g->prefill_ids = malloc((size_t)(g->carry_cap ? g->carry_cap : g->prefill_cap) *
                             sizeof(*g->prefill_ids));
     g->rows_view = calloc(g->prefill_cap, sizeof(*g->rows_view));
+    g->hist = calloc(DS41_HIST_TOKENS, sizeof(*g->hist));
     g->prefill_tokens = ds4_gpu_tensor_alloc((uint64_t)g->prefill_cap * sizeof(int32_t));
-    if (!g->token_map || !g->prefill_ids || !g->rows_view || !g->prefill_tokens) goto fail;
+    if (!g->token_map || !g->prefill_ids || !g->rows_view || !g->prefill_tokens || !g->hist)
+        goto fail;
     g->engram.token_map = g->token_map;
     g->engram.vocab_size = DS4_N_VOCAB;
     g->engram.compressed_vocab_size = required_u32(m, "deepseek41.engram.compressed_vocab_size");
@@ -44826,6 +44849,54 @@ static bool ds41_sabl_finish(ds41_gpu_graph *g, uint32_t il) {
  * two sessions to reach the window - in the command stream right after the
  * layer writes it. No allocation, wait or readback in the decode; the rows
  * are compared once the sessions have finished. */
+static unsigned long long g_ds41_hist_seq;
+
+#ifdef __APPLE__
+void ds4_gpu_history_counts(unsigned long long out[8]);
+int ds4_gpu_stream_expert_probe(uint32_t layer, uint32_t expert, unsigned long long out[7]);
+uint32_t ds4_gpu_gate_seg_seq(void);
+uint32_t ds4_gpu_gate_encode_slot(void);
+int ds4_gpu_gate_read_route(uint32_t layer, int32_t *ids, uint32_t *n);
+
+static void ds41_hist_record(ds41_gpu_graph *g, uint32_t lo, uint32_t n, int token) {
+    if (!g->hist) return;
+    struct ds41_hist_rec *r = &g->hist[g->hist_n++ % DS41_HIST_TOKENS];
+    r->seq = ++g_ds41_hist_seq;
+    r->pos = g->pos;
+    r->token = (uint32_t)token;
+    r->seg_seq = ds4_gpu_gate_seg_seq();
+    r->encode_slot = ds4_gpu_gate_encode_slot();
+    r->bad = 0;
+    ds4_gpu_history_counts(r->counts);
+    for (uint32_t il = 0; il < DS4_N_LAYER && il < DS4_MAX_LAYER; il++) {
+        int32_t ids[8];
+        uint32_t cnt = 0;
+        const bool have = il >= lo && il < n && ds4_gpu_gate_read_route(il, ids, &cnt) && cnt >= 6u;
+        for (uint32_t k = 0; k < 6u; k++) {
+            unsigned long long e[7] = {0};
+            r->ids[il][k] = have ? ids[k] : -1;
+            r->ok[il][k] = 1;
+            if (!have || !ds4_gpu_stream_expert_probe(il, (uint32_t)ids[k], e)) {
+                r->state[il][k] = r->gen[il][k] = r->slot[il][k] = 0;
+                r->addr[il][k] = 0;
+                continue;
+            }
+            r->state[il][k] = (uint32_t)e[1];
+            r->gen[il][k] = (uint32_t)e[2];
+            r->slot[il][k] = (uint32_t)e[3];
+            r->addr[il][k] = e[4];
+            /* Current at the token's end: valid, CACHED or PINNED, the seed
+             * and live table slots the directory's address. An earlier
+             * layer's expert a later repair evicted is legitimately not; the
+             * guard on that is ds4_cache_busy_check's. */
+            r->ok[il][k] = e[0] && (e[1] == 2u || e[1] == 3u) && e[4] &&
+                           e[4] == e[5] && e[5] == e[6];
+            if (!r->ok[il][k]) r->bad++;
+        }
+    }
+}
+#endif
+
 static uint32_t g_ds41_trace_lo, g_ds41_trace_hi;
 static ds4_gpu_tensor *g_ds41_trace_ring[2];
 static const ds41_gpu_graph *g_ds41_trace_owner[2];
@@ -46406,6 +46477,7 @@ spec_done:;
          * synchronisation of its own, and once per layer however many
          * continuations that layer took. */
         const double gt_acct0 = now_sec();
+        if (ok) ds41_hist_record(g, gate_lo, gate_n, token);
         if (ok) {
             unsigned long long touched = 0;
             ds4_gpu_gate_account_begin();
@@ -99851,6 +99923,32 @@ int ds4_test_v41_carry_ms(ds4_session *s, double out[2]) {
 }
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+/* A session's last `last` history records (ds41_hist_record), oldest first:
+ * a line a token, then a line a layer with its six experts' id, state,
+ * generation, slab slot and whether the invariant held. */
+void ds4_test_v41_history_dump(ds4_session *s, uint32_t last, const char *tag);
+void ds4_test_v41_history_dump(ds4_session *s, uint32_t last, const char *tag) {
+    if (!s || !s->ds41_graph_ready || !s->ds41_graph.hist) return;
+    const ds41_gpu_graph *g = &s->ds41_graph;
+    const uint32_t have = g->hist_n < DS41_HIST_TOKENS ? g->hist_n : DS41_HIST_TOKENS;
+    if (last > have) last = have;
+    for (uint32_t t = g->hist_n - last; t < g->hist_n; t++) {
+        const struct ds41_hist_rec *r = &g->hist[t % DS41_HIST_TOKENS];
+        printf("hist %s eval %llu pos %u token %u seg %u slot %u installs %llu early %llu/%llu/%llu "
+               "spares %llu addr-mismatch %llu busy-mutations %llu of %llu checks bad %u\n", tag, r->seq, r->pos, r->token,
+               r->seg_seq, r->encode_slot, r->counts[0], r->counts[1], r->counts[2],
+               r->counts[3], r->counts[4], r->counts[5], r->counts[6], r->counts[7], r->bad);
+        for (uint32_t il = 0; il < DS4_N_LAYER && il < DS4_MAX_LAYER; il++) {
+            if (r->ids[il][0] < 0) continue;
+            printf("hist %s   L%02u", tag, il);
+            for (uint32_t k = 0; k < 6u; k++)
+                printf(" %d:%u/%u/%u%s", r->ids[il][k], r->state[il][k], r->gen[il][k],
+                       r->slot[il][k], r->ok[il][k] ? "" : "!");
+            printf("\n");
+        }
+    }
+}
+
 /* One traced residual (ds4_test_v41_trace) of a session, n_hc * n_embd
  * floats. Returns the floats, 0 if the session or row was not traced. */
 int ds4_test_v41_trace_read(ds4_session *s, uint32_t pos, uint32_t il, float *out);
