@@ -44821,11 +44821,45 @@ static bool ds41_sabl_finish(ds41_gpu_graph *g, uint32_t il) {
            ds41_sabl_seam_many(DS41_SABL_FINISH, il, out, 1);
 }
 
+/* Test hook: at decode positions [lo, hi) (a few), each layer's residual is
+ * copied into a ring made when the hook is set - one per session, the first
+ * two sessions to reach the window - in the command stream right after the
+ * layer writes it. No allocation, wait or readback in the decode; the rows
+ * are compared once the sessions have finished. */
+static uint32_t g_ds41_trace_lo, g_ds41_trace_hi;
+static ds4_gpu_tensor *g_ds41_trace_ring[2];
+static const ds41_gpu_graph *g_ds41_trace_owner[2];
+void ds4_test_v41_trace(uint32_t lo, uint32_t hi);
+void ds4_test_v41_trace(uint32_t lo, uint32_t hi) {
+    const uint64_t bytes = (uint64_t)(hi - lo) * DS4_N_LAYER * DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    for (int i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(g_ds41_trace_ring[i]);
+        g_ds41_trace_ring[i] = hi > lo ? ds4_gpu_tensor_alloc(bytes) : NULL;
+        g_ds41_trace_owner[i] = NULL;
+    }
+    g_ds41_trace_lo = lo;
+    g_ds41_trace_hi = g_ds41_trace_ring[0] && g_ds41_trace_ring[1] ? hi : 0;
+}
+
+static bool ds41_trace_layer(ds41_gpu_graph *g, uint32_t il) {
+    if (g->pos < g_ds41_trace_lo || g->pos >= g_ds41_trace_hi) return true;
+    int i = g_ds41_trace_owner[0] == g ? 0 : g_ds41_trace_owner[1] == g ? 1 : -1;
+    if (i < 0) {
+        i = !g_ds41_trace_owner[0] ? 0 : !g_ds41_trace_owner[1] ? 1 : -1;
+        if (i < 0) return true;
+        g_ds41_trace_owner[i] = g;
+    }
+    const uint64_t hc = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    return ds4_gpu_tensor_copy(g_ds41_trace_ring[i],
+        ((uint64_t)(g->pos - g_ds41_trace_lo) * DS4_N_LAYER + il) * hc, g->residual, 0, hc) != 0;
+}
+
 static bool ds41_sabl_after_moe(ds41_gpu_graph *g, uint32_t il) {
     ds4_gpu_tensor *hc[8] = { g->residual, g->pre, g->attn_split, g->ffn_split, g->mix,
                               g->x, g->norm, g->after_attn };
     return (ds41_sabl_skip(DS41_SABL_AFTERMOE) || ds41_graph_after_moe(g)) &&
-           ds41_sabl_seam_many(DS41_SABL_AFTERMOE, il, hc, 8);
+           ds41_sabl_seam_many(DS41_SABL_AFTERMOE, il, hc, 8) &&
+           (!g_ds41_trace_hi || ds41_trace_layer(g, il));
 }
 
 double g_v41_pre_moe_ms, g_v41_moe_ms, g_v41_post_moe_ms;
@@ -44838,7 +44872,7 @@ static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
     const double t1 = prof ? now_sec() : 0.0;
     if (!ds41_moe(g, m, l, il, (uint32_t)token)) return false;
     const double t2 = prof ? now_sec() : 0.0;
-    const bool ok = ds41_graph_after_moe(g);
+    const bool ok = ds41_graph_after_moe(g) && (!g_ds41_trace_hi || ds41_trace_layer(g, il));
     if (prof) {
         const double t3 = now_sec();
         g_v41_pre_moe_ms += (t1 - t0) * 1000.0;
@@ -99815,6 +99849,23 @@ int ds4_test_v41_carry_ms(ds4_session *s, double out[2]) {
     return -1;
 #endif
 }
+
+#if defined(__APPLE__) && !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+/* One traced residual (ds4_test_v41_trace) of a session, n_hc * n_embd
+ * floats. Returns the floats, 0 if the session or row was not traced. */
+int ds4_test_v41_trace_read(ds4_session *s, uint32_t pos, uint32_t il, float *out);
+int ds4_test_v41_trace_read(ds4_session *s, uint32_t pos, uint32_t il, float *out) {
+    if (!s || !s->ds41_graph_ready || pos < g_ds41_trace_lo || pos >= g_ds41_trace_hi ||
+        il >= DS4_N_LAYER) return 0;
+    const int i = g_ds41_trace_owner[0] == &s->ds41_graph ? 0 :
+                  g_ds41_trace_owner[1] == &s->ds41_graph ? 1 : -1;
+    const uint64_t hc = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    if (i < 0 || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(g_ds41_trace_ring[i],
+            ((uint64_t)(pos - g_ds41_trace_lo) * DS4_N_LAYER + il) * hc, out, hc)) return 0;
+    return (int)(hc / sizeof(float));
+}
+#endif
 
 int ds4_test_engine_q8_tiles(ds4_engine *e) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)

@@ -1,6 +1,6 @@
 /* The V4.1 Metal 4 backend on the real model, in one process.
  *
- *   test_deepseek41_backend <model.gguf> [story.txt]
+ *   test_deepseek41_backend <model.gguf> [story.txt [short] [trace:LO:HI] [cache:N]]
  *
  * Run with the production environment (bench/m4prod.sh's), so the gated
  * decode, the expert cache and its repairs are the ones the server runs.
@@ -57,6 +57,35 @@ static void chat_prompt(ds4_engine *e, const char *text, ds4_tokens *out) {
     ds4_chat_append_assistant_prefix(e, out, DS4_THINK_NONE);
 }
 
+void ds4_test_v41_trace(uint32_t lo, uint32_t hi) __attribute__((weak));
+int ds4_test_v41_trace_read(ds4_session *s, uint32_t pos, uint32_t il, float *out)
+    __attribute__((weak));
+static uint32_t g_trace_lo, g_trace_hi, g_cache_experts = 10268;
+static int g_short_only;
+
+/* The first traced (position, layer) where the two sessions' residuals
+ * differ, and how many words differ there. */
+static void trace_compare(ds4_session *a, ds4_session *b) {
+    static float row_a[1 << 16], row_b[1 << 16];
+    for (uint32_t pos = g_trace_lo; pos < g_trace_hi; pos++)
+        for (uint32_t il = 0; il < 40; il++) {
+            const int n = ds4_test_v41_trace_read(a, pos, il, row_a);
+            if (n <= 0 || n > (1 << 16) || ds4_test_v41_trace_read(b, pos, il, row_b) != n) {
+                printf("trace      position %u layer %u: no row\n", pos, il);
+                return;
+            }
+            int words = 0;
+            for (int k = 0; k < n; k++) words += memcmp(&row_a[k], &row_b[k], 4) != 0;
+            if (words) {
+                printf("trace      first difference at position %u layer %u: %d of %d residual "
+                       "words\n", pos, il, words, n);
+                return;
+            }
+        }
+    printf("trace      positions %u-%u, 40 layers: the residuals agree\n", g_trace_lo,
+           g_trace_hi - 1);
+}
+
 /* Logits of both sessions, compared whole. Returns 1 if identical. */
 static int same_logits(ds4_session *a, ds4_session *b, float *la, float *lb, int vocab) {
     const int na = ds4_session_copy_logits(a, la, vocab);
@@ -106,6 +135,7 @@ static void paired(ds4_engine *e, const char *name, const char *text, int steps,
            name, prompt.len, n, diff_steps, n + 1, first_diff, token_diff,
            (unsigned long long)ha, (unsigned long long)hb);
     CHECK(diff_steps == 0 && token_diff < 0 && ha == hb, "%s: sessions disagree", name);
+    if (g_trace_hi && ds4_test_v41_trace_read) trace_compare(a, b);
     free(la); free(lb);
     ds4_session_free(a);
     ds4_session_free(b);
@@ -215,10 +245,19 @@ int main(int argc, char **argv) {
         return 2;
     }
     const int steps = getenv("STEPS") ? atoi(getenv("STEPS")) : 2048;
+    /* After the story, in any order: "short" (the short pair alone),
+     * "trace:LO:HI" (the decode positions to trace), "cache:N" (the expert
+     * cache asked for; a small one evicts more). */
+    for (int i = 3; i < argc; i++) {
+        if (strcmp(argv[i], "short") == 0) g_short_only = 1;
+        else if (sscanf(argv[i], "trace:%u:%u", &g_trace_lo, &g_trace_hi) == 2) {}
+        else if (sscanf(argv[i], "cache:%u", &g_cache_experts) == 1) {}
+        else return 2;
+    }
     ds4_engine *engine = NULL;
     ds4_engine_options opt = {
         .model_path = argv[1], .backend = DS4_BACKEND_METAL,
-        .ssd_streaming = true, .ssd_streaming_cache_experts = 10268,
+        .ssd_streaming = true, .ssd_streaming_cache_experts = g_cache_experts,
         .context_size = 8192, .placement_ctx_hint = 8192,
         .placement_session_count_hint = 2, .power_percent = 100,
     };
@@ -249,8 +288,15 @@ int main(int argc, char **argv) {
     int *ref = calloc((size_t)steps, sizeof(int));
     uint64_t hits = 0, misses = 0;
 
+    if (g_trace_hi && ds4_test_v41_trace) ds4_test_v41_trace(g_trace_lo, g_trace_hi);
     paired(engine, "short", "Explain how a modern CPU executes an instruction, from fetch "
            "to retire, in as much detail as you can.", steps, vocab, ref);
+    if (g_short_only) {
+        free(ref);
+        ds4_engine_close(engine);
+        printf("%s\n", g_failures ? "FAIL" : "PASS");
+        return g_failures ? 1 : 0;
+    }
     paired(engine, "haiku", "俳句を三つ、季語を変えて詠んでください。", 256, vocab, NULL);
     if (argc > 2) {
         char *story = read_prefix(argv[2], 22000);
