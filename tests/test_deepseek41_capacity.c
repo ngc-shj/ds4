@@ -1,7 +1,7 @@
 /* One long prompt at one expert-cache size, every logit written out.
  *
  *   test_deepseek41_capacity <model.gguf> <story.txt> <cache_experts> <steps> <logits.out>
- *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2] [noil] [base] [attnchk]]
+ *       [bytes [token-major|prev] [cached|uncached] [noblock] [rows=N] [parts=N] [q8nr2] [noil] [base] [nosb] [attnchk]]
  *
  * The expert cache is a performance state: what it holds, and how often it
  * misses, must not change a single logit. Run this once per cache size, each
@@ -166,6 +166,11 @@ int main(int argc, char **argv) {
             ds4_test_v41_topk_batch(0);
             ds4_test_v41_every_block(0);
             ds4_test_v41_attn_rows(0);
+        } else if (strcmp(argv[a], "nosb") == 0) {
+            /* Only the prefix superbatch off: the decode comparison of the
+             * same binary with and without it. */
+            if (!ds4_test_v41_superbatch) return 2;
+            ds4_test_v41_superbatch(0);
         } else if (strcmp(argv[a], "noil") == 0) {
             /* The prefix, then the tail: not layer by layer. */
             if (!ds4_test_v41_interleave) return 2;
@@ -193,6 +198,8 @@ int main(int argc, char **argv) {
         printf("reads    during the prefill: %.0f loads, %.2f GiB pread, %.2f s of read-thread "
                "time\n", r[2] - r0[2], (r[0] - r0[0]) / 1073741824.0, (r[1] - r0[1]) / 1000.0);
     }
+    const unsigned long long sb_prefill = ds4_test_v41_superbatch_layers ?
+        ds4_test_v41_superbatch_layers() : 0;
     uint64_t ids = 1469598103934665603ull, lh = ids;
     int i = 0;
     struct timespec d0, d1;
@@ -213,6 +220,9 @@ int main(int argc, char **argv) {
         printf("decode   %d steps in %.3f s, %.2f ms a token (logits copied and written each step)\n",
                steps, (double)(d1.tv_sec - d0.tv_sec) + (double)(d1.tv_nsec - d0.tv_nsec) * 1e-9,
                ((double)(d1.tv_sec - d0.tv_sec) + (double)(d1.tv_nsec - d0.tv_nsec) * 1e-9) * 1000.0 / steps);
+    if (ok && steps > 0 && ds4_test_v41_superbatch_layers)
+        printf("superbatch %llu layers during the decode\n",
+               ds4_test_v41_superbatch_layers() - sb_prefill);
     uint64_t sh = 0, sb = 0;
     if (ok) ok = payload_hash(s, &sh, &sb);
     printf("capacity %u experts: prompt %d tokens, %d evaluations written, ids %016llx, "
