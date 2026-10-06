@@ -11400,7 +11400,8 @@ static const char *g_cache_busy_first;
 static void ds4_cache_busy_check(const char *where) {
     if (g_backend != 4 || !g_mtl4_event) return;
     g_cache_busy_checks++;
-    if (g_mtl4_event.signaledValue < g_mtl4_stamp && g_cache_busy_mutations++ == 0) {
+    if (g_mtl4_stamp > g_mtl4_event_base && g_mtl4_event.signaledValue < g_mtl4_stamp &&
+        g_cache_busy_mutations++ == 0) {
         g_cache_busy_first = where;
         fprintf(stderr, "ds4: expert cache changed while the GPU was busy: %s (stamp %llu, "
                 "signalled %llu)\n", where, (unsigned long long)g_mtl4_stamp,

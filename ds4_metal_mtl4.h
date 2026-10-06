@@ -307,6 +307,9 @@ static double g_gpu_span_accum_ms;
 static uint64_t g_gpu_span_cbs;
 static uint64_t g_mtl4_stamp;                /* last value handed to a commit */
 static uint64_t g_mtl4_done;                 /* last value waited for */
+/* g_mtl4_stamp when g_mtl4_event was made: a new engine's event starts at 0
+ * while the stamp carries on, so nothing at or below this is in flight. */
+static uint64_t g_mtl4_event_base;
 
 static unsigned long long g_mtl4_dispatches, g_mtl4_segments;
 /* Contexts actually sent, against contexts begun: the two differ by the ones
@@ -1207,6 +1210,7 @@ static int ds4_mtl4_ready(void) {
     if (g_mtl4_queue) return 1;
     g_mtl4_queue = [g_device newMTL4CommandQueue];
     g_mtl4_event = [g_device newSharedEvent];
+    g_mtl4_event_base = g_mtl4_stamp;
     if (!g_mtl4_queue || !g_mtl4_event) {
         fprintf(stderr, "ds4: Metal 4 queue unavailable\n");
         g_mtl4_queue = nil;
