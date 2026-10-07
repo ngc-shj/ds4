@@ -18,6 +18,118 @@ We test things in integration: model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
+## This fork: DeepSeek V4.1 Flash Q2 on one 128 GB M5 Max (Metal 4)
+
+This branch of `ngc-shj/ds4` is a Metal 4 build of DeepSeek V4.1 Flash Q2 for a
+single **Apple M5 Max with 128 GB** of unified memory, streaming the experts
+from SSD. Its outputs are bit-identical to a frozen reference build (token
+ids, every logit, and the saved KV/carry state). On a 4795-token prompt with
+the page cache dropped, measured back to back, its first-request prefill took
+64-71 s against 99-103 s for the same binary with the newer prefill paths
+off; on a cool machine the same prompt takes about 35 s. It was tested on
+macOS 26.6.2; it needs macOS 26 or later (Metal 4) and was not tested on
+other machines.
+
+### Build
+
+```bash
+git clone https://github.com/ngc-shj/ds4.git ds4-v41
+cd ds4-v41
+git checkout ds4-v41-metal4-superbatch-exact-production-documented
+make ds4-server
+```
+
+Run the server from this directory: it compiles the Metal sources under
+`metal/` when it starts.
+
+### Model
+
+DeepSeek V4.1 Flash calibrated Q2, `DeepSeek-V4.1-Flash-Q2.gguf`, about
+341 GiB on disk (`antirez/deepseek-v4.1-flash-gguf` on Hugging Face):
+
+```bash
+HF_HUB_DISABLE_XET=1 ./download_model.sh ds41f-q2    # writes gguf/DeepSeek-V4.1-Flash-Q2.gguf
+```
+
+Keep it on the internal SSD; every prefill reads the expert weights from it.
+
+### Launch
+
+The tested production command. Every variable below is a switch already in
+the engine; the release was measured with all of them set, so change none of
+them.
+
+```bash
+env DS4_METAL_V41_MTL4=1 \
+    DS4_METAL_V41_STREAMING_MEMORY_BUDGET_GIB=80 \
+    DS4_METAL_V41_DECODE_QUEUE=1 \
+    DS4_METAL_V41_DECODE_LEND_HEADROOM=2 \
+    DS4_METAL_IQ2_SELECTED_SHARED_EVENT=1 \
+    DS4_METAL_STREAM_SPLIT_MIN_MISSING=1 \
+    DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP=8192 \
+    DS4_METAL_V41_ABORT_GATE=40 DS4_METAL_V41_ABORT_GATE_SEG=3 \
+    DS4_METAL_V41_EXPERT_RESIDENCY_SET=1 \
+    DS4_METAL_V41_FFN_OVERLAP=1 \
+    DS4_METAL_V41_ROUTER_FUSE_TRANSFORM=5 \
+    DS4_METAL_V41_FUSE_BF16=2 \
+    DS4_METAL_V41_HC_COMPOUND=1 \
+    DS4_METAL_V41_GATE_ENCODE_AHEAD=1 \
+    ./ds4-server -m gguf/DeepSeek-V4.1-Flash-Q2.gguf \
+    --ssd-streaming --ctx 8192 --ssd-streaming-cache-experts 10268 \
+    --host 127.0.0.1 --port 8019
+```
+
+| Variable | Role |
+| --- | --- |
+| `DS4_METAL_V41_MTL4=1` | V4.1 runs on the Metal 4 command path |
+| `DS4_METAL_V41_STREAMING_MEMORY_BUDGET_GIB=80` | the engine's memory budget: KV, buffers, resident weights, expert cache and prefill reserve all fit in 80 GiB, leaving the rest of 128 GB to macOS |
+| `DS4_METAL_V41_DECODE_QUEUE=1`, `..._DECODE_LEND_HEADROOM=2` | decode layers queue without a drain each; the prefill reserve is lent to the decode cache between requests |
+| `DS4_METAL_V41_ABORT_GATE=40`, `..._ABORT_GATE_SEG=3`, `..._GATE_ENCODE_AHEAD=1` | gated decode: a layer whose expert is not cached stops the segment, the expert is loaded, the segment resumes; segments are encoded ahead |
+| `DS4_METAL_IQ2_SELECTED_SHARED_EVENT=1`, `DS4_METAL_STREAM_SPLIT_MIN_MISSING=1`, `DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP=8192`, `DS4_METAL_V41_EXPERT_RESIDENCY_SET=1` | expert streaming: shared-event completion, split loads, startup preload of the built-in hot list, residency set for loaded experts |
+| `DS4_METAL_V41_FFN_OVERLAP=1`, `..._ROUTER_FUSE_TRANSFORM=5`, `..._FUSE_BF16=2`, `..._HC_COMPOUND=1` | fused and overlapped kernels in the layer |
+
+`--ssd-streaming-cache-experts 10268` asks for that many cached experts; the
+80 GiB budget fits the cache to what remains - about 7034 experts (9.5 MiB
+each) at `--ctx 8192` - and the startup log says so. `--ctx 8192` is the
+tested context. Run one `ds4-server` at a time: two GPU processes on the same
+machine push memory pressure up and the measurements no longer hold.
+
+### Check it
+
+The log should show, in order:
+
+```text
+ds4: V4.1 SSD cache fitted from 10268 to 7034 experts for context/runtime headroom
+ds4: Metal backend: Metal 4
+ds4: expert cache prewarmed from the built-in V4.1 hotlist: 6264 experts ...
+ds4: memory: KV 0.06 GiB ... + expert cache 58.08 GiB + prefill expert reserve 7.12 GiB = 77.99 GiB planned
+ds4-server: listening on http://127.0.0.1:8019
+```
+
+Then:
+
+```bash
+curl -s http://127.0.0.1:8019/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"ds4","messages":[{"role":"user","content":"Hello"}],"max_tokens":64,"temperature":0,"think":false}'
+```
+
+V4.1 thinks by default; `"think":false` returns the answer directly. To watch
+the answer arrive token by token:
+
+```bash
+curl -sN http://127.0.0.1:8019/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"ds4","messages":[{"role":"user","content":"Explain B-tree node splitting."}],"max_tokens":512,"temperature":0,"stream":true,"think":false}' \
+| jq -Rrj --unbuffered 'select(startswith("data: {")) | .[6:] | fromjson | .choices[0].delta.content // empty'; echo
+```
+
+What to expect on this machine: a long prompt's first-request prefill is
+about 35 s on a cool machine and slows under back-to-back long prompts as the
+GPU heats (about 35, 38 and 55 s for three in a row); decode is about
+45 ms a token once the expert cache is warm. Each server log line
+`prefill chunk`, `prompt done` and `decoding` reports the timings.
+
 ## Supported hardware
 
 * **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
